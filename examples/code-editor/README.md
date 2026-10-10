@@ -34,7 +34,7 @@ README:
   `presentFrame` would dirty the frame just presented and render without
   end.
 - The device scale is chosen once; a window resize goes through
-  `dom.document.viewport.resizeTo(width, height, deviceScale)` on the kept
+  `surface.viewport.resizeTo(width, height, deviceScale)` on the kept
   surface.
 
 `globalThis.example` exposes read-only state of the document (text, caret

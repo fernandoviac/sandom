@@ -287,6 +287,8 @@ import {
   LAYOUT_NODE_OFFSET_PADDING_BOTTOM,
   LAYOUT_NODE_OFFSET_PADDING_LEFT,
   LAYOUT_NODE_OFFSET_ROW_GAP,
+  LAYOUT_NODE_OFFSET_GRID_ROW_GAP_PERCENTAGE,
+  LAYOUT_NODE_OFFSET_GRID_COLUMN_GAP_PERCENTAGE,
   LAYOUT_NODE_OFFSET_COLUMN_GAP,
   LAYOUT_NODE_OFFSET_TRANSFORM,
   LAYOUT_NODE_OFFSET_TRANSFORM_KIND,
@@ -8014,7 +8016,11 @@ export async function createSceneRendererRuntime({
       // The painted scrollbar parts, back to front: the scene index of the
       // scroller (-1 for the viewport), x, y, width, height and radius in
       // viewport CSS px, and the colour. The raster plan expands each
-      // scroller's scrollbar marker from them.
+      // scroller's scrollbar marker from them. A function is called once,
+      // after this frame's layout and before its raster, with the frame's
+      // boxes and the engine's layout work so far (layout_compute_total: an
+      // equal reading means no node was laid out since), and returns the
+      // parts.
       scrollbarParts = [],
       ...rasterOptions
     } = renderOptions;
@@ -8654,6 +8660,9 @@ export async function createSceneRendererRuntime({
       ? retainBoxSnapshot(previous.boxes)
       : readSceneBoxes({ nodes });
     sampledLayout?.(boxes);
+    const frameScrollbarParts = typeof scrollbarParts === "function"
+      ? scrollbarParts(boxes, engine.exports.layout_compute_total())
+      : scrollbarParts;
     // Generate glyph atlases on the CPU for every raster backend. The WebGPU
     // atlas generator is not cross-browser safe: Chrome produced empty atlases,
     // Firefox produced partial atlases, and Safari produced complete atlases.
@@ -8808,9 +8817,9 @@ export async function createSceneRendererRuntime({
       // each painted part under its scroller's engine row, -1 for the
       // viewport's.
       const scrollbarFloats = RASTER_PLAN_SCROLLBAR_ROW_SIZE / 4;
-      const scrollbarRows = new Float32Array(scrollbarParts.length * scrollbarFloats);
+      const scrollbarRows = new Float32Array(frameScrollbarParts.length * scrollbarFloats);
       let scrollbarRowCount = 0;
-      for (const part of scrollbarParts) {
+      for (const part of frameScrollbarParts) {
         const node = part.ownerIndex < 0
           ? -1
           : engineIndexOfSceneNode(nodes, part.ownerIndex);
@@ -9398,9 +9407,25 @@ export async function createSceneRendererRuntime({
     "column-gap": LAYOUT_NODE_OFFSET_COLUMN_GAP,
     "font-size": LAYOUT_NODE_OFFSET_FONT_SIZE,
   });
+  // A gap whose percentage coefficient is NaN holds a length expression
+  // (src/wasm/layout.js), which does not interpolate.
+  const ANIMATION_PROPERTY_RECORD_GAP_PERCENTAGES = Object.freeze({
+    "row-gap": LAYOUT_NODE_OFFSET_GRID_ROW_GAP_PERCENTAGE,
+    "column-gap": LAYOUT_NODE_OFFSET_GRID_COLUMN_GAP_PERCENTAGE,
+  });
   function animationValueForRecord(bytes, recordView, base, propertyName, box) {
     const scalarOffset = ANIMATION_PROPERTY_RECORD_SCALARS[propertyName];
     if (scalarOffset !== undefined) {
+      const gapPercentage = ANIMATION_PROPERTY_RECORD_GAP_PERCENTAGES[propertyName];
+      if (
+        gapPercentage !== undefined &&
+        Number.isNaN(recordView.getFloat32(base + gapPercentage, true))
+      ) {
+        return {
+          kind: "lengthExpression",
+          expression: recordView.getFloat32(base + scalarOffset, true),
+        };
+      }
       return { kind: "scalar", value: recordView.getFloat32(base + scalarOffset, true) };
     }
     if (propertyName === "line-height") {
@@ -9422,11 +9447,15 @@ export async function createSceneRendererRuntime({
         return sceneAnimationLengthPercentage(`${value}%`, propertyName);
       }
       if (tag === SIZE_TAG_CALC_PAIR) {
+        const percentage = recordView.getFloat32(base + percentOffset, true);
+        // A NaN percentage marks a length expression (src/wasm/layout.js):
+        // a min(), max(), or clamp() that compares a percentage with
+        // another unit. It does not interpolate.
+        if (Number.isNaN(percentage)) {
+          return { kind: "lengthExpression", expression: value };
+        }
         return sceneAnimationLengthPercentage(
-          {
-            pixels: value,
-            percentage: recordView.getFloat32(base + percentOffset, true),
-          },
+          { pixels: value, percentage },
           propertyName,
         );
       }
@@ -9987,6 +10016,12 @@ export async function createSceneRendererRuntime({
               if (
                 propertyName in ANIMATION_PROPERTY_RECORD_SIZES &&
                 (previousTarget.kind === "keyword" || nextTarget.kind === "keyword")
+              ) continue;
+              // A length expression that compares a percentage with another
+              // unit resolves only at layout; it changes discretely.
+              if (
+                previousTarget.kind === "lengthExpression" ||
+                nextTarget.kind === "lengthExpression"
               ) continue;
               if (propertyName === "line-height" &&
                 (previousTarget.unit === "normal" || nextTarget.unit === "normal" ||

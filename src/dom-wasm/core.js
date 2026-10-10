@@ -2596,11 +2596,18 @@ export class DomCore {
     this.exports.length_viewport_set(width, height);
   }
 
-  // Returns a keyword string, a pixel number, a "N%" string, or a
-  // { pixels, percentage } pair; throws a SyntaxError on invalid input.
+  // Returns a keyword string, a pixel number, a "N%" string, a
+  // { pixels, percentage } pair, or a length expression { expression,
+  // cssText }; throws a SyntaxError on invalid input.
   resolveLength(value) {
     const kind = this.status("length_resolve", ...this.input(value));
     if (kind === 1) return this.outputString();
+    if (kind === 5) {
+      return {
+        expression: this.exports.length_result_expression(),
+        cssText: this.outputString(),
+      };
+    }
     const pixels = this.exports.length_result_pixels();
     if (kind === 2) return pixels;
     const percentage = this.exports.length_result_percentage();
@@ -3069,6 +3076,16 @@ export class DomCore {
         slot.value = {
           pixels: view.getFloat64(offset + 8, true),
           percentage: view.getFloat64(offset + 16, true),
+        };
+      } else if (valueKind === 23) {
+        // A length expression: layout evaluates the interned program once
+        // it knows the percentage basis; cssText is the computed value.
+        slot.value = {
+          expression: view.getFloat64(offset + 8, true),
+          cssText: text(
+            view.getUint32(offset + 52, true),
+            view.getUint32(offset + 56, true),
+          ),
         };
       } else if (valueKind === 4 || valueKind === 6 || valueKind === 8) {
         slot.value = text(

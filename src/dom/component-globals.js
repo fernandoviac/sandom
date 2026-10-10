@@ -21,6 +21,7 @@ import { parseHTMLDocument } from "./html.js";
 import { parseXMLDocument } from "./xml.js";
 import { SDRange, SDSelection } from "./selection.js";
 import { SandomGPUCanvasContext } from "./canvas.js";
+import { CanvasRenderingContext2D, ImageData } from "./canvas-2d.js";
 import {
   CustomElementRegistry,
   CustomStateSet,
@@ -221,6 +222,8 @@ export function installComponentGlobals(
     HTMLButtonElement: SDHTMLButtonElement,
     HTMLCanvasElement: SDHTMLCanvasElement,
     GPUCanvasContext: SandomGPUCanvasContext,
+    CanvasRenderingContext2D,
+    ImageData,
     HTMLTemplateElement: SDHTMLTemplateElement,
     HTMLInputElement: SDHTMLInputElement,
     HTMLFormElement: SDHTMLFormElement,

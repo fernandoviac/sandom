@@ -64,6 +64,13 @@ import { queueDetailsToggle } from "./details.js";
 import {
   SandomGPUCanvasContext,
 } from "./canvas.js";
+import {
+  assertCanvas2DSettingsSupported,
+  canvasToBlob,
+  convertCanvas2DSettings,
+  createCanvasRenderingContext2D,
+  readMemberNotSupported,
+} from "./canvas-2d.js";
 import { SDRange, SDSelection } from "./selection.js";
 import { requestSubmit, runInputActivation } from "./input-activation.js";
 import { copyControlIdentities, inputControlRuntime } from "./input-controls.js";
@@ -1159,7 +1166,22 @@ export class SDHTMLCanvasElement extends SDHTMLElement {
   constructor(tag = "canvas", ownerDocument = null) {
     super(tag, HTML_NS, ownerDocument);
   }
-  _getContextFromString(contextIdentifier) {
+  _getContextFromString(contextIdentifier, options) {
+    if (contextIdentifier === "2d") {
+      const settings = convertCanvas2DSettings(options);
+      if (this._canvasContextType === "2d") return this._canvasContext;
+      if (this._canvasContextType !== null) return null;
+      assertCanvas2DSettingsSupported(settings);
+      // The 2D context takes over the canvas resource that the element
+      // registered, so paint reaches its bitmap through the same source.
+      const resourceHandle = this._canvasContext._resourceHandle;
+      const context = createCanvasRenderingContext2D(this, settings, resourceHandle);
+      this.ownerDocument?._canvasContexts?.delete(this._canvasContext);
+      this.ownerDocument?._canvasContexts?.add(context);
+      this._canvasContext = context;
+      this._canvasContextType = "2d";
+      return context;
+    }
     const identifier = contextIdentifier.toLowerCase();
     if (identifier !== "webgpu") return null;
     if (
@@ -1172,6 +1194,12 @@ export class SDHTMLCanvasElement extends SDHTMLElement {
     if (!graphicsCapability) return null;
     this._canvasContextType = identifier;
     return this._canvasContext;
+  }
+  toBlob(callback, type = undefined, quality = undefined) {
+    canvasToBlob(this, arguments.length, callback, type, quality);
+  }
+  toDataURL() {
+    throw readMemberNotSupported("HTMLCanvasElement.toDataURL");
   }
   _setParsedAttribute(localName, value, namespaceURI = null, prefix = null) {
     const result = super._setParsedAttribute(

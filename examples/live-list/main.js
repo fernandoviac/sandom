@@ -756,7 +756,7 @@ globalThis.addEventListener("resize", () => {
   if (height === viewportHeight) return;
   viewportHeight = height;
   projection = projectOntoRectangle(canvas, { width: viewportWidth, height });
-  dom.document.viewport.resizeTo(viewportWidth, height, deviceScale);
+  surface.viewport.resizeTo(viewportWidth, height, deviceScale);
 });
 
 // ---------------------------------------------------------------- state

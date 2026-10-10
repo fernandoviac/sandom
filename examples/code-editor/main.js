@@ -525,7 +525,7 @@ globalThis.addEventListener("resize", () => {
   viewportWidth = width;
   viewportHeight = height;
   projection = projectOntoRectangle(canvas, { width, height });
-  dom.document.viewport.resizeTo(width, height, deviceScale);
+  surface.viewport.resizeTo(width, height, deviceScale);
 });
 
 // Read-only state of the Sandom document, read by automation and handy in

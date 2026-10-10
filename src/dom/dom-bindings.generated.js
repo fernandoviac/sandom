@@ -1378,9 +1378,9 @@ export function installCanvasResourceBindings(runtime, prototype) {
       let text = String(normalized);
       callBindingFunction(captured, this, "height", text);
     },
-    getContext(contextIdentifier) {
+    getContext(contextIdentifier, options) {
       let identifier = String(contextIdentifier);
-      return this["_getContextFromString"](identifier);
+      return this["_getContextFromString"](identifier, options);
     },
   };
   Object.defineProperty(binding, "width", {"enumerable": false});

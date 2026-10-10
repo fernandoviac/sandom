@@ -17,7 +17,7 @@ README:
   canvas; `bindProjectedInput` with `projectOntoRectangle` routes the
   canvas's pointer, wheel, and keyboard events into the document; the
   surface's loop decides when to render. The device scale is chosen once,
-  and a window resize goes through `dom.document.viewport.resizeTo`.
+  and a window resize goes through `surface.viewport.resizeTo`.
 - The tree is built once and the nodes that change are kept. Each item's
   record holds its `<li>`, checkbox, title button, and control buttons, so
   every action changes only the nodes it is about: checking an item moves the same

@@ -225,7 +225,7 @@ heavy load:
   text node's `data`, an element's `style` property, or a class; do not
   replace the subtree around them.
 - Keep one surface per shown document, and resize it through
-  `dom.document.viewport.resizeTo(width, height, deviceScale)`.
+  `surface.viewport.resizeTo(width, height, deviceScale)`.
 - Let the surface's loop decide when to render. After `surface.start()` it
   requests a host animation frame only when the document changed, an
   animation runs, a caret blinks, or a scrollbar fades; an idle document

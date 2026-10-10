@@ -200,6 +200,11 @@ function caretVisibleInPhase(anchorMilliseconds, timeMilliseconds) {
   return Math.floor(elapsed / CARET_BLINK_MILLISECONDS) % 2 === 0;
 }
 
+// Each presented frame's reading of the engine's layout work
+// (layout_compute_total) when its boxes were read; absent for a frame
+// whose renderer reports none.
+const presentedLayoutWork = new WeakMap();
+
 function motionValueSignature(value) {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => motionValueSignature(entry)).join(",")}]`;
@@ -3674,15 +3679,9 @@ class DOMRenderSurface {
         );
       }
 
-      // Scrollbars (wide-color plan, package 4): computed BEFORE the
-      // render from a synchronous layout pass and emitted as overlay
-      // rects through the render graph's own rect pipeline, replacing
-      // the old CPU byte compositing over the readback. Keeps scrollbar
-      // color in the floating-point path.
-      if (this._lastBoxes.length === 0 && boxes.length === 0) {
-        // First frame only: no engine baseline exists yet, so scrollbar
-        // descriptors take one JS layout pass. Every later frame reads the
-        // retained engine boxes.
+      // A frame that only prepares (prepareNow) and has no engine baseline
+      // yet takes one layout pass for its boxes.
+      if (!rasterize && this._lastBoxes.length === 0 && boxes.length === 0) {
         boxes = await this._layoutTreeBoxes({
           width: frameViewport.width,
           height: frameViewport.height,
@@ -3690,15 +3689,12 @@ class DOMRenderSurface {
           imageSources: serialized.imageSources,
         }, svgImageTimings);
       }
-      // ONE geometry source for scrollbar descriptors: the presented
-      // snapshot (the engine's boxes, the same family the delivered pixels
-      // paint). It describes the PREVIOUS frame; THIS frame's pending
-      // scroll deltas are known exactly, so scrollbars_build predicts
-      // current geometry natively instead of lagging one frame behind the
-      // painted content: each pending target takes its clamped requested
-      // offset and each scroller box shifts by its frozen ancestors'
-      // pending deltas. The first frame has no snapshot and builds one from
-      // the layout pass once. No layout pass runs here.
+      // The presented snapshot (the engine's boxes, the same family the
+      // delivered pixels paint) describes the PREVIOUS frame; THIS frame's
+      // pending scroll deltas are known exactly, so the core predicts
+      // current geometry natively from it: each pending target takes its
+      // clamped requested offset and each scroller box shifts by its
+      // frozen ancestors' pending deltas.
       const snapshot = this._presentedFrame;
       const predictScroll = (target, slot) =>
         this._root._domCore.status(
@@ -3739,50 +3735,80 @@ class DOMRenderSurface {
           core.refreshBytes().buffer.slice(base, base + nodes.length * 32),
         );
       };
-      const scrollbars = snapshot
-        ? snapshotScrollbars(
-          this._root,
-          this.viewport,
-          snapshot.geometryCore,
-          snapshot.geometryHandle,
-          capturedScrollRequests.size > 0 ? capturedScrollRequests.handle : 0n,
-          this.scrollbarStyle,
-        )
-        : computeScrollbars(serialized, boxes, this.viewport, this.scrollbarStyle);
-      // Each descriptor carries the visibility it paints with; a hidden
-      // overlay bar emits nothing, a fading one scales its colors' alpha.
-      const scrollbarVisibility = this._scrollbarVisibility.advance(
-        scrollbars,
-        this._scrollbars,
-        timeMilliseconds,
-      );
-      for (const [index, scrollbar] of scrollbars.entries()) {
-        scrollbar.visibility = scrollbarVisibility[index];
-      }
+      // Scrollbar descriptors describe the layout this frame paints. The
+      // renderer asks for their parts after it laid the frame out and
+      // before it rasterizes (scene-renderer's scrollbarParts), with the
+      // engine's layout work so far. When no node was laid out since the
+      // presented frame's layout (a scroll, a paint change), the frame
+      // keeps that layout, and its descriptors come from the presented
+      // snapshot with the prediction above. Otherwise (a script changed
+      // an overflow, the content grew, a layout getter ran, the first
+      // frame) they are built from the frame's own boxes: the presented
+      // snapshot still holds the previous ranges, classic bar space and
+      // overflow.
+      let scrollbars = null;
+      let frameLayoutWork = null;
+      const describeScrollbars = (frameBoxes, laidOut) => {
+        scrollbars = snapshot && !laidOut
+          ? snapshotScrollbars(
+            this._root,
+            this.viewport,
+            snapshot.geometryCore,
+            snapshot.geometryHandle,
+            capturedScrollRequests.size > 0 ? capturedScrollRequests.handle : 0n,
+            this.scrollbarStyle,
+          )
+          : computeScrollbars(serialized, frameBoxes, this.viewport, this.scrollbarStyle);
+        // Each descriptor carries the visibility it paints with; a hidden
+        // overlay bar emits nothing, a fading one scales its colors' alpha.
+        const scrollbarVisibility = this._scrollbarVisibility.advance(
+          scrollbars,
+          this._scrollbars,
+          timeMilliseconds,
+        );
+        for (const [index, scrollbar] of scrollbars.entries()) {
+          scrollbar.visibility = scrollbarVisibility[index];
+        }
+      };
       // Sandom's scrollbar design (src/dom/scrollbar-paint.js): each bar's
       // track, edge line, rounded thumb and classic corner in viewport CSS
       // px, under its scroller's scene index (-1 for the viewport). The
       // engine paints them at its scroller's scrollbar marker, inside the
       // clips over the scroller, and repaints what changed.
-      const paintedScrollbars = paintScrollbars(scrollbars, this.scrollbarStyle);
-      const scrollbarParts = [];
-      for (const { bar, parts } of paintedScrollbars) {
-        const ownerIndex = bar.element === this.viewport
-          ? -1
-          : serialized.indexOf.get(bar.element);
-        if (ownerIndex === undefined) continue;
-        for (const part of parts) {
-          scrollbarParts.push({
-            ownerIndex,
-            x: part.x,
-            y: part.y,
-            width: part.width,
-            height: part.height,
-            radius: part.radius,
-            color: part.color,
-          });
+      //
+      // One frame has one set of bars. The first call describes them; a
+      // later call (a caller that renders this frame's render options
+      // again) paints the same descriptors. The frame's scroll capture,
+      // which the prediction reads, is released when the frame ends, and
+      // the bars' visibility advances once per frame.
+      const scrollbarParts = (frameBoxes, layoutWork) => {
+        if (scrollbars === null) {
+          frameLayoutWork = layoutWork;
+          describeScrollbars(
+            frameBoxes,
+            snapshot === null || presentedLayoutWork.get(snapshot) !== layoutWork,
+          );
         }
-      }
+        const parts = [];
+        for (const { bar, parts: barParts } of paintScrollbars(scrollbars, this.scrollbarStyle)) {
+          const ownerIndex = bar.element === this.viewport
+            ? -1
+            : serialized.indexOf.get(bar.element);
+          if (ownerIndex === undefined) continue;
+          for (const part of barParts) {
+            parts.push({
+              ownerIndex,
+              x: part.x,
+              y: part.y,
+              width: part.width,
+              height: part.height,
+              radius: part.radius,
+              color: part.color,
+            });
+          }
+        }
+        return parts;
+      };
       // Selected text paints in the text's own paint order (the renderer's
       // text highlights), never as an overlay over the finished frame.
       const textHighlights = [];
@@ -3977,7 +4003,7 @@ class DOMRenderSurface {
         ...(scrollOnly && declaredChangedNodeIndices !== null
           ? { scrollOnlyNodeIndices: declaredChangedNodeIndices }
           : {}),
-        ...(scrollbarParts.length > 0 ? { scrollbarParts } : {}),
+        scrollbarParts,
         ...(textHighlights.length > 0 ? { textHighlights } : {}),
         ...(textCaret !== null ? { textCaret } : {}),
         ...(declaredChangedNodeIndices !== null
@@ -4149,6 +4175,9 @@ class DOMRenderSurface {
         }, svgImageTimings);
       }
       const effectiveBoxes = rendered.boxes?.length ? rendered.boxes : boxes;
+      // A caller-supplied renderer that paints no scrollbars never asks for
+      // their parts; the frame still publishes its descriptors.
+      if (scrollbars === null) describeScrollbars(effectiveBoxes, true);
 
       const dirtyRectangles = !authoritativeDirtyTiles &&
           rendered.dirtyRects?.length
@@ -4769,6 +4798,7 @@ class DOMRenderSurface {
         this._lastDeliveredFrame = frame;
         this._lastRendered = rendered;
         this._presentedFrame = successor;
+        if (frameLayoutWork !== null) presentedLayoutWork.set(successor, frameLayoutWork);
         successorPublished = true;
         core.status(
           "scroll_presented",

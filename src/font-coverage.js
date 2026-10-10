@@ -146,6 +146,46 @@ export function decodeFontCoverage(bytes) {
   };
 }
 
+// The 1-based index of the language of `coverage` (a decodeFontCoverage
+// result) that the content language `lang` selects, or 0: the first tag
+// that equals `lang` or is a prefix of it that ends before a "-", compared
+// ASCII case-insensitively, as the engine matches ($coverageLanguage).
+export function fontCoverageLanguage(coverage, lang) {
+  if (!lang) return 0;
+  const tag = lang.toLowerCase();
+  const index = coverage.languages.findIndex((candidate) => {
+    const prefix = candidate.toLowerCase();
+    return tag === prefix || tag.startsWith(`${prefix}-`);
+  });
+  return index + 1;
+}
+
+// The family that `coverage` selects for `scalar` in text of the 1-based
+// coverage language `language` (0 for none), or null: a language range of
+// that language first, then the default range that holds `scalar`, as the
+// engine looks up ($coverageFamily).
+export function fontCoverageFamily(coverage, scalar, language) {
+  const view = new DataView(coverage.ranges.buffer, coverage.ranges.byteOffset, coverage.ranges.byteLength);
+  const rangeCount = coverage.ranges.byteLength / FONT_COVERAGE_RANGE_SIZE;
+  for (let index = coverage.defaultCount; language !== 0 && index < rangeCount; index++) {
+    const offset = index * FONT_COVERAGE_RANGE_SIZE;
+    if (view.getUint16(offset + 10, true) === language &&
+      scalar >= view.getUint32(offset, true) && scalar <= view.getUint32(offset + 4, true)) {
+      return coverage.families[view.getUint16(offset + 8, true)];
+    }
+  }
+  let low = 0;
+  let high = coverage.defaultCount - 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const offset = middle * FONT_COVERAGE_RANGE_SIZE;
+    if (scalar < view.getUint32(offset, true)) high = middle - 1;
+    else if (scalar > view.getUint32(offset + 4, true)) low = middle + 1;
+    else return coverage.families[view.getUint16(offset + 8, true)];
+  }
+  return null;
+}
+
 // The sorted, disjoint [first, last] scalar ranges that the `cmap` table of
 // the font at `bytes` maps to a glyph other than 0. Reads the Unicode
 // subtables: format 12 (full repertoire) before format 4 (BMP).

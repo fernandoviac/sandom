@@ -931,9 +931,10 @@ export const LAYOUT_NODE_OFFSET_INTERIOR_CLEAR_PIN_GEN = 0x290; // u32
 // style ends at 0x278
 // scratch uses 0x278-0x293
 
-// Animated <length-percentage> coefficients. Static values keep their existing
-// tags and zero these companions; TAG_CALC_PAIR stores pixels in the original
-// value field and the percentage fraction here.
+// <length-percentage> coefficients. A length or a percentage keeps its own
+// tag and zeroes the companion; TAG_CALC_PAIR stores pixels in the original
+// value field and the percentage fraction (or NaN for a length expression)
+// here.
 export const LAYOUT_NODE_OFFSET_WIDTH_PERCENT = 0x2A8;
 export const LAYOUT_NODE_OFFSET_HEIGHT_PERCENT = 0x2AC;
 export const LAYOUT_NODE_OFFSET_MIN_WIDTH_PERCENT = 0x2B0;
@@ -1085,7 +1086,13 @@ export const SIZE_TAG_PERCENT = 2;
 export const SIZE_TAG_MIN_CONTENT = 3; // width:min-content
 export const SIZE_TAG_MAX_CONTENT = 4; // width:max-content
 export const SIZE_TAG_FIT_CONTENT = 8; // width/height:fit-content
-export const SIZE_TAG_CALC_PAIR = 5; // animation-only px + percentage-fraction pair
+// A px + percentage-fraction pair. A NaN percentage marks a length
+// expression: the value is the identifier of a program the DOM core interned
+// (src/dom-wasm/lengths.watpart) for a min(), max(), or clamp() that
+// compares a percentage with another unit, evaluated at layout against the
+// percentage basis. The same convention holds for the gap and grid track
+// pixel/percentage pairs.
+export const SIZE_TAG_CALC_PAIR = 5;
 export const SIZE_TAG_COVER = 6; // background-size:cover (P5c)
 export const SIZE_TAG_CONTAIN = 7; // background-size:contain (P5c)
 
