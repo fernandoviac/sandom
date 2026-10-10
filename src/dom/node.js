@@ -362,6 +362,18 @@ function copyClonedHostState(source, clone, deep) {
   }
 }
 
+// A stable order between DOM core instances, for compareDocumentPosition.
+const coreOrdinals = new WeakMap();
+let nextCoreOrdinal = 0;
+function coreOrdinal(core) {
+  let ordinal = coreOrdinals.get(core);
+  if (ordinal === undefined) {
+    ordinal = nextCoreOrdinal++;
+    coreOrdinals.set(core, ordinal);
+  }
+  return ordinal;
+}
+
 export class SDNode {
   constructor(_nodeType, _nodeName, ownerDocument, coreState) {
     if (!coreState?.core || typeof coreState.handle !== "bigint") {
@@ -413,6 +425,42 @@ export class SDNode {
       this._coreHandle,
       candidate._coreHandle,
     ) === 1;
+  }
+
+  compareDocumentPosition(other) {
+    const node = ensureNode(other);
+    if (node === this) return 0;
+    const path = (start) => {
+      const nodes = [];
+      for (let current = start; current !== null; current = current.parentNode) {
+        nodes.unshift(current);
+      }
+      return nodes;
+    };
+    const ours = path(this);
+    const theirs = path(node);
+    if (ours[0] !== theirs[0]) {
+      // Disconnected: any order, as long as it is consistent. Ordering by
+      // root keeps every node of one tree on the same side of the other.
+      const following = this._domCore === node._domCore
+        ? ours[0]._coreHandle < theirs[0]._coreHandle
+        : coreOrdinal(this._domCore) < coreOrdinal(node._domCore);
+      return SDNode.DOCUMENT_POSITION_DISCONNECTED |
+        SDNode.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC |
+        (following ? SDNode.DOCUMENT_POSITION_FOLLOWING : SDNode.DOCUMENT_POSITION_PRECEDING);
+    }
+    let depth = 0;
+    while (depth < ours.length && depth < theirs.length && ours[depth] === theirs[depth]) depth += 1;
+    if (depth === ours.length) {
+      return SDNode.DOCUMENT_POSITION_CONTAINED_BY | SDNode.DOCUMENT_POSITION_FOLLOWING;
+    }
+    if (depth === theirs.length) {
+      return SDNode.DOCUMENT_POSITION_CONTAINS | SDNode.DOCUMENT_POSITION_PRECEDING;
+    }
+    for (let sibling = ours[depth].nextSibling; sibling !== null; sibling = sibling.nextSibling) {
+      if (sibling === theirs[depth]) return SDNode.DOCUMENT_POSITION_FOLLOWING;
+    }
+    return SDNode.DOCUMENT_POSITION_PRECEDING;
   }
 
   _transportIsEqualNode(otherNode) {
@@ -1506,6 +1554,17 @@ const elementFamily = createElementFamily({
 });
 
 installNodeBindings({ addListener, removeListener, dispatchNativeEvent }, SDNode.prototype);
+for (const [name, value] of Object.entries({
+  DOCUMENT_POSITION_DISCONNECTED: 0x01,
+  DOCUMENT_POSITION_PRECEDING: 0x02,
+  DOCUMENT_POSITION_FOLLOWING: 0x04,
+  DOCUMENT_POSITION_CONTAINS: 0x08,
+  DOCUMENT_POSITION_CONTAINED_BY: 0x10,
+  DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 0x20,
+})) {
+  Object.defineProperty(SDNode, name, { value, enumerable: true });
+  Object.defineProperty(SDNode.prototype, name, { value, enumerable: true });
+}
 installElementAnimationBindings({ animationHost: elementAnimationHost }, SDElement.prototype);
 installElementGeometryBindings(layoutGetters, SDElement.prototype);
 installElementBindings({
