@@ -1,5 +1,5 @@
 // Exact outline coverage of the text in a display list, and the envelope
-// of coverage Sandom may draw around it (plans/PLAN-text-ink-approval.md);
+// of coverage Sandom may draw around it (plans/text/PLAN-text-ink-approval.md);
 // the same for SVG fills (plans/PLAN-svg-source-truth.md).
 //
 // The coverage comes from src/wasm/text-ink-reference.wat. For text it
@@ -72,10 +72,10 @@ function configureEnvelope(exports, mechanisms, subject) {
 }
 
 // The key of a glyph's distance field in the renderer's atlas, as
-// vendor/msdfgen-wasm-cpp/src/atlas.cpp computes it from the text
+// src/wasm/glyph-atlas.watpart computes it from the text
 // command's CSS font size: the size class, its field size
-// (glyphMsdfSizeForClass) and its minimum texel in font units
-// (glyphMinimumShapeUnitsPerTexel).
+// (atlas_glyph_msdf_size) and its minimum texel in font units
+// (atlas_glyph_minimum_shape_units_per_texel).
 const MSDF_RANGE = 6;
 const TEXT_FIELD_REACH_PX = 0.95;
 function glyphFieldKey(cssFontSize, unitsPerEm) {

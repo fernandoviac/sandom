@@ -10,7 +10,7 @@
 // worker (protocol END/ENDED) and parks the worker; the next
 // createSessionHost for the same workerURL re-mounts into it, importing
 // nothing. Reuse is the default because the teardown contract is proven
-// at the source (test/session_host_reuse_test.js: custom elements,
+// at the source (test/surfaces-and-hosts/session_host_reuse_test.js: custom elements,
 // globals, observers, and stylesheets from a previous session are
 // unreachable; fonts and module registries are retained by design), and
 // because every reuse failure is loud: a failed or overdue END degrades

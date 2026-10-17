@@ -1,4 +1,5 @@
 import { sharedDomCore } from "../dom-wasm/core.js";
+import { enterComponentCode } from "./component-code.js";
 import {
   createCustomElementRegistryBinding,
   createCustomStateSetBinding,
@@ -6,6 +7,7 @@ import {
 } from "./dom-bindings.generated.js";
 
 const constructors = new WeakMap();
+const constructorCores = new WeakMap();
 const coreStates = new WeakMap();
 const contexts = new WeakMap();
 const constructions = new WeakMap();
@@ -68,12 +70,27 @@ function definitionText(core, id, field) {
   return core.string("custom_definition_text", id, field);
 }
 
-export function constructionCandidate(constructor) {
-  const core = constructionCore;
-  const id = constructors.get(constructor);
-  return id === undefined ? null : core.wrapperFor(
-    core.handle("custom_construction_candidate", id),
+export function constructHTMLElement(constructor, interfaceConstructor, autonomous = false) {
+  const core = constructorCores.get(constructor) ?? constructionCore;
+  const definition = core.status(
+    "custom_html_constructor_prepare",
+    constructors.get(constructor) ?? 0,
+    constructorIdentity(interfaceConstructor),
+    autonomous ? 1 : 0,
   );
+  const requestedPrototype = constructor.prototype;
+  const prototype = requestedPrototype !== null &&
+      (typeof requestedPrototype === "object" || typeof requestedPrototype === "function")
+    ? requestedPrototype : interfaceConstructor.prototype;
+  const handle = core.handle("custom_html_constructor_create", definition);
+  try {
+    const element = core.wrapperFor(handle);
+    Object.setPrototypeOf(element, prototype);
+    core.status("custom_html_constructor_finish", definition, handle);
+    return element;
+  } finally {
+    core.status("node_release", handle);
+  }
 }
 
 export function customElementState(element) {
@@ -132,9 +149,15 @@ const callbackNames = [
   "disconnectedCallback",
   "attributeChangedCallback",
   "adoptedCallback",
+  "connectedMoveCallback",
 ];
 
+// Runs a reaction as component code of its element's document.
 function invokeReaction(reaction, context = null) {
+  return enterComponentCode(reaction.element?.ownerDocument, runReaction, null, [reaction, context]);
+}
+
+function runReaction(reaction, context) {
   const { definition, element, kind, argumentsList } = reaction;
   if (kind === 0) {
     return definition.host
@@ -147,11 +170,27 @@ function invokeReaction(reaction, context = null) {
       : definition.registry._upgradeElement(element, definition);
   }
   const name = callbackNames[kind];
-  const callback = definition.host ? definition.callbacks[name] : element[name];
-  if (typeof callback !== "function") return;
-  return definition.host
+  const callbackOf = (callbackName) => definition.host ? definition.callbacks[callbackName] : element[callbackName];
+  const call = (callback) => definition.host
     ? callback(element, ...argumentsList, context, definition.participant)
     : callback.apply(element, argumentsList);
+  const callback = callbackOf(name);
+  if (typeof callback === "function") return call(callback);
+  // HTML "enqueue a custom element callback reaction": without
+  // connectedMoveCallback, a move runs disconnectedCallback and then
+  // connectedCallback as two reactions; an exception in the first is
+  // reported and the second still runs.
+  if (kind !== 5) return;
+  const disconnected = callbackOf("disconnectedCallback");
+  if (typeof disconnected === "function") {
+    try {
+      call(disconnected);
+    } catch (error) {
+      definition.registry._reportException(error);
+    }
+  }
+  const connected = callbackOf("connectedCallback");
+  if (typeof connected === "function") return call(connected);
 }
 
 function completeReaction(core, handle, registry, reaction, error) {
@@ -423,11 +462,12 @@ class CustomElementRegistryRuntime {
     this._domCore = core;
     this._coreRegistry = core.status("custom_registry_create");
     this._supportedBuiltIns = supportedBuiltIns;
-    for (const name of supportedBuiltIns.keys()) {
+    for (const [name, interfaceConstructor] of supportedBuiltIns) {
       core.status(
         "custom_registry_builtin",
         this._coreRegistry,
         ...core.input(name),
+        constructorIdentity(interfaceConstructor),
       );
     }
     this._waiting = new Map();
@@ -587,6 +627,7 @@ class CustomElementRegistryRuntime {
       constructor === null ? 0 : constructorIdentity(constructor),
       host ? 1 : 0,
     );
+    if (constructor !== null) constructorCores.set(constructor, core);
     for (const attribute of observedAttributes) {
       core.status("custom_definition_observe", id, ...core.input(attribute));
     }
@@ -791,7 +832,7 @@ class CustomElementRegistryRuntime {
       : document.createElement(localName);
   }
 
-  async _bindingUpgradeHost(root, reactionContext) {
+  _bindingUpgradeHost(root, reactionContext) {
     this._validateReactionContext(reactionContext);
     this.upgrade(root);
   }
@@ -1007,19 +1048,21 @@ class CustomElementRegistryRuntime {
     construction = false,
   ) {
     const core = this._domCore;
-    if (!definition) return;
-    withCustomElementReactions(() => {
+    if (!definition) return element;
+    return withCustomElementReactions(() => {
       const token = this._beginConstruction(
         element,
         definition,
         null,
         construction ? 1 : 0,
       );
-      if (!token) return;
+      if (!token) return element;
       const binding = constructions.get(token);
       let failure;
       let outcome = 0;
       let result;
+      let returned;
+      let constructed = element;
       try {
         binding.claim = core.handle(
           "custom_construction_claim",
@@ -1028,16 +1071,14 @@ class CustomElementRegistryRuntime {
           definition.id,
           0n,
         );
-        Object.setPrototypeOf(element, definition.constructor.prototype);
         const previousCore = constructionCore;
-        let returned;
         try {
           constructionCore = core;
           returned = Reflect.construct(definition.constructor, []);
         } finally {
           constructionCore = previousCore;
         }
-        if (returned !== element) {
+        if (!construction && returned !== element) {
           outcome = 2;
           failure = new TypeError(
             "Custom element constructor returned a different object",
@@ -1048,25 +1089,43 @@ class CustomElementRegistryRuntime {
         failure = error;
       }
       try {
-        result = core.status(
-          "custom_construction_complete",
-          binding.handle,
-          this._coreRegistry,
-          0n,
-          binding.claim,
-          outcome,
-        );
-        applyConstructionResult(binding, result);
+        if (construction) {
+          result = core.status(
+            "custom_creation_complete",
+            binding.handle,
+            this._coreRegistry,
+            binding.claim,
+            core.handleForWrapper(returned),
+            outcome,
+          );
+          constructed = core.wrapperFor(core.handle(
+            "custom_creation_result", binding.handle, this._coreRegistry,
+          ));
+          constructed._dispatchCoreTreeRecords();
+          constructed._notifyMutation("state", "defined");
+        } else {
+          result = core.status(
+            "custom_construction_complete",
+            binding.handle,
+            this._coreRegistry,
+            0n,
+            binding.claim,
+            outcome,
+          );
+          applyConstructionResult(binding, result);
+        }
       } finally {
         this._releaseConstruction(token);
       }
       if (result === 4) {
         failure = new DOMException(
-          "A custom element constructor must not add attributes, children, or a parent",
+          "Custom element creation requires an empty, detached element with the requested document and local name",
           "NotSupportedError",
         );
       }
+      if (result === 5) failure = new TypeError("Custom element constructor returned an invalid element");
       if (result !== 1) this._reportException(failure);
+      return constructed;
     }, core);
   }
 
@@ -1079,26 +1138,21 @@ class CustomElementRegistryRuntime {
     );
   }
 
-  _construct(document, localName, is = null) {
+  _construct(element, is = null) {
     const core = this._domCore;
     const { definitions } = coreState(core);
-    requireCore(core, document);
+    requireCore(core, element);
     const id = core.status(
       "custom_registry_match",
       this._coreRegistry,
-      ...core.input(localName),
+      ...core.input(element.localName),
       ...core.nullableInput(is),
       0,
     );
     const definition = definitions.get(id);
-    if (!definition) return null;
-    const baseConstructor = this._supportedBuiltIns.get(definition.extendedTag);
-    const element = baseConstructor
-      ? new baseConstructor(localName, document)
-      : document._createUncustomizedElement(localName);
+    if (!definition) return element;
     if (is) element._setParsedAttribute("is", is);
-    this._upgradeElement(element, definition, true);
-    return element;
+    return this._upgradeElement(element, definition, true);
   }
 }
 

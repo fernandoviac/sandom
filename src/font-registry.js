@@ -1,7 +1,6 @@
-import { readFontMetrics } from "./font-metrics.js";
 import { decodeFontCoverage } from "./font-coverage.js";
 
-import { hasFileSystem, readBinaryFile } from "./host.js";
+import { createDocumentResourceLoader } from "./dom/document-resources.js";
 import { sharedDomCore } from "./dom-wasm/core.js";
 
 const fontCatalogFinalizer = new FinalizationRegistry((lifetime) => {
@@ -11,6 +10,7 @@ const fontCatalogFinalizer = new FinalizationRegistry((lifetime) => {
   const core = lifetime.coreReference.deref();
   if (!core) return;
   for (const resource of lifetime.resources.values()) core.status("resource_release", resource);
+  if (lifetime.sourceSync !== 0n) core.status("font_source_sync_release", lifetime.sourceSync);
   core.status("font_catalog_release", lifetime.handle);
 });
 
@@ -19,8 +19,32 @@ export const DEFAULT_FONT_SIZE = 14;
 // Hosted faces are immutable process resources. Every registry in one module
 // realm must resolve a hosted family key to the same selected face record.
 const hostedFontFamilies = new Map();
-const hostedFaceRequests = new WeakMap();
 const registrySources = new WeakMap();
+// Opaque identities of the host values that a registry's resolver and
+// bundled fonts read (font_catalog_host_sources); 0 for an absent value.
+const hostValueTokens = new WeakMap();
+let nextHostValueToken = 1;
+function hostValueToken(value) {
+  if (value === undefined || value === null) return 0;
+  let token = hostValueTokens.get(value);
+  if (token === undefined) hostValueTokens.set(value, token = nextHostValueToken++);
+  return token;
+}
+const fontLoadRequestCaches = new WeakMap();
+const fontLoadRequestFinalizer = new FinalizationRegistry((handle) => {
+  sharedDomCore.status("font_load_requests_release", handle);
+});
+
+function fontLoadRequestFor(owner, family, weight, style) {
+  let handle = fontLoadRequestCaches.get(owner);
+  if (handle === undefined) {
+    handle = sharedDomCore.status("font_load_requests_create");
+    fontLoadRequestCaches.set(owner, handle);
+    fontLoadRequestFinalizer.register(owner, handle);
+  }
+  return sharedDomCore.status("font_load_request", handle, Number(family),
+    Number(weight), ...sharedDomCore.input(String(style)));
+}
 
 function subscribeFontSource(registry, synchronizeReference) {
   const unsubscribe = registry.subscribe(() => {
@@ -37,105 +61,38 @@ function normalizedFamilyName(value, lower, core) {
   ) ?? "";
 }
 
-const SFNT_COLLECTION_TAG = 0x74746366; // 'ttcf'
-const FVAR_TABLE_TAG = 0x66766172; // 'fvar'
-const variationAxesByBytes = new WeakMap();
-
-// The variation axes face $faceIndex of sfnt bytes declares in its fvar
-// table, by tag: { minimum, default, maximum } in design coordinates. A
-// static face has none. The renderer registers a face without a 'wdth' or
-// 'slnt' axis as-is at every stretch and slope, so a static file never
-// takes one engine font instance per requested value. Bytes too short for
-// their own table directory throw.
-export function fontVariationAxes(bytes, faceIndex = 0) {
-  let byFace = variationAxesByBytes.get(bytes);
-  if (byFace === undefined) {
-    byFace = new Map();
-    variationAxesByBytes.set(bytes, byFace);
-  }
-  let axes = byFace.get(faceIndex);
-  if (axes !== undefined) return axes;
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const directory = view.getUint32(0) === SFNT_COLLECTION_TAG
-    ? view.getUint32(12 + faceIndex * 4)
-    : 0;
-  const tableCount = view.getUint16(directory + 4);
-  axes = new Map();
-  for (let table = 0; table < tableCount; table++) {
-    const record = directory + 12 + table * 16;
-    if (view.getUint32(record) !== FVAR_TABLE_TAG) continue;
-    const fvar = view.getUint32(record + 8);
-    const axesOffset = view.getUint16(fvar + 4);
-    const axisCount = view.getUint16(fvar + 8);
-    const axisSize = view.getUint16(fvar + 10);
-    for (let axis = 0; axis < axisCount; axis++) {
-      const axisRecord = fvar + axesOffset + axis * axisSize;
-      axes.set(
-        String.fromCharCode(...bytes.subarray(axisRecord, axisRecord + 4)),
-        Object.freeze({
-          minimum: view.getInt32(axisRecord + 4) / 65536,
-          default: view.getInt32(axisRecord + 8) / 65536,
-          maximum: view.getInt32(axisRecord + 12) / 65536,
-        }),
-      );
-    }
-    break;
-  }
-  byFace.set(faceIndex, axes);
-  return axes;
+// The message of font registry failure `kind` (font_registry_message),
+// naming `number` and the texts.
+function registryMessage(core, kind, number, ...texts) {
+  const inputs = [0, 1, 2, 3].flatMap((index) => core.input(texts[index] ?? ""));
+  return core.string("font_registry_message", kind, number, ...inputs) ?? "";
 }
 
-// The font-style slope of italic and of an oblique without an angle, in
-// degrees: Chrome matches both as this oblique angle.
-export const ITALIC_SLOPE = 14;
-
-const ANGLE_DEGREES_PER_UNIT = Object.freeze({ deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 });
+// The font-style slope a request without an explicit slope selects
+// (font_style_default_slope): Chrome matches italic and an oblique
+// without an angle as the same oblique angle.
+function defaultSlope(core, style) {
+  return core.status("font_style_default_slope", ...core.input(String(style)));
+}
 
 // An @font-face font-style descriptor (CSS Fonts 4, 4.4) as a slope range
-// in degrees: auto (matched as normal; a 'slnt' axis instances at the
-// requested angle), normal [0, 0], italic and oblique [14, 14], oblique
-// with one angle, or oblique with two (a decreasing range swaps its ends).
-// Angles take deg, grad, rad or turn, lie in [-90deg, 90deg], and truncate
-// to a quarter degree, the precision Chrome keeps. Returns
-// { slopeMinimum, slopeMaximum, slopeAuto }, or null for any other text.
-export function fontFaceStyleDescriptor(text) {
-  const tokens = String(text ?? "").trim().toLowerCase().split(/\s+/);
-  if (tokens.length === 1) {
-    if (tokens[0] === "auto") return { slopeMinimum: 0, slopeMaximum: 0, slopeAuto: true };
-    if (tokens[0] === "normal") return { slopeMinimum: 0, slopeMaximum: 0, slopeAuto: false };
-    if (tokens[0] === "italic" || tokens[0] === "oblique") {
-      return { slopeMinimum: ITALIC_SLOPE, slopeMaximum: ITALIC_SLOPE, slopeAuto: false };
-    }
-    return null;
-  }
-  if (tokens[0] !== "oblique" || tokens.length > 3) return null;
-  const angles = tokens.slice(1).map((token) => {
-    const match = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(deg|grad|rad|turn)$/.exec(token);
-    if (match === null) return NaN;
-    const degrees = Number(match[1]) * ANGLE_DEGREES_PER_UNIT[match[2]];
-    return degrees >= -90 && degrees <= 90 ? Math.trunc(degrees * 4) / 4 + 0 : NaN;
-  });
-  if (!angles.every((angle) => Number.isFinite(angle))) return null;
+// in degrees, read by the core (font_face_style_descriptor): auto (matched
+// as normal; a 'slnt' axis instances at the requested angle), normal [0, 0],
+// italic and oblique [14, 14], oblique with one angle, or oblique with two.
+// Returns { slopeMinimum, slopeMaximum, slopeAuto }, or null for any other
+// text.
+export function fontFaceStyleDescriptor(text, core = sharedDomCore) {
+  if (core.status("font_face_style_descriptor", ...core.input(String(text ?? ""))) === 0) return null;
+  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 24);
   return {
-    slopeMinimum: Math.min(...angles),
-    slopeMaximum: Math.max(...angles),
-    slopeAuto: false,
+    slopeMinimum: view.getFloat64(0, true),
+    slopeMaximum: view.getFloat64(8, true),
+    slopeAuto: view.getInt32(16, true) !== 0,
   };
 }
 
-// The 'slnt' coordinate of a CSS font-style slope: OpenType turns positive
-// slnt values counter-clockwise, CSS turns positive oblique angles
-// clockwise.
-export function slantCoordinate(slope) {
-  return slope === 0 ? 0 : -slope;
-}
-
-// Actual bytes and shaping objects stay in the host; catalog values and
-// matching live in the core. A registry ID namespaces shared resource keys.
-let nextRegistryID = 1;
-
-// The registry fallback families of `fallbackFamilies` (plans/
-// PLAN-font-fallback.md): `coverage`, a coverage index
+// The registry fallback families of `fallbackFamilies`
+// (design/font-fallback.md): `coverage`, a coverage index
 // (src/font-coverage.js, tools/generate-font-coverage.js), and `faces`, an
 // object with one entry for each family the index names:
 // `{ url, load({ url, weight, style }) }`. `load` returns a promise of the
@@ -157,14 +114,12 @@ function createFallbackFamilies(fallbackFamilies) {
   const faces = coverage.families.map((family) => {
     const entry = Object.hasOwn(fallbackFamilies.faces, family) ? fallbackFamilies.faces[family] : undefined;
     if (typeof entry?.url !== "string" || typeof entry?.load !== "function") {
-      throw new Error(
-        `The font coverage index names the fallback family "${family}", and fallbackFamilies.faces has no ` +
-          `{ url, load } entry for it`,
-      );
+      throw new Error(registryMessage(sharedDomCore, 5, 0, family));
     }
     return entry;
   });
   const loads = new Map();
+  const requestOwner = {};
   return Object.freeze({
     coverage,
     // The face of fallback family `family` (its index in the coverage
@@ -172,18 +127,19 @@ function createFallbackFamilies(fallbackFamilies) {
     // { family, bytes, faceIndex, finalURL }. A failed load rejects with
     // the family, the URL, and the cause.
     load(family, weight, style) {
-      const key = `${family}\n${weight}\n${style}`;
+      const key = fontLoadRequestFor(requestOwner, family, weight, style);
       let resource = loads.get(key);
       if (resource === undefined) {
         const name = coverage.families[family];
         const { url, load } = faces[family];
-        resource = { state: "pending", url, promise: null };
+        resource = { family: name, weight: Number(weight), style: String(style), state: "pending", url, promise: null };
         resource.promise = Promise.resolve().then(() => load({ url, weight, style })).then((response) => {
           const bytes = response instanceof Uint8Array ? response : response?.bytes;
           if (!(bytes instanceof Uint8Array)) {
             throw new TypeError(`load returned ${Object.prototype.toString.call(response)}, not font bytes`);
           }
-          readFontMetrics(bytes, { faceIndex: Number(response?.faceIndex ?? 0) });
+          // Bytes that are not a font fail the load (font_bytes_readable).
+          sharedDomCore.status("font_bytes_readable", ...sharedDomCore.byteInput(bytes), Number(response?.faceIndex ?? 0));
           Object.assign(resource, { state: "loaded" });
           return {
             family: name, bytes, faceIndex: Number(response?.faceIndex ?? 0),
@@ -191,11 +147,8 @@ function createFallbackFamilies(fallbackFamilies) {
           };
         }).catch((cause) => {
           Object.assign(resource, { state: "failed", error: cause });
-          throw new Error(
-            `The fallback font family "${name}" (weight ${weight}, ${style}) failed to load from ${url}: ` +
-              `${cause?.message ?? cause}`,
-            { cause },
-          );
+          throw new Error(registryMessage(sharedDomCore, 6, Number(weight), name, String(style), url,
+            String(cause?.message ?? cause)), { cause });
         });
         loads.set(key, resource);
       }
@@ -203,10 +156,8 @@ function createFallbackFamilies(fallbackFamilies) {
     },
     // The state of each face load: [{ family, weight, style, url, state }].
     get resources() {
-      return [...loads].map(([key, { url, state }]) => {
-        const [family, weight, style] = key.split("\n");
-        return { family: coverage.families[Number(family)], weight: Number(weight), style, url, state };
-      });
+      return [...loads.values()].map(({ family, weight, style, url, state }) =>
+        ({ family, weight, style, url, state }));
     },
   });
 }
@@ -232,17 +183,27 @@ function fallbackFamiliesOfBundledFonts(bundledSystemFonts) {
 // families of the bundled font set are the registry fallback families when
 // neither `fallbackFamilies` nor the source registry names others.
 // `fallbackFamilies`: see createFallbackFamilies.
-export function createFontRegistry({
+export function createFontRegistry(options = {}) {
+  return createRegistry(options, null);
+}
+
+// `hostSources`: null, or a function that returns the host values that the
+// resolver and the bundled fonts of the registry read at each request
+// (defaultFontRegistry reads them from globalThis). When one of them
+// changes, the registry forgets each answer that the earlier values gave
+// (refreshHostAnswers).
+function createRegistry({
   resolveSystemFontFamily = null,
   bundledSystemFonts = null,
   fallbackFamilies = null,
   core = sharedDomCore,
   sourceRegistry = null,
-} = {}) {
+} = {}, hostSources) {
   const source = sourceRegistry === null ? null : registrySources.get(sourceRegistry);
   if (sourceRegistry !== null && !source) throw new TypeError("Unknown source font registry");
   resolveSystemFontFamily ??= source?.resolveSystemFontFamily ?? null;
   bundledSystemFonts ??= source?.bundledSystemFonts ?? null;
+  hostSources ??= source?.hostSources ?? null;
   const explicitFallback = fallbackFamilies === null ? null : createFallbackFamilies(fallbackFamilies);
   // Read when the renderer asks, so that a host can install the bundled
   // fonts after the default registry exists.
@@ -259,120 +220,76 @@ export function createFontRegistry({
   }
 
   const runtimeFontFamilies = new Map();
-  const runtimeFamilyKeysByName = new Map();
+  // Opaque host owner identities stay live exactly while native faces use them.
+  const runtimeOwnerTokens = new Map();
   const facesByID = new Map();
+  // The inspection record of each face whose bytes the core keeps:
+  // { family, weight, stretch } (hosted and runtime faces).
+  const keptFaceRecords = new Map();
   const faceIDs = new WeakMap();
-  const publishedMetrics = new WeakSet();
   const familyKeys = new WeakMap();
   const listeners = new Set();
   const resources = new Map();
-  const faceSources = new Map();
   let engineSourceTransport = null;
   let defaultFamilyKey = null;
-  const registryID = nextRegistryID++;
-  let nextFaceID = 1;
+  let nextOwnerToken = 1;
   let disposed = false;
   const genericFontFamilies = new Map();
+  // The keys of the hosted families that this catalog holds.
+  const hostedFamilyKeys = new Set();
+  function recordHostSources() {
+    const tokens = Uint32Array.from(hostSources(), hostValueToken);
+    return core.status("font_catalog_host_sources", fontCatalogHandle,
+      ...core.byteInput(new Uint8Array(tokens.buffer)));
+  }
   let runtimeFontVersion = 0;
   const fontCatalogHandle = core.status("font_catalog_create");
+  if (hostSources !== null) recordHostSources();
   const lifetime = {
     coreReference: new WeakRef(core),
     handle: fontCatalogHandle,
     resources,
     unsubscribe: null,
+    sourceSync: 0n,
   };
   function changed() {
     defaultFamilyKey = null;
     const revision = core.status("font_catalog_revision", fontCatalogHandle);
     for (const listener of [...listeners]) listener(revision);
   }
-  function publishSpecification(key, specification, generic = false) {
-    familyKeys.set(specification, key);
-    core.status(
-      "font_catalog_family", fontCatalogHandle,
-      ...core.input(key), ...core.input(specification.cssFamily),
-      ...core.input(specification.fallback),
-      (specification.variable === true ? 1 : 0) |
-        (generic && !specification.resolveFace ? 2 : 0) |
-        (specification.resolveFace ? 4 : 0),
-    );
-    if (Number.isFinite(specification.zeroAdvanceRatio)) {
-      core.status(
-        "font_catalog_metrics", fontCatalogHandle, ...core.input(key),
-        specification.zeroAdvanceRatio, NaN, NaN, NaN, NaN,
-      );
-      publishedMetrics.add(specification);
-    }
-  }
-  // A face covers the weights weightMinimum to weightMaximum, the stretches
-  // stretchMinimum to stretchMaximum and the font-style slopes
-  // slopeMinimum to slopeMaximum: one value each for a static face, the
-  // @font-face descriptor's range for a variable one. descriptor.unicodeRange
-  // is a Uint32Array of {start, end} scalar pairs, or null for U+0-10FFFF.
-  // available: 1 for a loaded face; 0 for a face that an @font-face rule
-  // with unicode-range declares before its bytes load (declareRuntimeFont),
-  // which has no resource and no engine source; -1 removes the face.
-  function publishFace(key, face, descriptor, available = 1) {
-    let faceID = faceIDs.get(face);
-    if (faceID === undefined) {
-      faceID = nextFaceID++;
-      faceIDs.set(face, faceID);
-    }
-    facesByID.set(faceID, face);
-    const ranges = descriptor.unicodeRange ?? null;
-    core.status(
-      "font_catalog_face", fontCatalogHandle, ...core.input(key),
-      faceID, descriptor.weightMinimum, descriptor.weightMaximum,
-      descriptor.stretchMinimum, descriptor.stretchMaximum,
-      descriptor.slopeMinimum, descriptor.slopeMaximum, available,
-      ...core.byteInput(ranges === null
-        ? new Uint8Array(0)
-        : new Uint8Array(ranges.buffer, ranges.byteOffset, ranges.byteLength)),
-    );
-    if (available < 0) facesByID.delete(faceID);
-    let resource = resources.get(faceID);
-    if (available > 0 && resource === undefined) {
-      resource = core.status(
-        "resource_register", 3,
-        ...core.input(`font:${registryID}:${faceID}`),
-      );
-      resources.set(faceID, resource);
-    }
-    if (resource !== undefined) {
-      if (available < 0) {
-        core.status("resource_release", resource);
-        resources.delete(faceID);
-      } else {
-        core.status("resource_update", resource, 1, 0, 0, 1, 0);
-      }
-    }
-    publishedMetrics.delete(runtimeFontFamilies.get(key) ?? hostedFontFamilies.get(key));
-    // The renderer forgets a released face's registration of its engine
-    // instance, which other faces with the same bytes may share.
-    if (available < 0) {
-      const released = faceSources.get(faceID);
-      faceSources.delete(faceID);
-      if (released) engineSourceTransport?.release(released);
-    } else if (resource !== undefined) {
-      const source = { family: key, faceID, face, descriptor, resourceHandle: resource,
-        variable: (runtimeFontFamilies.get(key) ?? hostedFontFamilies.get(key) ?? genericFontFamilies.get(key))?.variable === true };
-      faceSources.set(faceID, source);
-      engineSourceTransport?.register(source);
-    }
-  }
-  const publishFamily = (name, key, layer) => {
-    core.status(
-      "font_catalog_set",
-      fontCatalogHandle,
-      ...core.input(name),
-      ...core.input(key),
-      layer,
-    );
-  };
 
-  // weight: one CSS weight, or the [minimum, maximum] range of a variable
-  // face's font-weight descriptor. A range face instances the file's 'wght'
-  // axis at the requested weight clamped into its range.
+  // Forgets each host answer of the catalog when a host value changed
+  // (font_catalog_host_sources): the core removes the hosted and generic
+  // families with their faces and font resources; the registry drops its
+  // records of them. The next request asks the current host again, so a
+  // document gets the answer that a fresh process gives.
+  function refreshHostAnswers() {
+    if (hostSources === null) return;
+    const count = recordHostSources();
+    if (count < 0) return;
+    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * 16);
+    const released = Array.from({ length: count }, (_, row) =>
+      [report.getUint32(row * 16, true), report.getBigInt64(row * 16 + 8, true)]);
+    for (const [faceID, resourceHandle] of released) {
+      faceIDs.delete(facesByID.get(faceID));
+      facesByID.delete(faceID);
+      keptFaceRecords.delete(faceID);
+      resources.delete(faceID);
+      if (resourceHandle !== 0n) engineSourceTransport?.release({ resourceHandle });
+    }
+    for (const key of hostedFamilyKeys) familyKeys.delete(hostedFontFamilies.get(key));
+    for (const specification of genericFontFamilies.values()) familyKeys.delete(specification);
+    hostedFamilyKeys.clear();
+    genericFontFamilies.clear();
+    changed();
+  }
+
+  // weight: "auto" (an absent or auto font-weight descriptor), one CSS
+  // weight, or the [minimum, maximum] range of a variable face's
+  // font-weight descriptor. Face matching takes "auto" as 400; a file with
+  // a 'wght' axis instances it at the requested weight ("auto", as Blink's
+  // range set from auto does) or the requested weight clamped into the
+  // range.
   // stretch: "auto" (an absent or auto font-stretch descriptor), one CSS
   // stretch percentage, or a [minimum, maximum] range. Face matching takes
   // "auto" as 100%; a file with a 'wdth' axis instances it at the requested
@@ -386,41 +303,51 @@ export function createFontRegistry({
   // unicodeRange: the {start, end} scalar pairs of an @font-face
   // unicode-range descriptor (DomCore.fontUnicodeRanges), or null for
   // U+0-10FFFF. The face applies only to the scalars of its range
-  // (plans/PLAN-font-unicode-range.md).
+  // (design/text-rendering.md, "unicode-range faces").
+  // document: the document of the @font-face rule that supplies the face,
+  // or null. Only that document selects a face of a document; a face
+  // without a document serves every document of the registry.
   function registerRuntimeFont(
     cssFamily,
     bytes,
-    { weight = 400, stretch = "auto", style = "normal", unicodeRange = null, finalURL = null, owner = null } = {},
+    { weight = 400, stretch = "auto", style = "normal", unicodeRange = null, finalURL = null, owner = null, document = null } = {},
   ) {
     if (!(bytes instanceof Uint8Array)) {
       throw new TypeError("Runtime font bytes must be a Uint8Array");
     }
     const descriptor = runtimeFaceDescriptor(cssFamily, { weight, stretch, style, unicodeRange });
-    // Publishing a face registers it in the engine, which parses the
-    // file's table directory (variation axes) and its metric tables. Parse
-    // both before anything is published: bytes that are not a font throw
-    // here and leave no family, face or catalog entry behind. Both parses
-    // are cached by byte identity, so the engine registration reuses them.
-    fontVariationAxes(bytes);
-    readFontMetrics(bytes);
     return publishRuntimeFace(descriptor, {
       bytes,
       version: ++runtimeFontVersion,
       finalURL,
       owner,
-    }, 1);
+      document: ownerDocument(document),
+    });
   }
 
+  // The document of a runtime face: null, or a document of this
+  // registry's core.
+  function ownerDocument(document) {
+    if (document === null) return null;
+    if (document?._domCore !== core) {
+      throw new TypeError(
+        `A runtime font face belongs to a document of the font registry's core or to no document; got ${document}`,
+      );
+    }
+    return document;
+  }
+
+
   // Declares the face of an @font-face rule with a unicode-range
-  // descriptor before its bytes load (decision 3 of
-  // plans/PLAN-font-unicode-range.md). The face joins the font stack of
+  // descriptor before its bytes load (item 3 of "unicode-range faces" in
+  // design/text-rendering.md). The face joins the font stack of
   // its family as an unloaded range face. When the text needs it, the
   // renderer calls loadDeclaredFace, which calls `load`; `load` registers
   // the bytes with registerRuntimeFont and the same owner, and returns a
   // promise that settles after that registration or with the load error.
   function declareRuntimeFont(
     cssFamily,
-    { weight = 400, stretch = "auto", style = "normal", unicodeRange, owner, load } = {},
+    { weight = 400, stretch = "auto", style = "normal", unicodeRange, owner, load, document = null } = {},
   ) {
     if (!(unicodeRange instanceof Uint32Array)) {
       throw new TypeError(`A declared runtime font needs its unicode-range pairs as a Uint32Array; got ${unicodeRange}`);
@@ -435,43 +362,36 @@ export function createFontRegistry({
       finalURL: null,
       owner,
       load,
-    }, 0);
+      document: ownerDocument(document),
+    });
   }
 
-  // The checked descriptors of a runtime face (registerRuntimeFont).
+  // Numeric conversion belongs to the host; descriptor policy belongs to WAT.
   function runtimeFaceDescriptor(cssFamily, { weight, stretch, style, unicodeRange }) {
-    const name = normalizedFamilyName(cssFamily, false, core);
-    if (!name) throw new TypeError("Font family must not be empty");
-    const [weightMinimum, weightMaximum] = Array.isArray(weight)
-      ? weight.map(Number)
-      : [Number(weight), Number(weight)];
-    if (!Number.isFinite(weightMinimum) || !Number.isFinite(weightMaximum) || weightMinimum > weightMaximum) {
-      throw new RangeError(`Runtime font weight must be a number or an increasing [minimum, maximum] pair; got ${weight}`);
+    if (unicodeRange !== null && !(unicodeRange instanceof Uint32Array)) {
+      throw new TypeError("Runtime font unicodeRange must be null or a Uint32Array");
     }
-    const stretchAuto = stretch === "auto";
-    const [stretchMinimum, stretchMaximum] = stretchAuto
-      ? [100, 100]
-      : Array.isArray(stretch)
-      ? stretch.map(Number)
-      : [Number(stretch), Number(stretch)];
-    if (!(stretchMinimum >= 0) || !Number.isFinite(stretchMaximum) || stretchMinimum > stretchMaximum) {
-      throw new RangeError(`Runtime font stretch must be "auto", a non-negative percentage or an increasing [minimum, maximum] pair; got ${stretch}`);
-    }
-    const slope = fontFaceStyleDescriptor(style);
-    if (slope === null) {
-      throw new RangeError(`Runtime font style must be an @font-face font-style descriptor (auto, normal, italic, oblique, or oblique with one or two angles from -90deg to 90deg); got ${style}`);
-    }
-    if (unicodeRange !== null && !(unicodeRange instanceof Uint32Array && unicodeRange.length % 2 === 0)) {
-      throw new TypeError(`Runtime font unicodeRange must be null or a Uint32Array of {start, end} pairs; got ${unicodeRange}`);
-    }
+    const weights = Array.isArray(weight) ? weight : [weight, weight];
+    const stretches = Array.isArray(stretch) ? stretch : [stretch, stretch];
+    core.status(
+      "font_runtime_descriptor", ...core.input(String(cssFamily)),
+      ...core.input(typeof weight === "string" ? weight : ""), Number(weights[0]), Number(weights[1]),
+      ...core.input(typeof stretch === "string" ? stretch : ""), Number(stretches[0]), Number(stretches[1]),
+      ...core.input(String(style)), unicodeRange?.byteLength ?? 0,
+    );
+    const pointer = core.exports.abi_output_pointer();
+    const bytes = core.refreshBytes();
+    const descriptor = new DataView(bytes.buffer, pointer, 56);
     return {
-      name,
-      weightMinimum,
-      weightMaximum,
-      stretchMinimum,
-      stretchMaximum,
-      stretchAuto,
-      ...slope,
+      name: new TextDecoder().decode(bytes.subarray(pointer + 56, pointer + core.exports.abi_output_length())),
+      weightMinimum: descriptor.getFloat64(0, true),
+      weightMaximum: descriptor.getFloat64(8, true),
+      stretchMinimum: descriptor.getFloat64(16, true),
+      stretchMaximum: descriptor.getFloat64(24, true),
+      weightAuto: descriptor.getUint32(32, true) !== 0,
+      stretchAuto: descriptor.getUint32(36, true) !== 0,
+      initialWeight: descriptor.getFloat64(40, true),
+      initialStretch: descriptor.getFloat64(48, true),
       style: String(style),
       unicodeRange,
     };
@@ -480,30 +400,67 @@ export function createFontRegistry({
   // Publishes a runtime face of `descriptor` (runtimeFaceDescriptor) with
   // `fields`; the face of the same owner is updated in place, so that a
   // declared face keeps its catalog ID, and its place among the faces of
-  // the family, when it loads.
-  function publishRuntimeFace({ name, ...descriptor }, fields, available) {
-    const normalizedName = normalizedFamilyName(name, true, core);
-    let key = runtimeFamilyKeysByName.get(normalizedName);
-    let specification = key === undefined ? null : runtimeFontFamilies.get(key);
-    if (!specification) {
-      key = `runtime:${normalizedName}`;
-      specification = {
-        cssFamily: name,
-        fallback: "sans-serif",
-        faces: [],
-      };
-      runtimeFontFamilies.set(key, specification);
-      publishSpecification(key, specification);
-      runtimeFamilyKeysByName.set(normalizedName, key);
-    }
-    const existing = specification.faces.find((face) => face.owner === fields.owner);
+  // the family, when it loads. Native publication selects the document family
+  // and the face of the opaque owner. Host records retain byte/load effects
+  // and inspection values, keyed by the returned native identities.
+  function publishRuntimeFace({ name, ...descriptor }, { document, ...fields }) {
     const face = { ...descriptor, ...fields };
+    let ownerBinding = runtimeOwnerTokens.get(fields.owner);
+    if (!ownerBinding) {
+      ownerBinding = { token: nextOwnerToken++, references: 0 };
+      runtimeOwnerTokens.set(fields.owner, ownerBinding);
+    }
+    const ranges = descriptor.unicodeRange;
+    let faceID;
+    try {
+      faceID = core.status(
+        "font_runtime_face_publish", fontCatalogHandle, document?._coreHandle ?? 0n,
+        engineSourceTransport?.ensureScope() ?? 0n, ownerBinding.token,
+        ...core.input(name), descriptor.weightMinimum, descriptor.weightMaximum, descriptor.weightAuto ? 1 : 0,
+        descriptor.stretchMinimum, descriptor.stretchMaximum, descriptor.stretchAuto ? 1 : 0,
+        ...core.input(descriptor.style),
+        ...core.byteInput(ranges === null
+          ? new Uint8Array(0)
+          : new Uint8Array(ranges.buffer, ranges.byteOffset, ranges.byteLength)),
+        ...core.byteInput(fields.bytes ?? new Uint8Array(0)),
+      );
+    } catch (error) {
+      if (ownerBinding.references === 0) runtimeOwnerTokens.delete(fields.owner);
+      throw error;
+    }
+    const outputPointer = core.exports.abi_output_pointer();
+    const output = core.refreshBytes().slice(outputPointer, outputPointer + core.exports.abi_output_length());
+    const report = new DataView(output.buffer, output.byteOffset, 16);
+    const index = report.getInt32(4, true);
+    const resourceHandle = report.getBigInt64(8, true);
+    const key = new TextDecoder().decode(output.subarray(16));
+    const existing = facesByID.get(faceID);
     const registered = existing ?? face;
+    if (!existing) ownerBinding.references++;
+    let specification = runtimeFontFamilies.get(key);
+    if (!specification) {
+      specification = { cssFamily: name, faces: [], ofDocument: document !== null };
+      runtimeFontFamilies.set(key, specification);
+      familyKeys.set(specification, key);
+    }
     if (existing) Object.assign(existing, face);
     else specification.faces.push(face);
-    delete specification.zeroAdvanceRatio;
-    publishFace(key, registered, face, available);
-    publishFamily(name, key, 1);
+    faceIDs.set(registered, faceID);
+    facesByID.set(faceID, registered);
+    if (fields.bytes) {
+      // `document`: the handle of the face's document, 0n for a face of
+      // every document; the renderer names an engine instance after a face
+      // the rendered document can select.
+      const record = {
+        family: key,
+        weight: descriptor.initialWeight,
+        stretch: descriptor.initialStretch,
+        document: document?._coreHandle ?? 0n,
+      };
+      keptFaceRecords.set(faceID, record);
+      resources.set(faceID, resourceHandle);
+      if (index >= 0) engineSourceTransport.recordFaceInstance(index, { ...record, face: registered, resourceHandle });
+    }
     changed();
     return key;
   }
@@ -514,82 +471,78 @@ export function createFontRegistry({
   function loadDeclaredFace(faceID) {
     const face = facesByID.get(faceID);
     if (typeof face?.load !== "function") {
-      throw new Error(
-        `The renderer requested the declared font face ${faceID}, and the font registry has no declared face with that ID; ` +
-          "declare it with declareRuntimeFont",
-      );
+      throw new Error(registryMessage(core, 3, Number(faceID)));
     }
     return face.load();
   }
 
   function unregisterRuntimeFont(familyKey, owner) {
+    const ownerBinding = runtimeOwnerTokens.get(owner);
+    const removed = core.status("font_runtime_face_remove", fontCatalogHandle,
+      ...core.input(familyKey), ownerBinding?.token ?? 0);
+    if (removed === 0) return;
+    const faceID = new DataView(core.refreshBytes().buffer,
+      core.exports.abi_output_pointer(), 4).getUint32(0, true);
+    const face = facesByID.get(faceID);
+    const resourceHandle = resources.get(faceID);
     const specification = runtimeFontFamilies.get(familyKey);
-    if (!specification) return;
-    specification.faces = specification.faces.filter((face) => {
-      if (face.owner !== owner) return true;
-      runtimeFontVersion++;
-      publishFace(familyKey, face, face, -1);
-      return false;
-    });
-    delete specification.zeroAdvanceRatio;
-    if (specification.faces.length !== 0) {
-      changed();
-      return;
-    }
-    runtimeFontFamilies.delete(familyKey);
-    runtimeFamilyKeysByName.delete(normalizedFamilyName(specification.cssFamily, true, core));
-    publishFamily(specification.cssFamily, "", 1);
-    core.status("font_catalog_remove", fontCatalogHandle, ...core.input(familyKey));
+    specification.faces.splice(specification.faces.indexOf(face), 1);
+    if (removed === 2) runtimeFontFamilies.delete(familyKey);
+    faceIDs.delete(face);
+    facesByID.delete(faceID);
+    keptFaceRecords.delete(faceID);
+    resources.delete(faceID);
+    ownerBinding.references--;
+    if (ownerBinding.references === 0) runtimeOwnerTokens.delete(owner);
+    runtimeFontVersion++;
+    if (resourceHandle !== undefined) engineSourceTransport?.release({ resourceHandle });
     changed();
   }
 
   async function loadFont(
     cssFamily,
     source,
-    { weight = 400, stretch = "auto", style = "normal" } = {},
+    { weight = 400, stretch = "auto", style = "normal", host = null } = {},
   ) {
     const name = normalizedFamilyName(cssFamily, false, core);
-    if (!name) throw new TypeError("Font family must not be empty");
+    if (!name) throw new TypeError(registryMessage(core, 7, 0));
     let bytes;
     let finalURL = null;
     if (source instanceof Uint8Array) {
       bytes = source;
     } else if (source instanceof ArrayBuffer) {
       bytes = new Uint8Array(source);
-    } else {
+    } else if (source instanceof URL || typeof source === "string") {
+      // A locator source is a font demand: the host obtains it.
       let sourceURL;
-      if (source instanceof URL) {
-        sourceURL = source;
-      } else if (typeof source === "string") {
-        try {
-          sourceURL = new URL(source);
-        } catch (error) {
-          if (!(error instanceof TypeError)) throw error;
-          if (!hasFileSystem) {
-            sourceURL = new URL(
-              source,
-              globalThis.location?.href ?? import.meta.url,
-            );
-          }
-        }
-      } else {
+      try {
+        sourceURL = new URL(source);
+      } catch (cause) {
         throw new TypeError(
-          "Font source must be a URL, path, Uint8Array, or ArrayBuffer",
+          `Font source ${JSON.stringify(String(source))} must be bytes or an absolute URL`,
+          { cause },
         );
       }
-      if (hasFileSystem && (!sourceURL || sourceURL.protocol === "file:")) {
-        bytes = await readBinaryFile(sourceURL ?? source);
-        finalURL = sourceURL?.href ?? String(source);
-      } else {
-        const response = await fetch(sourceURL);
-        if (!response.ok) {
-          throw new Error(
-            `Font request failed with HTTP ${response.status}: ${sourceURL}`,
-          );
-        }
-        bytes = new Uint8Array(await response.arrayBuffer());
-        finalURL = response.url || sourceURL.href;
+      if (host === null) {
+        throw new TypeError(
+          `Font source ${sourceURL.href} is a locator; loadFont needs { host } to obtain it`,
+        );
       }
+      const loader = createDocumentResourceLoader({ host, documentURL: sourceURL.href });
+      try {
+        const resource = await loader.resolveResource({
+          requestedURL: sourceURL.href,
+          kind: "font",
+        });
+        bytes = resource.bytes;
+        finalURL = resource.finalURL;
+      } finally {
+        await loader.release();
+      }
+    } else {
+      throw new TypeError(
+        "Font source must be an absolute URL, Uint8Array, or ArrayBuffer",
+      );
     }
     const owner = {};
     const family = registerRuntimeFont(name, bytes, {
@@ -612,50 +565,52 @@ export function createFontRegistry({
   }
 
   function familySpec(familyKey) {
-    let specification = runtimeFontFamilies.get(familyKey) ??
-      hostedFontFamilies.get(familyKey) ??
-      genericFontFamilies.get(familyKey);
-    let key = String(familyKey);
-    if (key.startsWith("generic:")) {
-      const [localKey] = fontStackKeysForCssValue(
-        key.slice("generic:".length),
-      );
-      specification = runtimeFontFamilies.get(localKey) ??
-        hostedFontFamilies.get(localKey) ??
-        genericFontFamilies.get(localKey);
-      if (specification) key = localKey;
-    }
-    if (!specification && key.startsWith("host:")) {
-      const familyEnd = key.indexOf(":", "host:".length);
-      if (familyEnd === -1) {
-        throw new Error(`invalid hosted fontFamily key: ${familyKey}`);
-      }
-      const cssFamily = decodeURIComponent(
-        key.slice("host:".length, familyEnd),
-      );
-      const [localKey] = fontStackKeysForCssValue(cssFamily);
-      specification = runtimeFontFamilies.get(localKey) ??
-        hostedFontFamilies.get(localKey) ??
-        genericFontFamilies.get(localKey);
-      if (specification) key = localKey;
-    }
-    if (!specification) {
-      // A bare, unprefixed key is an authored family name (scene specs and
-      // the oracle harnesses address families by name). Resolve it the same
-      // way fontStackKeysForCssValue resolves one entry: registered name
-      // lookup first, then the system font resolver.
-      const [namedKey] = fontStackKeysForCssValue(key);
-      specification = runtimeFontFamilies.get(namedKey) ??
-        hostedFontFamilies.get(namedKey) ??
-        genericFontFamilies.get(namedKey);
-      key = namedKey;
-    }
-    if (!specification) throw new Error(`unknown fontFamily key: ${familyKey}`);
-    if (!familyKeys.has(specification)) publishSpecification(key, specification);
+    const specification = lookupFamily(familyKey);
+    if (specification === null) throw new Error(registryMessage(core, 0, 0, String(familyKey)));
     return specification;
   }
 
-  function registerResolvedHostFamily(authoredName, resolved) {
+  // The family record of a key or authored family name, or null when no
+  // family of the registry or its host matches. The core names the CSS
+  // family value of the key and whether the key itself selects first
+  // (font_family_key_value).
+  function lookupFamily(familyKey) {
+    const registered = (localKey) =>
+      runtimeFontFamilies.get(localKey) ?? hostedFontFamilies.get(localKey) ?? genericFontFamilies.get(localKey);
+    const kind = core.status("font_family_key_value", ...core.input(String(familyKey)));
+    const value = core.outputString() ?? "";
+    let specification = kind === 1 ? undefined : registered(familyKey);
+    if (!specification) {
+      const [localKey] = stackKeys(value).keys;
+      if (localKey !== undefined) specification = registered(localKey);
+    }
+    if (!specification) return null;
+    // Runtime and generic records belong to this registry; a hosted record
+    // is realm-wide, and another registry may have resolved it.
+    if (!familyKeys.has(specification)) publishSharedHostedFamily(specification);
+    return specification;
+  }
+
+  // Publishes in this catalog a realm-wide hosted family record another
+  // registry resolved, as the family session does
+  // (font_hosted_family_publish).
+  function publishSharedHostedFamily(specification) {
+    core.status(
+      "font_hosted_family_publish", fontCatalogHandle,
+      ...core.input(specification.familyIdentity), ...core.input(specification.cssFamily),
+      ...core.input(specification.fallback ?? ""), specification.variable === true ? 1 : 0,
+      Number.isFinite(specification.zeroAdvanceRatio) ? specification.zeroAdvanceRatio : NaN,
+    );
+    const key = core.outputString() ?? "";
+    familyKeys.set(specification, key);
+    hostedFamilyKeys.add(key);
+    changed();
+  }
+
+  // The family record a system font resolver returned for `authoredName`,
+  // or null. The core checks and normalizes its identity, CSS family and
+  // fallback (font_host_family_record).
+  function hostFamilyRecord(authoredName, resolved) {
     if (resolved === null || resolved === undefined) return null;
     if (typeof resolved !== "object") {
       throw new TypeError(
@@ -667,31 +622,127 @@ export function createFontRegistry({
         "A resolved system font family must provide resolveFace",
       );
     }
-    const identity = String(resolved.familyIdentity ?? "").trim();
-    const cssFamily = normalizedFamilyName(resolved.cssFamily ?? authoredName, false, core);
-    if (!identity || !cssFamily) {
-      throw new TypeError(
-        "A resolved system font family needs identity and CSS family values",
-      );
-    }
-    const key = `host:${encodeURIComponent(cssFamily)}:${identity}`;
-    if (!hostedFontFamilies.has(key)) {
-      hostedFontFamilies.set(key, {
+    const cssPresent = resolved.cssFamily !== undefined && resolved.cssFamily !== null;
+    const fallbackPresent = resolved.fallback !== undefined && resolved.fallback !== null;
+    core.exports.font_host_family_record(
+      ...core.input(String(resolved.familyIdentity ?? "")),
+      ...core.input(cssPresent ? String(resolved.cssFamily) : ""), Number(cssPresent),
+      ...core.input(String(authoredName)),
+      ...core.input(fallbackPresent ? String(resolved.fallback) : ""), Number(fallbackPresent),
+    );
+    core.throwIfError(true);
+    const bytes = core.refreshBytes();
+    const pointer = core.exports.abi_output_pointer();
+    const lengths = new DataView(bytes.buffer, pointer, 12);
+    const decoder = new TextDecoder();
+    let cursor = pointer + 12;
+    const [identity, cssFamily, fallback] = [0, 4, 8].map((offset) => {
+      const start = cursor;
+      cursor += lengths.getUint32(offset, true);
+      return decoder.decode(bytes.subarray(start, cursor));
+    });
+    return {
+      identity,
+      specification: {
+        familyIdentity: identity,
         cssFamily,
-        fallback: resolved.fallback ?? "sans-serif",
+        fallback,
         zeroAdvanceRatio: resolved.zeroAdvanceRatio,
         // Variable families instance the 'wght' axis at registration;
         // static families register their weight's file as-is.
         variable: resolved.variable === true,
         resolveFace: resolved.resolveFace,
         faces: new Map(),
-      });
+      },
+    };
+  }
+
+  // The family record of a system family named `name`: the host's system
+  // resolver answers first; bundled system fonts are installed under their
+  // own names too.
+  function systemFamilyRecord(name) {
+    return hostFamilyRecord(
+      name,
+      (resolveSystemFontFamily === null ? null : resolveSystemFontFamily(name)) ??
+        bundledSystemFonts?.familyNamed?.(name) ?? null,
+    );
+  }
+
+  // Keeps the specification of hosted family `key`, which the core
+  // published; the first record of a key stays.
+  function adoptHostedFamily(key, specification) {
+    if (!hostedFontFamilies.has(key)) hostedFontFamilies.set(key, specification);
+    familyKeys.set(hostedFontFamilies.get(key), key);
+    hostedFamilyKeys.add(key);
+  }
+
+  // Answers every font-family value the cascade of `document` requested
+  // (font_answer_next). The core resolves, publishes and records; the
+  // registry supplies system family records, generic family records and
+  // the metrics face of a family.
+  function answerFontFamilies(document) {
+    refreshHostAnswers();
+    const revision = core.status("font_catalog_revision", fontCatalogHandle);
+    const session = core.status("font_answer_begin", fontCatalogHandle, document._coreHandle);
+    try {
+      runFamilySession(session);
+    } finally {
+      core.status("font_answer_end", session);
     }
-    publishSpecification(key, hostedFontFamilies.get(key));
-    publishFamily(authoredName, key, 0);
-    publishFamily(cssFamily, key, 0);
-    changed();
-    return key;
+    if (core.status("font_catalog_revision", fontCatalogHandle) !== revision) changed();
+  }
+
+  // Answers the requests of a family session until it finishes: system and
+  // generic family records, and the metrics face of a family.
+  function runFamilySession(session) {
+    for (;;) {
+      const request = core.status("font_answer_next", session);
+      if (request === 0) return;
+      const name = core.outputString() ?? "";
+      const token = core.status("font_answer_token", session);
+      if (request === 1 || request === 2) {
+        const record = request === 1
+          ? systemFamilyRecord(name)
+          : genericFamilyRecord(name);
+        const specification = record?.specification;
+        core.status(
+          "font_answer_family", session, token,
+          ...core.input(record?.identity ?? ""),
+          ...core.input(specification?.cssFamily ?? ""),
+          ...core.input(specification?.fallback ?? ""),
+          specification?.variable === true ? 1 : 0,
+          Number.isFinite(specification?.zeroAdvanceRatio) ? specification.zeroAdvanceRatio : NaN,
+        );
+        const key = core.outputString() ?? "";
+        if (request === 1 && record !== null) adoptHostedFamily(key, record.specification);
+        if (request === 2) adoptGenericFamily(key, name, specification ?? null);
+      } else {
+        const face = metricsFace(name);
+        core.status(
+          "font_answer_metrics", session, token,
+          face?.catalogID ?? 0, face?.resourceHandle ?? 0n,
+          ...core.byteInput(face?.bytes ?? new Uint8Array(0)), face?.faceIndex ?? 0,
+        );
+      }
+    }
+  }
+
+  // The family record of generic family `name`: its bundled font, or null
+  // for a generic family without faces.
+  function genericFamilyRecord(name) {
+    const bundled = bundledSystemFonts?.familyFor(name) ?? null;
+    if (bundled === null) return null;
+    return {
+      identity: bundled.familyIdentity,
+      specification: { ...bundled, cssFamily: name, faces: new Map() },
+    };
+  }
+
+  function adoptGenericFamily(key, name, specification) {
+    if (!genericFontFamilies.has(key)) {
+      genericFontFamilies.set(key, specification ?? { cssFamily: name, fallback: name, faces: new Map() });
+    }
+    familyKeys.set(genericFontFamilies.get(key), key);
   }
 
   function fontFamilyCssValue(familyKey) {
@@ -703,78 +754,42 @@ export function createFontRegistry({
   }
 
   // The authored stack of a CSS font-family value: the key of each
-  // available family in authored order. Key 0 is the primary family. A
-  // value without an available family throws.
-  function fontStackKeysForCssValue(cssValue, { isUnavailable = null } = {}) {
-    const source = String(cssValue);
-    const query = core.status(
-      "font_query_begin",
-      fontCatalogHandle,
-      ...core.input(source),
-      isUnavailable === null ? 0 : 1,
-    );
+  // available family in authored order, resolved by the core
+  // (font_stack_begin). Key 0 is the primary family. A value without an
+  // available family throws. `document`: the document whose @font-face
+  // families the value can also select, or null for the families of every
+  // document only.
+  function fontStackKeysForCssValue(cssValue, { document = null } = {}) {
+    const { keys, error } = stackKeys(cssValue, document);
+    if (keys.length === 0) throw new Error(error);
+    return keys;
+  }
+
+  // The keys of the available families of a CSS font-family value, in
+  // authored order, with the host asked for each family as a resolution
+  // does; none when no family of the value is available.
+  function availableFontStackKeys(cssValue, { document = null } = {}) {
+    return stackKeys(cssValue, document).keys;
+  }
+
+  // The family keys of a font-family value; none, with the core's reason,
+  // when no family of the value is available.
+  function stackKeys(cssValue, document = null) {
+    refreshHostAnswers();
+    const documentHandle = document === null ? 0n : ownerDocument(document)._coreHandle;
+    const revision = core.status("font_catalog_revision", fontCatalogHandle);
+    const session = core.status("font_stack_begin", fontCatalogHandle, documentHandle, ...core.input(String(cssValue)));
     try {
-      for (;;) {
-        const request = core.status("font_query_next", query);
-        if (request === 0) break;
-        const name = core.outputString() ?? "";
-        const token = core.status("font_query_token", query);
-        if (request === 1) {
-          const unavailable = isUnavailable(name);
-          core.status(
-            "font_query_resume",
-            query,
-            token,
-            unavailable ? 1 : 0,
-            ...core.input(""),
-          );
-        } else {
-          // The host's system resolver answers first; bundled system fonts
-          // are installed under their own names too.
-          const resolved = (resolveSystemFontFamily === null ? null : resolveSystemFontFamily(name)) ??
-            bundledSystemFonts?.familyNamed?.(name) ?? null;
-          const key = resolved === null ? null : registerResolvedHostFamily(name, resolved);
-          core.status(
-            "font_query_resume",
-            query,
-            token,
-            0,
-            ...core.input(key ?? ""),
-          );
-        }
-      }
-      const count = core.status("font_query_result_count", query);
-      if (count === 0) {
-        throw new Error(
-          core.string(
-            "font_query_error",
-            query,
-            ...core.input(String(cssValue)),
-          ) ?? "",
-        );
-      }
-      const keys = new Array(count);
-      for (let index = 0; index < count; index++) {
-        const key = core.string("font_query_result_at", query, index) ?? "";
-        if (key.startsWith("generic:") && !genericFontFamilies.has(key)) {
-          const name = key.slice("generic:".length);
-          // With bundled system fonts, a generic family with a bundled font
-          // resolves its faces from the bundled files; otherwise the generic
-          // family has no faces.
-          const bundled = bundledSystemFonts?.familyFor(name) ?? null;
-          genericFontFamilies.set(
-            key,
-            bundled === null
-              ? { cssFamily: name, fallback: name, faces: new Map() }
-              : { ...bundled, cssFamily: name, faces: new Map() },
-          );
-          publishSpecification(key, genericFontFamilies.get(key), true);
-        }
-        keys[index] = key;
-      }
-      return keys;
+      runFamilySession(session);
+      const count = core.status("font_stack_key_count", session);
+      if (count === 0) return { keys: [], error: core.string("font_stack_error", session) ?? "" };
+      return {
+        keys: Array.from({ length: count }, (_, index) => core.string("font_stack_key_at", session, index) ?? ""),
+        error: null,
+      };
     } finally {
-      core.status("font_query_dispose", query);
+      core.status("font_answer_end", session);
+      if (core.status("font_catalog_revision", fontCatalogHandle) !== revision) changed();
     }
   }
 
@@ -795,55 +810,92 @@ export function createFontRegistry({
   function importHostFontSource(familyKey, weight, style) {
     const specification = hostedFontFamilies.get(familyKey) ?? genericFontFamilies.get(familyKey);
     if (!specification?.resolveFace) {
-      throw new Error(`Native font source request has no system provider for ${familyKey}`);
+      throw new Error(registryMessage(core, 2, 0, String(familyKey)));
     }
     const face = hostFontFace(specification, Number(weight), style);
     return face;
   }
 
+  // The face a hosted family's provider resolves for a weight and host
+  // style ("normal", "italic" or "oblique"). The provider's answer is
+  // cached on the realm-wide family specification; the core checks the
+  // bytes, publishes the face, its font resource and its engine source in
+  // this registry's catalog (font_hosted_face_supply).
   function hostFontFace(specification, requestedWeight, hostStyle) {
-    let weights = specification.faces.get(requestedWeight);
-    let face = weights?.get(hostStyle);
+    const request = fontLoadRequestFor(specification, 0, requestedWeight, hostStyle);
+    let face = specification.faces.get(request);
     if (!face) {
       const resolved = specification.resolveFace(requestedWeight, hostStyle);
       if (!resolved || !(resolved.bytes instanceof Uint8Array)) {
-        throw new Error(`System font family "${specification.cssFamily}" did not resolve a usable face`);
+        throw new Error(registryMessage(core, 1, 0, String(specification.cssFamily)));
       }
-      // Parse the table directory and metric tables before the face is
-      // cached or published, as registerRuntimeFont does: bytes that are not
-      // a font throw here and leave no catalog row, resource or engine
-      // source behind. Both parses are cached by byte identity.
-      fontVariationAxes(resolved.bytes);
-      readFontMetrics(resolved.bytes);
       face = {
         bytes: resolved.bytes, faceIndex: Number(resolved.faceIndex ?? 0),
-        italicFace: resolved.style === "italic", version: resolved.faceIdentity ?? resolved.finalURL ?? null,
+        italicFace: core.status("font_style_is_italic", ...core.input(String(resolved.style))) !== 0,
+        version: resolved.faceIdentity ?? resolved.finalURL ?? null,
         finalURL: resolved.finalURL ?? null,
       };
-      if (!weights) specification.faces.set(requestedWeight, weights = new Map());
-      weights.set(hostStyle, face);
-      hostedFaceRequests.set(face, { weight: requestedWeight, style: hostStyle });
     }
-    const requested = hostedFaceRequests.get(face);
     if (!faceIDs.has(face)) {
-      publishFace(familyKeys.get(specification), face, {
-        weightMinimum: requested.weight, weightMaximum: requested.weight,
-        stretchMinimum: 100, stretchMaximum: 100, stretchAuto: true,
-        slopeMinimum: requested.style === "normal" ? 0 : ITALIC_SLOPE,
-        slopeMaximum: requested.style === "normal" ? 0 : ITALIC_SLOPE,
-        slopeAuto: true,
-      });
+      const styleCode = core.status("font_host_style_code", ...core.input(String(hostStyle)));
+      const key = familyKeys.get(specification);
+      const scope = engineSourceTransport?.ensureScope() ?? 0n;
+      const faceID = core.status(
+        "font_hosted_face_supply", fontCatalogHandle, scope, ...core.input(key),
+        requestedWeight, styleCode,
+        ...core.byteInput(face.bytes), face.faceIndex,
+      );
+      const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 16);
+      const index = report.getInt32(4, true);
+      const resource = report.getBigInt64(8, true);
+      faceIDs.set(face, faceID);
+      facesByID.set(faceID, face);
+      const record = { family: key, weight: requestedWeight, stretch: 100, document: 0n };
+      keptFaceRecords.set(faceID, record);
+      resources.set(faceID, resource);
+      specification.faces.set(request, face);
+      if (index >= 0) engineSourceTransport.recordFaceInstance(index, { ...record, face, resourceHandle: resource });
       changed();
     }
     return face;
   }
 
-  function fontFileFor(familyKey, weight, style = "normal", stretch = 100, slope = style === "normal" ? 0 : ITALIC_SLOPE) {
+  // Registers every face whose bytes the core keeps (hosted and runtime
+  // faces) in the renderer's scope.
+  function registerKeptFaces() {
+    const count = core.status("font_catalog_faces_register", fontCatalogHandle, engineSourceTransport.ensureScope());
+    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * 16);
+    const rows = Array.from({ length: count }, (_, row) => ({
+      faceID: report.getInt32(row * 16, true),
+      index: report.getInt32(row * 16 + 4, true),
+      resourceHandle: report.getBigInt64(row * 16 + 8, true),
+    }));
+    for (const { faceID, index, resourceHandle } of rows) {
+      engineSourceTransport.recordFaceInstance(index, {
+        ...keptFaceRecords.get(faceID), face: facesByID.get(faceID), resourceHandle,
+      });
+    }
+  }
+
+  function fontFileFor(familyKey, weight, style = "normal", stretch = 100, slope = defaultSlope(core, style)) {
+    const face = faceFor(familyKey, weight, style, stretch, slope);
+    if (face !== null) return face;
+    const specification = familySpec(familyKey);
+    const kind = !(specification.faces instanceof Map) ? 0 : resolveSystemFontFamily === null ? 1 : 2;
+    core.status("font_family_face_error", ...core.input(specification.cssFamily),
+      ...core.input(String(familyKey)), kind);
+  }
+
+  // The face fontFileFor returns, or null when the family has no face: a
+  // generic family without a resolver face, or a runtime family without a
+  // loaded face. A host resolver's failure throws.
+  function faceFor(familyKey, weight, style = "normal", stretch = 100, slope = defaultSlope(core, style)) {
+    refreshHostAnswers();
     const specification = familySpec(familyKey);
     if (specification.resolveFace) {
       // A platform font request asks for an upright face at a slope of 0deg
       // or less, as Chrome's does.
-      const hostStyle = style === "oblique" && !(slope > 0) ? "normal" : String(style);
+      const hostStyle = core.string("font_request_style", ...core.input(String(style)), Number(slope));
       const face = hostFontFace(specification, Number(weight), hostStyle);
       // The host resolver returns the physical face for this exact request.
       // Retain that imported identity; a later host request must not replace
@@ -853,49 +905,31 @@ export function createFontRegistry({
         ...face,
         catalogID,
         resourceHandle: resources.get(catalogID),
+        variationWeight: core.status("font_catalog_instance_weight", fontCatalogHandle,
+          ...core.input(familyKeys.get(specification)), Number(weight)),
         variationWidth: Number(stretch),
-        variationSlant: slantCoordinate(Number(slope)),
+        variationSlant: core.exports.font_slant_coordinate(Number(slope)),
       };
     }
-    if (specification.faces instanceof Map) {
-      const cause = resolveSystemFontFamily === null
-        ? "has no system font resolver"
-        : "is not currently available from its system font resolver";
-      throw new Error(
-        `Generic font family "${specification.cssFamily}" ${cause}; declare @font-face with a resolvable font URL`,
-      );
-    }
+    if (specification.faces instanceof Map) return null;
     const faceID = core.status(
-      "font_catalog_select_face", fontCatalogHandle,
-      ...core.input(familyKeys.get(specification)),
+      "font_face_instance", fontCatalogHandle, ...core.input(familyKeys.get(specification)),
       Number(weight), Number(stretch), Number(slope),
     );
+    if (faceID === 0) return null;
+    const instance = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 32);
     const face = facesByID.get(faceID);
-    if (!face) {
-      throw new Error(`runtime font family "${familyKey}" has no loaded faces`);
-    }
-    const faceIndex = Number(face.faceIndex ?? 0);
     return {
       bytes: face.bytes,
-      faceIndex,
-      // An auto descriptor matches as normal, but a file whose 'slnt' axis
-      // reaches right-leaning angles slants its own glyphs.
-      italicFace: face.slopeMaximum !== 0 ||
-        (face.slopeAuto && (fontVariationAxes(face.bytes, faceIndex).get("slnt")?.minimum ?? 0) < 0),
+      faceIndex: Number(face.faceIndex ?? 0),
+      italicFace: instance.getInt32(24, true) !== 0,
       version: face.version,
       finalURL: face.finalURL,
       catalogID: faceID,
       resourceHandle: resources.get(faceID),
-      // A range face instances its 'wght' axis; a static face registers as-is.
-      variationWeight: face.weightMaximum > face.weightMinimum
-        ? Math.min(Math.max(Number(weight), face.weightMinimum), face.weightMaximum)
-        : 0,
-      variationWidth: face.stretchAuto
-        ? Number(stretch)
-        : Math.min(Math.max(Number(stretch), face.stretchMinimum), face.stretchMaximum),
-      variationSlant: slantCoordinate(face.slopeAuto
-        ? Number(slope)
-        : Math.min(Math.max(Number(slope), face.slopeMinimum), face.slopeMaximum)),
+      variationWeight: instance.getFloat64(0, true),
+      variationWidth: instance.getFloat64(8, true),
+      variationSlant: instance.getFloat64(16, true),
     };
   }
 
@@ -919,68 +953,47 @@ export function createFontRegistry({
 
   // CSS Values and Units, "ch": when it is impossible or impractical to
   // determine the measure of the "0" glyph, it must be assumed to be
-  // 0.5em wide. An unknown family, a family the resolver cannot supply,
-  // or a face without measurable metrics therefore resolves ch against
-  // this ratio instead of throwing — a throw here classified a VALID
-  // ch declaration as an invalid value, and the cascade swallow policy
-  // then silently dropped the whole declaration (found through
-  // sandscript.run: `padding: "40px 4ch"` on an element with an
-  // unresolvable default family vanished without an error).
+  // 0.5em wide. A ch declaration is valid either way, so the ratio never
+  // classifies it as invalid.
+  // A family the registry cannot find, a generic family without a face and
+  // a runtime family with no loaded face have no "0" glyph to measure, so
+  // their ratio is the specified 0.5em. Every other failure (a host
+  // resolver that throws, or one that names a family and returns no usable
+  // face) throws and names the family.
   function zeroAdvanceRatioFor(familyKey) {
-    let specification;
-    try {
-      specification = familySpec(familyKey);
-    } catch {
+    const specification = lookupFamily(familyKey);
+    if (specification === null) {
       return core.status(
         "font_catalog_metric", fontCatalogHandle, ...core.input(""), 0,
       );
     }
     const key = familyKeys.get(specification);
-    if (!publishedMetrics.has(specification)) {
-      let metrics;
-      let face;
-      try {
-        if (!Number.isFinite(specification.zeroAdvanceRatio)) {
-          face = fontFileFor(key, 400, "normal");
-          metrics = readFontMetrics(face.bytes, { faceIndex: face.faceIndex });
-        }
-      } catch {
-        // Invalid/unavailable bytes are diagnosed by the actual loader or
-        // shaping caller. Unknown metrics stay NaN; the core supplies ch.
-      }
-      specification.zeroAdvanceRatio = metrics?.zeroAdvanceRatio ?? specification.zeroAdvanceRatio ?? NaN;
+    const revision = core.status("font_catalog_revision", fontCatalogHandle);
+    if (core.status("font_family_metrics", fontCatalogHandle, ...core.input(key)) === 0) {
+      const face = metricsFace(key);
       core.status(
-        "font_catalog_metrics", fontCatalogHandle, ...core.input(key),
-        specification.zeroAdvanceRatio, metrics?.ascender ?? NaN,
-        metrics?.descender ?? NaN, metrics?.lineGap ?? NaN, metrics?.upem ?? NaN,
+        "font_family_metrics_face", fontCatalogHandle, ...core.input(key),
+        face?.catalogID ?? 0, face?.resourceHandle ?? 0n,
+        ...core.byteInput(face?.bytes ?? new Uint8Array(0)), face?.faceIndex ?? 0,
       );
-      if (face && metrics) {
-        const metricsChanged = core.status(
-          "font_catalog_face_metrics", fontCatalogHandle, ...core.input(key), face.catalogID,
-          metrics.zeroAdvanceRatio, metrics.ascender, metrics.descender, metrics.lineGap, metrics.upem,
-        );
-        if (metricsChanged && face.resourceHandle) {
-          core.status("resource_metrics_changed", face.resourceHandle);
-        }
-      }
-      publishedMetrics.add(specification);
-      changed();
     }
+    if (core.status("font_catalog_revision", fontCatalogHandle) !== revision) changed();
     return core.status(
       "font_catalog_metric", fontCatalogHandle, ...core.input(key), 0,
     );
   }
 
-  function familiesInNodes(nodes) {
-    const keys = new Set();
-    for (const node of nodes) {
-      if (node.display === "text") {
-        keys.add(
-          node.fontFamily ?? fontStackKeysForCssValue(DEFAULT_FONT_FAMILY)[0],
-        );
-      }
+  // The weight 400 normal face of a family, whose metrics the core reads,
+  // or null when the family has no face (faceFor): ch then uses 0.5em.
+  // A face the host fails to supply throws, naming the family and the
+  // cause.
+  function metricsFace(key) {
+    try {
+      return faceFor(key, 400, "normal");
+    } catch (cause) {
+      const family = lookupFamily(key)?.cssFamily ?? key;
+      throw new Error(registryMessage(core, 4, 0, String(family), String(cause?.message ?? cause)), { cause });
     }
-    return [...keys];
   }
 
   const registry = Object.freeze({
@@ -1012,16 +1025,17 @@ export function createFontRegistry({
     attachEngineSourceTransport(transport) {
       if (engineSourceTransport !== null) throw new Error("Font catalog already has a renderer source owner");
       engineSourceTransport = transport;
-      for (const source of faceSources.values()) transport.register(source);
+      if (keptFaceRecords.size !== 0) registerKeptFaces();
     },
     prepareNativeFontPublication(root) {
+      refreshHostAnswers();
       if (engineSourceTransport === null) return;
       registry.bindDocument(root.nodeType === 9 ? root : root.ownerDocument);
       defaultFamilyKey ??= fontStackKeysForCssValue(DEFAULT_FONT_FAMILY)[0];
       engineSourceTransport.prepare(root, defaultFamilyKey, importHostFontSource);
     },
     replayEngineSources() {
-      for (const source of faceSources.values()) engineSourceTransport.register(source);
+      if (keptFaceRecords.size !== 0) registerKeptFaces();
     },
     dispose() {
       if (disposed) return;
@@ -1031,9 +1045,10 @@ export function createFontRegistry({
       registrySources.get(registry).synchronize = null;
       listeners.clear();
       engineSourceTransport = null;
-      faceSources.clear();
       for (const resource of resources.values()) core.status("resource_release", resource);
+      if (lifetime.sourceSync !== 0n) core.status("font_source_sync_release", lifetime.sourceSync);
       resources.clear();
+      runtimeOwnerTokens.clear();
       core.status("font_catalog_release", fontCatalogHandle);
       fontCatalogFinalizer.unregister(registry);
     },
@@ -1045,49 +1060,68 @@ export function createFontRegistry({
     runtimeFontFamily,
     fontFamilyCssValue,
     fontStackKeysForCssValue,
+    availableFontStackKeys,
     fontFileFor,
     fontWeightInCssUnits,
     fontWeightInSceneUnits,
     isVariableFamily,
     zeroAdvanceRatioFor,
-    familiesInNodes,
+    answerFontFamilies,
+    refreshHostAnswers,
   });
   fontCatalogFinalizer.register(registry, lifetime, registry);
   registrySources.set(registry, {
     runtimeFontFamilies,
     resolveSystemFontFamily,
     bundledSystemFonts,
+    hostSources,
     fallback: currentFallback,
     get version() { return runtimeFontVersion; },
   });
   if (source) {
     // A standalone persistent renderer needs its own native catalog/resource
     // handles, while immutable font bytes and authored family keys stay shared.
-    const versions = new Map();
+    // The faces of a document stay with that document: the registry made
+    // from a source serves other cores, which hold no document of the source.
+    // The core decides which source faces to copy and which copies to
+    // remove (font_source_sync_face, font_source_sync_stale); the registry
+    // copies the source face's descriptor and bytes.
+    const sync = core.status("font_source_sync_create");
+    lifetime.sourceSync = sync;
+    const copies = new Map();
+    const faceTokens = new WeakMap();
+    let nextFaceToken = 1;
     let synchronizedVersion = -1;
     const synchronizeSource = () => {
       if (synchronizedVersion === source.version) return;
       synchronizedVersion = source.version;
-      const live = new Set();
       for (const [key, specification] of source.runtimeFontFamilies) {
         for (const face of specification.faces) {
-          live.add(face);
-          if (versions.get(face)?.version === face.version) continue;
-          const descriptors = {
-            weight: [face.weightMinimum, face.weightMaximum],
-            stretch: face.stretchAuto ? "auto" : [face.stretchMinimum, face.stretchMaximum],
-            style: face.style, unicodeRange: face.unicodeRange ?? null, owner: face,
+          let token = faceTokens.get(face);
+          if (token === undefined) faceTokens.set(face, token = nextFaceToken++);
+          if (core.status("font_source_sync_face", sync, token, face.version, specification.ofDocument ? 1 : 0) === 0) continue;
+          const {
+            weightMinimum, weightMaximum, weightAuto, stretchMinimum, stretchMaximum, stretchAuto,
+            initialWeight, initialStretch, style, unicodeRange,
+          } = face;
+          const descriptor = {
+            name: specification.cssFamily, weightMinimum, weightMaximum, weightAuto, stretchMinimum,
+            stretchMaximum, stretchAuto, initialWeight, initialStretch, style, unicodeRange: unicodeRange ?? null,
           };
           // A declared face loads through its source registry's load.
-          if (face.bytes === null) declareRuntimeFont(specification.cssFamily, { ...descriptors, load: face.load });
-          else registerRuntimeFont(specification.cssFamily, face.bytes, { ...descriptors, finalURL: face.finalURL });
-          versions.set(face, { key, version: face.version });
+          publishRuntimeFace(descriptor, face.bytes === null
+            ? { bytes: null, version: ++runtimeFontVersion, finalURL: null, owner: face, load: face.load, document: null }
+            : { bytes: face.bytes, version: ++runtimeFontVersion, finalURL: face.finalURL, owner: face, document: null });
+          copies.set(token, { key, face });
         }
       }
-      for (const [face, previous] of versions) {
-        if (live.has(face)) continue;
-        unregisterRuntimeFont(previous.key, face);
-        versions.delete(face);
+      const count = core.status("font_source_sync_stale", sync);
+      const pointer = core.exports.abi_output_pointer();
+      const stale = new Uint32Array(core.refreshBytes().slice(pointer, pointer + count * 4).buffer);
+      for (const token of stale) {
+        const { key, face } = copies.get(token);
+        copies.delete(token);
+        unregisterRuntimeFont(key, face);
       }
     };
     synchronizeSource();
@@ -1102,7 +1136,9 @@ export function createFontRegistry({
 // installed bundled system fonts lazily on every unresolved family, so the
 // host (a test harness, a shell, a page) can seed the process before or
 // after this module evaluates — the same seeding pattern as sandom.hbBytes.
-export const defaultFontRegistry = createFontRegistry({
+// When the host installs another resolver or other bundled fonts, or
+// removes them, the registry forgets the answers of the earlier ones.
+export const defaultFontRegistry = createRegistry({
   resolveSystemFontFamily: (name) => {
     const resolver = globalThis[Symbol.for("sandom.resolveSystemFontFamily")];
     return resolver ? resolver(name) : null;
@@ -1117,7 +1153,10 @@ export const defaultFontRegistry = createFontRegistry({
         globalThis[Symbol.for("sandom.fontSetFallbackFamilies")] ?? null;
     },
   },
-});
+}, () => [
+  globalThis[Symbol.for("sandom.resolveSystemFontFamily")],
+  globalThis[Symbol.for("sandom.bundledSystemFonts")],
+]);
 sharedDomCore.defaultFontRegistry = defaultFontRegistry;
 
 export const registerRuntimeFont = (...arguments_) =>
@@ -1142,5 +1181,3 @@ export const isVariableFamily = (...arguments_) =>
   defaultFontRegistry.isVariableFamily(...arguments_);
 export const zeroAdvanceRatioFor = (...arguments_) =>
   defaultFontRegistry.zeroAdvanceRatioFor(...arguments_);
-export const familiesInNodes = (...arguments_) =>
-  defaultFontRegistry.familiesInNodes(...arguments_);

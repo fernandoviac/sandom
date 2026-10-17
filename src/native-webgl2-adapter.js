@@ -55,6 +55,7 @@ const CONSTANTS = Object.freeze({
   TEXTURE_WRAP_T: 0x2803,
   TRIANGLES: 0x0004,
   UNPACK_ALIGNMENT: 0x0CF5,
+  UNPACK_ROW_LENGTH: 0x0CF2,
   UNSIGNED_BYTE: 0x1401,
   VERTEX_SHADER: 0x8B31,
   ZERO: 0,
@@ -71,8 +72,17 @@ export function prepareNativeWebgl2Host() {
     try {
       imported = await import(packageSpecifier);
     } catch (error) {
+      // The package is not installed.
+      if (error?.code === "ERR_MODULE_NOT_FOUND") {
+        throw new Error(
+          "Native WebGL 2 requires the optional native-gles dependency. Run deno task install-cli to install it.",
+          { cause: error },
+        );
+      }
+      // The package is installed and its import failed: a native library
+      // that does not load, or an error of the runtime's package resolution.
       throw new Error(
-        "Native WebGL 2 requires the optional native-gles dependency. Run deno task install-cli to install it.",
+        `Native WebGL 2 could not load the native-gles dependency: ${error?.message ?? error}`,
         { cause: error },
       );
     }

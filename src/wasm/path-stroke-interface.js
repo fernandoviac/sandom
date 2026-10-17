@@ -1,4 +1,4 @@
-// Generated from path-stroke-interface.json; do not edit.
+// Handwritten binding for path-stroke-interface.json.
 export const ABI_VERSION = 1;
 export const ALIGNMENT = 8;
 export const FLAG_PRESENT = 1;

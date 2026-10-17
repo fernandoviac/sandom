@@ -86,17 +86,59 @@ import {
   SESSION_HOST_STEP_KIND,
   SESSION_HOST_STYLE_SET_KIND,
 } from "./session-host-protocol.js";
+import { createBrowserSandomHost } from "../host/browser-host.js";
+import { createResourceDemand, originOf, receiveResourceResponse } from "../host/contract.js";
+import { sharedDomCore } from "../dom-wasm/core.js";
+
+// This worker is a browser host: native browser Fetch obtains its fonts and
+// stylesheet locators.
+const browserHost = createBrowserSandomHost();
+// The worker's own OffscreenCanvas and ImageData, taken before a session
+// installs Sandom's on this global (src/dom/component-globals.js).
+const HostOffscreenCanvas = globalThis.OffscreenCanvas;
+const HostImageData = globalThis.ImageData;
+let stylesheetGeneration = 0;
+
+async function readBrowserStylesheet(locator) {
+  const session = browserHost.openResourceSession();
+  const demand = createResourceDemand({
+    reference: locator,
+    baseURL: location.href,
+    destination: "style",
+    clientOrigin: originOf(location.href),
+    mode: "cors",
+    generation: ++stylesheetGeneration,
+    signal: new AbortController().signal,
+  });
+  try {
+    return await receiveResourceResponse(
+      await session.request(demand),
+      browserHost.backend,
+      locator,
+    );
+  } finally {
+    session.release();
+  }
+}
 
 // Locator stylesheets fetch by URL so their own relative url() references
 // resolve against the real stylesheet location. Their @font-face rules are
 // dropped: the host's caller registers its faces through the start
 // message's fonts list, and a site-absolute font URL (for example an
 // exactas /assets/fonts/... reference) resolves to a host-server 404 whose
-// body Sandom would register as font bytes. A @font-face block never nests
-// braces, so the removal is a complete-block match. This is a documented
-// host rule: every locator stylesheet passes through this removal.
+// body Sandom would register as font bytes. Native filtering matches the
+// case-sensitive rule name and removes through its next closing brace.
+// Every locator stylesheet passes through this removal.
 export function removeFontFaceBlocks(source) {
-  return source.replaceAll(/@font-face\s*\{[^}]*\}/g, "");
+  if (typeof source !== "string") throw new TypeError("Stylesheet source must be a string");
+  const pointer = sharedDomCore.exports.abi_allocate(source.length * 2);
+  const units = new Uint16Array(sharedDomCore.refreshBytes().buffer, pointer, source.length);
+  for (let index = 0; index < source.length; index++) units[index] = source.charCodeAt(index);
+  const count = sharedDomCore.status("font_stylesheet_filter", pointer, source.length);
+  const spans = new Uint32Array(sharedDomCore.refreshBytes().buffer, sharedDomCore.exports.abi_output_pointer(), count * 2);
+  const parts = new Array(count);
+  for (let index = 0; index < count; index++) parts[index] = source.slice(spans[index * 2], spans[index * 2 + 1]);
+  return parts.join("");
 }
 
 function serializeStyleDeclaration(declaration) {
@@ -232,9 +274,9 @@ function encodePixelFrame(frame) {
       Math.min(255, Math.round(pixels[index] * 255)),
     );
   }
-  const staging = new OffscreenCanvas(frame.width, frame.height);
+  const staging = new HostOffscreenCanvas(frame.width, frame.height);
   staging.getContext("2d").putImageData(
-    new ImageData(encoded, frame.width, frame.height),
+    new HostImageData(encoded, frame.width, frame.height),
     0,
     0,
   );
@@ -295,14 +337,14 @@ async function start(message) {
   // cache hit (fonts are retained across warm re-mounts by design). A
   // failed load leaves the cache so the next start retries it.
   // The Noto fallback families of the sandom-fonts set
-  // (plans/PLAN-fallback-font-coverage.md) paint each script that the
+  // (design/font-fallback.md) paint each script that the
   // caller's faces do not cover; a face loads when a text needs it.
   const fontsLoaded = Promise.all([
     ...(message.fonts ?? []).map(({ family, url }) => {
       const face = `${family}\u0000${url}`;
       let loading = loadedSessionFonts.get(face);
       if (loading === undefined) {
-        loading = loadFont(family, url);
+        loading = loadFont(family, new URL(url, location.href), { host: browserHost });
         loadedSessionFonts.set(face, loading);
         loading.catch(() => loadedSessionFonts.delete(face));
       }
@@ -360,22 +402,17 @@ async function start(message) {
   };
   // The start message's stylesheets list is ordered; the cascade applies
   // entries in list order. A { url, source } entry applies as supplied. A
-  // { locator } entry fetches here and passes the documented @font-face
-  // removal above.
+  // { locator } entry is a style demand of the browser host and passes the
+  // documented @font-face removal above.
   const stylesheets = await Promise.all(
     (message.stylesheets ?? []).map(async (entry) => {
       if (entry.locator === undefined) {
         return { url: entry.url, source: entry.source };
       }
-      const response = await fetch(entry.locator);
-      if (!response.ok) {
-        throw new Error(
-          `Session stylesheet ${entry.locator} failed with HTTP ${response.status}`,
-        );
-      }
+      const stylesheet = await readBrowserStylesheet(entry.locator);
       return {
-        url: new URL(entry.locator, location.origin).href,
-        source: removeFontFaceBlocks(await response.text()),
+        url: stylesheet.finalURL,
+        source: removeFontFaceBlocks(new TextDecoder().decode(stylesheet.bytes)),
       };
     }),
   );
@@ -386,6 +423,7 @@ async function start(message) {
     width: message.width,
     height: message.height,
     deviceScale: message.deviceScale,
+    host: browserHost,
     display,
     presentFrame: (delivery) => presentDelivery(delivery),
     stylesheets,

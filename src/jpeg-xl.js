@@ -25,13 +25,13 @@
  * central output transform (src/output/image.js) owns request
  * validation and color conversion; this module only drives the codec.
  * `encodeJXLAnimation` takes one frame sequence plus the closed animation
- * record (plans/PLAN-jpeg-xl-animation-output.md) and returns one
+ * record (`@sandom/jpeg-xl` plans/PLAN-jpeg-xl-animation-output.md) and returns one
  * animated container with the timing it selected.
  */
 
 import { isJXL } from './jpeg-xl-signature.js';
 import { validateImageDescriptor } from './image-data.js';
-import { readBinaryFile } from './host.js';
+import { readPackageAsset } from './package-assets.js';
 import { transformImageForOutput } from './output/color-transform.js';
 import { packSignal, packHalf, unpackHalf } from './output/packing.js';
 
@@ -46,7 +46,7 @@ async function ensureJxl() {
   const wasmBytes = getJpegXlBytes
     ? await getJpegXlBytes()
     : jpegXlBytes ??
-      await readBinaryFile(new URL('../vendor/jpeg-xl.wasm', import.meta.url));
+      await readPackageAsset(new URL('../vendor/jpeg-xl.wasm', import.meta.url));
   // The module is a standalone-WASM reactor: the only imports are the C
   // runtime's minimal WASI surface (never exercised on the paths this
   // shim uses - no files, no stdio) plus emscripten's memory-growth
@@ -515,7 +515,7 @@ async function encodeJXL(samples, width, height, {
   return output;
 }
 
-// Animation timing (plans/PLAN-jpeg-xl-animation-output.md, timing
+// Animation timing (`@sandom/jpeg-xl` plans/PLAN-jpeg-xl-animation-output.md, timing
 // model). One integer timebase carries the complete sequence. The
 // candidates are the millisecond grid and its decimal refinements down
 // to one microsecond; the codestream's own bound on the tick rate is
@@ -667,7 +667,7 @@ function resolveRepetition(repetitionCount) {
   );
 }
 
-// The closed metadata-box type set (plans/PLAN-jpeg-xl-animation-output.md).
+// The closed metadata-box type set (`@sandom/jpeg-xl` plans/PLAN-jpeg-xl-animation-output.md).
 // "Exif", "xml ", and "jumb" are the container format's own metadata
 // types; "sdrr" carries Sandom's typed render receipt. Closing the set
 // keeps Sandom out of the jxl-prefixed types the format reserves and out

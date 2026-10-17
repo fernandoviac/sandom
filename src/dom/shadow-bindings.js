@@ -2,6 +2,8 @@ import { DomCore, domCoreForWrapper, sharedDomCore } from "../dom-wasm/core.js";
 import {
   installShadowCloneBindings,
   installShadowElementBindings,
+  installElementInternalsBindings,
+  installSlotBindings,
 } from "./dom-bindings.generated.js";
 
 const nativeCreateShadowRoot = DomCore.prototype.createShadowRoot;
@@ -152,8 +154,7 @@ function runShadowActions(node, kind, argument, runtime) {
 }
 
 export function installShadowBindings(prototypes, runtime) {
-  installShadowElementBindings({
-    ElementInternals: runtime.ElementInternals,
+  const bindingRuntime = {
     shadowRoot(node) {
       const core = domCoreForWrapper(node) ?? sharedDomCore;
       const mode = node._shadowRoot?.mode;
@@ -194,7 +195,10 @@ export function installShadowBindings(prototypes, runtime) {
         return Boolean(core.status("shadow_binding_decide", 4, typeof type === "number" ? type : NaN));
       });
     },
-  }, prototypes.element);
+  };
+  installShadowElementBindings(bindingRuntime, prototypes.element);
+  installSlotBindings(bindingRuntime, prototypes.slot);
+  installElementInternalsBindings({ ElementInternals: runtime.ElementInternals }, prototypes.htmlElement);
   installShadowCloneBindings({
     cloneNode(node, deep) {
       return runShadowActions(node, 2, deep, runtime);

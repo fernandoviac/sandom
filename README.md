@@ -26,8 +26,9 @@ flex, grid, table, and stacking layout to Chrome's boxes.
 
 - **Documents and DOM:** an HTML parser with templates and declarative shadow
   DOM; a WebAssembly DOM core; shadow DOM, custom elements, observers,
-  constructable stylesheets, and event dispatch; `type="module"` scripts in
-  HTML inputs.
+  constructable stylesheets, and event dispatch; classic and `type="module"`
+  scripts in HTML inputs; the `canvas` element with the WebGPU and Canvas 2D
+  contexts, `OffscreenCanvas` and `ImageBitmap`.
 - **CSS:** custom properties, `calc()`, `@media`, `@supports`, `@layer`,
   `@font-face`, `@keyframes`, `@import`; selectors including `:has()`,
   `:is()`, `:where()`, `:nth-child(An+B of S)`, and `:focus-visible`.
@@ -51,15 +52,15 @@ flex, grid, table, and stacking layout to Chrome's boxes.
 - **Output:** GPU textures or float32 pixels; PNG, JPEG XL, gain-map JPEG,
   raw, BMP, PPM, and animated GIF.
 
-Not implemented: CSS Nesting, container queries, `min()`, `max()`, `clamp()`,
-counters, relative color syntax, and `light-dark()`; `backdrop-filter`, masks,
-`border-image`, `clip-path` shapes, `text-shadow`, `background-blend-mode`, and
-`isolation` on the HTML and CSS path; vertical writing modes, 3D transforms,
-subgrid, and `flex-wrap: wrap-reverse`; `<use>`, patterns, markers, filters,
-and masks in inline SVG; `contenteditable` editing hosts, `<dialog>`,
-popovers, and the date, time, number, range, color, and file input types;
-classic scripts in HTML inputs; Canvas 2D and WebGL canvas contexts; GIF and
-AVIF decoding; video output.
+Not implemented: CSS Nesting, container queries, counters, relative color
+syntax, and `light-dark()`; `backdrop-filter`, masks, `border-image`,
+`clip-path` shapes, `text-shadow`, `background-blend-mode`, and `isolation`
+on the HTML and CSS path; vertical writing modes, 3D transforms, subgrid, and
+`flex-wrap: wrap-reverse`; `<use>`, patterns, markers, filters, and masks in
+inline SVG; `contenteditable` editing hosts, `<dialog>`, popovers, and the
+date, time, number, range, color, and file input types; WebGL canvas
+contexts and Canvas 2D `getImageData()` and `toDataURL()`; GIF and AVIF
+decoding; video output.
 
 ## Install
 
@@ -73,6 +74,7 @@ bun  add     sandom bun-webgpu # Bun
 ```javascript
 import "sandom/gpu"; // mounts navigator.gpu on Node and Bun; no-op elsewhere
 import { loadFont } from "sandom/font-registry";
+import { createLocalSandomHost } from "sandom/host/local";
 import { createRenderSurface, createSandomDOM } from "sandom/dom";
 import { encodeImage } from "sandom/output";
 
@@ -82,6 +84,8 @@ const font = await loadFont(
     "../test-assets/IBMPlexMono-Regular.ttf",
     import.meta.resolve("sandom"),
   ),
+  // A locator source goes through a host that may read it.
+  { host: createLocalSandomHost({ authorizedRoots: [new URL("../test-assets/", import.meta.resolve("sandom"))] }) },
 );
 const dom = createSandomDOM({ viewportW: 320, viewportH: 180 });
 const root = dom.createElement("main");
@@ -111,14 +115,50 @@ texture and performs no readback.
 
 `sandom/gpu` resolves per runtime through conditional exports: the Node entry
 mounts Google Dawn from the `webgpu` package, the Bun entry mounts Dawn from
-`bun-webgpu`, and the default entry verifies that the host already provides
-`navigator.gpu`.
+`bun-webgpu`, and the Deno and default entries verify that the host already
+provides `navigator.gpu`.
+
+Sandom's GPU devices live on a GPU thread, a worker that performs the GPU
+effects that Sandom's WebAssembly requests. Page script and components see
+those devices through a WebGPU facade, so synchronous Canvas reads such as
+`getImageData()` can wait for the GPU. On Node and Bun the GPU thread imports
+the `sandom/gpu` entry that mounted the GPU, so import it before any other
+Sandom module. A browser runs Sandom in a worker of a cross-origin-isolated
+page (`Cross-Origin-Opener-Policy: same-origin`,
+`Cross-Origin-Embedder-Policy: require-corp`).
+
+A host that supplies its own devices passes a provider module, which runs on
+the GPU thread:
+
+```javascript
+// device-provider.js, loaded on the GPU thread
+export function provideDevice({ adapter, descriptor, options }, operation) {
+  adapter.requestDevice({ ...descriptor, label: options.label })
+    .then(operation.reply, operation.throw);
+}
+```
+
+```javascript
+import { createGpuThread } from "sandom";
+
+createGpuThread(
+  { provider: { module: new URL("./device-provider.js", import.meta.url).href, options: { label: "host" } } },
+  { reply(thread) { /* thread.gpu is the facade's GPU */ }, throw(error) { throw error; } },
+);
+```
+
+The provider replies with a native `GPUDevice` of the GPU thread. A scene
+renderer also draws on a native device of the script thread
+(`createSceneRenderer({ graphicsDevice })`). Canvas contexts and component
+WebGPU take GPU-thread devices only, because their synchronous reads block
+on the GPU thread.
 
 For a server bundle, supply final runtime resources instead of package-relative
 URLs:
 
 ```javascript
 import { createSandomRuntime } from "sandom/runtime";
+import { createSuppliedResourceHost } from "sandom/host/supplied-resources";
 
 const runtime = await createSandomRuntime({
   assets: {
@@ -128,7 +168,9 @@ const runtime = await createSandomRuntime({
 });
 // The runtime owns its font registry: load into that, not the module-level
 // registry, so each runtime keeps separate font and glyph state.
-await runtime.loadFont("Inter", interFontURL);
+await runtime.loadFont("Inter", interFontURL, {
+  host: createSuppliedResourceHost({ resources: { [interFontURL]: interFontBytes } }),
+});
 const dom = runtime.createSandomDOM({ viewportW: 800, viewportH: 600 });
 const root = dom.createElement("main");
 root.style.fontFamily = "Inter";
@@ -144,16 +186,36 @@ engine assets are `harfbuzz` and `msdfgen`; JPEG, PNG, WebP and JPEG XL bytes
 go under `assets.codecs` and stay lazy. Supplying `assets` at all means
 supplying every asset the document needs — the runtime stops resolving
 package-relative URLs and reports `runtime.assets.mode === "explicit"`.
-`resolveSystemFontFamily` is the only other accepted option; there are no
-built-in document fonts, so a document's families come from `loadFont` or
-`@font-face`. Each runtime owns separate WebAssembly instances, font and glyph
+`resolveSystemFontFamily` and `bundledSystemFonts` are the other accepted
+options; there are no built-in document fonts, so a document's families come
+from `loadFont`, `@font-face`, a system font resolver, or the generic faces of
+`bundledSystemFonts`. A runtime owns its font registry, so give it the generic
+faces of the bundled font set at creation:
+
+```javascript
+import { createSandomRuntime } from "sandom/runtime";
+import { loadBundledSystemFonts } from "sandom/system-fonts";
+
+const runtime = await createSandomRuntime({
+  bundledSystemFonts: await loadBundledSystemFonts(),
+});
+```
+
+Each runtime owns separate WebAssembly instances, font and glyph
 state, path and image caches, and renderer contexts, and releases the last of
 those with `runtime.releaseRenderContexts()`.
 
-OpenType scalar metrics come from the exact `@sandom/font-metrics@0.1.0`
-dependency. Sandom owns font loading, collection-face selection, WASM
-marshalling, and the renderer/registry error policies; it contains no fallback
-font-table parser.
+The renderer core composes the `@sandom/font-metrics` 0.1.0 WAT reader.
+Native font operations validate collection-face indices, read scalar metrics,
+and return diagnostics. The host loads font bytes and transports native records.
+
+PNG decoding and encoding run in the exact `@sandom/png@0.1.0` dependency.
+Sandom owns the binding that copies bytes in and out; the package has no
+JavaScript and Sandom has no fallback PNG codec.
+
+JPEG and WebP decoding run in the exact `@sandom/image-codecs@0.1.0`
+dependency. Sandom owns the bindings; the package has no JavaScript and Sandom
+has no fallback JPEG or WebP decoder.
 
 ## Performance
 
@@ -249,160 +311,11 @@ grows on frames that reused the retained scene. For host time, record
 `performance.now()` in the surface's `requestFrame` callback and again in
 `presentFrame`, and show it outside the rendered document.
 
-## Examples
+## Component adapters
 
-Complete programs that follow the Performance patterns live in the
-repository's
-[`examples/`](https://github.com/fernandoviac/sandom/tree/main/examples)
-directory. Each imports only this package and pinned public CDNs, and its
-README says how to run it and what it produces.
-
-- [`book`](https://github.com/fernandoviac/sandom/tree/main/examples/book)
-  — books with physics-turned pages in a WebGPU scene, printed from a live
-  HTML and CSS document you can edit, replace, and type into on the paper.
-- [`live-list`](https://github.com/fernandoviac/sandom/tree/main/examples/live-list)
-  — a task list on a canvas whose items are inserted, removed, reordered,
-  and expanded while shown, with each change's measured cost beside it.
-- [`code-editor`](https://github.com/fernandoviac/sandom/tree/main/examples/code-editor)
-  — a live editor on a canvas: texture presentation and projected input.
-- [`wikipedia-scroll`](https://github.com/fernandoviac/sandom/tree/main/examples/wikipedia-scroll)
-  — a long, scrolling document on a mesh in a three.js WebGPU scene.
-- [`shatter`](https://github.com/fernandoviac/sandom/tree/main/examples/shatter)
-  — one live, animated document split across many meshes in a three.js scene.
-- [`still-image`](https://github.com/fernandoviac/sandom/tree/main/examples/still-image)
-  — one PNG from a DOM built in the process, then more from the same kept
-  surface, on Node or Deno.
-- [`motion-gif`](https://github.com/fernandoviac/sandom/tree/main/examples/motion-gif)
-  — a CSS animation captured to an animated GIF by the surface's own clock.
-- [`react-session`](https://github.com/fernandoviac/sandom/tree/main/examples/react-session)
-  — a React application mounted once in a kept component session.
-
-## Vite component adapter
-
-Install Vite only when the project uses the optional adapter:
-
-```sh
-npm install sandom vite
-```
-
-The adapter requires Vite `>=8.2.0 <9` and Deno 2. It validates the installed
-Vite version during adapter creation.
-
-```javascript
-import { createViteComponentAdapter } from "sandom/adapters/vite";
-
-const adapter = await createViteComponentAdapter({
-  vite: {
-    root: process.cwd(),
-    server: { host: "127.0.0.1", port: 0, strictPort: true },
-  },
-  entry: "/src/mount-entry.jsx",
-  stylesheet: "/src/styles.css?inline",
-  revision: { module: "/src/revision.js", export: "SOURCE_REVISION" },
-  resources: [{
-    module: "/src/resources.js",
-    export: "fontURL",
-    kind: "font",
-  }],
-});
-
-const result = await adapter.render({ revision: "source-1" });
-await adapter.dispose();
-```
-
-The entry module exports `mount(context)`. The adapter imports that module only
-after the Deno realm installs Sandom globals.
-
-Each render uses a fresh Deno process. The result has kind
-`sandom/component-adapter-result` and version 1. The adapter serves review and
-test renders; a live view keeps one component session instead of paying for a
-process per render.
-
-Pass `server` instead of `vite` creation options to use a caller server. That
-server must have a documented `DevEnvironment` with the selected environment
-name.
-
-Root package imports do not load Vite or adapter code.
-
-## Compiled application adapter
-
-Use the generic entry for a public compiled browser application:
-
-```javascript
-import {
-  createCompiledApplicationAdapter,
-} from "sandom/adapters/compiled-application";
-
-const adapter = await createCompiledApplicationAdapter({
-  documentURL: "http://127.0.0.1:3000/component-review",
-  readiness: {
-    selector: "html",
-    attribute: "data-application-ready",
-  },
-});
-
-const result = await adapter.render({ revision: "source-1" });
-await adapter.dispose();
-```
-
-The adapter fetches one public document and a finite resource set.
-It executes selected classic scripts in document order.
-It transfers assets, resources, pixels, and images as raw bytes.
-Application console calls return as structured diagnostics.
-The realm reserves standard output for protocol frames.
-The realm owns application timers and WebSockets.
-Terminal disposal cancels timers and closes sockets.
-It then emits evidence and destroys the process without global restoration.
-
-Each render uses a fresh Deno process.
-The process receives an empty environment.
-The host command does not require environment-variable permission.
-The adapter rejects missing readiness, unlisted scripts, missing resources,
-incomplete disposal, standard-error output, and an inexact exit.
-
-## Next.js component adapter
-
-Install Next.js only when the project uses the optional entry:
-
-```sh
-npm install sandom next react react-dom
-```
-
-The adapter requires Next.js `>=16.3.1 <17` and Deno 2.
-It validates the installed Next.js version during adapter creation.
-
-```javascript
-import { createNextComponentAdapter } from "sandom/adapters/next";
-
-const adapter = await createNextComponentAdapter({
-  documentURL: "http://127.0.0.1:3000/component-review",
-  serverEnvironmentURL:
-    "http://127.0.0.1:3000/api/server-environment",
-});
-
-const result = await adapter.render({
-  revision: "source-1",
-  interaction: {
-    target: { selector: "[data-component-action]" },
-  },
-});
-await adapter.dispose();
-```
-
-The adapter uses public Next.js HTML, scripts, resources, and the development
-middleware manifest.
-It supplies a real WebSocket to the isolated realm.
-
-The server environment endpoint returns global descriptors, Sandom global
-names, and one process identifier.
-The adapter requires this record to stay unchanged.
-
-The Next.js entry does not use a private compiler registry.
-It does not call a production build.
-It creates a fresh realm after incremental compilation.
-
-Root package imports do not load compiled-application or Next.js adapter code.
-
+The Vite, Next.js, and compiled-application adapters are in the separate
+`@sandom/adapters` package. Root package imports do not load adapter or
+framework code.
 
 ## Bun
 
@@ -429,8 +342,10 @@ realm's DOM globals until it is disposed. Code that builds its own tree with
 
 ```javascript
 import { renderComponent } from "sandom/dom";
+import { noResourceHost } from "sandom/host";
 
 const component = await renderComponent({
+  host: noResourceHost, // the component loads no resource
   width: 320,
   height: 180,
   mount({ document, container }) {
@@ -477,14 +392,25 @@ defaults, and cross-document navigation are not implemented.
   `recommendMotionCapture`, `RenderPlanningError`, `loadFont`,
   `createCanvasPresenter`, `createTexturePresenter`, `bindProjectedInput`,
   `projectOntoRectangle`, `createGpuCompositor`, `encodeImage`,
-  `OUTPUT_FORMATS`, `validateOutputRequest`, `createGifRecorder`, and
-  `quantizeWorkingPixels`.
+  `OUTPUT_FORMATS`, `validateOutputRequest`, `createGifRecorder`,
+  `quantizeWorkingPixels`, and `createGlyphOutlineSource` (the glyph
+  outlines of a font's bytes, from the shaper Sandom renders with). The
+  rectangle commands of `createDisplayListArtifact` carry their `paint`:
+  fill, border widths, corner radii and whether a transform places them.
 - `sandom/runtime` — the bundler-safe `createSandomRuntime` entry.
 - `sandom/dom` — the public DOM facade: `createSandomRuntime`,
   `createSandomDOM`, `createRenderSurface`, `renderComponent`, document
-  sessions, render planning, inspection, and browser-worker rendering.
-- `sandom/web-component` — the `<sandom-renderer>` browser component.
+  sessions, render planning, inspection, browser-worker rendering,
+  `DOMParser`, `createInputWindow` (the window that a document's classic
+  scripts run against), and `caretRectangle` and `selectionRectangles` (the
+  caret and selection geometry of a surface's presented frame).
 - `sandom/font-registry` — `loadFont` and the font family registry.
+- `sandom/system-fonts` — the bundled font set: `loadBundledSystemFonts`,
+  `installBundledSystemFonts`, `loadFontSetFallbackFamilies` and
+  `installFontSetFallbackFamilies`.
+- `sandom/host`, `sandom/host/local`, `sandom/host/supplied-resources`,
+  `sandom/host/browser` — the resource hosts; `sandom/host/browser` exports
+  `createBrowserSandomHost`.
 - `sandom/gpu-compositor` — `createGpuCompositor`, the same-device texture and
   text compositor.
 - `sandom/adaptive-jpeg` — the focused gain-map JPEG encoder, inspector, and
@@ -495,12 +421,8 @@ defaults, and cross-document navigation are not implemented.
   transform.
 - `sandom/jsx-runtime` — the JSX automatic runtime for Sandom documents.
 - `sandom/gpu` — runtime-conditional `navigator.gpu` mounting.
-- `sandom/adapters/vite` — the optional Vite development adapter.
-- `sandom/adapters/compiled-application` — the public browser-application
-  adapter.
-- `sandom/adapters/next` — the optional Next.js development adapter.
-- `sandom/component-adapter-result` — the shared result validator.
-- `sandom/component-adapter-realm-protocol` — the versioned realm protocol.
+- `sandom/dom/node` — `DOMParser` and document helpers for `@sandom/adapters`.
+- `sandom/dom-wasm/core` — the shared DOM core for `@sandom/adapters`.
 - `sandom/src/*.js` — direct module access, identical to the CDN layout.
 
 ## Project status

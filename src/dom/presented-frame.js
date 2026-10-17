@@ -4,7 +4,7 @@
 // Host-side records are decoded on demand: hit testing, scrolling and
 // anchoring query the native snapshot directly, so a frame that nobody
 // inspects materializes no JavaScript records.
-import { buildGeometry, buildGeometryRestyleSuccessor, buildGeometrySuccessor, ShiftedTextGeometry, snapshotTextGeometry } from "./geometry.js";
+import { buildGeometry, buildGeometryRestyleSuccessor, buildGeometrySuccessor, controlSelectionRectangles, snapshotTextGeometry, TextGeometryView } from "./geometry.js";
 import { GEOMETRY_RECORD_SIZE } from "../dom-wasm/geometry-wire.js";
 
 const axis = (value, sign) => Object.freeze({ axis: value === 0 ? "x" : "y", startAtHigh: sign < 0 });
@@ -40,7 +40,7 @@ function decodeAll(frame) {
     allRecords.push(Object.freeze(record));
     if (record.engineIndex >= 0) boxes[record.engineIndex] = record.box;
     if (record.viewport) viewportScroll = record.scroll;
-    if (record.element?.tag === undefined) continue;
+    if (record.element?.nodeType !== 1) continue;
     records.push(record);
     recordOf.set(record.element, record);
   }
@@ -49,10 +49,10 @@ function decodeAll(frame) {
 
 const successorRevisionNames = ["document", "style", "resource", "viewport"];
 
-// The text geometry a snapshot's text block was written from: a shifted
-// view's base, or the map itself.
+// The text geometry a snapshot's text block was written from: a view's
+// base, or the map itself.
 function textGeometryBase(textGeometry) {
-  return textGeometry instanceof ShiftedTextGeometry ? textGeometry.base : textGeometry;
+  return textGeometry instanceof TextGeometryView ? textGeometry.base : textGeometry;
 }
 
 // Whether two text geometries of a node cover the same caret stops and
@@ -69,12 +69,12 @@ function sameTextRun(previous, geometry) {
 
 // Whether `textGeometry` covers the predecessor's text block: the same
 // entries in the same order over the same caret stops and glyphs, whatever
-// their translations. A shifted view over the predecessor's base shares
-// that base's entries; only the ones it finished itself are compared.
+// their translations. A view over the predecessor's base shares that
+// base's entries; only the ones it finished itself are compared.
 function textRunsHold(predecessor, textGeometry) {
   const previousText = snapshotTextGeometry(predecessor.textGeometryByNode, predecessor.textGeometryByElement);
   if (previousText.size !== textGeometry.size) return false;
-  if (textGeometry instanceof ShiftedTextGeometry && textGeometry.base === textGeometryBase(previousText)) {
+  if (textGeometry instanceof TextGeometryView && textGeometry.base === textGeometryBase(previousText)) {
     for (const node of textGeometry.overrides.keys()) {
       if (!sameTextRun(previousText.get(node), textGeometry.get(node))) return false;
     }
@@ -131,8 +131,7 @@ function restyleRefusal(predecessor, { root, viewport, viewportIndex, sourceRevi
 // Whether every text geometry entry of a frame is the predecessor's own
 // object, in the predecessor's order, and the predecessor's node map is
 // the text geometry its text block was written from. The frame's snapshot
-// then shares that block under the predecessor's text shift, and the frame
-// keeps the predecessor's node map, whose shift a later view continues.
+// then shares that block, and the frame keeps the predecessor's node map.
 function sameTextObjects(predecessor, textGeometry) {
   const previousText = predecessor.textGeometryByNode;
   if (
@@ -147,22 +146,25 @@ function sameTextObjects(predecessor, textGeometry) {
   return true;
 }
 
-// The text shift under which a successor keeps its predecessor's carets and
-// glyphs: `textGeometry` shifts the base the predecessor's text block was
-// written from, and the predecessor's snapshot carries its own view's
-// shift (zero for a map). Null when each text node's translation is
-// written instead.
-function sharedTextShift(predecessor, textGeometry) {
-  if (!(textGeometry instanceof ShiftedTextGeometry)) return null;
+// Whether a successor keeps its predecessor's carets and glyphs: the
+// frame's text geometry is a view over the base the predecessor's text
+// block was written from, and each entry the view finished itself has the
+// run and the translation of the predecessor's entry. A translation holds
+// no scroll, so a scroll keeps every entry.
+function sharedText(predecessor, textGeometry) {
+  if (!(textGeometry instanceof TextGeometryView)) return false;
   const previousText = snapshotTextGeometry(predecessor.textGeometryByNode, predecessor.textGeometryByElement);
-  if (textGeometryBase(previousText) !== textGeometry.base) return null;
-  const shifted = previousText instanceof ShiftedTextGeometry;
-  return {
-    previousX: shifted ? previousText.shiftX : 0,
-    previousY: shifted ? previousText.shiftY : 0,
-    x: textGeometry.shiftX,
-    y: textGeometry.shiftY,
-  };
+  if (textGeometryBase(previousText) !== textGeometry.base) return false;
+  for (const node of textGeometry.overrides.keys()) {
+    const previous = previousText.get(node);
+    const geometry = textGeometry.get(node);
+    if (
+      !sameTextRun(previous, geometry) ||
+      !Object.is(previous.translationX ?? 0, geometry.translationX ?? 0) ||
+      !Object.is(previous.translationY ?? 0, geometry.translationY ?? 0)
+    ) return false;
+  }
+  return true;
 }
 
 // `scrollPredecessor`: the presented frame this one only scrolled from, or
@@ -181,26 +183,26 @@ export function buildInteractionSnapshot({ root, viewport, viewportIndex = 0, re
   let derivation = null;
   let refusal = null;
   let work = null;
-  let textShift = null;
+  let shareText = false;
   let keptTextGeometry = textGeometryByNode;
   let geometry = null;
   if (scrollPredecessor !== null && scrollSuccessorHolds(scrollPredecessor, { root, viewport, viewportIndex, boxes, publication, sourceRevisions, textGeometry })) {
-    textShift = sharedTextShift(scrollPredecessor, textGeometry);
-    ({ geometry, work } = buildGeometrySuccessor({ predecessor: scrollPredecessor.geometry, root, boxes, revision, scrollbars, textGeometry, textShift, sourceRevisions }));
+    shareText = sharedText(scrollPredecessor, textGeometry);
+    if (!shareText && sameTextObjects(scrollPredecessor, textGeometry)) {
+      shareText = true;
+      keptTextGeometry = scrollPredecessor.textGeometryByNode;
+    }
+    ({ geometry, work } = buildGeometrySuccessor({ predecessor: scrollPredecessor.geometry, root, boxes, revision, scrollbars, textGeometry, shareText, sourceRevisions }));
     derivation = "scroll";
   } else if (restylePredecessor !== null) {
     refusal = restyleRefusal(restylePredecessor, { root, viewport, viewportIndex, sourceRevisions, textGeometry });
     if (refusal === null) {
-      textShift = sharedTextShift(restylePredecessor, textGeometry);
-      if (textShift === null && sameTextObjects(restylePredecessor, textGeometry)) {
-        const previousText = restylePredecessor.textGeometryByNode;
-        const shifted = previousText instanceof ShiftedTextGeometry;
-        const x = shifted ? previousText.shiftX : 0;
-        const y = shifted ? previousText.shiftY : 0;
-        textShift = { previousX: x, previousY: y, x, y };
-        keptTextGeometry = previousText;
+      shareText = sharedText(restylePredecessor, textGeometry);
+      if (!shareText && sameTextObjects(restylePredecessor, textGeometry)) {
+        shareText = true;
+        keptTextGeometry = restylePredecessor.textGeometryByNode;
       }
-      const derived = buildGeometryRestyleSuccessor({ predecessor: restylePredecessor.geometry, root, boxes, publication, viewportIndex, revision, scrollbars, textGeometry, textShift, sourceRevisions });
+      const derived = buildGeometryRestyleSuccessor({ predecessor: restylePredecessor.geometry, root, boxes, publication, viewportIndex, revision, scrollbars, textGeometry, shareText, sourceRevisions });
       refusal = derived.refusal;
       if (derived.geometry !== null) {
         geometry = derived.geometry;
@@ -210,16 +212,10 @@ export function buildInteractionSnapshot({ root, viewport, viewportIndex = 0, re
     }
   }
   if (geometry === null) {
-    textShift = null;
     keptTextGeometry = textGeometryByNode;
     geometry = buildGeometry({ root, viewport, viewportIndex, revision, boxes, publication, scrollbars, textGeometryByElement, textGeometryByNode, sourceRevisions, presented: true });
   }
-  // A text block written from a shifted view holds the view's entries at no
-  // shift, so the frame keeps those entries as the base the next frame's
-  // view shifts.
-  const frameTextGeometryByNode = textShift === null && keptTextGeometry instanceof ShiftedTextGeometry
-    ? new Map(keptTextGeometry)
-    : keptTextGeometry;
+  const frameTextGeometryByNode = keptTextGeometry;
   let decoded = null;
   const frame = {
     kind: "presented-interaction-frame", version: 1, revision, timeMilliseconds,
@@ -233,6 +229,15 @@ export function buildInteractionSnapshot({ root, viewport, viewportIndex = 0, re
     textGeometryByElement, textGeometryByNode: frameTextGeometryByNode,
     scrollbars: Object.freeze(scrollbars.map((scrollbar) => Object.freeze({ ...scrollbar, track: Object.freeze({ ...scrollbar.track }), clip: scrollbar.clip ? Object.freeze({ ...scrollbar.clip }) : null }))),
   };
+  // Each text control's selection rectangles (selectionRectanglesByElement),
+  // answered by this frame's geometry while it is live: they depend on the
+  // control's scroll and its ancestors'.
+  const selectionRectanglesByElement = new Map();
+  for (const [element, entry] of textGeometryByElement) {
+    if (entry.selectionStart === undefined) continue;
+    selectionRectanglesByElement.set(element, controlSelectionRectangles(frame, element, entry));
+  }
+  frame.selectionRectanglesByElement = selectionRectanglesByElement;
   const lazy = (name) => ({ enumerable: true, get() { decoded ??= decodeAll(frame); return decoded[name]; } });
   Object.defineProperties(frame, { records: lazy("records"), recordOf: lazy("recordOf"), boxes: lazy("boxes"), viewportScroll: lazy("viewportScroll") });
   return Object.freeze(frame);

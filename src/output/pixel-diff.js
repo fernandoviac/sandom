@@ -2,7 +2,7 @@ import { quantizeWorkingPixels } from "./color-transform.js";
 
 // Canonical RGBA pixel comparison — the SINGLE source of truth for both the
 // browser gallery (examples/layout-gallery.js) and the headless parity test
-// (test/layout_pixel_test.js). Both import classifyDiff from here so the test
+// (test/layout-flow/layout_pixel_test.js). Both import classifyDiff from here so the test
 // can never pass while the gallery shows a difference, or vice versa.
 //
 // Why classify instead of just count: two correct raster engines never agree

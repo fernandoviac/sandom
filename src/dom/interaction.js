@@ -190,10 +190,11 @@ export function normalizeInputRecord(record) {
     x: finite(record.x, "x"),
     y: finite(record.y, "y"),
     pressure,
-    timeMilliseconds: finite(
-      record.timeMilliseconds ?? performance.now(),
-      "timeMilliseconds",
-    ),
+    // A record without a time takes the time of the surface's clock when it
+    // is dispatched (input-controller.js), the clock its frames run on.
+    ...((record.timeMilliseconds ?? undefined) === undefined
+      ? {}
+      : { timeMilliseconds: finite(record.timeMilliseconds, "timeMilliseconds") }),
     ...modifiers(record),
   });
 }

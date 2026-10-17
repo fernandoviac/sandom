@@ -3,14 +3,14 @@
 const callBindingFunction = Function.prototype.call.bind(Function.prototype.call);
 export function createEventBindings(runtime) {
   const binding = {
-    addEventListener(target, type, callback, options) {
+    addEventListener(target, type, callback, options = undefined) {
       if ((callback ?? undefined) === undefined) return;
       let normalized = runtime["listenerOptions"](options);
       if (normalized.signal?.aborted) return;
       let eventType = String(type);
       runtime["addListener"](target, eventType, callback, normalized);
     },
-    removeEventListener(target, type, callback, options) {
+    removeEventListener(target, type, callback, options = undefined) {
       let binding = runtime["lookupTarget"](target);
       let eventType = String(type);
       if ((binding ?? undefined) === undefined) return;
@@ -34,7 +34,7 @@ export function createMutationObserverClass(runtime) {
       }
       super(document, callback);
     }
-    observe(target, options) {
+    observe(target, options = undefined) {
       let validatedTarget = this["_requireTarget"](target);
       let normalizedOptions = runtime["normalizeOptions"](options);
       this["_transportObserve"](validatedTarget, normalizedOptions);
@@ -224,6 +224,9 @@ export function createCSSStyleSheetClass(runtime) {
     get cssRules() {
       return this["_getRules"]();
     }
+    get rules() {
+      return this["_getRules"]();
+    }
     get diagnostics() {
       return this["_getDiagnostics"]();
     }
@@ -236,15 +239,13 @@ export function createCSSStyleSheetClass(runtime) {
       this["_setMedia"](normalized);
     }
     replaceSync(source) {
-      let checkedSource = String(source);
-      let checked = this["_checkReplaceSource"](checkedSource);
       let normalized = String(source);
       this["_replaceSyncTransport"](normalized);
     }
     replace(source) {
       return this["_replaceTransport"](source);
     }
-    insertRule(rule, index) {
+    insertRule(rule, index = undefined) {
       let defaultIndex = this["_defaultInsertIndex"](index);
       let numericIndex = Number(defaultIndex);
       let position = this["_checkInsertIndex"](numericIndex);
@@ -333,6 +334,9 @@ export function createInlineStyleClass(runtime) {
 
 export function installNodeBindings(runtime, prototype) {
   const binding = {
+    get childNodes() {
+      return this._childNodesCollection;
+    },
     get nodeType() {
       return this._domCore["nodeType"](this._coreHandle);
     },
@@ -360,24 +364,6 @@ export function installNodeBindings(runtime, prototype) {
     get parentElement() {
       return this._domCore["nodeHandle"]("node_element_navigation", this._coreHandle, 0);
     },
-    get previousElementSibling() {
-      return this._domCore["nodeHandle"]("node_element_navigation", this._coreHandle, 1);
-    },
-    get nextElementSibling() {
-      return this._domCore["nodeHandle"]("node_element_navigation", this._coreHandle, 2);
-    },
-    get firstElementChild() {
-      return this._domCore["elementChildEdge"](this._coreHandle, false);
-    },
-    get lastElementChild() {
-      return this._domCore["elementChildEdge"](this._coreHandle, true);
-    },
-    get childElementCount() {
-      return this._domCore["childElementCount"](this._coreHandle);
-    },
-    get assignedSlot() {
-      return this._domCore["assignedSlot"](this._coreHandle);
-    },
     getRootNode(options = {}) {
       let callReceiver = this._domCore;
       let capturedCallee = callReceiver.rootNode;
@@ -390,38 +376,11 @@ export function installNodeBindings(runtime, prototype) {
       connected = !!(connected);
       return connected;
     },
-    addEventListener(type, callback, options) {
-      runtime["addListener"](this, type, callback, options);
-    },
-    removeEventListener(type, callback, options) {
-      runtime["removeListener"](this, type, callback, options);
-    },
-    dispatchEvent(event) {
-      return runtime["dispatchNativeEvent"](this, event);
-    },
-    append(...nodes) {
-      this["_bindingNodeSequence"](0, nodes);
-    },
-    prepend(...nodes) {
-      this["_bindingNodeSequence"](1, nodes);
-    },
-    before(...nodes) {
-      this["_bindingNodeSequence"](2, nodes);
-    },
-    after(...nodes) {
-      this["_bindingNodeSequence"](3, nodes);
-    },
-    replaceWith(...nodes) {
-      this["_bindingNodeSequence"](4, nodes);
-    },
-    replaceChildren(...nodes) {
-      this["_bindingNodeSequence"](5, nodes);
-    },
-    remove() {
-      this["_bindingNodeSequence"](6, []);
-    },
     contains(other) {
       return this["_transportContains"](other);
+    },
+    compareDocumentPosition(other) {
+      return this["_transportCompareDocumentPosition"](other);
     },
     isEqualNode(otherNode) {
       return this["_transportIsEqualNode"](otherNode);
@@ -442,6 +401,43 @@ export function installNodeBindings(runtime, prototype) {
       return this["_transportCloneNode"](deep);
     },
   };
+  Object.defineProperty(prototype.constructor, "ELEMENT_NODE", { value: 1, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "ELEMENT_NODE", { value: 1, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "ATTRIBUTE_NODE", { value: 2, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "ATTRIBUTE_NODE", { value: 2, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "TEXT_NODE", { value: 3, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "TEXT_NODE", { value: 3, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "CDATA_SECTION_NODE", { value: 4, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "CDATA_SECTION_NODE", { value: 4, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "ENTITY_REFERENCE_NODE", { value: 5, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "ENTITY_REFERENCE_NODE", { value: 5, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "ENTITY_NODE", { value: 6, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "ENTITY_NODE", { value: 6, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "PROCESSING_INSTRUCTION_NODE", { value: 7, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "PROCESSING_INSTRUCTION_NODE", { value: 7, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "COMMENT_NODE", { value: 8, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "COMMENT_NODE", { value: 8, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_NODE", { value: 9, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_NODE", { value: 9, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_TYPE_NODE", { value: 10, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_TYPE_NODE", { value: 10, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_FRAGMENT_NODE", { value: 11, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_FRAGMENT_NODE", { value: 11, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "NOTATION_NODE", { value: 12, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "NOTATION_NODE", { value: 12, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_POSITION_DISCONNECTED", { value: 1, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_POSITION_DISCONNECTED", { value: 1, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_POSITION_PRECEDING", { value: 2, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_POSITION_PRECEDING", { value: 2, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_POSITION_FOLLOWING", { value: 4, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_POSITION_FOLLOWING", { value: 4, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_POSITION_CONTAINS", { value: 8, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_POSITION_CONTAINS", { value: 8, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_POSITION_CONTAINED_BY", { value: 16, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_POSITION_CONTAINED_BY", { value: 16, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", { value: 32, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", { value: 32, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(binding, "childNodes", {"enumerable": false});
   Object.defineProperty(binding, "nodeType", {"enumerable": false});
   Object.defineProperty(binding, "nodeName", {"enumerable": false});
   Object.defineProperty(binding, "ownerDocument", {"enumerable": false});
@@ -451,25 +447,10 @@ export function installNodeBindings(runtime, prototype) {
   Object.defineProperty(binding, "previousSibling", {"enumerable": false});
   Object.defineProperty(binding, "nextSibling", {"enumerable": false});
   Object.defineProperty(binding, "parentElement", {"enumerable": false});
-  Object.defineProperty(binding, "previousElementSibling", {"enumerable": false});
-  Object.defineProperty(binding, "nextElementSibling", {"enumerable": false});
-  Object.defineProperty(binding, "firstElementChild", {"enumerable": false});
-  Object.defineProperty(binding, "lastElementChild", {"enumerable": false});
-  Object.defineProperty(binding, "childElementCount", {"enumerable": false});
-  Object.defineProperty(binding, "assignedSlot", {"enumerable": false});
   Object.defineProperty(binding, "getRootNode", {"enumerable": false});
   Object.defineProperty(binding, "isConnected", {"enumerable": false});
-  Object.defineProperty(binding, "addEventListener", {"enumerable": false});
-  Object.defineProperty(binding, "removeEventListener", {"enumerable": false});
-  Object.defineProperty(binding, "dispatchEvent", {"enumerable": false});
-  Object.defineProperty(binding, "append", {"enumerable": false});
-  Object.defineProperty(binding, "prepend", {"enumerable": false});
-  Object.defineProperty(binding, "before", {"enumerable": false});
-  Object.defineProperty(binding, "after", {"enumerable": false});
-  Object.defineProperty(binding, "replaceWith", {"enumerable": false});
-  Object.defineProperty(binding, "replaceChildren", {"enumerable": false});
-  Object.defineProperty(binding, "remove", {"enumerable": false});
   Object.defineProperty(binding, "contains", {"enumerable": false});
+  Object.defineProperty(binding, "compareDocumentPosition", {"enumerable": false});
   Object.defineProperty(binding, "isEqualNode", {"enumerable": false});
   Object.defineProperty(binding, "appendChild", {"enumerable": false});
   Object.defineProperty(binding, "insertBefore", {"enumerable": false});
@@ -477,6 +458,7 @@ export function installNodeBindings(runtime, prototype) {
   Object.defineProperty(binding, "replaceChild", {"enumerable": false});
   Object.defineProperty(binding, "cloneNode", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["childNodes"].set;
   delete descriptors["nodeType"].set;
   delete descriptors["nodeName"].set;
   delete descriptors["ownerDocument"].set;
@@ -486,13 +468,122 @@ export function installNodeBindings(runtime, prototype) {
   delete descriptors["previousSibling"].set;
   delete descriptors["nextSibling"].set;
   delete descriptors["parentElement"].set;
-  delete descriptors["previousElementSibling"].set;
-  delete descriptors["nextElementSibling"].set;
+  delete descriptors["isConnected"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installParentNodeBindings(runtime, prototype) {
+  const binding = {
+    get firstElementChild() {
+      return this._domCore["elementChildEdge"](this._coreHandle, false);
+    },
+    get lastElementChild() {
+      return this._domCore["elementChildEdge"](this._coreHandle, true);
+    },
+    get childElementCount() {
+      return this._domCore["childElementCount"](this._coreHandle);
+    },
+    append(...nodes) {
+      this["_bindingNodeSequence"](0, nodes);
+    },
+    prepend(...nodes) {
+      this["_bindingNodeSequence"](1, nodes);
+    },
+    replaceChildren(...nodes) {
+      this["_bindingNodeSequence"](5, nodes);
+    },
+    moveBefore(node, child) {
+      this["_transportMoveBefore"](node, child);
+    },
+    get children() {
+      return this["_bindingChildren"]();
+    },
+  };
+  Object.defineProperty(binding, "firstElementChild", {"enumerable": false});
+  Object.defineProperty(binding, "lastElementChild", {"enumerable": false});
+  Object.defineProperty(binding, "childElementCount", {"enumerable": false});
+  Object.defineProperty(binding, "append", {"enumerable": false});
+  Object.defineProperty(binding, "prepend", {"enumerable": false});
+  Object.defineProperty(binding, "replaceChildren", {"enumerable": false});
+  Object.defineProperty(binding, "moveBefore", {"enumerable": false});
+  Object.defineProperty(binding, "children", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
   delete descriptors["firstElementChild"].set;
   delete descriptors["lastElementChild"].set;
   delete descriptors["childElementCount"].set;
+  delete descriptors["children"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installChildNodeBindings(runtime, prototype) {
+  const binding = {
+    before(...nodes) {
+      this["_bindingNodeSequence"](2, nodes);
+    },
+    after(...nodes) {
+      this["_bindingNodeSequence"](3, nodes);
+    },
+    replaceWith(...nodes) {
+      this["_bindingNodeSequence"](4, nodes);
+    },
+    remove() {
+      this["_bindingNodeSequence"](6, []);
+    },
+  };
+  Object.defineProperty(binding, "before", {"enumerable": false});
+  Object.defineProperty(binding, "after", {"enumerable": false});
+  Object.defineProperty(binding, "replaceWith", {"enumerable": false});
+  Object.defineProperty(binding, "remove", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installElementSiblingBindings(runtime, prototype) {
+  const binding = {
+    get previousElementSibling() {
+      return this._domCore["nodeHandle"]("node_element_navigation", this._coreHandle, 1);
+    },
+    get nextElementSibling() {
+      return this._domCore["nodeHandle"]("node_element_navigation", this._coreHandle, 2);
+    },
+  };
+  Object.defineProperty(binding, "previousElementSibling", {"enumerable": false});
+  Object.defineProperty(binding, "nextElementSibling", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["previousElementSibling"].set;
+  delete descriptors["nextElementSibling"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installSlottableBindings(runtime, prototype) {
+  const binding = {
+    get assignedSlot() {
+      return this._domCore["assignedSlot"](this._coreHandle);
+    },
+  };
+  Object.defineProperty(binding, "assignedSlot", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
   delete descriptors["assignedSlot"].set;
-  delete descriptors["isConnected"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installElementInlineStyleBindings(runtime, prototype) {
+  const binding = {
+    get style() {
+      return this._style;
+    },
+    set style(value) {
+      this._style.cssText = value;
+      null;
+    },
+  };
+  Object.defineProperty(binding, "style", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
@@ -514,11 +605,8 @@ export function installDocumentBindings(runtime, prototype) {
       return callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
     },
     querySelectorAll(selector) {
-      let callReceiver = this._domCore;
-      let capturedCallee = callReceiver.selectorQueryAll;
-      let argument0 = this._coreHandle;
       let normalized = String(selector);
-      return callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
+      return runtime["querySelectorAll"](this, normalized);
     },
     createTextNode(data) {
       let result = new runtime["SDTextNode"](data, this);
@@ -536,7 +624,7 @@ export function installDocumentBindings(runtime, prototype) {
       let result = new runtime["SDCDATASection"](data, this);
       return result;
     },
-    createProcessingInstruction(target, data = "") {
+    createProcessingInstruction(target, data) {
       let result = new runtime["SDProcessingInstruction"](target, data, this);
       return result;
     },
@@ -619,6 +707,15 @@ export function installDocumentBindings(runtime, prototype) {
     getElementsByTagName(qualifiedName) {
       return runtime["elementsByTagName"](this, qualifiedName);
     },
+    getElementsByTagNameNS(namespace, localName) {
+      return runtime["elementsByTagNameNS"](this, namespace, localName);
+    },
+    getElementsByClassName(classNames) {
+      return runtime["elementsByClassName"](this, classNames);
+    },
+    getElementsByName(elementName) {
+      return runtime["elementsByName"](this, elementName);
+    },
     cloneNode() {
       runtime.sharedDomCore["status"]("node_clone_guard", 9);
     },
@@ -652,6 +749,9 @@ export function installDocumentBindings(runtime, prototype) {
   Object.defineProperty(binding, "createRange", {"enumerable": false});
   Object.defineProperty(binding, "createTreeWalker", {"enumerable": false});
   Object.defineProperty(binding, "getElementsByTagName", {"enumerable": false});
+  Object.defineProperty(binding, "getElementsByTagNameNS", {"enumerable": false});
+  Object.defineProperty(binding, "getElementsByClassName", {"enumerable": false});
+  Object.defineProperty(binding, "getElementsByName", {"enumerable": false});
   Object.defineProperty(binding, "cloneNode", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
   delete descriptors["documentElement"].set;
@@ -699,13 +799,22 @@ export function installCSSRuleBindings(runtime, prototype) {
       return (text ?? "");
     },
   };
-  Object.defineProperty(prototype.constructor, "STYLE_RULE", { value: 1, writable: true, enumerable: true, configurable: true });
-  Object.defineProperty(prototype.constructor, "IMPORT_RULE", { value: 3, writable: true, enumerable: true, configurable: true });
-  Object.defineProperty(prototype.constructor, "MEDIA_RULE", { value: 4, writable: true, enumerable: true, configurable: true });
-  Object.defineProperty(prototype.constructor, "FONT_FACE_RULE", { value: 5, writable: true, enumerable: true, configurable: true });
-  Object.defineProperty(prototype.constructor, "KEYFRAMES_RULE", { value: 7, writable: true, enumerable: true, configurable: true });
-  Object.defineProperty(prototype.constructor, "KEYFRAME_RULE", { value: 8, writable: true, enumerable: true, configurable: true });
-  Object.defineProperty(prototype.constructor, "SUPPORTS_RULE", { value: 12, writable: true, enumerable: true, configurable: true });
+  Object.defineProperty(prototype.constructor, "STYLE_RULE", { value: 1, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "STYLE_RULE", { value: 1, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "IMPORT_RULE", { value: 3, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "IMPORT_RULE", { value: 3, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "MEDIA_RULE", { value: 4, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "MEDIA_RULE", { value: 4, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "FONT_FACE_RULE", { value: 5, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "FONT_FACE_RULE", { value: 5, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "KEYFRAMES_RULE", { value: 7, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "KEYFRAMES_RULE", { value: 7, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "KEYFRAME_RULE", { value: 8, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "KEYFRAME_RULE", { value: 8, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "SUPPORTS_RULE", { value: 12, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "SUPPORTS_RULE", { value: 12, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "FONT_FEATURE_VALUES_RULE", { value: 14, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "FONT_FEATURE_VALUES_RULE", { value: 14, writable: false, enumerable: true, configurable: false });
   Object.defineProperty(binding, "parentStyleSheet", {"enumerable": false});
   Object.defineProperty(binding, "parentRule", {"enumerable": false});
   Object.defineProperty(binding, "type", {"enumerable": false});
@@ -771,6 +880,25 @@ export function installCSSFontFaceRuleBindings(runtime, prototype) {
   return prototype;
 }
 
+export function installCSSFontFeatureValuesRuleBindings(runtime, prototype) {
+  const binding = {
+    get type() {
+      return runtime.CSSRule.FONT_FEATURE_VALUES_RULE;
+    },
+    get fontFamily() {
+      let text = this._domCore["string"]("css_rule_prelude", this._coreRuleHandle);
+      return (text ?? "");
+    },
+  };
+  Object.defineProperty(binding, "type", {"enumerable": false});
+  Object.defineProperty(binding, "fontFamily", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["type"].set;
+  delete descriptors["fontFamily"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
 export function installCSSKeyframeRuleBindings(runtime, prototype) {
   const binding = {
     get type() {
@@ -782,10 +910,7 @@ export function installCSSKeyframeRuleBindings(runtime, prototype) {
     },
     set keyText(value) {
       let text = String(value);
-      this.selectorText = text;
       runtime["setKeyText"](this, text);
-      text = this._domCore["string"]("css_rule_prelude", this._coreRuleHandle);
-      this.selectorText = (text ?? "");
       this["_changed"]();
     },
   };
@@ -818,8 +943,8 @@ export function installCSSKeyframesRuleBindings(runtime, prototype) {
 
 export function installElementBindings(runtime, prototype) {
   const binding = {
-    get tag() {
-      return this.localName;
+    get attributes() {
+      return this._attributes;
     },
     get tagName() {
       return this.nodeName;
@@ -854,6 +979,27 @@ export function installElementBindings(runtime, prototype) {
     set slot(value) {
       this["setAttribute"]("slot", value);
     },
+  };
+  Object.defineProperty(binding, "attributes", {"enumerable": false});
+  Object.defineProperty(binding, "tagName", {"enumerable": false});
+  Object.defineProperty(binding, "classList", {"enumerable": false});
+  Object.defineProperty(binding, "part", {"enumerable": false});
+  Object.defineProperty(binding, "localName", {"enumerable": false});
+  Object.defineProperty(binding, "id", {"enumerable": false});
+  Object.defineProperty(binding, "className", {"enumerable": false});
+  Object.defineProperty(binding, "slot", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["attributes"].set;
+  delete descriptors["tagName"].set;
+  delete descriptors["classList"].set;
+  delete descriptors["part"].set;
+  delete descriptors["localName"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installNamedElementBindings(runtime, prototype) {
+  const binding = {
     get name() {
       let value = this["getAttribute"]("name");
       return (value ?? "");
@@ -861,6 +1007,15 @@ export function installElementBindings(runtime, prototype) {
     set name(value) {
       this["setAttribute"]("name", value);
     },
+  };
+  Object.defineProperty(binding, "name", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installHiddenBindings(runtime, prototype) {
+  const binding = {
     get hidden() {
       return this["hasAttribute"]("hidden");
     },
@@ -871,6 +1026,15 @@ export function installElementBindings(runtime, prototype) {
       let normalized = Boolean(value);
       callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
     },
+  };
+  Object.defineProperty(binding, "hidden", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installInputDefaultCheckedBindings(runtime, prototype) {
+  const binding = {
     get defaultChecked() {
       return this["hasAttribute"]("checked");
     },
@@ -881,6 +1045,15 @@ export function installElementBindings(runtime, prototype) {
       let normalized = Boolean(value);
       callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
     },
+  };
+  Object.defineProperty(binding, "defaultChecked", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installElementAttributeBindings(runtime, prototype) {
+  const binding = {
     getAttribute(name) {
       let callReceiver = this._domCore;
       let capturedCallee = callReceiver.getAttribute;
@@ -917,11 +1090,8 @@ export function installElementBindings(runtime, prototype) {
       return callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
     },
     querySelectorAll(selector) {
-      let callReceiver = this._domCore;
-      let capturedCallee = callReceiver.selectorQueryAll;
-      let argument0 = this._coreHandle;
       let normalized = String(selector);
-      return callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
+      return runtime["querySelectorAll"](this, normalized);
     },
     getAttributeNS(namespaceURI, localName) {
       let callReceiver = this._domCore;
@@ -940,9 +1110,7 @@ export function installElementBindings(runtime, prototype) {
       return runtime["emptyToNull"](value);
     },
     getAttributeNames() {
-      let keys = this.attributes["keys"]();
-      let names = [...keys];
-      return names;
+      return runtime["attributeNames"](this);
     },
     hasAttributeNS(namespaceURI, localName) {
       let value = this["getAttributeNS"](namespaceURI, localName);
@@ -957,30 +1125,10 @@ export function installElementBindings(runtime, prototype) {
     removeAttributeNS(namespaceURI, localName) {
       this["_transportRemoveAttributeNS"](namespaceURI, localName);
     },
-    toggleAttribute(name, force) {
+    toggleAttribute(name, force = undefined) {
       return this["_bindingToggleAttribute"](name, force);
     },
-    get sheet() {
-      return this["_bindingSheet"]();
-    },
-    getElementsByTagName(qualifiedName) {
-      return runtime["elementsByTagName"](this, qualifiedName);
-    },
-    get dataset() {
-      return runtime["dataset"](this);
-    },
   };
-  Object.defineProperty(binding, "tag", {"enumerable": false});
-  Object.defineProperty(binding, "tagName", {"enumerable": false});
-  Object.defineProperty(binding, "classList", {"enumerable": false});
-  Object.defineProperty(binding, "part", {"enumerable": false});
-  Object.defineProperty(binding, "localName", {"enumerable": false});
-  Object.defineProperty(binding, "id", {"enumerable": false});
-  Object.defineProperty(binding, "className", {"enumerable": false});
-  Object.defineProperty(binding, "slot", {"enumerable": false});
-  Object.defineProperty(binding, "name", {"enumerable": false});
-  Object.defineProperty(binding, "hidden", {"enumerable": false});
-  Object.defineProperty(binding, "defaultChecked", {"enumerable": false});
   Object.defineProperty(binding, "getAttribute", {"enumerable": false});
   Object.defineProperty(binding, "hasAttribute", {"enumerable": false});
   Object.defineProperty(binding, "matches", {"enumerable": false});
@@ -996,24 +1144,60 @@ export function installElementBindings(runtime, prototype) {
   Object.defineProperty(binding, "removeAttribute", {"enumerable": false});
   Object.defineProperty(binding, "removeAttributeNS", {"enumerable": false});
   Object.defineProperty(binding, "toggleAttribute", {"enumerable": false});
-  Object.defineProperty(binding, "sheet", {"enumerable": false});
-  Object.defineProperty(binding, "getElementsByTagName", {"enumerable": false});
-  Object.defineProperty(binding, "dataset", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
-  delete descriptors["tag"].set;
-  delete descriptors["tagName"].set;
-  delete descriptors["classList"].set;
-  delete descriptors["part"].set;
-  delete descriptors["localName"].set;
   delete descriptors["prefix"].set;
   delete descriptors["namespaceURI"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installStylesheetElementBindings(runtime, prototype) {
+  const binding = {
+    get sheet() {
+      return this["_bindingSheet"]();
+    },
+  };
+  Object.defineProperty(binding, "sheet", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
   delete descriptors["sheet"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installElementCollectionBindings(runtime, prototype) {
+  const binding = {
+    getElementsByTagName(qualifiedName) {
+      return runtime["elementsByTagName"](this, qualifiedName);
+    },
+    getElementsByTagNameNS(namespace, localName) {
+      return runtime["elementsByTagNameNS"](this, namespace, localName);
+    },
+    getElementsByClassName(classNames) {
+      return runtime["elementsByClassName"](this, classNames);
+    },
+  };
+  Object.defineProperty(binding, "getElementsByTagName", {"enumerable": false});
+  Object.defineProperty(binding, "getElementsByTagNameNS", {"enumerable": false});
+  Object.defineProperty(binding, "getElementsByClassName", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installDatasetBindings(runtime, prototype) {
+  const binding = {
+    get dataset() {
+      return runtime["dataset"](this);
+    },
+  };
+  Object.defineProperty(binding, "dataset", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
   delete descriptors["dataset"].set;
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
 
-export function installRangeBindings(runtime, prototype) {
+export function installAbstractRangeBindings(runtime, prototype) {
   const binding = {
     get startContainer() {
       return this["_bindingStartContainer"]();
@@ -1029,6 +1213,61 @@ export function installRangeBindings(runtime, prototype) {
     },
     get collapsed() {
       return this["_bindingCollapsed"]();
+    },
+  };
+  Object.defineProperty(binding, "startContainer", {"enumerable": false});
+  Object.defineProperty(binding, "startOffset", {"enumerable": false});
+  Object.defineProperty(binding, "endContainer", {"enumerable": false});
+  Object.defineProperty(binding, "endOffset", {"enumerable": false});
+  Object.defineProperty(binding, "collapsed", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["startContainer"].set;
+  delete descriptors["startOffset"].set;
+  delete descriptors["endContainer"].set;
+  delete descriptors["endOffset"].set;
+  delete descriptors["collapsed"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installRangeBindings(runtime, prototype) {
+  const binding = {
+    compareBoundaryPoints(how, sourceRange) {
+      return this["_bindingCompareBoundaryPoints"](how, sourceRange);
+    },
+    comparePoint(node, offset) {
+      return this["_bindingComparePoint"](node, offset);
+    },
+    isPointInRange(node, offset) {
+      return this["_bindingIsPointInRange"](node, offset);
+    },
+    intersectsNode(node) {
+      return this["_bindingIntersectsNode"](node);
+    },
+    selectNode(node) {
+      this["_bindingSelectNode"](node);
+    },
+    detach() {
+      this["_bindingDetach"]();
+    },
+    cloneContents() {
+      return this["_bindingCloneContents"]();
+    },
+    deleteContents() {
+      this["_bindingDeleteContents"]();
+    },
+    extractContents() {
+      return this["_bindingExtractContents"]();
+    },
+    insertNode(node) {
+      this["_bindingInsertNode"](node);
+    },
+    surroundContents(newParent) {
+      this["_bindingSurroundContents"](newParent);
+    },
+    createContextualFragment(string) {
+      let markup = String(string);
+      return this["_bindingCreateContextualFragment"](markup);
     },
     get commonAncestorContainer() {
       return this["_bindingCommonAncestorContainer"]();
@@ -1051,7 +1290,7 @@ export function installRangeBindings(runtime, prototype) {
     setEndAfter(node) {
       this["_bindingSetEndAfter"](node);
     },
-    collapse(toStart) {
+    collapse(toStart = undefined) {
       this["_bindingCollapse"](toStart);
     },
     selectNodeContents(node) {
@@ -1063,12 +1302,33 @@ export function installRangeBindings(runtime, prototype) {
     toString() {
       return this["_bindingToString"]();
     },
+    getClientRects() {
+      return this["_bindingGetClientRects"]();
+    },
+    getBoundingClientRect() {
+      return this["_bindingGetBoundingClientRect"]();
+    },
   };
-  Object.defineProperty(binding, "startContainer", {"enumerable": false});
-  Object.defineProperty(binding, "startOffset", {"enumerable": false});
-  Object.defineProperty(binding, "endContainer", {"enumerable": false});
-  Object.defineProperty(binding, "endOffset", {"enumerable": false});
-  Object.defineProperty(binding, "collapsed", {"enumerable": false});
+  Object.defineProperty(prototype.constructor, "START_TO_START", { value: 0, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "START_TO_START", { value: 0, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "START_TO_END", { value: 1, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "START_TO_END", { value: 1, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "END_TO_END", { value: 2, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "END_TO_END", { value: 2, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype.constructor, "END_TO_START", { value: 3, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(prototype, "END_TO_START", { value: 3, writable: false, enumerable: true, configurable: false });
+  Object.defineProperty(binding, "compareBoundaryPoints", {"enumerable": false});
+  Object.defineProperty(binding, "comparePoint", {"enumerable": false});
+  Object.defineProperty(binding, "isPointInRange", {"enumerable": false});
+  Object.defineProperty(binding, "intersectsNode", {"enumerable": false});
+  Object.defineProperty(binding, "selectNode", {"enumerable": false});
+  Object.defineProperty(binding, "detach", {"enumerable": false});
+  Object.defineProperty(binding, "cloneContents", {"enumerable": false});
+  Object.defineProperty(binding, "deleteContents", {"enumerable": false});
+  Object.defineProperty(binding, "extractContents", {"enumerable": false});
+  Object.defineProperty(binding, "insertNode", {"enumerable": false});
+  Object.defineProperty(binding, "surroundContents", {"enumerable": false});
+  Object.defineProperty(binding, "createContextualFragment", {"enumerable": false});
   Object.defineProperty(binding, "commonAncestorContainer", {"enumerable": false});
   Object.defineProperty(binding, "setStart", {"enumerable": false});
   Object.defineProperty(binding, "setEnd", {"enumerable": false});
@@ -1080,19 +1340,53 @@ export function installRangeBindings(runtime, prototype) {
   Object.defineProperty(binding, "selectNodeContents", {"enumerable": false});
   Object.defineProperty(binding, "cloneRange", {"enumerable": false});
   Object.defineProperty(binding, "toString", {"enumerable": false});
+  Object.defineProperty(binding, "getClientRects", {"enumerable": false});
+  Object.defineProperty(binding, "getBoundingClientRect", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
-  delete descriptors["startContainer"].set;
-  delete descriptors["startOffset"].set;
-  delete descriptors["endContainer"].set;
-  delete descriptors["endOffset"].set;
-  delete descriptors["collapsed"].set;
   delete descriptors["commonAncestorContainer"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installCaretPositionBindings(runtime, prototype) {
+  const binding = {
+    get offsetNode() {
+      return this["_bindingOffsetNode"]();
+    },
+    get offset() {
+      return this["_bindingOffset"]();
+    },
+    getClientRect() {
+      return this["_bindingGetClientRect"]();
+    },
+  };
+  Object.defineProperty(binding, "offsetNode", {"enumerable": false});
+  Object.defineProperty(binding, "offset", {"enumerable": false});
+  Object.defineProperty(binding, "getClientRect", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["offsetNode"].set;
+  delete descriptors["offset"].set;
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
 
 export function installSelectionBindings(runtime, prototype) {
   const binding = {
+    collapseToStart() {
+      this["_bindingCollapseToStart"]();
+    },
+    collapseToEnd() {
+      this["_bindingCollapseToEnd"]();
+    },
+    removeRange(range) {
+      this["_bindingRemoveRange"](range);
+    },
+    deleteFromDocument() {
+      this["_bindingDeleteFromDocument"]();
+    },
+    get direction() {
+      return this["_bindingDirection"]();
+    },
     get anchorNode() {
       return this["_bindingAnchorNode"]();
     },
@@ -1117,13 +1411,13 @@ export function installSelectionBindings(runtime, prototype) {
     setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset) {
       this["_bindingSetBaseAndExtent"](anchorNode, anchorOffset, focusNode, focusOffset);
     },
-    collapse(node, offset) {
+    collapse(node, offset = undefined) {
       this["_bindingCollapse"](node, offset);
     },
-    setPosition(node, offset) {
+    setPosition(node, offset = undefined) {
       this["_bindingSetPosition"](node, offset);
     },
-    extend(node, offset) {
+    extend(node, offset = undefined) {
       this["_bindingExtend"](node, offset);
     },
     selectAllChildren(node) {
@@ -1141,13 +1435,18 @@ export function installSelectionBindings(runtime, prototype) {
     empty() {
       this["_bindingEmpty"]();
     },
-    containsNode(node, allowPartialContainment) {
+    containsNode(node, allowPartialContainment = undefined) {
       return this["_bindingContainsNode"](node, allowPartialContainment);
     },
     toString() {
       return this["_bindingToString"]();
     },
   };
+  Object.defineProperty(binding, "collapseToStart", {"enumerable": false});
+  Object.defineProperty(binding, "collapseToEnd", {"enumerable": false});
+  Object.defineProperty(binding, "removeRange", {"enumerable": false});
+  Object.defineProperty(binding, "deleteFromDocument", {"enumerable": false});
+  Object.defineProperty(binding, "direction", {"enumerable": false});
   Object.defineProperty(binding, "anchorNode", {"enumerable": false});
   Object.defineProperty(binding, "anchorOffset", {"enumerable": false});
   Object.defineProperty(binding, "focusNode", {"enumerable": false});
@@ -1167,6 +1466,7 @@ export function installSelectionBindings(runtime, prototype) {
   Object.defineProperty(binding, "containsNode", {"enumerable": false});
   Object.defineProperty(binding, "toString", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["direction"].set;
   delete descriptors["anchorNode"].set;
   delete descriptors["anchorOffset"].set;
   delete descriptors["focusNode"].set;
@@ -1327,6 +1627,9 @@ export function installAnimationBindings(runtime, prototype) {
     get playState() {
       return runtime["readState"](this);
     },
+    get pending() {
+      return runtime["readPending"](this);
+    },
     get ready() {
       return this._ready;
     },
@@ -1347,11 +1650,13 @@ export function installAnimationBindings(runtime, prototype) {
   Object.defineProperty(binding, "startTime", {"enumerable": false});
   Object.defineProperty(binding, "playbackRate", {"enumerable": false});
   Object.defineProperty(binding, "playState", {"enumerable": false});
+  Object.defineProperty(binding, "pending", {"enumerable": false});
   Object.defineProperty(binding, "ready", {"enumerable": false});
   Object.defineProperty(binding, "finished", {"enumerable": false});
   Object.defineProperty(binding, "updatePlaybackRate", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
   delete descriptors["playState"].set;
+  delete descriptors["pending"].set;
   delete descriptors["ready"].set;
   delete descriptors["finished"].set;
   Object.defineProperties(prototype, descriptors);
@@ -1378,7 +1683,7 @@ export function installCanvasResourceBindings(runtime, prototype) {
       let text = String(normalized);
       callBindingFunction(captured, this, "height", text);
     },
-    getContext(contextIdentifier, options) {
+    getContext(contextIdentifier, options = undefined) {
       let identifier = String(contextIdentifier);
       return this["_getContextFromString"](identifier, options);
     },
@@ -1389,70 +1694,6 @@ export function installCanvasResourceBindings(runtime, prototype) {
   const descriptors = Object.getOwnPropertyDescriptors(binding);
   Object.defineProperties(prototype, descriptors);
   return prototype;
-}
-
-export function createNodeListBinding(runtime) {
-  const binding = {
-    item(index) {
-      index = Number(index);
-      let value = runtime["at"](index);
-      return (value ?? null);
-    },
-    [Symbol.iterator]() {
-      return runtime["iterator"]();
-    },
-    forEach(callback, thisArgument) {
-      runtime["forEach"](callback, thisArgument);
-    },
-  };
-  return new Proxy(binding, {
-    get(target, property, receiver) {
-      if (property === "length") return runtime.count();
-      if (typeof property === "string" && /^(0|[1-9][0-9]*)$/.test(property)) return runtime.at(Number(property));
-      return Reflect.get(target, property, receiver);
-    },
-    ownKeys(target) {
-      return Array.from({ length: runtime.count() }, (_, index) => String(index)).concat(Reflect.ownKeys(target));
-    },
-    getOwnPropertyDescriptor(target, property) {
-      if (typeof property === "string" && /^(0|[1-9][0-9]*)$/.test(property) && Number(property) < runtime.count()) {
-        return { configurable: true, enumerable: true, value: runtime.at(Number(property)) };
-      }
-      return Reflect.getOwnPropertyDescriptor(target, property);
-    },
-  });
-}
-
-export function createHTMLCollectionBinding(runtime) {
-  const binding = {
-    item(index) {
-      index = Number(index);
-      let value = runtime["at"](index);
-      return (value ?? null);
-    },
-    [Symbol.iterator]() {
-      return runtime["iterator"]();
-    },
-    namedItem(name) {
-      return runtime["named"](name);
-    },
-  };
-  return new Proxy(binding, {
-    get(target, property, receiver) {
-      if (property === "length") return runtime.count();
-      if (typeof property === "string" && /^(0|[1-9][0-9]*)$/.test(property)) return runtime.at(Number(property));
-      return Reflect.get(target, property, receiver);
-    },
-    ownKeys(target) {
-      return Array.from({ length: runtime.count() }, (_, index) => String(index)).concat(Reflect.ownKeys(target));
-    },
-    getOwnPropertyDescriptor(target, property) {
-      if (typeof property === "string" && /^(0|[1-9][0-9]*)$/.test(property) && Number(property) < runtime.count()) {
-        return { configurable: true, enumerable: true, value: runtime.at(Number(property)) };
-      }
-      return Reflect.getOwnPropertyDescriptor(target, property);
-    },
-  });
 }
 
 export function installComputedStyleBindings(runtime, prototype) {
@@ -1481,6 +1722,31 @@ export function installComputedStyleBindings(runtime, prototype) {
 
 export function installCharacterDataBindings(runtime, prototype) {
   const binding = {
+    substringData(offset, count) {
+      let start = (Number(offset) >>> 0);
+      let length = (Number(count) >>> 0);
+      return this["_bindingSubstringData"](start, length);
+    },
+    appendData(data) {
+      let text = String(data);
+      this["_bindingReplaceDataAtEnd"](text);
+    },
+    insertData(offset, data) {
+      let start = (Number(offset) >>> 0);
+      let text = String(data);
+      this["_bindingReplaceData"](start, 0, text);
+    },
+    deleteData(offset, count) {
+      let start = (Number(offset) >>> 0);
+      let length = (Number(count) >>> 0);
+      this["_bindingReplaceData"](start, length, "");
+    },
+    replaceData(offset, count, data) {
+      let start = (Number(offset) >>> 0);
+      let length = (Number(count) >>> 0);
+      let text = String(data);
+      this["_bindingReplaceData"](start, length, text);
+    },
     get data() {
       let value = this._domCore["nodeString"]("node_data", this._coreHandle);
       return (value ?? "");
@@ -1504,11 +1770,21 @@ export function installCharacterDataBindings(runtime, prototype) {
       this.data = (value ?? "");
       null;
     },
+    get length() {
+      return this.data.length;
+    },
   };
+  Object.defineProperty(binding, "substringData", {"enumerable": false});
+  Object.defineProperty(binding, "appendData", {"enumerable": false});
+  Object.defineProperty(binding, "insertData", {"enumerable": false});
+  Object.defineProperty(binding, "deleteData", {"enumerable": false});
+  Object.defineProperty(binding, "replaceData", {"enumerable": false});
   Object.defineProperty(binding, "data", {"enumerable": false});
   Object.defineProperty(binding, "nodeValue", {"enumerable": false});
   Object.defineProperty(binding, "textContent", {"enumerable": false});
+  Object.defineProperty(binding, "length", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["length"].set;
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
@@ -1556,11 +1832,8 @@ export function installDocumentFragmentBindings(runtime, prototype) {
       return callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
     },
     querySelectorAll(selector) {
-      let callReceiver = this._domCore;
-      let capturedCallee = callReceiver.selectorQueryAll;
-      let argument0 = this._coreHandle;
       let normalized = String(selector);
-      return callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
+      return runtime["querySelectorAll"](this, normalized);
     },
     get textContent() {
       return this._domCore["textContent"](this._coreHandle);
@@ -1791,26 +2064,6 @@ export function installHTMLElementBindings(runtime, prototype) {
     set onpointerup(candidate) {
       runtime["setEventHandler"](this, "pointerup", candidate);
     },
-    get autofocus() {
-      return this["hasAttribute"]("autofocus");
-    },
-    set autofocus(value) {
-      let callReceiver = this;
-      let capturedCallee = callReceiver.toggleAttribute;
-      let argument0 = "autofocus";
-      let normalized = Boolean(value);
-      callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
-    },
-    get open() {
-      return this["hasAttribute"]("open");
-    },
-    set open(value) {
-      let callReceiver = this;
-      let capturedCallee = callReceiver.toggleAttribute;
-      let argument0 = "open";
-      let normalized = Boolean(value);
-      callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
-    },
   };
   Object.defineProperty(binding, "onbeforeinput", {"enumerable": true, "configurable": true});
   Object.defineProperty(binding, "onblur", {"enumerable": true, "configurable": true});
@@ -1842,7 +2095,43 @@ export function installHTMLElementBindings(runtime, prototype) {
   Object.defineProperty(binding, "onpointerout", {"enumerable": true, "configurable": true});
   Object.defineProperty(binding, "onpointerover", {"enumerable": true, "configurable": true});
   Object.defineProperty(binding, "onpointerup", {"enumerable": true, "configurable": true});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installAutofocusBindings(runtime, prototype) {
+  const binding = {
+    get autofocus() {
+      return this["hasAttribute"]("autofocus");
+    },
+    set autofocus(value) {
+      let callReceiver = this;
+      let capturedCallee = callReceiver.toggleAttribute;
+      let argument0 = "autofocus";
+      let normalized = Boolean(value);
+      callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
+    },
+  };
   Object.defineProperty(binding, "autofocus", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installOpenElementBindings(runtime, prototype) {
+  const binding = {
+    get open() {
+      return this["hasAttribute"]("open");
+    },
+    set open(value) {
+      let callReceiver = this;
+      let capturedCallee = callReceiver.toggleAttribute;
+      let argument0 = "open";
+      let normalized = Boolean(value);
+      callBindingFunction(capturedCallee, callReceiver, argument0, normalized);
+    },
+  };
   Object.defineProperty(binding, "open", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
   Object.defineProperties(prototype, descriptors);
@@ -1966,63 +2255,133 @@ export function createLayoutGeometryBindings(runtime) {
     elementFromPoint(root, x, y, options) {
       return runtime["queryHit"](root, x, y, options);
     },
+    elementsFromPoint(root, x, y, options) {
+      return runtime["queryHits"](root, x, y, options);
+    },
   };
   return binding;
 }
 
-export function installInputControlBindings(runtime, prototype) {
+export function installSelectIndexBindings(runtime, prototype) {
   const binding = {
-    get options() {
-      return runtime["options"](this);
-    },
     get selectedIndex() {
       return runtime["selectedIndex"](this);
     },
     set selectedIndex(value) {
       runtime["setSelectedIndex"](this, value);
     },
+  };
+  Object.defineProperty(binding, "selectedIndex", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installControlValueBindings(runtime, prototype) {
+  const binding = {
     get value() {
       return runtime["value"](this);
     },
     set value(value) {
       runtime["setValue"](this, value);
     },
+  };
+  Object.defineProperty(binding, "value", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installTextControlDefaultValueBindings(runtime, prototype) {
+  const binding = {
     get defaultValue() {
       return runtime["defaultValue"](this);
     },
     set defaultValue(value) {
       runtime["setDefaultValue"](this, value);
     },
+  };
+  Object.defineProperty(binding, "defaultValue", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installControlDisabledBindings(runtime, prototype) {
+  const binding = {
     get disabled() {
       return runtime["disabled"](this);
     },
     set disabled(value) {
       runtime["setDisabled"](this, value);
     },
+  };
+  Object.defineProperty(binding, "disabled", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installInputCheckedBindings(runtime, prototype) {
+  const binding = {
     get checked() {
       return runtime["checked"](this);
     },
     set checked(value) {
       runtime["setChecked"](this, value);
     },
+  };
+  Object.defineProperty(binding, "checked", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installOptionSelectedBindings(runtime, prototype) {
+  const binding = {
     get selected() {
       return runtime["selected"](this);
     },
     set selected(value) {
       runtime["setSelected"](this, value);
     },
+  };
+  Object.defineProperty(binding, "selected", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installControlFormBindings(runtime, prototype) {
+  const binding = {
     get form() {
       return runtime["form"](this);
     },
+  };
+  Object.defineProperty(binding, "form", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["form"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installTabIndexBindings(runtime, prototype) {
+  const binding = {
     get tabIndex() {
       return runtime["tabIndex"](this);
     },
     set tabIndex(value) {
       runtime["setTabIndex"](this, value);
     },
-    _setUserEditedValue(value, selectionStart, selectionEnd = undefined) {
-      runtime["editValue"](this, value, selectionStart, selectionEnd);
-    },
+  };
+  Object.defineProperty(binding, "tabIndex", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installTextControlSelectionBindings(runtime, prototype) {
+  const binding = {
     setSelectionRange(start, end, direction = undefined) {
       runtime["setSelectionRange"](this, start, end, direction);
     },
@@ -2030,21 +2389,9 @@ export function installInputControlBindings(runtime, prototype) {
       runtime["select"](this);
     },
   };
-  Object.defineProperty(binding, "options", {"enumerable": false});
-  Object.defineProperty(binding, "selectedIndex", {"enumerable": false});
-  Object.defineProperty(binding, "value", {"enumerable": false});
-  Object.defineProperty(binding, "defaultValue", {"enumerable": false});
-  Object.defineProperty(binding, "disabled", {"enumerable": false});
-  Object.defineProperty(binding, "checked", {"enumerable": false});
-  Object.defineProperty(binding, "selected", {"enumerable": false});
-  Object.defineProperty(binding, "form", {"enumerable": false});
-  Object.defineProperty(binding, "tabIndex", {"enumerable": false});
-  Object.defineProperty(binding, "_setUserEditedValue", {"enumerable": false});
   Object.defineProperty(binding, "setSelectionRange", {"enumerable": false});
   Object.defineProperty(binding, "select", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
-  delete descriptors["options"].set;
-  delete descriptors["form"].set;
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
@@ -2064,7 +2411,7 @@ export function installInputTypeBindings(runtime, prototype) {
   return prototype;
 }
 
-export function installInputControlStateBindings(runtime, prototype) {
+export function installTextControlSelectionStateBindings(runtime, prototype) {
   const binding = {
     get selectionStart() {
       return runtime["selection"](this, 0);
@@ -2084,6 +2431,17 @@ export function installInputControlStateBindings(runtime, prototype) {
     set selectionDirection(value) {
       runtime["setDirection"](this, value);
     },
+  };
+  Object.defineProperty(binding, "selectionStart", {"enumerable": true, "configurable": true});
+  Object.defineProperty(binding, "selectionEnd", {"enumerable": true, "configurable": true});
+  Object.defineProperty(binding, "selectionDirection", {"enumerable": true, "configurable": true});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installInputControlStateBindings(runtime, prototype) {
+  const binding = {
     get _value() {
       return runtime["rawValue"](this);
     },
@@ -2121,9 +2479,6 @@ export function installInputControlStateBindings(runtime, prototype) {
       runtime["setRaw"](this, "_valueDirty", 4, value);
     },
   };
-  Object.defineProperty(binding, "selectionStart", {"enumerable": true, "configurable": true});
-  Object.defineProperty(binding, "selectionEnd", {"enumerable": true, "configurable": true});
-  Object.defineProperty(binding, "selectionDirection", {"enumerable": true, "configurable": true});
   Object.defineProperty(binding, "_value", {"enumerable": true, "configurable": true});
   Object.defineProperty(binding, "_checked", {"enumerable": true, "configurable": true});
   Object.defineProperty(binding, "_checkedDirty", {"enumerable": true, "configurable": true});
@@ -2135,7 +2490,7 @@ export function installInputControlStateBindings(runtime, prototype) {
   return prototype;
 }
 
-export function installInputActivationBindings(runtime, prototype) {
+export function installFocusBindings(runtime, prototype) {
   const binding = {
     focus() {
       runtime["runInputActivation"](this, 1);
@@ -2143,12 +2498,20 @@ export function installInputActivationBindings(runtime, prototype) {
     blur() {
       runtime["runInputActivation"](this, 2);
     },
+  };
+  Object.defineProperty(binding, "focus", {"enumerable": false});
+  Object.defineProperty(binding, "blur", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installHTMLElementActivationBindings(runtime, prototype) {
+  const binding = {
     click() {
       runtime["runInputActivation"](this, 3);
     },
   };
-  Object.defineProperty(binding, "focus", {"enumerable": false});
-  Object.defineProperty(binding, "blur", {"enumerable": false});
   Object.defineProperty(binding, "click", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
   Object.defineProperties(prototype, descriptors);
@@ -2175,41 +2538,214 @@ export function createElementFamily(runtime) {
   return {
     prototypeFor(localName, namespaceURI) {
       switch (namespaceURI) {
+        case "http://www.w3.org/1998/Math/MathML":
+          return runtime.MathMLElement.prototype;
         case "http://www.w3.org/2000/svg":
-          return runtime.SDSVGElement.prototype;
+          switch (localName) {
+            case "a": return runtime.SVGAElement.prototype;
+            case "animate": return runtime.SVGAnimateElement.prototype;
+            case "animateMotion": return runtime.SVGAnimateMotionElement.prototype;
+            case "animateTransform": return runtime.SVGAnimateTransformElement.prototype;
+            case "circle": return runtime.SVGCircleElement.prototype;
+            case "clipPath": return runtime.SVGClipPathElement.prototype;
+            case "defs": return runtime.SVGDefsElement.prototype;
+            case "desc": return runtime.SVGDescElement.prototype;
+            case "ellipse": return runtime.SVGEllipseElement.prototype;
+            case "feBlend": return runtime.SVGFEBlendElement.prototype;
+            case "feColorMatrix": return runtime.SVGFEColorMatrixElement.prototype;
+            case "feComponentTransfer": return runtime.SVGFEComponentTransferElement.prototype;
+            case "feComposite": return runtime.SVGFECompositeElement.prototype;
+            case "feConvolveMatrix": return runtime.SVGFEConvolveMatrixElement.prototype;
+            case "feDiffuseLighting": return runtime.SVGFEDiffuseLightingElement.prototype;
+            case "feDisplacementMap": return runtime.SVGFEDisplacementMapElement.prototype;
+            case "feDistantLight": return runtime.SVGFEDistantLightElement.prototype;
+            case "feDropShadow": return runtime.SVGFEDropShadowElement.prototype;
+            case "feFlood": return runtime.SVGFEFloodElement.prototype;
+            case "feFuncA": return runtime.SVGFEFuncAElement.prototype;
+            case "feFuncB": return runtime.SVGFEFuncBElement.prototype;
+            case "feFuncG": return runtime.SVGFEFuncGElement.prototype;
+            case "feFuncR": return runtime.SVGFEFuncRElement.prototype;
+            case "feGaussianBlur": return runtime.SVGFEGaussianBlurElement.prototype;
+            case "feImage": return runtime.SVGFEImageElement.prototype;
+            case "feMerge": return runtime.SVGFEMergeElement.prototype;
+            case "feMergeNode": return runtime.SVGFEMergeNodeElement.prototype;
+            case "feMorphology": return runtime.SVGFEMorphologyElement.prototype;
+            case "feOffset": return runtime.SVGFEOffsetElement.prototype;
+            case "fePointLight": return runtime.SVGFEPointLightElement.prototype;
+            case "feSpecularLighting": return runtime.SVGFESpecularLightingElement.prototype;
+            case "feSpotLight": return runtime.SVGFESpotLightElement.prototype;
+            case "feTile": return runtime.SVGFETileElement.prototype;
+            case "feTurbulence": return runtime.SVGFETurbulenceElement.prototype;
+            case "filter": return runtime.SVGFilterElement.prototype;
+            case "foreignObject": return runtime.SVGForeignObjectElement.prototype;
+            case "g": return runtime.SVGGElement.prototype;
+            case "image": return runtime.SVGImageElement.prototype;
+            case "line": return runtime.SVGLineElement.prototype;
+            case "linearGradient": return runtime.SVGLinearGradientElement.prototype;
+            case "marker": return runtime.SVGMarkerElement.prototype;
+            case "mask": return runtime.SVGMaskElement.prototype;
+            case "metadata": return runtime.SVGMetadataElement.prototype;
+            case "mpath": return runtime.SVGMPathElement.prototype;
+            case "path": return runtime.SVGPathElement.prototype;
+            case "pattern": return runtime.SVGPatternElement.prototype;
+            case "polygon": return runtime.SVGPolygonElement.prototype;
+            case "polyline": return runtime.SVGPolylineElement.prototype;
+            case "radialGradient": return runtime.SVGRadialGradientElement.prototype;
+            case "rect": return runtime.SVGRectElement.prototype;
+            case "script": return runtime.SVGScriptElement.prototype;
+            case "set": return runtime.SVGSetElement.prototype;
+            case "stop": return runtime.SVGStopElement.prototype;
+            case "style": return runtime.SVGStyleElement.prototype;
+            case "svg": return runtime.SVGSVGElement.prototype;
+            case "switch": return runtime.SVGSwitchElement.prototype;
+            case "symbol": return runtime.SVGSymbolElement.prototype;
+            case "text": return runtime.SVGTextElement.prototype;
+            case "textPath": return runtime.SVGTextPathElement.prototype;
+            case "title": return runtime.SVGTitleElement.prototype;
+            case "tspan": return runtime.SVGTSpanElement.prototype;
+            case "use": return runtime.SVGUseElement.prototype;
+            case "view": return runtime.SVGViewElement.prototype;
+            default: return runtime.SDSVGElement.prototype;
+          }
         case "http://www.w3.org/1999/xhtml":
           switch (localName) {
+            case "abbr": return runtime.SDHTMLElement.prototype;
+            case "acronym": return runtime.SDHTMLElement.prototype;
+            case "address": return runtime.SDHTMLElement.prototype;
+            case "article": return runtime.SDHTMLElement.prototype;
+            case "aside": return runtime.SDHTMLElement.prototype;
+            case "b": return runtime.SDHTMLElement.prototype;
+            case "basefont": return runtime.SDHTMLElement.prototype;
+            case "bdi": return runtime.SDHTMLElement.prototype;
+            case "bdo": return runtime.SDHTMLElement.prototype;
+            case "big": return runtime.SDHTMLElement.prototype;
+            case "center": return runtime.SDHTMLElement.prototype;
+            case "cite": return runtime.SDHTMLElement.prototype;
+            case "code": return runtime.SDHTMLElement.prototype;
+            case "dd": return runtime.SDHTMLElement.prototype;
+            case "dfn": return runtime.SDHTMLElement.prototype;
+            case "dt": return runtime.SDHTMLElement.prototype;
+            case "em": return runtime.SDHTMLElement.prototype;
+            case "figcaption": return runtime.SDHTMLElement.prototype;
+            case "figure": return runtime.SDHTMLElement.prototype;
+            case "footer": return runtime.SDHTMLElement.prototype;
+            case "header": return runtime.SDHTMLElement.prototype;
+            case "hgroup": return runtime.SDHTMLElement.prototype;
+            case "i": return runtime.SDHTMLElement.prototype;
+            case "kbd": return runtime.SDHTMLElement.prototype;
+            case "main": return runtime.SDHTMLElement.prototype;
+            case "mark": return runtime.SDHTMLElement.prototype;
+            case "nav": return runtime.SDHTMLElement.prototype;
+            case "nobr": return runtime.SDHTMLElement.prototype;
+            case "noembed": return runtime.SDHTMLElement.prototype;
+            case "noframes": return runtime.SDHTMLElement.prototype;
+            case "noscript": return runtime.SDHTMLElement.prototype;
+            case "plaintext": return runtime.SDHTMLElement.prototype;
+            case "rb": return runtime.SDHTMLElement.prototype;
+            case "rp": return runtime.SDHTMLElement.prototype;
+            case "rt": return runtime.SDHTMLElement.prototype;
+            case "rtc": return runtime.SDHTMLElement.prototype;
+            case "ruby": return runtime.SDHTMLElement.prototype;
+            case "s": return runtime.SDHTMLElement.prototype;
+            case "samp": return runtime.SDHTMLElement.prototype;
+            case "search": return runtime.SDHTMLElement.prototype;
+            case "section": return runtime.SDHTMLElement.prototype;
+            case "small": return runtime.SDHTMLElement.prototype;
+            case "strike": return runtime.SDHTMLElement.prototype;
+            case "strong": return runtime.SDHTMLElement.prototype;
+            case "sub": return runtime.SDHTMLElement.prototype;
+            case "summary": return runtime.SDHTMLElement.prototype;
+            case "sup": return runtime.SDHTMLElement.prototype;
+            case "tt": return runtime.SDHTMLElement.prototype;
+            case "u": return runtime.SDHTMLElement.prototype;
+            case "var": return runtime.SDHTMLElement.prototype;
+            case "wbr": return runtime.SDHTMLElement.prototype;
+            case "area": return runtime.HTMLAreaElement.prototype;
+            case "audio": return runtime.HTMLAudioElement.prototype;
+            case "base": return runtime.HTMLBaseElement.prototype;
+            case "blockquote": return runtime.HTMLQuoteElement.prototype;
+            case "body": return runtime.HTMLBodyElement.prototype;
+            case "br": return runtime.HTMLBRElement.prototype;
+            case "caption": return runtime.HTMLTableCaptionElement.prototype;
+            case "col": return runtime.HTMLTableColElement.prototype;
+            case "colgroup": return runtime.HTMLTableColElement.prototype;
+            case "data": return runtime.HTMLDataElement.prototype;
+            case "del": return runtime.HTMLModElement.prototype;
+            case "details": return runtime.HTMLDetailsElement.prototype;
+            case "dialog": return runtime.HTMLDialogElement.prototype;
+            case "dir": return runtime.HTMLDirectoryElement.prototype;
+            case "div": return runtime.HTMLDivElement.prototype;
+            case "dl": return runtime.HTMLDListElement.prototype;
+            case "embed": return runtime.HTMLEmbedElement.prototype;
+            case "fencedframe": return runtime.HTMLFencedFrameElement.prototype;
+            case "font": return runtime.HTMLFontElement.prototype;
+            case "frame": return runtime.HTMLFrameElement.prototype;
+            case "frameset": return runtime.HTMLFrameSetElement.prototype;
+            case "h1": return runtime.HTMLHeadingElement.prototype;
+            case "h2": return runtime.HTMLHeadingElement.prototype;
+            case "h3": return runtime.HTMLHeadingElement.prototype;
+            case "h4": return runtime.HTMLHeadingElement.prototype;
+            case "h5": return runtime.HTMLHeadingElement.prototype;
+            case "h6": return runtime.HTMLHeadingElement.prototype;
+            case "head": return runtime.HTMLHeadElement.prototype;
+            case "hr": return runtime.HTMLHRElement.prototype;
+            case "html": return runtime.HTMLHtmlElement.prototype;
+            case "ins": return runtime.HTMLModElement.prototype;
+            case "legend": return runtime.HTMLLegendElement.prototype;
+            case "li": return runtime.HTMLLIElement.prototype;
+            case "link": return runtime.HTMLLinkElement.prototype;
+            case "listing": return runtime.HTMLPreElement.prototype;
+            case "marquee": return runtime.HTMLMarqueeElement.prototype;
+            case "menu": return runtime.HTMLMenuElement.prototype;
+            case "meta": return runtime.HTMLMetaElement.prototype;
+            case "meter": return runtime.HTMLMeterElement.prototype;
+            case "object": return runtime.HTMLObjectElement.prototype;
+            case "ol": return runtime.HTMLOListElement.prototype;
+            case "optgroup": return runtime.HTMLOptGroupElement.prototype;
+            case "p": return runtime.HTMLParagraphElement.prototype;
+            case "param": return runtime.HTMLParamElement.prototype;
+            case "picture": return runtime.HTMLPictureElement.prototype;
+            case "pre": return runtime.HTMLPreElement.prototype;
+            case "progress": return runtime.HTMLProgressElement.prototype;
+            case "q": return runtime.HTMLQuoteElement.prototype;
+            case "selectedcontent": return runtime.HTMLSelectedContentElement.prototype;
+            case "slot": return runtime.HTMLSlotElement.prototype;
+            case "span": return runtime.HTMLSpanElement.prototype;
+            case "style": return runtime.HTMLStyleElement.prototype;
+            case "tbody": return runtime.HTMLTableSectionElement.prototype;
+            case "td": return runtime.HTMLTableCellElement.prototype;
+            case "tfoot": return runtime.HTMLTableSectionElement.prototype;
+            case "th": return runtime.HTMLTableCellElement.prototype;
+            case "thead": return runtime.HTMLTableSectionElement.prototype;
+            case "time": return runtime.HTMLTimeElement.prototype;
+            case "title": return runtime.HTMLTitleElement.prototype;
+            case "track": return runtime.HTMLTrackElement.prototype;
+            case "ul": return runtime.HTMLUListElement.prototype;
+            case "video": return runtime.HTMLVideoElement.prototype;
+            case "xmp": return runtime.HTMLPreElement.prototype;
             case "template": return runtime.SDHTMLTemplateElement.prototype;
             case "button": return runtime.SDHTMLButtonElement.prototype;
             case "canvas": return runtime.SDHTMLCanvasElement.prototype;
             case "form": return runtime.SDHTMLFormElement.prototype;
             case "input": return runtime.SDHTMLInputElement.prototype;
+            case "datalist": return runtime.SDHTMLDataListElement.prototype;
+            case "table": return runtime.SDHTMLTableElement.prototype;
+            case "tr": return runtime.SDHTMLTableRowElement.prototype;
+            case "map": return runtime.SDHTMLMapElement.prototype;
+            case "a": return runtime.SDHTMLAnchorElement.prototype;
             case "select": return runtime.SDHTMLSelectElement.prototype;
+            case "textarea": return runtime.SDHTMLTextAreaElement.prototype;
+            case "option": return runtime.SDHTMLOptionElement.prototype;
+            case "fieldset": return runtime.SDHTMLFieldSetElement.prototype;
+            case "output": return runtime.SDHTMLOutputElement.prototype;
+            case "label": return runtime.SDHTMLLabelElement.prototype;
             case "script": return runtime.SDHTMLScriptElement.prototype;
+            case "img": return runtime.SDHTMLImageElement.prototype;
+            case "source": return runtime.SDHTMLSourceElement.prototype;
             case "iframe": return runtime.SDHTMLIFrameElement.prototype;
-            default: return runtime.SDHTMLElement.prototype;
+            default: return runtime.HTMLUnknownElement.prototype;
           }
         default: return runtime.SDElement.prototype;
-      }
-    },
-    construct(document, tag, namespaceURI) {
-      const localName = String(tag).toLowerCase();
-      switch (namespaceURI) {
-        case "http://www.w3.org/2000/svg":
-          return new runtime.SDSVGElement(tag, namespaceURI, document);
-        case "http://www.w3.org/1999/xhtml":
-          switch (localName) {
-            case "template": return new runtime.SDHTMLTemplateElement("template", namespaceURI, document);
-            case "button": return new runtime.SDHTMLButtonElement("button", document);
-            case "canvas": return new runtime.SDHTMLCanvasElement("canvas", document);
-            case "form": return new runtime.SDHTMLFormElement("form", document);
-            case "input": return new runtime.SDHTMLInputElement("input", document);
-            case "select": return new runtime.SDHTMLSelectElement("select", document);
-            case "script": return new runtime.SDHTMLScriptElement("script", document);
-            case "iframe": return new runtime.SDHTMLIFrameElement("iframe", document);
-            default: return new runtime.SDHTMLElement(tag, namespaceURI, document);
-          }
-        default: return new runtime.SDElement(tag, namespaceURI, document);
       }
     },
   };
@@ -2217,11 +2753,20 @@ export function createElementFamily(runtime) {
 
 export function createAnimationEffectBindings(runtime) {
   const binding = {
+    get target() {
+      return runtime["readTarget"]();
+    },
+    get composite() {
+      return runtime["readComposite"]();
+    },
     getKeyframes() {
-      return runtime["cloneAuthoredKeyframes"]();
+      return runtime["reportKeyframes"]();
     },
     getTiming() {
-      return runtime["cloneAuthoredTiming"]();
+      return runtime["reportTiming"]();
+    },
+    getComputedTiming() {
+      return runtime["computeTiming"]();
     },
   };
   return binding;
@@ -2234,12 +2779,6 @@ export function installElementMarkupBindings(runtime, prototype) {
     },
     set textContent(value) {
       runtime["execute"](this, 1, value);
-    },
-    get innerText() {
-      return runtime["execute"](this, 2);
-    },
-    set innerText(value) {
-      runtime["execute"](this, 3, value);
     },
     get innerHTML() {
       return runtime["execute"](this, 4);
@@ -2264,12 +2803,41 @@ export function installElementMarkupBindings(runtime, prototype) {
     },
   };
   Object.defineProperty(binding, "textContent", {"enumerable": false});
-  Object.defineProperty(binding, "innerText", {"enumerable": false});
   Object.defineProperty(binding, "innerHTML", {"enumerable": false});
   Object.defineProperty(binding, "outerHTML", {"enumerable": false});
   Object.defineProperty(binding, "insertAdjacentElement", {"enumerable": false});
   Object.defineProperty(binding, "insertAdjacentHTML", {"enumerable": false});
   Object.defineProperty(binding, "setAttributeNS", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installInnerTextBindings(runtime, prototype) {
+  const binding = {
+    get innerText() {
+      return runtime["execute"](this, 2);
+    },
+    set innerText(value) {
+      runtime["execute"](this, 3, value);
+    },
+  };
+  Object.defineProperty(binding, "innerText", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installOuterTextBindings(runtime, prototype) {
+  const binding = {
+    get outerText() {
+      return runtime["execute"](this, 24);
+    },
+    set outerText(value) {
+      runtime["execute"](this, 25, value);
+    },
+  };
+  Object.defineProperty(binding, "outerText", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
   Object.defineProperties(prototype, descriptors);
   return prototype;
@@ -2323,17 +2891,17 @@ export function installElementScrollBindings(runtime, prototype) {
       let top = runtime["normalizeScrollProperty"](value);
       runtime["applyScrollPosition"](this, setPosition, left, top, "property");
     },
-    scroll(first, second) {
+    scroll(first = undefined, second = undefined) {
       let coordinates = runtime["normalizeScrollCoordinates"](first, second, this.scrollLeft, this.scrollTop);
       let setPosition = this._setScrollPosition;
       runtime["applyScrollPosition"](this, setPosition, coordinates.left, coordinates.top, "scroll", coordinates.behavior);
     },
-    scrollTo(first, second) {
+    scrollTo(first = undefined, second = undefined) {
       let coordinates = runtime["normalizeScrollCoordinates"](first, second, this.scrollLeft, this.scrollTop);
       let setPosition = this._setScrollPosition;
       runtime["applyScrollPosition"](this, setPosition, coordinates.left, coordinates.top, "scrollTo", coordinates.behavior);
     },
-    scrollBy(first, second) {
+    scrollBy(first = undefined, second = undefined) {
       let delta = runtime["normalizeScrollCoordinates"](first, second, 0, 0);
       let setPosition = this._setScrollPosition;
       let left = runtime["addScrollDelta"](this.scrollLeft, delta.left);
@@ -2365,15 +2933,15 @@ export function installViewportScrollBindings(runtime, prototype) {
     get pageYOffset() {
       return this._effectiveTop;
     },
-    scroll(first, second) {
+    scroll(first = undefined, second = undefined) {
       let coordinates = runtime["normalizeScrollCoordinates"](first, second, this.scrollX, this.scrollY);
       runtime["viewportScrollRequest"](this, coordinates.left, coordinates.top, "scroll", coordinates.behavior);
     },
-    scrollTo(first, second) {
+    scrollTo(first = undefined, second = undefined) {
       let coordinates = runtime["normalizeScrollCoordinates"](first, second, this.scrollX, this.scrollY);
       runtime["viewportScrollRequest"](this, coordinates.left, coordinates.top, "scrollTo", coordinates.behavior);
     },
-    scrollBy(first, second) {
+    scrollBy(first = undefined, second = undefined) {
       let delta = runtime["normalizeScrollCoordinates"](first, second, 0, 0);
       let left = runtime["addScrollDelta"](this.scrollX, delta.left);
       let top = runtime["addScrollDelta"](this.scrollY, delta.top);
@@ -2465,108 +3033,6 @@ export function createInputBindings(runtime) {
   return binding;
 }
 
-export function createPartTokenListBinding(runtime) {
-  const binding = {
-    get length() {
-      return runtime["length"]();
-    },
-    item(index) {
-      return runtime["item"](index);
-    },
-    contains(token) {
-      return runtime["contains"](token);
-    },
-    add(...tokens) {
-      runtime["add"](tokens);
-    },
-    remove(...tokens) {
-      runtime["remove"](tokens);
-    },
-    toggle(token, force) {
-      return runtime["toggle"](token, force);
-    },
-    replace(oldToken, newToken) {
-      return runtime["replace"](oldToken, newToken);
-    },
-    get value() {
-      return runtime["getValue"]();
-    },
-    set value(value) {
-      runtime["setValue"](value);
-    },
-    [Symbol.iterator]() {
-      return runtime["iterator"]();
-    },
-    toString() {
-      return runtime["getValue"]();
-    },
-  };
-  Object.defineProperty(binding, "length", {"enumerable": true, "configurable": true});
-  Object.defineProperty(binding, "item", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "contains", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "add", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "remove", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "toggle", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "replace", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "value", {"enumerable": true, "configurable": true});
-  Object.defineProperty(binding, Symbol.iterator, {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "toString", {"enumerable": true, "configurable": true, "writable": true});
-  return binding;
-}
-
-export function createClassTokenListBinding(runtime) {
-  const binding = {
-    get length() {
-      return runtime["length"]();
-    },
-    item(index) {
-      return runtime["item"](index);
-    },
-    contains(token) {
-      return runtime["contains"](token);
-    },
-    add(...tokens) {
-      runtime["add"](tokens);
-    },
-    remove(...tokens) {
-      runtime["remove"](tokens);
-    },
-    toggle(token, force) {
-      return runtime["toggle"](token, force);
-    },
-    replace(oldToken, newToken) {
-      return runtime["replace"](oldToken, newToken);
-    },
-    get value() {
-      return runtime["getValue"]();
-    },
-    set value(value) {
-      runtime["setValue"](value);
-    },
-    *[Symbol.iterator]() {
-      let count = runtime.core["classCount"](runtime.handle);
-      for (let index = 0; index < count; index++) {
-        yield runtime.core["classItem"](runtime.handle, index);
-      }
-      null;
-    },
-    toString() {
-      return runtime["getValue"]();
-    },
-  };
-  Object.defineProperty(binding, "length", {"enumerable": true, "configurable": true});
-  Object.defineProperty(binding, "item", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "contains", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "add", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "remove", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "toggle", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "replace", {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "value", {"enumerable": true, "configurable": true});
-  Object.defineProperty(binding, Symbol.iterator, {"enumerable": true, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "toString", {"enumerable": true, "configurable": true, "writable": true});
-  return binding;
-}
-
 export function createDatasetTrapsBinding(runtime) {
   const binding = {
     get(target, property) {
@@ -2590,11 +3056,31 @@ export function installShadowElementBindings(runtime, prototype) {
     attachShadow(options) {
       return runtime["attachShadow"](this, options);
     },
+  };
+  Object.defineProperty(binding, "shadowRoot", {"enumerable": false});
+  Object.defineProperty(binding, "attachShadow", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["shadowRoot"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installElementInternalsBindings(runtime, prototype) {
+  const binding = {
     attachInternals() {
       let internals = new runtime["ElementInternals"](this);
       this._internals = internals;
       return this._internals;
     },
+  };
+  Object.defineProperty(binding, "attachInternals", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installSlotBindings(runtime, prototype) {
+  const binding = {
     assign(...nodes) {
       runtime["assign"](this, nodes);
     },
@@ -2605,14 +3091,10 @@ export function installShadowElementBindings(runtime, prototype) {
       return runtime["assignedElements"](this, options);
     },
   };
-  Object.defineProperty(binding, "shadowRoot", {"enumerable": false});
-  Object.defineProperty(binding, "attachShadow", {"enumerable": false});
-  Object.defineProperty(binding, "attachInternals", {"enumerable": false});
   Object.defineProperty(binding, "assign", {"enumerable": false});
   Object.defineProperty(binding, "assignedNodes", {"enumerable": false});
   Object.defineProperty(binding, "assignedElements", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
-  delete descriptors["shadowRoot"].set;
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
@@ -2745,6 +3227,26 @@ export function installStyleDeclarationBindings(runtime, prototype) {
   return prototype;
 }
 
+export function installSVGGraphicsBindings(runtime, prototype) {
+  const binding = {
+    getBBox() {
+      return runtime["getBBox"](this, this._resolvedLayoutOptions);
+    },
+    getCTM() {
+      return runtime["getCTM"](this, this._resolvedLayoutOptions);
+    },
+    getScreenCTM() {
+      return runtime["getScreenCTM"](this, this._resolvedLayoutOptions);
+    },
+  };
+  Object.defineProperty(binding, "getBBox", {"enumerable": false});
+  Object.defineProperty(binding, "getCTM", {"enumerable": false});
+  Object.defineProperty(binding, "getScreenCTM", {"enumerable": false});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
 export function installElementGeometryBindings(runtime, prototype) {
   const binding = {
     getBoundingClientRect() {
@@ -2754,18 +3256,6 @@ export function installElementGeometryBindings(runtime, prototype) {
       let connected = this.isConnected;
       if (!(connected)) return [];
       return runtime["getClientRects"](this, this._resolvedLayoutOptions);
-    },
-    get offsetWidth() {
-      return runtime["offsetWidth"](this, this._resolvedLayoutOptions);
-    },
-    get offsetHeight() {
-      return runtime["offsetHeight"](this, this._resolvedLayoutOptions);
-    },
-    get offsetTop() {
-      return runtime["offsetTop"](this, this._resolvedLayoutOptions);
-    },
-    get offsetLeft() {
-      return runtime["offsetLeft"](this, this._resolvedLayoutOptions);
     },
     get clientWidth() {
       return runtime["clientWidth"](this, this._resolvedLayoutOptions);
@@ -2785,30 +3275,59 @@ export function installElementGeometryBindings(runtime, prototype) {
     get scrollHeight() {
       return runtime["scrollHeight"](this, this._resolvedLayoutOptions);
     },
+    checkVisibility(options = undefined) {
+      return runtime["checkVisibility"](this, options);
+    },
   };
   Object.defineProperty(binding, "getBoundingClientRect", {"enumerable": false, "configurable": true, "writable": true});
   Object.defineProperty(binding, "getClientRects", {"enumerable": false, "configurable": true, "writable": true});
-  Object.defineProperty(binding, "offsetWidth", {"enumerable": false, "configurable": true});
-  Object.defineProperty(binding, "offsetHeight", {"enumerable": false, "configurable": true});
-  Object.defineProperty(binding, "offsetTop", {"enumerable": false, "configurable": true});
-  Object.defineProperty(binding, "offsetLeft", {"enumerable": false, "configurable": true});
   Object.defineProperty(binding, "clientWidth", {"enumerable": false, "configurable": true});
   Object.defineProperty(binding, "clientHeight", {"enumerable": false, "configurable": true});
   Object.defineProperty(binding, "clientTop", {"enumerable": false, "configurable": true});
   Object.defineProperty(binding, "clientLeft", {"enumerable": false, "configurable": true});
   Object.defineProperty(binding, "scrollWidth", {"enumerable": false, "configurable": true});
   Object.defineProperty(binding, "scrollHeight", {"enumerable": false, "configurable": true});
+  Object.defineProperty(binding, "checkVisibility", {"enumerable": false, "configurable": true, "writable": true});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
-  delete descriptors["offsetWidth"].set;
-  delete descriptors["offsetHeight"].set;
-  delete descriptors["offsetTop"].set;
-  delete descriptors["offsetLeft"].set;
   delete descriptors["clientWidth"].set;
   delete descriptors["clientHeight"].set;
   delete descriptors["clientTop"].set;
   delete descriptors["clientLeft"].set;
   delete descriptors["scrollWidth"].set;
   delete descriptors["scrollHeight"].set;
+  Object.defineProperties(prototype, descriptors);
+  return prototype;
+}
+
+export function installHTMLElementGeometryBindings(runtime, prototype) {
+  const binding = {
+    get offsetWidth() {
+      return runtime["offsetWidth"](this, this._resolvedLayoutOptions);
+    },
+    get offsetHeight() {
+      return runtime["offsetHeight"](this, this._resolvedLayoutOptions);
+    },
+    get offsetTop() {
+      return runtime["offsetTop"](this, this._resolvedLayoutOptions);
+    },
+    get offsetLeft() {
+      return runtime["offsetLeft"](this, this._resolvedLayoutOptions);
+    },
+    get offsetParent() {
+      return runtime["offsetParent"](this, this._resolvedLayoutOptions);
+    },
+  };
+  Object.defineProperty(binding, "offsetWidth", {"enumerable": false, "configurable": true});
+  Object.defineProperty(binding, "offsetHeight", {"enumerable": false, "configurable": true});
+  Object.defineProperty(binding, "offsetTop", {"enumerable": false, "configurable": true});
+  Object.defineProperty(binding, "offsetLeft", {"enumerable": false, "configurable": true});
+  Object.defineProperty(binding, "offsetParent", {"enumerable": false, "configurable": true});
+  const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["offsetWidth"].set;
+  delete descriptors["offsetHeight"].set;
+  delete descriptors["offsetTop"].set;
+  delete descriptors["offsetLeft"].set;
+  delete descriptors["offsetParent"].set;
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
@@ -2824,8 +3343,28 @@ export function installDocumentGeometryBindings(runtime, prototype) {
       let options = this.documentElement._resolvedLayoutOptions;
       return runtime["elementFromPoint"](root, pointX, pointY, options);
     },
+    elementsFromPoint(x, y) {
+      let rootPresence = this.documentElement;
+      if (!(rootPresence)) return [];
+      let root = this.documentElement;
+      let pointX = Number(x);
+      let pointY = Number(y);
+      let options = this.documentElement._resolvedLayoutOptions;
+      return runtime["elementsFromPoint"](root, pointX, pointY, options);
+    },
+    caretPositionFromPoint(x, y) {
+      let rootPresence = this.documentElement;
+      if (!(rootPresence)) return null;
+      let root = this.documentElement;
+      let pointX = Number(x);
+      let pointY = Number(y);
+      let options = this.documentElement._resolvedLayoutOptions;
+      return runtime["caretPositionFromPoint"](root, pointX, pointY, options);
+    },
   };
   Object.defineProperty(binding, "elementFromPoint", {"enumerable": false, "configurable": true, "writable": true});
+  Object.defineProperty(binding, "elementsFromPoint", {"enumerable": false, "configurable": true, "writable": true});
+  Object.defineProperty(binding, "caretPositionFromPoint", {"enumerable": false, "configurable": true, "writable": true});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
   Object.defineProperties(prototype, descriptors);
   return prototype;
@@ -2885,16 +3424,21 @@ export function installDocumentAnimationBindings(runtime, prototype) {
     getAnimations() {
       return runtime["documentAnimations"](this);
     },
+    get timeline() {
+      return runtime["documentTimeline"](this);
+    },
   };
   Object.defineProperty(binding, "getAnimations", {"enumerable": false});
+  Object.defineProperty(binding, "timeline", {"enumerable": false});
   const descriptors = Object.getOwnPropertyDescriptors(binding);
+  delete descriptors["timeline"].set;
   Object.defineProperties(prototype, descriptors);
   return prototype;
 }
 
 export function createCSSBindings(runtime) {
   const binding = {
-    supports(propertyOrCondition, value) {
+    supports(propertyOrCondition, value = undefined) {
       return runtime["execute"](null, 17, propertyOrCondition, value);
     },
     escape(value) {

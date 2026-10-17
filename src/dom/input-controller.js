@@ -1,18 +1,14 @@
 import { createInputBindings } from "./dom-bindings.generated.js";
 import { createEvent, dispatchEvent as dispatchSandomEvent, SDDataTransfer } from "./events.js";
-import { runInputActivation } from "./input-activation.js";
-import { scrollByChained } from "./scroll-interaction.js";
-import { scrollScrollbar } from "./scroll-core.js";
+import { executeInputRun, inputInvoke as invoke } from "./input-activation.js";
 import { scrollbarAtPoint } from "./presented-frame.js";
 
 const measurementSymbol = Symbol.for("sandom.domCore.measurement");
 const encoder = new TextEncoder();
 const EVENTS = [null, "pointerout", "pointerleave", "pointerover", "pointerenter", "mouseout", "mouseleave", "mouseover", "mouseenter", "pointerdown", "mousedown", "pointermove", "mousemove", "pointerup", "mouseup", "pointercancel", "lostpointercapture", "gotpointercapture", "wheel", "keydown", "keyup", "compositionstart", "compositionupdate", "compositionend", "beforeinput", "input", "change", "copy", "cut", "paste"];
-const INPUT_TYPES = [null, "deleteContentBackward", "deleteContentForward", "insertLineBreak", "insertText", "insertCompositionText", "insertReplacementText", "insertFromPaste", "insertFromDrop", "deleteByCut"];
+const INPUT_TYPES = [null, "deleteContentBackward", "deleteContentForward", "insertLineBreak", "insertText", "insertCompositionText", "insertReplacementText", "insertFromPaste", "insertFromDrop", "deleteByCut", "deleteWordBackward", "deleteWordForward"];
 const INSERT_TEXT_TYPES = ["insertText", "insertReplacementText", "insertFromPaste", "insertFromDrop"];
 const DELETE_SELECTION_TYPES = ["deleteContentBackward", "deleteContentForward", "deleteByCut"];
-const SOURCES = [null, "property", "scroll", "scrollTo", "scrollBy", "wheel", "keyboard", "pointer", "snap", "anchor", "scrollIntoView", "resize", "scrollbar", "momentum"];
-const SELECTION_DIRECTIONS = ["none", "forward", "backward"];
 const stateFinalizer = typeof FinalizationRegistry === "function"
   ? new FinalizationRegistry(({ core, handle }) => core.status("input_state_release", handle))
   : null;
@@ -30,29 +26,20 @@ export function hostEditingPlatform() {
   return "linux";
 }
 
-function invoke(core, operation, ...args) {
-  const result = core.exports[operation](...args);
-  if (core.exports.abi_error_kind()) {
-    const code = core.exports.input_error_code();
-    if (code === 1 || code === 2) {
-      const id = core.exports.input_error_pointer_id();
-      throw new Error(`Pointer ${id} is ${code === 2 ? "already" : "not"} active`);
-    }
-    if (code === 3) throw new Error("A text composition is already active");
-    if (code === 4) throw new Error("Composition update requires an active composition");
-    if (code === 5) throw new Error("Composition end requires an active composition");
-    if (code === 6 || code === 7) throw new Error(`No ${code === 7 ? "vertical" : "horizontal"} scrollbar exists for the element`);
-    if (code === 8) throw new Error("Text composition requires an enabled focused text control");
-    if (code === 9) throw new Error("A text edit cannot run during an active text composition: end it with compositionEnd first");
-    core.throwIfError();
-  }
-  return result;
-}
-
 function protocolEnum(core, domain, value) {
   return typeof value === "string"
     ? core.status("input_schema_enum", domain, ...core.input(value))
     : 0;
+}
+
+// A pointer down, move or up without a time takes the time of the root's
+// render surface clock: the clock its frames and momentum run on.
+const TIMED_POINTER_KINDS = new Set(["pointer-down", "pointer-move", "pointer-up"]);
+function pointerRecordTime(root, record) {
+  if (record.timeMilliseconds !== undefined || !TIMED_POINTER_KINDS.has(record.kind)) return record.timeMilliseconds;
+  const surface = root._renderSurface;
+  if (!surface) throw new Error(`${record.kind} requires timeMilliseconds or a render surface whose clock supplies it`);
+  return surface._now();
 }
 
 function encodeRecords(core, root, records) {
@@ -74,7 +61,7 @@ function encodeRecords(core, root, records) {
     view.setUint32(base, item.kind, true);
     view.setUint32(base + 4, item.pointerType, true);
     view.setUint32(base + 8, (record.isPrimary ? 1 : 0) | (record.shiftKey ? 2 : 0) | (record.altKey ? 4 : 0) | (record.ctrlKey ? 8 : 0) | (record.metaKey ? 16 : 0) | (record.repeat ? 32 : 0) | (record.cancelled ? 64 : 0), true);
-    for (const [offset, value] of [[16, record.pointerId], [24, record.x], [32, record.y], [40, record.deltaX], [48, record.deltaY], [56, record.timeMilliseconds], [64, record.pressure], [72, record.button], [80, record.buttons], [112, record.selectionStart], [120, record.selectionEnd]]) {
+    for (const [offset, value] of [[16, record.pointerId], [24, record.x], [32, record.y], [40, record.deltaX], [48, record.deltaY], [56, pointerRecordTime(root, record)], [64, record.pressure], [72, record.button], [80, record.buttons], [112, record.selectionStart], [120, record.selectionEnd]]) {
       view.setFloat64(base + offset, value ?? 0, true);
     }
     view.setBigUint64(base + 88, record.target?._coreHandle ?? 0n, true);
@@ -91,7 +78,7 @@ function encodeRecords(core, root, records) {
     view.setBigUint64(base + 136, root._coreHandle, true);
   }
   const measurement = globalThis[measurementSymbol];
-  if (measurement) measurement.record({ category: "lifecycle", operation: "input_batch_begin", direction: "host-to-core", bytes: length, allocations: encoded.length * 2, allocationBytes: length - records.length * 160 });
+  if (measurement) measurement.record({ category: "lifecycle", operation: "input_run_begin", direction: "host-to-core", bytes: length, allocations: encoded.length * 2, allocationBytes: length - records.length * 160 });
   return [pointer, length];
 }
 
@@ -112,54 +99,49 @@ function inputTypeCode(operation, inputType, allowed) {
   return INPUT_TYPES.indexOf(inputType);
 }
 
-// Action19 names where copied text comes from; see $inputClipboardDefault.
-function clipboardText(action, record, target, root) {
-  if (action.aux === 0) {
+// The clipboard text of a copy or cut (input run host effect 1; see
+// $inputClipboardDefault): the listeners' data, or the core's text.
+function clipboardText(core, notification, record) {
+  const { aux } = notification;
+  if (aux === 0) {
     return record.clipboardData.types.includes("text/plain") ? record.clipboardData.getData("text/plain") : null;
   }
-  if (action.aux === 1) return target.value.slice(action.a, action.b);
-  if (action.aux === 2) {
-    const text = documentOf(root).getSelection().toString();
-    return text === "" ? null : text;
+  if (aux === 1 || aux === 2) {
+    const text = core.decoder.decode(core.refreshBytes().subarray(notification.a, notification.a + notification.b));
+    return aux === 2 && text === "" ? null : text;
   }
-  if (action.aux === 3) return null;
-  throw new Error(`Unknown native clipboard text source ${action.aux}`);
+  if (aux === 3) return null;
+  throw new Error(`Unknown native clipboard text source ${aux}`);
 }
 
-function readAction(core) {
-  const pointer = core.exports.abi_output_pointer();
-  const view = new DataView(core.refreshBytes().buffer, pointer, 80);
-  // Capture retained action fields before wrapping a node can reenter the core.
-  return { action: view.getUint32(0, true), event: view.getUint32(4, true), flags: view.getUint32(8, true), aux: view.getUint32(12, true), target: view.getBigUint64(16, true), related: view.getBigUint64(24, true), a: view.getFloat64(32, true), b: view.getFloat64(40, true), c: view.getFloat64(48, true), d: view.getFloat64(56, true) };
-}
-
-function eventFor(action, record, relatedTarget) {
-  const fields = { bubbles: Boolean(action.flags & 1), cancelable: Boolean(action.flags & 2), composed: Boolean(action.flags & 4) };
+// The Event of an input batch event notification (input action 1's fields).
+function eventFor(notification, record, relatedTarget) {
+  const { code, aux } = notification;
+  const fields = { bubbles: Boolean(notification.flags & 1), cancelable: Boolean(notification.flags & 2), composed: Boolean(notification.flags & 4) };
   const modifiers = { shiftKey: record.shiftKey ?? false, altKey: record.altKey ?? false, ctrlKey: record.ctrlKey ?? false, metaKey: record.metaKey ?? false };
-  const type = EVENTS[action.event];
-  if (action.event <= 17) {
-    if (action.aux & 32) {
+  if (code <= 17) {
+    if (aux & 32) {
       fields.pointerId = record.pointerId;
     } else {
-      Object.assign(fields, modifiers, { button: action.aux & 1 ? -1 : record.button ?? 0, buttons: action.aux & 2 ? 0 : action.aux & 4 ? 1 : record.buttons ?? 0, clientX: action.aux & 8 ? 0 : record.x ?? 0, clientY: action.aux & 8 ? 0 : record.y ?? 0 });
-      if (![5, 6, 7, 8, 10, 12, 14].includes(action.event)) {
-        Object.assign(fields, { pointerId: record.pointerId, pointerType: action.aux & 16 ? [null, "mouse", "pen", "touch"][action.c] : record.pointerType, isPrimary: action.aux & 16 ? Boolean(action.d) : record.isPrimary, pressure: record.pressure ?? 0 });
+      Object.assign(fields, modifiers, { button: aux & 1 ? -1 : record.button ?? 0, buttons: aux & 2 ? 0 : aux & 4 ? 1 : record.buttons ?? 0, clientX: aux & 8 ? 0 : record.x ?? 0, clientY: aux & 8 ? 0 : record.y ?? 0 });
+      if (![5, 6, 7, 8, 10, 12, 14].includes(code)) {
+        Object.assign(fields, { pointerId: record.pointerId, pointerType: aux & 16 ? [null, "mouse", "pen", "touch"][notification.c] : record.pointerType, isPrimary: aux & 16 ? Boolean(notification.d) : record.isPrimary, pressure: record.pressure ?? 0 });
       }
-      if (action.event <= 8) fields.relatedTarget = relatedTarget;
+      if (code <= 8) fields.relatedTarget = relatedTarget;
     }
-  } else if (action.event === 18) {
+  } else if (code === 18) {
     Object.assign(fields, modifiers, { clientX: record.x, clientY: record.y, deltaX: record.deltaX, deltaY: record.deltaY, deltaMode: record.deltaMode });
-  } else if (action.event === 19 || action.event === 20) {
+  } else if (code === 19 || code === 20) {
     Object.assign(fields, modifiers, { key: record.key, code: record.code ?? "", location: record.location ?? 0, repeat: record.repeat ?? false });
-  } else if (action.event >= 21 && action.event <= 23) {
-    Object.assign(fields, modifiers, { data: action.aux & 512 ? "" : record.text });
-  } else if (action.event === 24 || action.event === 25) {
-    const inputType = action.aux & 255;
-    Object.assign(fields, { inputType: INPUT_TYPES[inputType], data: insertedText(inputType, record), isComposing: Boolean(action.aux & 256) });
-  } else if (action.event >= 27 && action.event <= 29) {
+  } else if (code >= 21 && code <= 23) {
+    Object.assign(fields, modifiers, { data: aux & 512 ? "" : record.text });
+  } else if (code === 24 || code === 25) {
+    const inputType = aux & 255;
+    Object.assign(fields, { inputType: INPUT_TYPES[inputType], data: insertedText(inputType, record), isComposing: Boolean(aux & 256) });
+  } else if (code >= 27 && code <= 29) {
     fields.clipboardData = record.clipboardData;
   }
-  return createEvent(type, fields);
+  return createEvent(EVENTS[code], fields);
 }
 
 export function createInputController(layoutOptions, editingPlatform) {
@@ -186,7 +168,15 @@ export function createInputController(layoutOptions, editingPlatform) {
     if (!snapshot && required) throw new Error("Host input requires a presented frame: attach a render surface and deliver one frame before dispatching input.");
     return snapshot;
   }
-  function runOwned(state, root, snapshot, batch, records, hooks = {}) {
+  // Binds the scroll owner of the root's render surface and the document
+  // Selection to the state; a run that begins next executes against them.
+  function bind(state, root) {
+    invoke(state.core, "input_state_bind", state.handle, root._renderSurface?._scrollOwner ?? 0n, documentOf(root).getSelection()._handle);
+  }
+  // Executes run `run` over `records` (src/dom-wasm/input-run.watpart): the
+  // core executes every default action; this host dispatches the events,
+  // runs the record hooks and applies the facade's effects.
+  function runOwned(state, root, run, records, hooks = {}) {
     const core = state.core;
     const results = new Array(records.length);
     const viewportResults = new Set();
@@ -194,105 +184,60 @@ export function createInputController(layoutOptions, editingPlatform) {
     let valueChanged = false;
     let copiedText = null;
     let scrolled = false;
-    try {
-      for (;;) {
-        const actionCode = invoke(core, "input_batch_next", batch);
-        if (!actionCode) break;
-        const action = readAction(core);
-        const index = invoke(core, "input_batch_record", batch);
-        const token = invoke(core, "input_batch_token", batch);
-        const record = records[index];
-        let outcome = 0;
-        try {
-          const surface = root._renderSurface;
-          const target = action.aux & 64 && action.action === 1
-            ? surface?.viewport
-            : core.wrapperFor(action.target);
-          switch (action.action) {
-            case 1: {
-              if (action.aux & 64) viewportResults.add(index);
-              const event = eventFor(action, record, core.wrapperFor(action.related));
-              dispatchSandomEvent(target, event);
-              outcome = event.defaultPrevented ? 1 : 0;
-              break;
-            }
-            case 2:
-              if (action.aux === 1) target._hovered = Boolean(action.a);
-              else target._active = Boolean(action.a);
-              if (action.flags & 1) target._notifyMutation("state", action.aux === 1 ? "hover" : "active");
-              break;
-            case 3: target.focus(); break;
-            case 4: target.click(); break;
-            case 5: target.setSelectionRange(action.a, action.b, SELECTION_DIRECTIONS[action.c]); break;
-            case 6: {
-              const selection = documentOf(root).getSelection();
-              const mode = action.aux === 3
-                ? invoke(core, "input_pointer_selection_mode", selection._handle, action.target)
-                : action.aux;
-              if (mode === 2) selection.removeAllRanges();
-              else if (mode === 1) selection.extend(target, action.a);
-              else selection.setBaseAndExtent(target, action.a, target, action.a);
-              break;
-            }
-            case 7:
-              if (action.target === 0n) viewportResults.add(index);
-              scrolled = scrollByChained(surface, snapshot, target ?? surface?.viewport, action.a, action.b, SOURCES[action.aux]).scrolled || scrolled;
-              break;
-            case 8:
-              if (action.target === 0n) viewportResults.add(index);
-              surface?._beginScrollInteraction(target ?? surface.viewport);
-              break;
-            case 9: surface?._endScrollInteraction(); break;
-            case 10:
-              if (action.target === 0n) viewportResults.add(index);
-              surface?._startScrollMomentum(target ?? surface.viewport, action.a, action.b, action.c);
-              break;
-            case 11:
-              if (action.target === 0n) viewportResults.add(index);
-              scrollScrollbar(surface, target ?? surface.viewport, action.aux & 1, action.a, action.aux >= 2, action.b, action.c, action.d);
-              scrollbarChanged = true;
-              break;
-            case 12: {
-              const value = core.string("input_batch_edit_value", batch);
-              if (action.aux & 2048) target._setUserEditedValue(value, action.a, action.b);
-              else {
-                const next = value.slice(0, action.a) + (insertedText(action.aux & 255, record) ?? "") + value.slice(action.b);
-                if (next !== value) valueChanged = true;
-                target._setUserEditedValue(next, action.c);
-              }
-              break;
-            }
-            case 14: target._notifyMutation("state", action.aux === 1 ? "selected" : "checked"); break;
-            case 15:
-              scrolled = false;
-              hooks.beforeRecord?.(record, index);
-              break;
-            case 16: {
-              const result = record.kind === "pointer-leave" ? null : target ?? (viewportResults.has(index) ? surface?.viewport : null);
-              results[index] = result;
-              hooks.afterRecord?.(record, index, result, scrolled);
-              break;
-            }
-            case 17:
-              target._pointerController = pointerController;
-              target._layoutOptions = layoutOptions;
-              break;
-            case 18: documentOf(root).getSelection().selectAllChildren(target); break;
-            case 19: copiedText = clipboardText(action, record, target, root); break;
-            // Implicit submission of a form without a default button.
-            case 20: runInputActivation(target, 4); break;
-            default: throw new Error(`Unknown native input action ${action.action}`);
-          }
-        } catch (error) {
-          try { invoke(core, "input_batch_resume", batch, token, 2); } catch { /* Preserve the original listener/host exception. */ }
-          throw error;
+    executeInputRun(core, run, {
+      batchEvent(notification) {
+        const index = notification.record;
+        let target;
+        if (notification.aux & 64) {
+          viewportResults.add(index);
+          target = root._renderSurface?.viewport;
+        } else {
+          target = core.wrapperFor(notification.target);
         }
-        invoke(core, "input_batch_resume", batch, token, outcome);
-      }
-      return { results, scrollbarChanged, valueChanged, copiedText };
-    } finally {
-      core.status("input_batch_release", batch);
-    }
+        const event = eventFor(notification, records[index], core.wrapperFor(notification.related));
+        dispatchSandomEvent(target, event);
+        return event.defaultPrevented ? 1 : 0;
+      },
+      valueEdited(notification) {
+        if (notification.c) valueChanged = true;
+      },
+      scrolled(notification) {
+        const action = notification.aux;
+        if (notification.target === 0n && action !== 9) viewportResults.add(notification.record);
+        if (action === 7) scrolled = Boolean(notification.a) || scrolled;
+        if (action === 11) scrollbarChanged = true;
+        root._renderSurface?._inputScrolled(action, Boolean(notification.a));
+      },
+      clipboard(notification) {
+        copiedText = clipboardText(core, notification, records[notification.record]);
+      },
+      recordHook(notification) {
+        const index = notification.record;
+        const record = records[index];
+        const target = core.wrapperFor(notification.target);
+        if (notification.code === 15) {
+          scrolled = false;
+          hooks.beforeRecord?.(record, index);
+        } else if (notification.code === 16) {
+          const result = record.kind === "pointer-leave"
+            ? null
+            : target ?? (viewportResults.has(index) ? root._renderSurface?.viewport : null);
+          results[index] = result;
+          hooks.afterRecord?.(record, index, result, scrolled);
+        } else if (notification.code === 17) {
+          target._pointerController = pointerController;
+          target._layoutOptions = layoutOptions;
+        } else {
+          throw new Error(`Unknown native input record hook ${notification.code}`);
+        }
+      },
+    });
+    return { results, scrollbarChanged, valueChanged, copiedText };
+  }
+  // A run over a batch that `begin` makes, with the root's binding.
+  function adopt(state, root, begin) {
+    bind(state, root);
+    return invoke(state.core, "input_run_adopt", begin());
   }
   function dispatchBatch(root, records, hooks = {}) {
     const state = stateFor(root);
@@ -302,12 +247,13 @@ export function createInputController(layoutOptions, editingPlatform) {
     if (snapshot && snapshot.geometryCore !== state.core) {
       throw new TypeError("Input snapshot must use the document's DOM core.");
     }
+    bind(state, root);
     const [pointer, length] = encodeRecords(state.core, root, records);
     // The surface's touch-panning opt-in travels with the batch; the engine
     // decides whether a drag pans.
     const touchPanning = root._renderSurface?._touchPanning ? 1 : 0;
-    const batch = invoke(state.core, "input_batch_begin", state.handle, snapshot?.geometryHandle ?? 0n, pointer, length, records.length, touchPanning);
-    const results = runOwned(state, root, snapshot, batch, records, hooks).results;
+    const run = invoke(state.core, "input_run_begin", state.handle, snapshot?.geometryHandle ?? 0n, pointer, length, records.length, touchPanning);
+    const results = runOwned(state, root, run, records, hooks).results;
     // The engine knows which CSS cursor belongs at a document point. A host
     // that named an element for it gets the answer applied there, so the
     // pointer over text is a text cursor without every interactive host
@@ -324,7 +270,7 @@ export function createInputController(layoutOptions, editingPlatform) {
       }
     }
     // The scrollbar under the pointer shows an overlay bar and holds it
-    // shown (plans/PLAN-native-scrollbars.md, decision 2); a pointer that
+    // shown (design/scrollbars.md, decision 2); a pointer that
     // goes down on a thumb presses it until the pointer goes up.
     const pointerRecord = records.findLast((record) => record.kind.startsWith("pointer-"));
     if (surface && pointerRecord) {
@@ -352,13 +298,13 @@ export function createInputController(layoutOptions, editingPlatform) {
   const pointerController = {
     capture(element, pointerId) {
       const state = stateFor(element);
-      const batch = invoke(state.core, "input_pointer_capture_begin", state.handle, element._coreHandle, pointerId, 0);
-      runOwned(state, state.root, snapshotFor(state.root, false), batch, [{ kind: "pointer-capture", pointerId }]);
+      const run = adopt(state, state.root, () => invoke(state.core, "input_pointer_capture_begin", state.handle, element._coreHandle, pointerId, 0));
+      runOwned(state, state.root, run, [{ kind: "pointer-capture", pointerId }]);
     },
     release(element, pointerId) {
       const state = stateFor(element);
-      const batch = invoke(state.core, "input_pointer_capture_begin", state.handle, element._coreHandle, pointerId, 1);
-      runOwned(state, state.root, snapshotFor(state.root, false), batch, [{ kind: "pointer-release", pointerId }]);
+      const run = adopt(state, state.root, () => invoke(state.core, "input_pointer_capture_begin", state.handle, element._coreHandle, pointerId, 1));
+      runOwned(state, state.root, run, [{ kind: "pointer-release", pointerId }]);
     },
     has(element, pointerId) {
       const state = stateFor(element);
@@ -374,8 +320,9 @@ export function createInputController(layoutOptions, editingPlatform) {
     if (typeof target?._coreHandle !== "bigint") throw new TypeError(`${operation}: target must be a Sandom node, received ${String(target)}`);
     const state = stateFor(root);
     state.root = root;
-    const batch = invoke(state.core, "input_edit_begin", state.handle, target._coreHandle, root._coreHandle, command, code, ...state.core.input(text));
-    return runOwned(state, root, snapshotFor(root, false), batch, [record]);
+    bind(state, root);
+    const run = invoke(state.core, "input_run_edit_begin", state.handle, target._coreHandle, root._coreHandle, command, code, ...state.core.input(text));
+    return runOwned(state, root, run, [record]);
   }
   const runtime = {
     pointerController,
@@ -403,13 +350,13 @@ export function createInputController(layoutOptions, editingPlatform) {
       return one(root, { kind: "composition-end", text, cancelled, shiftKey, altKey, ctrlKey, metaKey });
     },
     accessibilityAction(root, target, action) { return one(root, { ...action, kind: "accessibility-action", target }); },
-    pointerDown(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, button = 0, buttons = 1, pressure = 0.5, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds = performance.now() } = {}) {
+    pointerDown(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, button = 0, buttons = 1, pressure = 0.5, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
       return one(root, { kind: "pointer-down", x, y, pointerId, pointerType, isPrimary, button, buttons, pressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
     },
-    pointerMove(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, buttons = 1, pressure = 0.5, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds = performance.now() } = {}) {
+    pointerMove(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, buttons = 1, pressure = 0.5, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
       return one(root, { kind: "pointer-move", x, y, pointerId, pointerType, isPrimary, button: -1, buttons, pressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
     },
-    pointerUp(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, button = 0, pressure = 0, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds = performance.now() } = {}) {
+    pointerUp(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, button = 0, pressure = 0, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
       return one(root, { kind: "pointer-up", x, y, pointerId, pointerType, isPrimary, button, buttons: 0, pressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
     },
     pointerCancel(root, pointerId = 1) { return one(root, { kind: "pointer-cancel", pointerId }); },
@@ -418,8 +365,8 @@ export function createInputController(layoutOptions, editingPlatform) {
       const state = stateFor(root);
       const snapshot = snapshotFor(root);
       const code = state.core.status("input_key_code", ...state.core.input(key));
-      const batch = invoke(state.core, "input_pointer_scrollbar_key_begin", state.handle, snapshot.geometryHandle, element?._coreHandle ?? 0n, orientation === "vertical" ? 1 : 0, code);
-      return runOwned(state, root, snapshot, batch, [{ kind: "scrollbar-key", key }]).scrollbarChanged;
+      const run = adopt(state, root, () => invoke(state.core, "input_pointer_scrollbar_key_begin", state.handle, snapshot.geometryHandle, element?._coreHandle ?? 0n, orientation === "vertical" ? 1 : 0, code));
+      return runOwned(state, root, run, [{ kind: "scrollbar-key", key }]).scrollbarChanged;
     },
     insertText(root, text, { inputType = "insertText", target = root.ownerDocument?._focusedElement ?? root.ownerDocument?.activeElement ?? root } = {}) {
       const code = inputTypeCode("insertText", inputType, INSERT_TEXT_TYPES);

@@ -20,6 +20,10 @@
 
 import { caretRectangle } from "./geometry.js";
 
+// `onTexture(texture, frame)` runs once for each new GPU texture: `texture`
+// is the frame's GPUTexture and `frame` the frame that brought it, both
+// never null. A frame without a GPU texture, or rendered on another device,
+// throws instead.
 export function createTexturePresenter({ device, onTexture }) {
   if (!device || typeof device.createShaderModule !== "function") {
     throw new TypeError("createTexturePresenter: device must be a GPUDevice");
@@ -192,26 +196,45 @@ function createInputSink(host, label) {
   return sink;
 }
 
+// Each hook, and each value the binding passes to it:
+//
 // `project(event, { target })` returns `{ x, y }` in document CSS pixels, or
 // null when the event misses every document. It may add `backend` and
-// `root` to route the point to another document than the default; during
-// a pressed gesture `target` is the document the gesture started on, so a
-// drag can keep tracking past that document's edge.
+// `root` to route the point to another document than the default. `event`
+// is never null: a `pointerdown`, `pointermove`, `pointerup`,
+// `pointercancel` or `wheel` event, or the last `pointermove` again when a
+// presented frame resolves the cursor of a resting pointer. `target` is
+// null except during a pressed gesture, where it is the `{ backend, root }`
+// the press started on, so a drag can keep tracking past that document's
+// edge.
 //
-// `unproject({ x, y }, target)` is the inverse: a point of `target`'s
-// document in document CSS pixels as `{ x, y }` in host client
-// coordinates, or null where that point is not visible. With it the input
-// sink sits at the caret of the focused text control, so the browser opens
-// its composition window where the reader is typing; without it the sink
-// sits at the host's top left corner.
+// `unproject(point, target)` is the inverse: `point` (never null) is a point
+// of `target`'s document in document CSS pixels, and `target` (never null)
+// is the `{ backend, root }` that has the keyboard. It returns the point as
+// `{ x, y }` in host client coordinates, or null where that point is not
+// visible. With it the input sink sits at the caret of the focused text
+// control, so the browser opens its composition window where the reader is
+// typing; without it the sink sits at the host's top left corner.
 //
 // `claimPointerDown(point, event)`, `claimWheel(point, event)` and
 // `claimKey(event)` keep a press, a wheel turn or a key for the host (a
 // click that orbits the camera, a wheel that zooms it, an Escape that
 // returns the keyboard); return true to claim. A claimed press or a miss
-// hands the keyboard back to the host element. `cursor(point, event)` may
-// return a cursor name to show instead of the document's own; `point` is
-// null on a miss. `onInput()` runs after every record the binding delivers.
+// hands the keyboard back to the host element. `claimPointerDown` receives
+// the `pointerdown` event and the point that `project` returned, null on a
+// miss. `claimWheel` receives the `wheel` event and a point that is never
+// null: a wheel over a miss stays with the host without a call.
+// `claimKey` receives the sink's `keydown` or `keyup` event, never null.
+//
+// `cursor(point, event)` may return a cursor name to show instead of the
+// document's own. `point` is the point that `project` returned, or null on
+// a miss. `event` is the `pointerdown`, `pointermove`, `pointerup` or
+// `pointercancel` event, or the last `pointermove` again when a presented
+// frame resolves the cursor of a resting pointer. When the pointer leaves
+// the host, both `point` and `event` are null.
+//
+// `onInput()` runs, without arguments, after every record the binding
+// delivers.
 export function bindProjectedInput({
   host,
   backend,

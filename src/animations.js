@@ -1,18 +1,23 @@
 import {
   normalizeAnimationOffsets,
-  writeAnimationTrack,
-  writeAnimationKeyframe,
-  updateAnimationTransition,
-  animationTransitionRevision,
-  animationTransitionDuration,
-  releaseAnimationTransition,
+  animationNumber,
   createAnimationTrackIdentity,
   releaseAnimationTrackIdentity,
-  identifyAnimationFeedback,
   nextAnimationReplacement,
   normalizeAnimationValue as normalizeValue,
   normalizeAnimationEasing as normalizeEasing,
   animationPropertyFrames,
+  animationTransitionProperties,
+  animationProperty,
+  animationDirectionMode,
+  animationEnumerationName,
+  animationFillMode,
+  throwAnimationDeclarationError,
+  animationEventName,
+  transformFrameComponents,
+  animationPropertyName,
+  animationTrackKind,
+  checkAnimationTrack,
 } from "./dom-wasm/animation.js";
 import { boxSnapshotFor } from "./dom-wasm/geometry-wire.js";
 import {
@@ -21,270 +26,19 @@ import {
   ANIMATION_EVENT_QUEUE_SIZE,
   ANIMATION_RECORD_SIZE,
   ANIMATION_RESULT_BASE,
-  ANIMATION_TABLE_BASE,
-  ANIMATION_TABLE_CAPACITY,
-  EFFECT_STACK_ENTRY_SIZE,
-  EFFECT_STACK_TABLE_BASE,
-  EFFECT_STACK_TABLE_CAPACITY,
-  KEYFRAME_ENTRY_SIZE,
-  KEYFRAME_POOL_BASE,
-  KEYFRAME_POOL_CAPACITY,
-  LAYOUT_NODE_OFFSET_BG_COLOR,
-  LAYOUT_NODE_OFFSET_FLEX_BASIS,
-  LAYOUT_NODE_OFFSET_FLEX_BASIS_PERCENT,
-  LAYOUT_NODE_OFFSET_FLEX_BASIS_TAG,
-  LAYOUT_NODE_OFFSET_FONT_SIZE,
-  LAYOUT_NODE_OFFSET_HEIGHT,
-  LAYOUT_NODE_OFFSET_HEIGHT_PERCENT,
-  LAYOUT_NODE_OFFSET_HEIGHT_TAG,
-  LAYOUT_NODE_OFFSET_INSET_BOTTOM,
-  LAYOUT_NODE_OFFSET_INSET_BOTTOM_PERCENT,
-  LAYOUT_NODE_OFFSET_INSET_BOTTOM_TAG,
-  LAYOUT_NODE_OFFSET_INSET_LEFT,
-  LAYOUT_NODE_OFFSET_INSET_LEFT_PERCENT,
-  LAYOUT_NODE_OFFSET_INSET_LEFT_TAG,
-  LAYOUT_NODE_OFFSET_INSET_RIGHT,
-  LAYOUT_NODE_OFFSET_INSET_RIGHT_PERCENT,
-  LAYOUT_NODE_OFFSET_INSET_RIGHT_TAG,
-  LAYOUT_NODE_OFFSET_INSET_TOP,
-  LAYOUT_NODE_OFFSET_INSET_TOP_PERCENT,
-  LAYOUT_NODE_OFFSET_INSET_TOP_TAG,
-  LAYOUT_NODE_OFFSET_MAX_H_TAG,
-  LAYOUT_NODE_OFFSET_MAX_HEIGHT,
-  LAYOUT_NODE_OFFSET_MAX_HEIGHT_PERCENT,
-  LAYOUT_NODE_OFFSET_MAX_W_TAG,
-  LAYOUT_NODE_OFFSET_MAX_WIDTH,
-  LAYOUT_NODE_OFFSET_MAX_WIDTH_PERCENT,
-  LAYOUT_NODE_OFFSET_MIN_H_TAG,
-  LAYOUT_NODE_OFFSET_MIN_HEIGHT,
-  LAYOUT_NODE_OFFSET_MIN_HEIGHT_PERCENT,
-  LAYOUT_NODE_OFFSET_MIN_W_TAG,
-  LAYOUT_NODE_OFFSET_MIN_WIDTH,
-  LAYOUT_NODE_OFFSET_MIN_WIDTH_PERCENT,
-  LAYOUT_NODE_OFFSET_LINE_HEIGHT,
-  LAYOUT_NODE_OFFSET_LINE_HEIGHT_TAG,
-  LAYOUT_NODE_OFFSET_OPACITY,
-  LAYOUT_NODE_OFFSET_PADDING_TOP,
-  LAYOUT_NODE_OFFSET_PADDING_RIGHT,
-  LAYOUT_NODE_OFFSET_PADDING_BOTTOM,
-  LAYOUT_NODE_OFFSET_PADDING_LEFT,
-  LAYOUT_NODE_OFFSET_ROW_GAP,
-  LAYOUT_NODE_OFFSET_COLUMN_GAP,
-  LAYOUT_NODE_OFFSET_SHADOW_COUNT,
-  LAYOUT_NODE_OFFSET_SHADOW_OFFSET,
-  LAYOUT_NODE_OFFSET_TEXT_COLOR,
-  LAYOUT_NODE_OFFSET_TRANSFORM,
-  LAYOUT_NODE_OFFSET_TRANSFORM_PERCENT,
-  LAYOUT_NODE_OFFSET_VISIBILITY_HIDDEN,
-  LAYOUT_NODE_OFFSET_WIDTH,
-  LAYOUT_NODE_OFFSET_WIDTH_PERCENT,
-  LAYOUT_NODE_OFFSET_WIDTH_TAG,
-  LAYOUT_NODE_SIZE,
-  LAYOUT_NODE_OFFSET_FLAGS,
-  LAYOUT_FLAG_HAS_BOX_SHADOW,
-  LINEAR_EASING_ENTRY_SIZE,
-  LINEAR_EASING_POOL_BASE,
-  LINEAR_EASING_POOL_CAPACITY,
   SHADOW_ENTRY_SIZE,
   SHADOW_OFFSET_COLOR,
   SHADOW_OFFSET_INSET,
-  SHADOW_POOL_BASE,
-  SIZE_TAG_CALC_PAIR,
-  SIZE_TAG_LENGTH,
-  SIZE_TAG_PERCENT,
-  TRANSFORM_COMPONENT_ENTRY_SIZE,
-  TRANSFORM_COMPONENT_POOL_BASE,
-  TRANSFORM_COMPONENT_POOL_CAPACITY,
 } from "./wasm/layout.js";
 
 const animationMeasurementKey = Symbol.for("sandom.domCore.measurement");
-
-const PROPERTY_REGISTRY = Object.freeze({
-  width: lengthProperty(
-    1,
-    LAYOUT_NODE_OFFSET_WIDTH,
-    LAYOUT_NODE_OFFSET_WIDTH_TAG,
-    LAYOUT_NODE_OFFSET_WIDTH_PERCENT,
-  ),
-  "min-width": lengthProperty(
-    2,
-    LAYOUT_NODE_OFFSET_MIN_WIDTH,
-    LAYOUT_NODE_OFFSET_MIN_W_TAG,
-    LAYOUT_NODE_OFFSET_MIN_WIDTH_PERCENT,
-  ),
-  "max-width": lengthProperty(
-    3,
-    LAYOUT_NODE_OFFSET_MAX_WIDTH,
-    LAYOUT_NODE_OFFSET_MAX_W_TAG,
-    LAYOUT_NODE_OFFSET_MAX_WIDTH_PERCENT,
-  ),
-  height: lengthProperty(
-    4,
-    LAYOUT_NODE_OFFSET_HEIGHT,
-    LAYOUT_NODE_OFFSET_HEIGHT_TAG,
-    LAYOUT_NODE_OFFSET_HEIGHT_PERCENT,
-  ),
-  "min-height": lengthProperty(
-    5,
-    LAYOUT_NODE_OFFSET_MIN_HEIGHT,
-    LAYOUT_NODE_OFFSET_MIN_H_TAG,
-    LAYOUT_NODE_OFFSET_MIN_HEIGHT_PERCENT,
-  ),
-  "max-height": lengthProperty(
-    6,
-    LAYOUT_NODE_OFFSET_MAX_HEIGHT,
-    LAYOUT_NODE_OFFSET_MAX_H_TAG,
-    LAYOUT_NODE_OFFSET_MAX_HEIGHT_PERCENT,
-  ),
-  left: lengthProperty(
-    7,
-    LAYOUT_NODE_OFFSET_INSET_LEFT,
-    LAYOUT_NODE_OFFSET_INSET_LEFT_TAG,
-    LAYOUT_NODE_OFFSET_INSET_LEFT_PERCENT,
-  ),
-  right: lengthProperty(
-    8,
-    LAYOUT_NODE_OFFSET_INSET_RIGHT,
-    LAYOUT_NODE_OFFSET_INSET_RIGHT_TAG,
-    LAYOUT_NODE_OFFSET_INSET_RIGHT_PERCENT,
-  ),
-  top: lengthProperty(
-    9,
-    LAYOUT_NODE_OFFSET_INSET_TOP,
-    LAYOUT_NODE_OFFSET_INSET_TOP_TAG,
-    LAYOUT_NODE_OFFSET_INSET_TOP_PERCENT,
-  ),
-  bottom: lengthProperty(
-    10,
-    LAYOUT_NODE_OFFSET_INSET_BOTTOM,
-    LAYOUT_NODE_OFFSET_INSET_BOTTOM_TAG,
-    LAYOUT_NODE_OFFSET_INSET_BOTTOM_PERCENT,
-  ),
-  "flex-basis": lengthProperty(
-    11,
-    LAYOUT_NODE_OFFSET_FLEX_BASIS,
-    LAYOUT_NODE_OFFSET_FLEX_BASIS_TAG,
-    LAYOUT_NODE_OFFSET_FLEX_BASIS_PERCENT,
-  ),
-  opacity: { id: 12, kind: 1, valueOffset: LAYOUT_NODE_OFFSET_OPACITY },
-  "background-color": {
-    id: 13,
-    kind: 3,
-    valueOffset: LAYOUT_NODE_OFFSET_BG_COLOR,
-  },
-  visibility: {
-    id: 14,
-    kind: 6,
-    valueOffset: LAYOUT_NODE_OFFSET_VISIBILITY_HIDDEN,
-  },
-  transform: { id: 15, kind: 4, valueOffset: LAYOUT_NODE_OFFSET_TRANSFORM },
-  // Text colour, same f32[4] rgba shape as background-color. The property
-  // a design system transitions most often: shadcn's controls declare
-  // `transition-property: color, box-shadow` on every trigger, tab and
-  // button, so leaving it unregistered made all of them snap.
-  color: {
-    id: 16,
-    kind: 3,
-    valueOffset: LAYOUT_NODE_OFFSET_TEXT_COLOR,
-  },
-  // The shadow list (kind 7). Its keyframes are component spans; the
-  // node's span pointer is what the track owns and restores.
-  "box-shadow": {
-    id: 17,
-    kind: 7,
-    valueOffset: LAYOUT_NODE_OFFSET_SHADOW_OFFSET,
-  },
-  "padding-top": { id: 18, kind: 1, valueOffset: LAYOUT_NODE_OFFSET_PADDING_TOP },
-  "padding-right": { id: 19, kind: 1, valueOffset: LAYOUT_NODE_OFFSET_PADDING_RIGHT },
-  "padding-bottom": { id: 20, kind: 1, valueOffset: LAYOUT_NODE_OFFSET_PADDING_BOTTOM },
-  "padding-left": { id: 21, kind: 1, valueOffset: LAYOUT_NODE_OFFSET_PADDING_LEFT },
-  "row-gap": { id: 22, kind: 1, valueOffset: LAYOUT_NODE_OFFSET_ROW_GAP },
-  "column-gap": { id: 23, kind: 1, valueOffset: LAYOUT_NODE_OFFSET_COLUMN_GAP },
-  "font-size": { id: 24, kind: 1, valueOffset: LAYOUT_NODE_OFFSET_FONT_SIZE },
-  "line-height": {
-    id: 25,
-    kind: 8,
-    valueOffset: LAYOUT_NODE_OFFSET_LINE_HEIGHT,
-    tagOffset: LAYOUT_NODE_OFFSET_LINE_HEIGHT_TAG,
-  },
-  translate: {
-    id: 26,
-    kind: 9,
-    // An active translate sample occupies the percentage-coefficient slots:
-    // the post-layout resolver has already consumed the authored transform's
-    // box-linear coefficients by then.
-    valueOffset: LAYOUT_NODE_OFFSET_TRANSFORM_PERCENT,
-  },
-});
-
-const PROPERTY_NAMES = new Map(
-  Object.entries(PROPERTY_REGISTRY).map(([name, value]) => [value.id, name]),
-);
-const COMPOSITE_VALUES = Object.freeze({ replace: 0, add: 1, accumulate: 2 });
-const EVENT_NAMES = Object.freeze([
-  "",
-  "animationstart",
-  "animationend",
-  "animationcancel",
-  "transitionstart",
-  "transitionend",
-  "transitioncancel",
-]);
-
-function lengthProperty(id, valueOffset, tagOffset, percentageOffset) {
-  return { id, kind: 2, valueOffset, tagOffset, percentageOffset };
-}
 
 function finite(value, label) {
   if (!Number.isFinite(value)) throw new TypeError(`${label} must be finite`);
   return value;
 }
 
-function firstFit(occupancy, count) {
-  if (count === 0) return 0;
-  let run = 0;
-  for (let index = 0; index < occupancy.length; index++) {
-    run = occupancy[index] === 0 ? run + 1 : 0;
-    if (run === count) return index - count + 1;
-  }
-  return -1;
-}
-
-function reserve(occupancy, offset, count) {
-  occupancy.fill(1, offset, offset + count);
-}
-
-function release(occupancy, offset, count) {
-  occupancy.fill(0, offset, offset + count);
-}
-
 export const normalizeOffsets = normalizeAnimationOffsets;
-
-
-
-// Per-ENGINE animation pool bookkeeping. Several controllers can share one
-// engine (persistent renderers created through one scene-renderer runtime),
-// so slot and pool occupancy must live per engine, not per controller —
-// otherwise two controllers double-book the same table rows and pool spans.
-// The table's occupant is per engine for the same reason (see acquire in
-// createAnimationController).
-const ENGINE_ANIMATION_POOLS = new WeakMap();
-
-function engineAnimationPools(engine) {
-  let pools = ENGINE_ANIMATION_POOLS.get(engine);
-  if (!pools) {
-    pools = {
-      trackReservations: new Set(),
-      keyframeOccupancy: new Uint8Array(KEYFRAME_POOL_CAPACITY),
-      transformOccupancy: new Uint8Array(TRANSFORM_COMPONENT_POOL_CAPACITY),
-      linearOccupancy: new Uint8Array(LINEAR_EASING_POOL_CAPACITY),
-      effectStackOccupancy: new Uint8Array(EFFECT_STACK_TABLE_CAPACITY),
-      occupant: null,
-    };
-    ENGINE_ANIMATION_POOLS.set(engine, pools);
-  }
-  return pools;
-}
 
 export function createAnimationController(engine, options = {}) {
   // Long-lived view over the shared engine+HarfBuzz memory — re-derived
@@ -295,6 +49,10 @@ export function createAnimationController(engine, options = {}) {
     ranges: [{ start: ANIMATION_EVENT_QUEUE_BASE, end: ANIMATION_EVENT_QUEUE_BASE + ANIMATION_EVENT_QUEUE_SIZE, category: "lifecycle" }],
   } : null;
   let view = new DataView(engine.memory.buffer);
+  // The track table, the effect stack table and the event queue move when
+  // they grow (src/wasm/engine-animation-pools.watpart): each address is
+  // read from the engine when it is used.
+  const trackAddress = (trackIndex) => engine.exports.animation_table_base() + trackIndex * ANIMATION_RECORD_SIZE;
   let sampleTime = null;
   let computedSamples = null;
   function bindComputedSamples(binding) {
@@ -304,11 +62,11 @@ export function createAnimationController(engine, options = {}) {
     if (!computedSamples || sampleTime === null) return;
     const { core, owner, elements } = computedSamples;
     for (const [slot, allocation] of allocations) {
-      const address = ANIMATION_TABLE_BASE + slot * ANIMATION_RECORD_SIZE;
+      const address = trackAddress(slot);
       const index = view.getUint16(address, true);
       const element = elements[index];
       if (!element || element._domCore !== core) continue;
-      const property = PROPERTY_REGISTRY[PROPERTY_NAMES.get(view.getUint16(address + 2, true))];
+      const property = propertyWithId(view.getUint16(address + 2, true));
       core.captureComputedSample(engine, owner, allocation.identity,
         element._coreHandle, index, address, property, sampleTime);
     }
@@ -347,59 +105,47 @@ export function createAnimationController(engine, options = {}) {
       view = measurement.wrapDataView(view, measurementOptions);
     }
   });
-  const pools = engineAnimationPools(engine);
-  const {
-    trackReservations,
-    keyframeOccupancy,
-    transformOccupancy,
-    linearOccupancy,
-    effectStackOccupancy,
-  } = pools;
   const allocations = new Map();
-  const liveTransitions = new Map();
-  const effectStacks = new Map();
-  let suppressEvents = false;
-  let declarationSequence = 0;
-  // Engine-table occupancy (shared-engine renderer coexistence). The engine
-  // tick samples every published track of the shared table and queues its
-  // events, so the table publishes the tracks of one controller only: the
-  // occupant's. The tracks of every other controller are suspended. A
-  // suspended track keeps its record bytes and JS bookkeeping but carries
-  // state 0, so the occupant's tick neither samples it onto the occupant's
-  // scene nodes nor queues an event that the occupant cannot identify.
-  // Time-based sampling makes suspension lossless: progress is a pure
-  // function of the tick time, never of elapsed ticks. The shared
-  // trackReservations set keeps a suspended (state 0) slot from being
-  // claimed by another controller.
-  const suspendedTrackStates = new Map();
-  const occupancy = Object.freeze({ suspend });
-
-  // Every operation that publishes a track or ticks the table acquires the
-  // table first, in the same synchronous turn. An acquisition does not hold
-  // across an await: another controller can acquire the table meanwhile.
-  function acquire() {
-    if (pools.occupant === occupancy) return;
-    pools.occupant?.suspend();
-    for (const [trackIndex, state] of suspendedTrackStates) {
-      view.setUint8(
-        ANIMATION_TABLE_BASE + trackIndex * ANIMATION_RECORD_SIZE + 4,
-        state,
-      );
-    }
-    suspendedTrackStates.clear();
-    pools.occupant = occupancy;
+  // This controller's effect stack on a node's property, or null
+  // (animation_owner_stack).
+  function stackOf(nodeIndex, propertyId) {
+    const index = engine.exports.animation_owner_stack(owner, nodeIndex, propertyId);
+    return index === 0xffff ? null : { index };
   }
 
-  function suspend() {
-    for (const trackIndex of allocations.keys()) {
-      if (suspendedTrackStates.has(trackIndex)) continue;
-      const address = ANIMATION_TABLE_BASE +
-        trackIndex * ANIMATION_RECORD_SIZE + 4;
-      const state = view.getUint8(address);
-      if (state === 0) continue;
-      suspendedTrackStates.set(trackIndex, state);
-      view.setUint8(address, 0);
-    }
+  // An animation property from the core's table, by its id: its canonical
+  // name, its value kind and where its value lies in a node row.
+  function propertyWithId(id) {
+    const layout = new DataView(engine.memory.buffer, engine.exports.animation_property_layout(id), 16);
+    const property = {
+      id,
+      valueOffset: layout.getUint32(0, true),
+      tagOffset: layout.getUint32(4, true),
+      percentageOffset: layout.getUint32(8, true),
+      kind: layout.getUint32(12, true),
+    };
+    property.name = animationPropertyName(id);
+    return property;
+  }
+
+  // An animation property by its CSS or IDL name, or null for a name the
+  // core does not know.
+  function propertyNamed(propertyName) {
+    const property = animationProperty(String(propertyName));
+    return property === null ? null : propertyWithId(property.id);
+  }
+  let suppressEvents = false;
+  // This controller's identity in the engine: its tracks and stacks carry
+  // it, and the engine orders them by it.
+  const owner = engine.exports.animation_owner_create();
+
+  // Every operation that publishes a track or ticks the table acquires the
+  // table first, in the same synchronous turn: the engine publishes one
+  // owner's tracks at a time and suspends the others' (animation_acquire).
+  // An acquisition does not hold across an await: another controller can
+  // acquire the table meanwhile.
+  function acquire() {
+    engine.exports.animation_acquire(owner);
   }
 
   // Layout-row ownership (shared-engine renderer coexistence). Renderers
@@ -409,42 +155,33 @@ export function createAnimationController(engine, options = {}) {
   // restored into them only while they fill the buffer. A controller alone
   // on its engine always owns the rows.
   const ownsLayoutRows = options.ownsLayoutRows ?? (() => true);
-  // Effect stacks declared while another scene's rows filled the buffer.
-  // Their base waits until this controller's rows are back.
-  const deferredBaseStacks = new Set();
-  // A deferred stack's base until it is read. The engine does not read it:
-  // a cancel before the read restores nothing, and every tick and layout
-  // of this controller's rows comes after the read.
-  const DEFERRED_BASE = Object.freeze({ tag: 0, values: Object.freeze([]) });
+  // A stack declared while another scene's rows fill the buffer waits for
+  // its base until this controller's rows are back (envelope flag 1); the
+  // engine reads it then (animation_owner_read_bases). Until then a cancel
+  // restores nothing, and every tick and layout of this controller's rows
+  // comes after the read.
+  const NO_BASE = Object.freeze({ tag: 0, values: Object.freeze([]) });
+
+  // An engine input block of $byteLength bytes and a view over it. The
+  // allocation can grow the memory, so the view is taken after it.
+  function engineInput(byteLength) {
+    const pointer = engine.exports.abi_allocate(byteLength);
+    if (pointer === 0) throw new RangeError(`Cannot allocate ${byteLength} bytes of animation input`);
+    return { pointer, input: new DataView(engine.memory.buffer, pointer, byteLength) };
+  }
 
   function writeStackBase(stack, base) {
-    stack.base = base;
-    const entryAddress = EFFECT_STACK_TABLE_BASE +
-      stack.index * EFFECT_STACK_ENTRY_SIZE;
-    view.setUint8(entryAddress + 4, base.tag);
+    const { pointer, input } = engineInput(28);
+    input.setUint32(0, base.tag, true);
     for (let index = 0; index < 6; index++) {
-      view.setFloat32(entryAddress + 8 + index * 4, base.values[index] ?? 0, true);
+      input.setFloat32(4 + index * 4, base.values[index] ?? 0, true);
     }
-    for (const trackIndex of stack.tracks) {
-      const address = ANIMATION_TABLE_BASE + trackIndex * ANIMATION_RECORD_SIZE;
-      view.setUint8(address + 58, base.tag);
-      for (let index = 0; index < 6; index++) {
-        view.setFloat32(address + 60 + index * 4, base.values[index] ?? 0, true);
-      }
-    }
+    engine.exports.animation_stack_write_base(stack.index, pointer);
   }
 
   // The caller guarantees that this controller's rows fill the buffer.
   function readDeferredBases() {
-    for (const stack of deferredBaseStacks) {
-      const entryAddress = EFFECT_STACK_TABLE_BASE +
-        stack.index * EFFECT_STACK_ENTRY_SIZE;
-      const property = PROPERTY_REGISTRY[
-        PROPERTY_NAMES.get(view.getUint16(entryAddress + 2, true))
-      ];
-      writeStackBase(stack, snapshotBase(view.getUint16(entryAddress, true), property));
-    }
-    deferredBaseStacks.clear();
+    engine.exports.animation_owner_read_bases(owner);
   }
 
   // Whether this controller's rows fill the buffer. Owning them, the
@@ -459,8 +196,11 @@ export function createAnimationController(engine, options = {}) {
   // another scene's rows fill the buffer it restores nothing: those rows are
   // not this controller's to write, and the next frame of this controller
   // writes every row of its scene again after that foreign write.
+  // The engine ends and frees the track; its cancel event is delivered.
   function cancelTrack(trackIndex) {
-    return engine.exports.cancel_animation(trackIndex, ownsRows() ? 1 : 0);
+    const writes = engine.exports.cancel_animation(trackIndex, ownsRows() ? 1 : 0);
+    settle(false);
+    return writes;
   }
 
   // The layout that follows reads the table and this controller's rows,
@@ -473,268 +213,91 @@ export function createAnimationController(engine, options = {}) {
   function cancelAll() {
     if (computedSamples) computedSamples.core.status("computed_samples_clear", computedSamples.owner);
     let writeCount = 0;
-    const transitions = [...liveTransitions].map(([key, state]) => [key, state, animationTransitionRevision(state)]);
-    try {
-      for (const [trackIndex, owned] of [...allocations]) {
-        if (allocations.get(trackIndex) !== owned) continue;
-        acquire();
-        writeCount += cancelTrack(trackIndex);
-        try { drainEvents(trackIndex); }
-        finally { freeTrack(trackIndex, owned); }
-      }
-      // A controller without tracks releases the table, so the engine keeps
-      // no reference to a controller that has shut down.
-      if (allocations.size === 0 && pools.occupant === occupancy) {
-        pools.occupant = null;
-      }
-    } finally {
-      for (const [key, state, revision] of transitions) {
-        if (liveTransitions.get(key) !== state || animationTransitionRevision(state) !== revision) continue;
-        liveTransitions.delete(key);
-        releaseAnimationTransition(state);
-      }
+    for (const [trackIndex, owned] of [...allocations]) {
+      if (allocations.get(trackIndex) !== owned) continue;
+      acquire();
+      writeCount += cancelTrack(trackIndex);
     }
+    // A controller without tracks releases the table.
+    if (allocations.size === 0) engine.exports.animation_owner_release(owner);
     return writeCount;
   }
-
-
-  function compactDeclarationSequences() {
-    const activeTrackIndices = [...allocations.keys()].sort((
-      left,
-      right,
-    ) =>
-      view.getUint32(
-        ANIMATION_TABLE_BASE + left * ANIMATION_RECORD_SIZE + 96,
-        true,
-      ) -
-      view.getUint32(
-        ANIMATION_TABLE_BASE + right * ANIMATION_RECORD_SIZE + 96,
-        true,
-      )
-    );
-    for (
-      let sequenceIndex = 0;
-      sequenceIndex < activeTrackIndices.length;
-      sequenceIndex++
-    ) {
-      view.setUint32(
-        ANIMATION_TABLE_BASE +
-          activeTrackIndices[sequenceIndex] * ANIMATION_RECORD_SIZE + 96,
-        (sequenceIndex + 1) * 1024,
-        true,
-      );
-    }
-    declarationSequence = activeTrackIndices.length * 1024;
-  }
-
-  function writeEasing(kindAddress, payloadAddress, easing, reservations) {
-    view.setUint8(kindAddress, easing.kind);
-    for (let index = 0; index < 4; index++) {
-      view.setFloat32(
-        payloadAddress + index * 4,
-        easing.payload?.[index] ?? 0,
-        true,
-      );
-    }
-    if (easing.kind === 3) {
-      const pointOffset = firstFit(linearOccupancy, easing.points.length);
-      if (pointOffset < 0) throw new RangeError("LINEAR_EASING_POOL is full");
-      reserve(linearOccupancy, pointOffset, easing.points.length);
-      reservations.push(() =>
-        release(linearOccupancy, pointOffset, easing.points.length)
-      );
-      for (let index = 0; index < easing.points.length; index++) {
-        const pointAddress = LINEAR_EASING_POOL_BASE +
-          (pointOffset + index) * LINEAR_EASING_ENTRY_SIZE;
-        view.setFloat32(pointAddress, easing.points[index].input, true);
-        view.setFloat32(pointAddress + 4, easing.points[index].output, true);
-      }
-      view.setUint32(
-        payloadAddress,
-        pointOffset * LINEAR_EASING_ENTRY_SIZE,
-        true,
-      );
-      view.setUint32(payloadAddress + 4, easing.points.length, true);
-    }
-  }
-
+  // The node's value beneath every effect, as the engine reads it from the
+  // node row (animation_node_base, engine-animation-tracks.watpart).
   function snapshotBase(nodeIndex, property) {
-    const nodeAddress = engine.exports.layout_buffer_base() + nodeIndex * LAYOUT_NODE_SIZE;
-    if (property.kind === 2) {
-      const tag = view.getUint8(nodeAddress + property.tagOffset);
-      const stored = view.getFloat32(nodeAddress + property.valueOffset, true);
-      if (tag === SIZE_TAG_LENGTH) return { tag, values: [stored, 0, stored] };
-      if (tag === SIZE_TAG_PERCENT) {
-        return { tag, values: [0, stored / 100, stored] };
-      }
-      if (tag === SIZE_TAG_CALC_PAIR) {
-        return {
-          tag,
-          values: [
-            stored,
-            view.getFloat32(nodeAddress + property.percentageOffset, true),
-            stored,
-          ],
-        };
-      }
-      return { tag, values: [0, 0, stored] };
-    }
-    if (property.kind === 3) {
-      return {
-        tag: 0,
-        values: [0, 1, 2, 3].map((index) =>
-          view.getFloat32(nodeAddress + property.valueOffset + index * 4, true)
-        ),
-      };
-    }
-    if (property.kind === 4) {
-      return {
-        tag: 0,
-        values: [0, 1, 2, 3, 4, 5].map((index) =>
-          view.getFloat32(nodeAddress + property.valueOffset + index * 4, true)
-        ),
-      };
-    }
-    if (property.kind === 9) {
-      return {
-        tag: 0,
-        values: [0, 1, 2, 3].map((index) =>
-          view.getFloat32(nodeAddress + property.valueOffset + index * 4, true)
-        ),
-      };
-    }
-    if (property.kind === 6) {
-      return {
-        tag: view.getUint8(nodeAddress + property.valueOffset),
-        values: [view.getUint8(nodeAddress + property.valueOffset)],
-      };
-    }
-    if (property.kind === 7) {
-      // The node's own span: what the track's end restores.
-      return {
-        tag: 0,
-        values: [
-          view.getUint32(nodeAddress + LAYOUT_NODE_OFFSET_SHADOW_OFFSET, true),
-          view.getUint8(nodeAddress + LAYOUT_NODE_OFFSET_SHADOW_COUNT),
-          (view.getUint16(nodeAddress + LAYOUT_NODE_OFFSET_FLAGS, true) & LAYOUT_FLAG_HAS_BOX_SHADOW) ? 1 : 0,
-        ],
-      };
-    }
-    if (property.kind === 8) {
-      const tag = view.getUint8(nodeAddress + property.tagOffset);
-      return { tag, values: [view.getFloat32(nodeAddress + property.valueOffset, true), tag] };
-    }
+    const pointer = engine.exports.animation_node_base(nodeIndex, property.id);
+    const base = new DataView(engine.memory.buffer, pointer, 28);
     return {
-      tag: 0,
-      values: [view.getFloat32(nodeAddress + property.valueOffset, true)],
+      tag: base.getUint32(0, true),
+      values: [0, 1, 2, 3, 4, 5].map((index) => base.getFloat32(4 + index * 4, true)),
     };
   }
 
-  // The shadow list the node paints now: its record's span, or the span an
-  // earlier box-shadow track is sampling into. The start of an interrupting
-  // transition.
-  function liveShadowList(nodeIndex) {
-    const nodeAddress = engine.exports.layout_buffer_base() + nodeIndex * LAYOUT_NODE_SIZE;
-    const painted = (view.getUint16(nodeAddress + LAYOUT_NODE_OFFSET_FLAGS, true) & LAYOUT_FLAG_HAS_BOX_SHADOW) !== 0;
-    const count = painted ? view.getUint8(nodeAddress + LAYOUT_NODE_OFFSET_SHADOW_COUNT) : 0;
-    const span = SHADOW_POOL_BASE + view.getUint32(nodeAddress + LAYOUT_NODE_OFFSET_SHADOW_OFFSET, true);
-    const shadows = [];
-    for (let index = 0; index < count; index++) {
-      const entry = span + index * SHADOW_ENTRY_SIZE;
-      shadows.push({
-        offsetX: view.getFloat32(entry, true),
-        offsetY: view.getFloat32(entry + 4, true),
-        blur: view.getFloat32(entry + 8, true),
-        spread: view.getFloat32(entry + 12, true),
-        color: [0, 1, 2, 3].map((k) => view.getFloat32(entry + SHADOW_OFFSET_COLOR + k * 4, true)),
-        inset: view.getUint8(entry + SHADOW_OFFSET_INSET) === 1,
-      });
-    }
-    return { kind: "shadowList", shadows };
-  }
+  // The identities of each event batch being delivered. A track that host
+  // code ends during a delivery leaves every batch: its later events in
+  // that batch are not delivered.
+  const deliveringBatches = new Set();
 
-  function drainEvents(expectedTrackIndex = null) {
+  // Takes what the last engine operation queued: its events, each naming
+  // its track, and the tracks it ended, which the engine has already freed.
+  // The ended tracks leave this controller before any host code runs, so
+  // a slot the engine frees is never declared again while this controller
+  // still holds it. `sampled`: the ended tracks were sampled by a tick,
+  // whose computed samples stay readable.
+  function settle(sampled) {
     const eventCount = view.getUint32(ANIMATION_RESULT_BASE + 12, true);
     const events = [];
-    // Resolve every old queue record before invoking host code. A nested cancel
-    // or tick owns a new queue and cannot overwrite the batch being delivered.
     for (let index = 0; index < eventCount; index++) {
-      const eventAddress = ANIMATION_EVENT_QUEUE_BASE + index * ANIMATION_EVENT_ENTRY_SIZE;
-      const nodeIndex = view.getUint16(eventAddress, true);
-      const propertyId = view.getUint16(eventAddress + 2, true);
-      const typeId = view.getUint8(eventAddress + 4);
-      const trackIndex = identifyAnimationFeedback(view, allocations, ANIMATION_TABLE_BASE,
-        ANIMATION_RECORD_SIZE, nodeIndex, propertyId, typeId, expectedTrackIndex);
-      if (trackIndex < 0) {
-        throw new Error(`Cannot identify ${EVENT_NAMES[typeId]} track for node ${nodeIndex} property ${propertyId}`);
-      }
+      const eventAddress = engine.exports.animation_event_queue_base() + index * ANIMATION_EVENT_ENTRY_SIZE;
+      const trackIndex = view.getUint16(eventAddress + 6, true);
       const allocation = allocations.get(trackIndex);
-      events.push({ nodeIndex, propertyId, propertyName: PROPERTY_NAMES.get(propertyId),
-        trackIndex, type: EVENT_NAMES[typeId], animationId: allocation.animationId,
+      const type = animationEventName(view.getUint8(eventAddress + 4));
+      if (!allocation) {
+        throw new Error(`The engine queued ${type} for track ${trackIndex}, which this controller does not hold`);
+      }
+      const propertyId = view.getUint16(eventAddress + 2, true);
+      events.push({ nodeIndex: view.getUint16(eventAddress, true), propertyId, propertyName: animationPropertyName(propertyId),
+        trackIndex, type, animationId: allocation.animationId,
         trackGeneration: allocation.trackGeneration, identity: allocation.identity });
     }
     view.setUint32(ANIMATION_RESULT_BASE + 12, 0, true);
-    if (!suppressEvents) {
+    const endedCount = engine.exports.animation_ended_count();
+    const ended = [];
+    for (let index = 0; index < endedCount; index++) ended.push(engine.exports.animation_ended_track(index));
+    engine.exports.animation_ended_clear();
+    for (const trackIndex of ended) releaseTrack(trackIndex, sampled);
+    if (suppressEvents) return;
+    const batch = new Set(events.map((event) => event.identity));
+    deliveringBatches.add(batch);
+    try {
       for (const event of events) {
-        if (allocations.get(event.trackIndex)?.identity === event.identity) options.onEvent?.(event);
+        if (batch.has(event.identity)) options.onEvent?.(event);
       }
+    } finally {
+      deliveringBatches.delete(batch);
     }
-    return eventCount;
   }
 
   function cancelReplacedTracks(nodeIndex, propertyId) {
     let cursor = 0;
     for (;;) {
-      const trackIndex = nextAnimationReplacement(view, allocations, ANIMATION_TABLE_BASE,
+      const trackIndex = nextAnimationReplacement(view, allocations, engine.exports.animation_table_base(),
         ANIMATION_RECORD_SIZE, nodeIndex, propertyId, cursor);
       if (trackIndex < 0) return;
       cursor = trackIndex + 1;
-      const owned = allocations.get(trackIndex);
       cancelTrack(trackIndex);
-      try { drainEvents(trackIndex); }
-      finally { freeTrack(trackIndex, owned); }
     }
   }
 
-  function freeTrack(trackIndex, expected = allocations.get(trackIndex), sampled = false) {
+  // Lets go of a track the engine has ended and freed.
+  function releaseTrack(trackIndex, sampled) {
     const owned = allocations.get(trackIndex);
-    if (!owned) return;
-    if (owned !== expected) return;
-    if (!sampled) forgetComputedSample(owned.identity);
-    const recordAddress = ANIMATION_TABLE_BASE +
-      trackIndex * ANIMATION_RECORD_SIZE;
-    const stackIndex = view.getUint16(recordAddress + 110, true);
-    const nodeIndex = view.getUint16(recordAddress, true);
-    const propertyId = view.getUint16(recordAddress + 2, true);
-    const key = `${nodeIndex}:${propertyId}`;
-    const stack = effectStacks.get(key);
-    if (stack && stack.index === stackIndex) {
-      stack.tracks = stack.tracks.filter((index) => index !== trackIndex);
-      for (let index = 0; index < stack.tracks.length; index++) {
-        const next = stack.tracks[index + 1] ?? 0xffff;
-        view.setUint16(
-          ANIMATION_TABLE_BASE + stack.tracks[index] * ANIMATION_RECORD_SIZE +
-            92,
-          next,
-          true,
-        );
-      }
-      const entryAddress = EFFECT_STACK_TABLE_BASE +
-        stack.index * EFFECT_STACK_ENTRY_SIZE;
-      if (stack.tracks.length === 0) {
-        view.setUint8(entryAddress + 6, 0);
-        effectStackOccupancy[stack.index] = 0;
-        effectStacks.delete(key);
-        deferredBaseStacks.delete(stack);
-      } else {
-        view.setUint16(entryAddress + 32, stack.tracks[0], true);
-        view.setUint16(entryAddress + 34, stack.tracks.at(-1), true);
-      }
+    if (!owned) {
+      throw new Error(`The engine ended track ${trackIndex}, which this controller does not hold`);
     }
-    for (const releaseAllocation of owned) releaseAllocation();
+    if (!sampled) forgetComputedSample(owned.identity);
     allocations.delete(trackIndex);
-    trackReservations.delete(trackIndex);
-    suspendedTrackStates.delete(trackIndex);
+    for (const batch of deliveringBatches) batch.delete(owned.identity);
     releaseAnimationTrackIdentity(owned.identity);
   }
 
@@ -756,297 +319,164 @@ export function createAnimationController(engine, options = {}) {
     transition = false,
     declarationOptions = {},
   ) {
-    requireRecordNodeIndex(nodeIndex);
     // The declaration reads the node's row. The layout buffer holds the
     // engine's live node capacity, which grows with the scene
     // (node_tables_reserve); the caller reserves the scene's rows first.
-    const nodeCapacity = engine.exports.node_capacity();
-    if (nodeIndex >= nodeCapacity) {
-      throw new RangeError(
-        `nodeIndex ${nodeIndex} is outside the layout buffer of ${nodeCapacity} nodes; reserve the scene's node tables before declaring its animations`,
-      );
-    }
-    const property = PROPERTY_REGISTRY[propertyName];
-    if (!property) {
-      throw new TypeError(
-        `Property is not registered for animation: ${propertyName}`,
-      );
-    }
-    const composite = COMPOSITE_VALUES[timing.composite ?? "replace"];
-    if (composite == null) {
-      throw new TypeError(`Unsupported composite mode: ${timing.composite}`);
-    }
-    if (
-      (property.kind === 3 || property.kind === 5 || property.kind === 6 || property.kind === 7 || property.kind === 8) &&
-      composite !== 0
-    ) {
-      throw new TypeError(`${propertyName} only supports replace composition`);
-    }
-    const frames = normalizeOffsets(rawFrames).map((frame) => ({
+    const property = propertyNamed(propertyName);
+    const composite = checkAnimationTrack(nodeIndex, engine.exports.node_capacity(), property, propertyName,
+      timing.composite ?? "replace");
+    // An engine-planned transition gives its frames normalized.
+    const frames = declarationOptions.normalizedFrames ?? normalizeOffsets(rawFrames).map((frame) => ({
       offset: frame.offset,
       easing: normalizeEasing(frame.easing ?? "linear"),
       value: normalizeValue(property, frame.value),
     }));
-    const effectiveKind = frames.some((frame) => frame.value.kind === 5)
-      ? 5
-      : property.kind;
-    if (effectiveKind === 5 && composite !== 0) {
-      throw new TypeError("Discrete tracks only support replace composition");
-    }
-    if (
-      frames.some((frame) =>
-        frame.value.kind !== effectiveKind &&
-        !(effectiveKind === 5 && frame.value.kind === 2)
-      )
-    ) {
-      throw new TypeError(
-        "Every keyframe in a track must have a compatible value kind",
-      );
-    }
+    const effectiveKind = animationTrackKind(property.kind, composite, frames);
 
     // The declared track publishes immediately, and its replaced tracks
-    // publish their cancellation.
+    // publish their cancellation. A transition takes its start and its
+    // shortening while the effect it replaces still runs.
     acquire();
-    const reservations = [];
-    let publishedTrack = -1;
-    try {
-      const trackIndex = [...Array(ANIMATION_TABLE_CAPACITY).keys()].find((
-        index,
-      ) =>
-        !trackReservations.has(index) &&
-        view.getUint8(
-          ANIMATION_TABLE_BASE + index * ANIMATION_RECORD_SIZE + 4,
-        ) === 0
-      );
-      if (trackIndex == null) throw new RangeError("ANIMATION_TABLE is full");
-      trackReservations.add(trackIndex);
-      reservations.push(() => trackReservations.delete(trackIndex));
-      const keyframeOffset = firstFit(keyframeOccupancy, frames.length);
-      if (keyframeOffset < 0) {
-        throw new RangeError(
-          "KEYFRAME_POOL has no contiguous span large enough",
-        );
-      }
-      reserve(keyframeOccupancy, keyframeOffset, frames.length);
-      reservations.push(() =>
-        release(keyframeOccupancy, keyframeOffset, frames.length)
-      );
-
-      const normalizedFrames = [];
-      for (const frame of frames) {
-        let transformOffset = 0;
-        let transformCount = 0;
-        if (frame.value.components) {
-          transformCount = frame.value.components.length;
-          transformOffset = firstFit(transformOccupancy, transformCount);
-          if (transformOffset < 0) {
-            throw new RangeError(
-              "TRANSFORM_COMPONENT_POOL has no contiguous span large enough",
-            );
-          }
-          reserve(transformOccupancy, transformOffset, transformCount);
-          reservations.push(() =>
-            release(transformOccupancy, transformOffset, transformCount)
-          );
-          for (let index = 0; index < transformCount; index++) {
-            const component = frame.value.components[index];
-            const componentAddress = TRANSFORM_COMPONENT_POOL_BASE +
-              (transformOffset + index) * TRANSFORM_COMPONENT_ENTRY_SIZE;
-            view.setUint8(componentAddress, component.kind);
-            for (let parameter = 0; parameter < 6; parameter++) {
-              view.setFloat32(
-                componentAddress + 4 + parameter * 4,
-                component.parameters[parameter],
-                true,
-              );
-            }
-          }
-        }
-        normalizedFrames.push({ ...frame, transformOffset, transformCount });
-      }
-
-      if (composite === 0 && !declarationOptions.preserveReplacedTracks) {
-        cancelReplacedTracks(nodeIndex, property.id);
-      }
-      const stackKey = `${nodeIndex}:${property.id}`;
-      let stack = effectStacks.get(stackKey);
-      const rowsOwned = ownsRows();
-      const base = stack?.base ??
-        (rowsOwned ? snapshotBase(nodeIndex, property) : DEFERRED_BASE);
-      const address = ANIMATION_TABLE_BASE + trackIndex * ANIMATION_RECORD_SIZE;
-      writeAnimationTrack(engine.memory, address, nodeIndex, property.id, timing,
-        transition, composite, keyframeOffset * KEYFRAME_ENTRY_SIZE,
-        normalizedFrames.length, base, effectiveKind);
-      const defaultEasing = normalizeEasing(timing.easing ?? "linear");
-      writeEasing(address + 7, address + 8, defaultEasing, reservations);
-      const beforeTrackIndices = declarationOptions.beforeTrackIndices;
-      let nextDeclarationSequence;
-      if (beforeTrackIndices?.size) {
-        let followingSequence = Infinity;
-        for (const beforeTrackIndex of beforeTrackIndices) {
-          if (!allocations.has(beforeTrackIndex)) continue;
-          const sequence = view.getUint32(
-            ANIMATION_TABLE_BASE +
-              beforeTrackIndex * ANIMATION_RECORD_SIZE + 96,
-            true,
-          );
-          if (sequence < followingSequence) followingSequence = sequence;
-        }
-        if (followingSequence !== Infinity) {
-          let previousSequence = 0;
-          for (
-            let candidateTrackIndex = 0;
-            candidateTrackIndex < ANIMATION_TABLE_CAPACITY;
-            candidateTrackIndex++
-          ) {
-            if (!allocations.has(candidateTrackIndex)) continue;
-            const sequence = view.getUint32(
-              ANIMATION_TABLE_BASE +
-                candidateTrackIndex * ANIMATION_RECORD_SIZE + 96,
-              true,
-            );
-            if (sequence < followingSequence && sequence > previousSequence) {
-              previousSequence = sequence;
-            }
-          }
-          if (followingSequence - previousSequence <= 1) {
-            compactDeclarationSequences();
-            followingSequence = Math.min(
-              ...[...beforeTrackIndices]
-                .filter((beforeTrackIndex) => allocations.has(beforeTrackIndex))
-                .map((beforeTrackIndex) =>
-                  view.getUint32(
-                    ANIMATION_TABLE_BASE +
-                      beforeTrackIndex * ANIMATION_RECORD_SIZE + 96,
-                    true,
-                  )
-                ),
-            );
-            previousSequence = 0;
-            for (
-              let candidateTrackIndex = 0;
-              candidateTrackIndex < ANIMATION_TABLE_CAPACITY;
-              candidateTrackIndex++
-            ) {
-              if (!allocations.has(candidateTrackIndex)) continue;
-              const sequence = view.getUint32(
-                ANIMATION_TABLE_BASE +
-                  candidateTrackIndex * ANIMATION_RECORD_SIZE + 96,
-                true,
-              );
-              if (
-                sequence < followingSequence && sequence > previousSequence
-              ) {
-                previousSequence = sequence;
-              }
-            }
-          }
-          nextDeclarationSequence = Math.floor(
-            (previousSequence + followingSequence) / 2,
-          );
-        }
-      }
-      if (nextDeclarationSequence === undefined) {
-        if (declarationSequence > 0xfffffbff) {
-          compactDeclarationSequences();
-        }
-        declarationSequence += 1024;
-        nextDeclarationSequence = declarationSequence;
-      }
-      view.setUint32(address + 96, nextDeclarationSequence, true);
-      let newStack = false;
-      if (!stack) {
-        const stackIndex = effectStackOccupancy.indexOf(0);
-        if (stackIndex < 0) throw new RangeError("EFFECT_STACK_TABLE is full");
-        stack = { index: stackIndex, base, kind: effectiveKind, tracks: [] };
-        newStack = true;
-      }
-      view.setUint16(address + 110, stack.index, true);
-
-      for (let index = 0; index < normalizedFrames.length; index++) {
-        const frame = normalizedFrames[index];
-        const frameAddress = KEYFRAME_POOL_BASE +
-          (keyframeOffset + index) * KEYFRAME_ENTRY_SIZE;
-        writeAnimationKeyframe(engine.memory, frameAddress, frame,
-          frame.transformOffset * TRANSFORM_COMPONENT_ENTRY_SIZE);
-        writeEasing(
-          frameAddress + 4,
-          frameAddress + 8,
-          frame.easing,
-          reservations,
-        );
-      }
-      const entryAddress = EFFECT_STACK_TABLE_BASE +
-        stack.index * EFFECT_STACK_ENTRY_SIZE;
-      if (newStack) {
-        new Uint8Array(
-          engine.memory.buffer,
-          entryAddress,
-          EFFECT_STACK_ENTRY_SIZE,
-        ).fill(0);
-        if (measurement) measurement.record({ category: "animation", operation: "effect-stack.zero", direction: "host-to-engine", bytes: EFFECT_STACK_ENTRY_SIZE, allocations: 1 });
-        view.setUint16(entryAddress, nodeIndex, true);
-        view.setUint16(entryAddress + 2, property.id, true);
-        view.setUint8(entryAddress + 4, base.tag);
-        view.setUint8(entryAddress + 5, effectiveKind);
-        for (let index = 0; index < 6; index++) {
-          view.setFloat32(
-            entryAddress + 8 + index * 4,
-            base.values[index] ?? 0,
-            true,
-          );
-        }
-        effectStackOccupancy[stack.index] = 1;
-        effectStacks.set(stackKey, stack);
-        if (!rowsOwned) deferredBaseStacks.add(stack);
-      }
-      const insertionIndex = beforeTrackIndices?.size
-        ? stack.tracks.findIndex((existingTrackIndex) =>
-          beforeTrackIndices.has(existingTrackIndex)
-        )
-        : -1;
-      if (insertionIndex < 0) stack.tracks.push(trackIndex);
-      else stack.tracks.splice(insertionIndex, 0, trackIndex);
-      for (let index = 0; index < stack.tracks.length; index++) {
-        view.setUint16(
-          ANIMATION_TABLE_BASE +
-            stack.tracks[index] * ANIMATION_RECORD_SIZE + 92,
-          stack.tracks[index + 1] ?? 0xffff,
-          true,
-        );
-      }
-      view.setUint16(entryAddress + 32, stack.tracks[0], true);
-      view.setUint16(entryAddress + 34, stack.tracks.at(-1), true);
-      view.setUint8(entryAddress + 6, 1);
-      reservations.identity = createAnimationTrackIdentity(declarationOptions.animationId);
-      reservations.animationId = declarationOptions.animationId ?? reservations.identity;
-      reservations.trackGeneration = declarationOptions.trackGeneration ?? 1;
-      allocations.set(trackIndex, reservations);
-      view.setUint8(address + 4, 1); // publish last
-      publishedTrack = trackIndex;
-      return trackIndex;
-    } catch (error) {
-      if (publishedTrack >= 0) {
-        view.setUint8(
-          ANIMATION_TABLE_BASE + publishedTrack * ANIMATION_RECORD_SIZE + 4,
-          0,
-        );
-      }
-      if (reservations.identity) releaseAnimationTrackIdentity(reservations.identity);
-      for (let index = reservations.length - 1; index >= 0; index--) {
-        reservations[index]();
-      }
-      throw error;
+    const change = declarationOptions.change;
+    const pending = change ? beginTransition(nodeIndex, property, propertyName, change) : 0;
+    if (composite === 0 && !declarationOptions.preserveReplacedTracks) {
+      cancelReplacedTracks(nodeIndex, property.id);
     }
+    const stack = stackOf(nodeIndex, property.id);
+    const rowsOwned = ownsRows();
+    const base = stack || !rowsOwned ? NO_BASE : snapshotBase(nodeIndex, property);
+    const beforeTrackIndices = declarationOptions.beforeTrackIndices;
+    const envelope = writeDeclaration({
+      nodeIndex,
+      propertyId: property.id,
+      timing,
+      transition,
+      composite,
+      effectiveKind,
+      frames,
+      easing: normalizeEasing(timing.easing ?? "linear"),
+      base,
+      stackIndex: stack?.index ?? 0xffff,
+      beforeTrackIndices: [...(beforeTrackIndices ?? [])],
+      deferredBase: !stack && !rowsOwned,
+    });
+    if (change) engine.exports.animation_transition_apply(envelope);
+    const trackIndex = engine.exports.animation_track_declare(envelope);
+    if (trackIndex < 0) throwAnimationDeclarationError(trackIndex);
+    if (change) {
+      if (view.getUint32(pending + 12, true) === 1) change.start = startValueAt(property, pending + 168);
+      const { pointer, input } = engineInput(28);
+      input.setUint32(0, change.base.tag, true);
+      for (let index = 0; index < 6; index++) {
+        input.setFloat32(4 + index * 4, change.base.values[index] ?? 0, true);
+      }
+      engine.exports.animation_transition_commit(trackIndex, pointer);
+    }
+    const identity = createAnimationTrackIdentity(declarationOptions.animationId);
+    allocations.set(trackIndex, {
+      identity,
+      animationId: declarationOptions.animationId ?? identity,
+      trackGeneration: declarationOptions.trackGeneration ?? 1,
+    });
+    return trackIndex;
   }
 
+
+  // The declaration envelope of animation_track_declare
+  // (src/wasm/engine-animation-tracks.watpart).
+  function writeDeclaration(declaration) {
+    const { frames, timing } = declaration;
+    // The core validates the numbers; its calls can recycle transient
+    // blocks, so they run before the envelope is allocated.
+    const startTime = animationNumber(timing.startTime ?? 0, "The start time");
+    const duration = animationNumber(timing.duration ?? 0, "The duration");
+    const delay = animationNumber(timing.delay ?? 0, "The delay");
+    const iterations = animationNumber(timing.iterations ?? 1, "The iteration count", 2);
+    const fillMode = animationFillMode(timing.fill);
+    const directionMode = animationDirectionMode(timing.direction);
+    const easingPoints = (easing) => easing.kind === 3 ? easing.points.length : 0;
+    const frameBytes = frames.length * 104;
+    const before = declaration.beforeTrackIndices;
+    let extraBytes = easingPoints(declaration.easing) * 8 + before.length * 4;
+    for (const frame of frames) {
+      extraBytes += easingPoints(frame.easing) * 8 + (frame.value.components?.length ?? 0) * 28;
+    }
+    const { pointer, input } = engineInput(144 + frameBytes + extraBytes);
+    let extra = 144 + frameBytes;
+    const writeEasingBlock = (at, easing) => {
+      input.setUint32(at, easing.kind, true);
+      for (let index = 0; index < 4; index++) {
+        input.setFloat32(at + 4 + index * 4, easing.kind === 3 ? 0 : easing.payload?.[index] ?? 0, true);
+      }
+      const count = easingPoints(easing);
+      input.setUint32(at + 20, count, true);
+      input.setUint32(at + 24, pointer + extra, true);
+      for (let index = 0; index < count; index++) {
+        input.setFloat32(extra, easing.points[index].input, true);
+        input.setFloat32(extra + 4, easing.points[index].output, true);
+        extra += 8;
+      }
+    };
+    input.setUint32(0, declaration.nodeIndex, true);
+    input.setUint32(4, declaration.propertyId, true);
+    input.setUint32(8, fillMode, true);
+    input.setUint32(12, directionMode, true);
+    input.setUint32(16, declaration.transition ? 1 : 0, true);
+    input.setUint32(20, declaration.composite, true);
+    input.setUint32(24, declaration.effectiveKind, true);
+    input.setUint32(28, frames.length, true);
+    input.setFloat64(32, startTime, true);
+    input.setFloat64(40, duration, true);
+    input.setFloat64(48, delay, true);
+    input.setFloat64(56, iterations, true);
+    writeEasingBlock(64, declaration.easing);
+    input.setUint32(92, declaration.base.tag, true);
+    for (let index = 0; index < 6; index++) {
+      input.setFloat32(96 + index * 4, declaration.base.values[index] ?? 0, true);
+    }
+    input.setUint32(120, declaration.stackIndex, true);
+    input.setUint32(124, before.length, true);
+    input.setUint32(128, owner, true);
+    input.setUint32(132, pointer + 144, true);
+    input.setUint32(136, pointer + extra, true);
+    for (const trackIndex of before) {
+      input.setUint32(extra, trackIndex, true);
+      extra += 4;
+    }
+    input.setUint32(140, declaration.deferredBase ? 1 : 0, true);
+    for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
+      const frame = frames[frameIndex];
+      const at = 144 + frameIndex * 104;
+      input.setFloat64(at, frame.offset, true);
+      writeEasingBlock(at + 8, frame.easing);
+      for (let index = 0; index < 6; index++) {
+        input.setFloat64(at + 40 + index * 8, frame.value.values[index] ?? 0, true);
+      }
+      const components = frame.value.components ?? [];
+      input.setUint32(at + 88, components.length, true);
+      input.setUint32(at + 92, pointer + extra, true);
+      for (const component of components) {
+        input.setUint32(extra, component.kind, true);
+        for (let parameter = 0; parameter < 6; parameter++) {
+          input.setFloat32(extra + 4 + parameter * 4, component.parameters[parameter], true);
+        }
+        extra += 28;
+      }
+    }
+    return pointer;
+  }
+
+  // One track per property of $keyframes. The offsets are computed over
+  // all the keyframes; each track takes the keyframes that hold a value of
+  // its property, which must include offsets 0 and 1 (the DOM adds the
+  // implicit keyframes of the underlying value, src/dom/animation.js).
   function animate(
     nodeIndex,
     keyframes,
     timing = {},
     declarationOptions = {},
   ) {
-    if (!Array.isArray(keyframes) || keyframes.length < 2) {
+    if (!Array.isArray(keyframes)) {
       throw new TypeError("keyframes must be an array");
     }
     const reserved = new Set(["offset", "easing", "composite"]);
@@ -1058,10 +488,11 @@ export function createAnimationController(engine, options = {}) {
     const beforeTrackIndices = new Set(
       declarationOptions.beforeTrackIndices ?? [],
     );
+    const offsetKeyframes = normalizeOffsets(keyframes);
     const trackIndices = [];
     try {
       for (const propertyName of properties) {
-        const propertyFrames = animationPropertyFrames(keyframes, propertyName);
+        const propertyFrames = animationPropertyFrames(offsetKeyframes, propertyName);
         trackIndices.push(
           declareTrack(
             nodeIndex,
@@ -1069,7 +500,7 @@ export function createAnimationController(engine, options = {}) {
             propertyFrames,
             {
               ...timing,
-              composite: keyframes.at(-1).composite ?? timing.composite,
+              composite: propertyFrames.at(-1).composite ?? timing.composite,
             },
             false,
             {
@@ -1083,10 +514,7 @@ export function createAnimationController(engine, options = {}) {
         );
       }
     } catch (error) {
-      for (const trackIndex of trackIndices) {
-        cancelTrack(trackIndex);
-        freeTrack(trackIndex);
-      }
+      for (const trackIndex of trackIndices) cancelTrack(trackIndex);
       throw error;
     }
     return animationHandle(trackIndices);
@@ -1104,13 +532,13 @@ export function createAnimationController(engine, options = {}) {
   }
 
   function replaceBase(nodeIndex, propertyName, target) {
-    const property = PROPERTY_REGISTRY[propertyName];
+    const property = propertyNamed(propertyName);
     if (!property) {
       throw new TypeError(
         `Property is not registered for animation: ${propertyName}`,
       );
     }
-    const stack = effectStacks.get(`${nodeIndex}:${property.id}`);
+    const stack = stackOf(nodeIndex, property.id);
     if (!stack) return false;
     // A shadow track's base is the node's own span, which the engine
     // captures at the sample write (the row's pointer is not known here).
@@ -1120,146 +548,341 @@ export function createAnimationController(engine, options = {}) {
       ? transformAffineValues(normalized)
       : normalized.values;
     writeStackBase(stack, { tag: normalized.tag, values: [...baseValues] });
-    deferredBaseStacks.delete(stack);
     return true;
   }
 
-  // Where each effect stack's node is after this controller's last layout:
-  // the composed sample, and for a shadow list the painted list. The caller
-  // guarantees that the rows it reads are this controller's, laid out and
+  // Copies the rows and box sizes of this controller's effect stacks for
+  // the samples of later style changes (animation_owner_capture). The
+  // caller guarantees that the rows are this controller's, laid out and
   // with their post-layout transforms resolved.
   function captureLiveValues() {
-    for (const stack of effectStacks.values()) {
-      const entryAddress = EFFECT_STACK_TABLE_BASE +
-        stack.index * EFFECT_STACK_ENTRY_SIZE;
-      const nodeIndex = view.getUint16(entryAddress, true);
-      const property = PROPERTY_REGISTRY[
-        PROPERTY_NAMES.get(view.getUint16(entryAddress + 2, true))
-      ];
-      stack.liveValue = {
-        base: snapshotBase(nodeIndex, property),
-        shadowList: property.kind === 7 ? liveShadowList(nodeIndex) : null,
+    engine.exports.animation_owner_capture(owner);
+  }
+
+  // The value a transition starts from, in the base form the engine gives
+  // it (u32 tag, f32 values[6], then the shadow entries' pointer and count),
+  // as the transition reports it.
+  function startValueAt(property, pointer) {
+    const start = new DataView(engine.memory.buffer, pointer, 36);
+    const values = [0, 1, 2, 3, 4, 5].map((index) => start.getFloat32(4 + index * 4, true));
+    if (property.kind === 2) return { kind: "lengthPercentage", pixels: values[0], percentage: values[1] };
+    if (property.kind === 1) return { kind: "scalar", value: values[0] };
+    if (property.kind === 3) return { kind: "color", value: values.slice(0, 4) };
+    if (property.kind === 6) return animationEnumerationName(5, values[0] ? 1 : 0);
+    if (property.kind === 7) return shadowListAt(start.getUint32(28, true), start.getUint32(32, true));
+    if (property.kind === 8) {
+      return { kind: "lineHeight", value: values[0], unit: animationEnumerationName(4, start.getUint32(0, true)) };
+    }
+    if (property.kind === 10) return { kind: "scale", x: values[0], y: values[1] };
+    if (property.kind === 9) {
+      return {
+        kind: "translate",
+        x: { pixels: values[0], percentage: values[1] },
+        y: { pixels: values[2], percentage: values[3] },
       };
     }
+    return { kind: "transform", components: [{ kind: "matrix", value: values }] };
   }
 
-  // Where the node of an interrupted stack is while another scene's rows
-  // fill the buffer. The value captured after this controller's last
-  // layout states it. A stack not laid out since its declaration leaves the
-  // node at the value beneath it: the caller's start value, or the stack's
-  // base.
-  function interruptedValue(stack, nodeIndex, propertyName, property, timing) {
-    if (stack.liveValue) return { ...stack.liveValue, callerStart: false };
-    const callerStart = timing.startValue !== undefined;
-    const baseKnown = !deferredBaseStacks.has(stack) && property.kind !== 7;
-    if (!baseKnown && (!callerStart || property.kind === 4)) {
+  function shadowListAt(span, count) {
+    const shadows = [];
+    for (let index = 0; index < count; index++) {
+      const entry = span + index * SHADOW_ENTRY_SIZE;
+      shadows.push({
+        offsetX: view.getFloat32(entry, true),
+        offsetY: view.getFloat32(entry + 4, true),
+        blur: view.getFloat32(entry + 8, true),
+        spread: view.getFloat32(entry + 12, true),
+        color: [0, 1, 2, 3].map((k) => view.getFloat32(entry + SHADOW_OFFSET_COLOR + k * 4, true)),
+        inset: view.getUint8(entry + SHADOW_OFFSET_INSET) === 1,
+      });
+    }
+    return { kind: "shadowList", shadows };
+  }
+
+  // The engine takes a transition's start and its reversing shortening at
+  // the change's time (animation_transition_begin), before the tracks the
+  // transition replaces are cancelled. Returns the pending change.
+  function beginTransition(nodeIndex, property, propertyName, change) {
+    const stack = stackOf(nodeIndex, property.id);
+    const rowsOwned = ownsRows();
+    const { pointer, input } = engineInput(128);
+    new Uint8Array(engine.memory.buffer, pointer, 128).fill(0);
+    input.setUint32(0, stack?.index ?? 0xffff, true);
+    input.setUint32(4, nodeIndex, true);
+    input.setUint32(8, property.id, true);
+    input.setUint32(12, property.kind, true);
+    input.setFloat64(16, change.time, true);
+    input.setUint32(24, (change.callerValues ? 1 : 0) | (rowsOwned ? 2 : 0), true);
+    input.setUint32(28, change.reversalTarget.length, true);
+    for (let index = 0; index < change.reversalTarget.length; index++) {
+      input.setFloat64(32 + index * 8, change.reversalTarget[index], true);
+    }
+    for (let index = 0; index < (change.callerValues?.length ?? 0); index++) {
+      input.setFloat64(80 + index * 8, change.callerValues[index], true);
+    }
+    const pending = engine.exports.animation_transition_begin(pointer);
+    if (pending === 0) {
       throw new Error(
-        `Cannot start the ${propertyName} transition of node ${nodeIndex}: another scene's layout rows fill the engine, and the running effect has not been laid out in this renderer's rows. Render this renderer first${callerStart ? "" : " or pass timing.startValue"}.`,
+        `Cannot start the ${propertyName} transition of node ${nodeIndex}: another scene's layout rows fill the engine, and ${stack ? "the running effect has not been laid out in this renderer's rows" : "no start value was given"}. Render this renderer first${change.callerValues ? "" : " or pass timing.startValue"}.`,
       );
     }
-    return { base: stack.base, shadowList: null, callerStart };
+    return pending;
   }
 
+  // css-transitions-1 §3. A change that interrupts a running effect starts
+  // from the effect's value at the change's time; otherwise the caller's
+  // before-change value is the start (timing.startValue), or the node's
+  // row. The buffer is shared with synchronous layout getters, which
+  // rewrite it with the after-change scene before this frame runs; a start
+  // read from it then equals the end and the transition snaps. For the
+  // transform the caller's value also keeps the CSS function list: a start
+  // list that matches the end list is what makes a rotate() transition
+  // interpolate its angle instead of its matrix.
   function transition(nodeIndex, propertyName, target, timing = {}) {
-    const property = PROPERTY_REGISTRY[propertyName];
+    const property = propertyNamed(propertyName);
     if (!property) {
       throw new TypeError(
         `Property is not registered for transition: ${propertyName}`,
       );
     }
-    const key = `${nodeIndex}:${property.id}`;
-    const stack = effectStacks.get(key);
-    // An interrupted transition continues from where its node is. This
-    // controller's rows show that; while another scene's rows fill the
-    // buffer, the value captured after this controller's last layout does.
-    const interrupted = stack !== undefined && !ownsRows()
-      ? interruptedValue(stack, nodeIndex, propertyName, property, timing)
-      : null;
-    const base = interrupted?.base ?? snapshotBase(nodeIndex, property);
-    // The engine buffer is the right start only while an earlier effect is
-    // still sampling this node: an interrupted transition continues from
-    // where it is. Otherwise the caller's before-change value is the start.
-    // The buffer is shared with synchronous layout getters, which rewrite
-    // it with the after-change scene before this frame runs; a start read
-    // from it then equals the end and the transition snaps. For the
-    // transform this also keeps the CSS function list: a start list that
-    // matches the end list is what makes a rotate() transition interpolate
-    // its angle instead of its matrix.
-    const callerStart = timing.startValue !== undefined &&
-      (stack === undefined || interrupted?.callerStart === true);
-    const start = callerStart
-      ? timing.startValue
-      : property.kind === 2
-      ? {
-        kind: "lengthPercentage",
-        pixels: base.values[0],
-        percentage: base.values[1],
-      }
-      : property.kind === 1
-      ? { kind: "scalar", value: base.values[0] }
-      : property.kind === 3
-      ? { kind: "color", value: base.values.slice(0, 4) }
-      : property.kind === 6
-      ? (base.values[0] ? "hidden" : "visible")
-      : property.kind === 7
-      ? interrupted?.shadowList ?? liveShadowList(nodeIndex)
-      : property.kind === 8
-      ? { kind: "lineHeight", value: base.values[0], unit: ["normal", "length", "number"][base.tag] }
-      : property.kind === 9
-      ? {
-        kind: "translate",
-        x: { pixels: base.values[0], percentage: base.values[1] },
-        y: { pixels: base.values[2], percentage: base.values[3] },
-      }
-      : {
-        kind: "transform",
-        components: [{ kind: "matrix", value: base.values.slice(0, 6) }],
-      };
-    const normalizedTarget = normalizeValue(property, target);
-    const duration = finite(timing.duration ?? 0, "duration");
-    // Reversing shortening measures how far the running transition got
-    // along its own start-to-end vector. A transform list carries no
-    // numbers in that vector, so the transform compares affines: the end
-    // value's resolved matrix against the node's live one.
-    const reversalTarget = property.kind === 4
-      ? transformAffineValues(
-        normalizeValue(property, timing.baseTarget ?? target),
-      )
-      : normalizedTarget.values;
-    const reversalStart = property.kind === 4
-      ? base.values.slice(0, 6)
-      : normalizeValue(property, start).values;
-    const transitionState = updateAnimationTransition(
-      liveTransitions.get(key),
-      callerStart ? reversalStart : base.values,
-      reversalTarget,
-      reversalStart,
-    );
-    liveTransitions.set(key, transitionState);
-    const adjustedTiming = {
-      ...timing,
-      duration: animationTransitionDuration(transitionState, duration),
+    const callerStart = timing.startValue !== undefined;
+    // The end the stack keeps as its base, and the vector the reversal
+    // test compares: a transform list carries no numbers in its vector, so
+    // the transform compares affines, the end value's resolved matrix.
+    const baseTarget = normalizeValue(property, timing.baseTarget ?? target);
+    const baseValues = property.kind === 4 ? transformAffineValues(baseTarget) : baseTarget.values;
+    const change = {
+      time: finite(timing.startTime ?? 0, "transition start time"),
+      callerValues: callerStart ? normalizeValue(property, timing.startValue).values : null,
+      reversalTarget: property.kind === 4 ? baseValues : normalizeValue(property, target).values,
+      base: { tag: baseTarget.tag, values: [...baseValues] },
+      start: null,
     };
     const trackIndex = declareTrack(
       nodeIndex,
       propertyName,
       [
-        { offset: 0, value: start },
+        { offset: 0, value: callerStart ? timing.startValue : target },
         { offset: 1, value: target },
       ],
-      adjustedTiming,
+      timing,
       true,
+      { change },
     );
-    replaceBase(nodeIndex, propertyName, timing.baseTarget ?? target);
     return Object.freeze({
       ...animationHandle([trackIndex]),
       // The track's duration: the requested one times the reversing
       // shortening factor.
-      duration: adjustedTiming.duration,
+      duration: view.getFloat64(trackAddress(trackIndex) + 32, true),
       // The value the track starts from: the caller's before-change value,
-      // or where an interrupted effect left the node.
-      start,
+      // or the value the engine took at the change's time.
+      start: change.start ?? timing.startValue,
       // The identity the track's events carry.
+      animationId: allocations.get(trackIndex).animationId,
+    });
+  }
+
+  // A frame value of the engine (f64 values, then 28-byte components:
+  // u32 kind, f32 parameters[6]) as an animation value object.
+  function frameValueObject(property, values, components) {
+    if (property.kind === 2) return { kind: "lengthPercentage", pixels: values[0], percentage: values[1] };
+    if (property.kind === 1) return { kind: "scalar", value: values[0] };
+    if (property.kind === 3) return { kind: "color", value: values.slice(0, 4) };
+    if (property.kind === 6) return { kind: "keyword", keyword: animationEnumerationName(5, values[0] ? 1 : 0) };
+    if (property.kind === 8) return { kind: "lineHeight", value: values[0], unit: animationEnumerationName(4, values[1]) };
+    if (property.kind === 10) return { kind: "scale", x: values[0], y: values[1] };
+    if (property.kind === 9) {
+      return {
+        kind: "translate",
+        x: { pixels: values[0], percentage: values[1] },
+        y: { pixels: values[2], percentage: values[3] },
+      };
+    }
+    if (property.kind === 7) {
+      const shadows = [];
+      for (let index = 0; index + 1 < components.length; index += 2) {
+        const [geometry, color] = [components[index], components[index + 1]];
+        shadows.push({
+          offsetX: geometry.parameters[0],
+          offsetY: geometry.parameters[1],
+          blur: geometry.parameters[2],
+          spread: geometry.parameters[3],
+          color: color.parameters.slice(0, 4),
+          inset: (geometry.kind & 1) === 1,
+        });
+      }
+      return { kind: "shadowList", shadows };
+    }
+    return { kind: "transform", components: transformFrameComponents(components, [], null) };
+  }
+
+  // The script value of a transition frame, its transform functions named
+  // after the before- or after-change transform list ($source, normalized
+  // to $normalized; animation_transform_frame_names).
+  function namedTransformFrame(property, frame, source, normalized) {
+    const value = frameValueObject(property, frame.values, frame.components);
+    if (value.kind !== "transform" || source === undefined) return value;
+    return {
+      kind: "transform",
+      components: transformFrameComponents(frame.components, normalized.map((component) => component.kind),
+        normalized.map((_, index) => source.components[index]?.kind)),
+    };
+  }
+
+  // The transitions a style change starts on one node
+  // (animation_transition_plan, engine-animation-transitions.watpart):
+  // the before-change and after-change records, the last layout's box, the
+  // CSS transform list both serializations carry, and the node's
+  // transition definitions. A name the core does not animate starts no
+  // transition, as in a browser, and is listed in `unanimated`.
+  function planTransitions(change) {
+    const definitions = [];
+    const unanimated = [];
+    for (const definition of change.definitions) {
+      const propertyNames = animationTransitionProperties(definition.propertyName);
+      if (propertyNames.length === 0) unanimated.push(definition.propertyName);
+      for (const propertyName of propertyNames) {
+        const property = propertyNamed(propertyName);
+        if (!property) {
+          throw new TypeError(`The core expands transition-property ${definition.propertyName} to ${propertyName}, which it does not know`);
+        }
+        definitions.push({ property, propertyName, definition });
+      }
+    }
+    const transformProperty = propertyNamed("transform");
+    const transformComponents = (transform) =>
+      normalizeValue(transformProperty, {
+        kind: "transform",
+        components: transform.cssText === "none" ? [] : transform.components ?? [],
+      }).components;
+    const carriesTransform = change.previousTransform !== undefined && change.nextTransform !== undefined;
+    // The core's calls can recycle transient blocks, so they run before
+    // the input is allocated.
+    const previousComponents = carriesTransform ? transformComponents(change.previousTransform) : [];
+    const nextComponents = carriesTransform ? transformComponents(change.nextTransform) : [];
+    for (const entry of definitions) {
+      entry.duration = animationNumber(entry.definition.duration, `The ${entry.propertyName} transition duration`);
+      entry.delay = animationNumber(entry.definition.delay, `The ${entry.propertyName} transition delay`);
+    }
+    const linear = normalizeEasing("linear");
+    const byteLength = 56 + change.previousRecord.byteLength + change.nextRecord.byteLength +
+      (previousComponents.length + nextComponents.length) * 28 + definitions.length * 24;
+    const { pointer, input } = engineInput(byteLength);
+    const bytes = new Uint8Array(engine.memory.buffer, pointer, byteLength);
+    bytes.fill(0, 0, 56);
+    let cursor = 56;
+    const place = (source) => {
+      bytes.set(source, cursor);
+      const at = pointer + cursor;
+      cursor += source.byteLength;
+      return at;
+    };
+    input.setUint32(0, place(change.previousRecord), true);
+    input.setUint32(4, change.previousRecord.byteLength, true);
+    input.setUint32(8, place(change.nextRecord), true);
+    input.setUint32(12, change.nextRecord.byteLength, true);
+    input.setFloat32(16, change.box?.w ?? 0, true);
+    input.setFloat32(20, change.box?.h ?? 0, true);
+    input.setUint32(24, carriesTransform ? 1 : 0, true);
+    const placeComponents = (components) => {
+      const at = pointer + cursor;
+      for (const component of components) {
+        input.setUint32(cursor, component.kind, true);
+        for (let index = 0; index < 6; index++) {
+          input.setFloat32(cursor + 4 + index * 4, component.parameters[index], true);
+        }
+        cursor += 28;
+      }
+      return at;
+    };
+    input.setUint32(28, previousComponents.length, true);
+    input.setUint32(32, placeComponents(previousComponents), true);
+    input.setUint32(36, nextComponents.length, true);
+    input.setUint32(40, placeComponents(nextComponents), true);
+    input.setUint32(48, definitions.length, true);
+    input.setUint32(52, pointer + cursor, true);
+    for (const { property, duration, delay } of definitions) {
+      input.setUint32(cursor, property.id, true);
+      input.setFloat64(cursor + 8, duration, true);
+      input.setFloat64(cursor + 16, delay, true);
+      cursor += 24;
+    }
+    const count = engine.exports.animation_transition_plan(pointer);
+    if (count === -1) {
+      throw new RangeError(`A style change starts more than 64 transitions on one element (${definitions.length} definitions)`);
+    }
+    const output = engine.exports.animation_transition_plan_output();
+    const plan = new DataView(engine.memory.buffer);
+    const frameAt = (at, property) => {
+      const kindCount = property.kind === 4 ? 0 : property.kind === 2 ? 3 : property.kind === 3 ? 4
+        : property.kind === 7 ? 6 : property.kind === 8 ? 2 : property.kind === 9 ? 4 : property.kind === 10 ? 2 : 1;
+      const values = Array.from({ length: kindCount }, (_, index) => plan.getFloat64(at + index * 8, true));
+      const componentCount = plan.getUint32(at + 48, true);
+      const componentAt = plan.getUint32(at + 52, true);
+      const components = Array.from({ length: componentCount }, (_, index) => ({
+        kind: plan.getUint32(componentAt + index * 28, true),
+        parameters: Array.from({ length: 6 }, (_, parameter) =>
+          plan.getFloat32(componentAt + index * 28 + 4 + parameter * 4, true)),
+      }));
+      return { values, components };
+    };
+    const transitions = [];
+    for (let index = 0; index < count; index++) {
+      const entry = output + index * 200;
+      const { property, propertyName, definition } = definitions[plan.getUint32(entry + 4, true)];
+      const start = frameAt(entry + 8, property);
+      const end = frameAt(entry + 64, property);
+      const tag = plan.getUint32(entry + 120, true);
+      const frameValue = (frame) => ({
+        kind: property.kind,
+        tag,
+        values: frame.values,
+        ...(property.kind === 4 || property.kind === 7 ? { components: frame.components } : {}),
+      });
+      transitions.push({
+        propertyName,
+        definition,
+        frames: [
+          { offset: 0, easing: linear, value: frameValue(start) },
+          { offset: 1, easing: linear, value: frameValue(end) },
+        ],
+        startValue: namedTransformFrame(property, start, change.previousTransform, previousComponents),
+        endValue: namedTransformFrame(property, end, change.nextTransform, nextComponents),
+        base: {
+          tag,
+          values: Array.from({ length: 6 }, (_, value) => plan.getFloat32(entry + 124 + value * 4, true)),
+        },
+        reversalTarget: Array.from({ length: plan.getUint32(entry + 148, true) }, (_, value) =>
+          plan.getFloat64(entry + 152 + value * 8, true)),
+      });
+    }
+    return { transitions, unanimated };
+  }
+
+  // Declares a transition planned by planTransitions. The change's time
+  // (`changeTime`, the track's start time when absent) is when the running
+  // effects the transition interrupts are sampled; `animationId` and
+  // `trackGeneration` give the track the identity of the object that holds
+  // it.
+  function startPlannedTransition(nodeIndex, planned, timing, { changeTime, animationId, trackGeneration } = {}) {
+    const change = {
+      time: finite(changeTime ?? timing.startTime ?? 0, "transition change time"),
+      callerValues: planned.frames[0].value.values,
+      reversalTarget: planned.reversalTarget,
+      base: planned.base,
+      start: null,
+    };
+    const trackIndex = declareTrack(nodeIndex, planned.propertyName, null, timing, true, {
+      change,
+      normalizedFrames: planned.frames,
+      animationId,
+      trackGeneration,
+    });
+    return Object.freeze({
+      ...animationHandle([trackIndex]),
+      duration: view.getFloat64(trackAddress(trackIndex) + 32, true),
+      start: change.start ?? planned.startValue,
       animationId: allocations.get(trackIndex).animationId,
     });
   }
@@ -1286,8 +909,6 @@ export function createAnimationController(engine, options = {}) {
           if (allocations.get(trackIndex) !== owned) continue;
           acquire();
           writeCount += cancelTrack(trackIndex);
-          try { drainEvents(trackIndex); }
-          finally { freeTrack(trackIndex, owned); }
         }
         return writeCount;
       },
@@ -1301,8 +922,6 @@ export function createAnimationController(engine, options = {}) {
             if (allocations.get(trackIndex) !== owned) continue;
             acquire();
             writeCount += cancelTrack(trackIndex);
-            try { drainEvents(trackIndex); }
-            finally { freeTrack(trackIndex, owned); }
           }
           return writeCount;
         } finally {
@@ -1335,15 +954,7 @@ export function createAnimationController(engine, options = {}) {
         for (const trackIndex of trackIndices) {
           if (allocations.get(trackIndex) !== identities.get(trackIndex)) continue;
           acquire();
-          const address = ANIMATION_TABLE_BASE +
-            trackIndex * ANIMATION_RECORD_SIZE;
-          view.setFloat64(
-            address + 24,
-            resolvedSampleTime - resolvedLocalTime,
-            true,
-          );
-          view.setFloat64(address + 84, resolvedSampleTime, true);
-          view.setUint8(address + 4, 1);
+          engine.exports.seek_animation(trackIndex, resolvedLocalTime, resolvedSampleTime);
         }
       },
     });
@@ -1356,60 +967,20 @@ export function createAnimationController(engine, options = {}) {
     // Check every new index before any state changes. The next frame's
     // row write reserves the node tables for the remapped scene.
     for (const trackIndex of allocations.keys()) {
-      const nextNodeIndex = indexMap.get(view.getUint16(
-        ANIMATION_TABLE_BASE + trackIndex * ANIMATION_RECORD_SIZE,
-        true,
-      ));
+      const nextNodeIndex = indexMap.get(view.getUint16(trackAddress(trackIndex), true));
       if (nextNodeIndex !== undefined) requireRecordNodeIndex(nextNodeIndex);
     }
     computedSamples?.core.remapComputedSamples(computedSamples.owner, indexMap);
-    let writeCount = 0;
-    for (const [trackIndex, owned] of [...allocations]) {
-      if (allocations.get(trackIndex) !== owned) continue;
-      acquire();
-      const address = ANIMATION_TABLE_BASE + trackIndex * ANIMATION_RECORD_SIZE;
-      const previousNodeIndex = view.getUint16(address, true);
-      const nextNodeIndex = indexMap.get(previousNodeIndex);
-      if (nextNodeIndex === undefined) {
-        writeCount += cancelTrack(trackIndex);
-        try { drainEvents(trackIndex); }
-        finally { freeTrack(trackIndex, owned); }
-      } else {
-        view.setUint16(address, nextNodeIndex, true);
-      }
+    acquire();
+    const { pointer, input } = engineInput(Math.max(8, indexMap.size * 8));
+    let offset = 0;
+    for (const [previousNodeIndex, nextNodeIndex] of indexMap) {
+      input.setUint32(offset, previousNodeIndex, true);
+      input.setUint32(offset + 4, nextNodeIndex, true);
+      offset += 8;
     }
-    const remappedStacks = new Map();
-    for (const [key, stack] of effectStacks) {
-      const separator = key.indexOf(":");
-      const previousNodeIndex = Number(key.slice(0, separator));
-      const propertyId = key.slice(separator + 1);
-      const nextNodeIndex = indexMap.get(previousNodeIndex);
-      if (nextNodeIndex === undefined || stack.tracks.length === 0) continue;
-      view.setUint16(
-        EFFECT_STACK_TABLE_BASE + stack.index * EFFECT_STACK_ENTRY_SIZE,
-        nextNodeIndex,
-        true,
-      );
-      remappedStacks.set(`${nextNodeIndex}:${propertyId}`, stack);
-    }
-    effectStacks.clear();
-    for (const [key, stack] of remappedStacks) effectStacks.set(key, stack);
-    const remappedTransitions = new Map();
-    for (const [key, transition] of liveTransitions) {
-      const separator = key.indexOf(":");
-      const previousNodeIndex = Number(key.slice(0, separator));
-      const propertyId = key.slice(separator + 1);
-      const nextNodeIndex = indexMap.get(previousNodeIndex);
-      if (nextNodeIndex !== undefined) {
-        remappedTransitions.set(`${nextNodeIndex}:${propertyId}`, transition);
-      } else {
-        releaseAnimationTransition(transition);
-      }
-    }
-    liveTransitions.clear();
-    for (const [key, transition] of remappedTransitions) {
-      liveTransitions.set(key, transition);
-    }
+    const writeCount = engine.exports.animation_owner_remap(owner, pointer, indexMap.size, ownsRows() ? 1 : 0);
+    settle(false);
     return writeCount;
   }
 
@@ -1424,18 +995,7 @@ export function createAnimationController(engine, options = {}) {
       eventCount: view.getUint32(resultAddress + 12, true),
     };
     captureComputedSamples();
-    drainEvents();
-    for (
-      let trackIndex = 0;
-      trackIndex < ANIMATION_TABLE_CAPACITY;
-      trackIndex++
-    ) {
-      if (
-        view.getUint8(
-          ANIMATION_TABLE_BASE + trackIndex * ANIMATION_RECORD_SIZE + 4,
-        ) === 0
-      ) freeTrack(trackIndex, allocations.get(trackIndex), true);
-    }
+    settle(true);
     return result;
   }
   // Samples this controller's tracks onto its rows, which the caller has
@@ -1451,11 +1011,11 @@ export function createAnimationController(engine, options = {}) {
   // Whether this controller runs an effect on the node's property: a
   // transition declared there interrupts it.
   function hasEffect(nodeIndex, propertyName) {
-    const property = PROPERTY_REGISTRY[propertyName];
+    const property = propertyNamed(propertyName);
     if (!property) {
       throw new TypeError(`Property is not registered for animation: ${propertyName}`);
     }
-    return effectStacks.has(`${nodeIndex}:${property.id}`);
+    return stackOf(nodeIndex, property.id) !== null;
   }
 
   // Brings the running transitions to the time of a style change before it
@@ -1473,47 +1033,30 @@ export function createAnimationController(engine, options = {}) {
     acquire();
     if (ownsRows()) return tick(time);
     finite(time, "advance time");
-    for (const [trackIndex, owned] of [...allocations]) {
-      if (allocations.get(trackIndex) !== owned) continue;
-      const address = ANIMATION_TABLE_BASE + trackIndex * ANIMATION_RECORD_SIZE;
-      // A running transition track; paused and filled tracks do not end.
-      if (view.getUint8(address + 4) !== 1) continue;
-      if ((view.getUint8(address + 5) & 16) === 0) continue;
-      // The engine's end test (engine-layout.watpart, tick).
-      const localTime = time -
-        (view.getFloat64(address + 24, true) + view.getFloat64(address + 40, true));
-      const iterationCount = view.getFloat32(address + 48, true);
-      const total = iterationCount < 0
-        ? Infinity
-        : view.getFloat64(address + 32, true) * iterationCount;
-      if (!(localTime >= total)) continue;
-      const types = view.getUint8(address + 59) === 0
-        ? ["transitionstart", "transitionend"]
-        : ["transitionend"];
-      view.setUint8(address + 4, 0);
-      const nodeIndex = view.getUint16(address, true);
-      const propertyId = view.getUint16(address + 2, true);
-      try {
-        if (!suppressEvents) {
-          for (const type of types) {
-            if (allocations.get(trackIndex)?.identity !== owned.identity) break;
-            options.onEvent?.({
-              nodeIndex,
-              propertyId,
-              propertyName: PROPERTY_NAMES.get(propertyId),
-              trackIndex,
-              type,
-              animationId: owned.animationId,
-              trackGeneration: owned.trackGeneration,
-              identity: owned.identity,
-            });
-          }
-        }
-      } finally {
-        freeTrack(trackIndex, owned);
-      }
-    }
+    // The engine ends the running transitions that time reaches, without
+    // sampling them; paused and filled tracks do not end.
+    engine.exports.animation_advance(time);
+    settle(false);
     return null;
+  }
+
+  // The value that the effect stack of a track gives its property at
+  // `time`, composed through that track (commitStyles(), Web Animations 1,
+  // section 6.4): its property's canonical name and value object.
+  function sampleThrough(trackIndex, time) {
+    if (!allocations.has(trackIndex)) {
+      throw new RangeError(`Track ${trackIndex} is not a track of this controller`);
+    }
+    acquire();
+    const address = trackAddress(trackIndex);
+    const propertyId = view.getUint16(address + 2, true);
+    const property = propertyWithId(propertyId);
+    const pointer = engine.exports.animation_stack_sample_through(
+      trackIndex, finite(time, "sample time"), ownsRows() ? 1 : 0);
+    if (pointer === 0) {
+      throw new Error(`Track ${trackIndex} has no laid-out row to sample: render its renderer first`);
+    }
+    return { propertyName: animationPropertyName(propertyId), value: startValueAt(property, pointer) };
   }
 
   // Ends the controller: its view stops following the engine's memory.
@@ -1530,10 +1073,13 @@ export function createAnimationController(engine, options = {}) {
     captureComputedPseudos,
     animate,
     transition,
+    planTransitions,
+    startPlannedTransition,
     declareTransitionTrack,
     declareTrack,
     tick,
     advance,
+    sampleThrough,
     hasEffect,
     resample,
     remapNodes,
@@ -1541,8 +1087,5 @@ export function createAnimationController(engine, options = {}) {
     prepareLayout,
     cancelAll,
     dispose,
-    properties: PROPERTY_REGISTRY,
   });
 }
-
-export { PROPERTY_REGISTRY };

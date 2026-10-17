@@ -1,3 +1,6 @@
+import { getDefaultGpu } from "../gpu-thread.js";
+import { isGpuThreadCapability } from "./webgpu-facade.js";
+
 const environmentState = new WeakMap();
 const locationEnvironment = new WeakMap();
 const historyEnvironment = new WeakMap();
@@ -191,9 +194,9 @@ export function normalizeComponentEnvironmentOptions(value, target = globalThis)
   }
   if (
     value.gpu !== undefined && value.gpu !== null &&
-    typeof value.gpu !== "object"
+    !isGpuThreadCapability(value.gpu)
   ) {
-    throw new TypeError("environment.gpu must be a WebGPU capability object or null");
+    throw new TypeError("environment.gpu must be a GPU-thread facade or null; supply native devices through a GPU-thread provider module");
   }
   const language = value.language ?? value.languages?.[0] ?? "en";
   const languages = Object.freeze([...(value.languages ?? [language])]);
@@ -224,9 +227,10 @@ export function normalizeComponentEnvironmentOptions(value, target = globalThis)
     screen: normalizeScreen(value.screen),
     fetch: value.fetch ?? null,
     createWebSocket: value.createWebSocket ?? null,
-    gpu: value.gpu !== undefined
-      ? value.gpu
-      : target.navigator?.gpu ?? null,
+    // Undefined selects the realm's capability when a component first uses
+    // it (the environment's gpu getter), so a component that never touches
+    // WebGPU does not start a GPU thread.
+    gpu: value.gpu,
     userAgent: value.userAgent ?? runtimeUserAgent(target),
     platform: value.platform ?? runtimePlatform(target),
     webdriver: value.webdriver ?? false,
@@ -356,6 +360,12 @@ function requestNavigation(environment, kind, requestedURL) {
   const internal = assertActive(environment, "Location", kind);
   const oldURL = internal.currentURL.href;
   const nextURL = new URL(requestedURL, oldURL);
+  // A javascript: URL evaluates in the document realm instead of
+  // navigating (HTML, "evaluate a javascript: URL").
+  if (nextURL.protocol === "javascript:") {
+    environment.document._scriptProcessing?.queueJavaScriptURL(nextURL.href);
+    return;
+  }
   if (kind !== "reload" && nextURL.href === oldURL) return;
   if (kind !== "reload" && sameDocumentExceptHash(internal.currentURL, nextURL)) {
     if (kind === "replace") replaceHistoryEntry(environment, nextURL, null);
@@ -672,7 +682,8 @@ export class Navigator {
     return readNavigator(this, "maxTouchPoints", "maximumTouchPoints");
   }
   get gpu() {
-    return readNavigator(this, "gpu", "gpu") ?? undefined;
+    readNavigator(this, "gpu", "gpu");
+    return navigatorEnvironment.get(this).gpu ?? undefined;
   }
   get webdriver() {
     return readNavigator(this, "webdriver", "webdriver");
@@ -864,6 +875,9 @@ export function createComponentEnvironment({
   }
   const initialURL = new URL(url).href;
   const observations = [];
+  // Whether the realm offers WebGPU, read before this environment installs
+  // its own navigator and without calling the realm's `gpu` getter.
+  const realmOffersGpu = target.navigator != null && "gpu" in target.navigator;
   const environment = {
     document,
     url: initialURL,
@@ -876,7 +890,12 @@ export function createComponentEnvironment({
     maximumTouchPoints: options.maximumTouchPoints,
     screen: options.screen,
     fetch: options.fetch,
-    gpu: options.gpu,
+    // A realm without WebGPU gives its components none; otherwise they use
+    // the GPU-thread facade of that capability.
+    get gpu() {
+      if (options.gpu !== undefined) return options.gpu;
+      return realmOffersGpu ? getDefaultGpu() : null;
+    },
     createWebSocket: options.createWebSocket,
     options,
     target,

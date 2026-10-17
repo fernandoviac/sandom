@@ -1,4 +1,5 @@
 import { createMutationObserverClass } from "./dom-bindings.generated.js";
+import { enterComponentCode } from "./component-code.js";
 
 function normalizeOptions(options) {
   return {
@@ -147,6 +148,22 @@ function checkpointRecords(core, checkpoint, owner) {
   return records;
 }
 
+// Calls the observer's callback as component code of its document.
+// Exception objects and reporting belong to the host: a microtask of the
+// same component code rethrows the exception. The native checkpoint still
+// receives one completion and continues its batch.
+function invokeObserver(records) {
+  try {
+    this._callback(records, this);
+    return 0;
+  } catch (error) {
+    queueMicrotask(() => {
+      throw error;
+    });
+    return 1;
+  }
+}
+
 function deliverMutationCheckpoint(core, owner) {
   const checkpoint = core.status("observer_checkpoint_begin", owner);
   if (!checkpoint) return;
@@ -160,14 +177,9 @@ function deliverMutationCheckpoint(core, owner) {
       const observer = core.observersById.get(id);
       let outcome = 0;
       try {
-        observer?._callback(records, observer);
-      } catch (error) {
-        outcome = 1;
-        // Exception objects and reporting belong to the host. The native
-        // checkpoint still receives one completion and continues its batch.
-        queueMicrotask(() => {
-          throw error;
-        });
+        if (observer) {
+          outcome = enterComponentCode(observer._document, invokeObserver, observer, [records]);
+        }
       } finally {
         core.status(
           "observer_checkpoint_resume",

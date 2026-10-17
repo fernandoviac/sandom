@@ -17,6 +17,7 @@
 // result, in attempt order, so a caller can render the decision.
 
 import { inspectPreparedInput } from "./render-animation.js";
+import { sharedDomCore as core } from "../dom-wasm/core.js";
 
 const CONTROL_NAMES = new Set([
   "BUTTON",
@@ -38,14 +39,6 @@ const VECTOR_DISPLAYS = new Set([
   "svg-text",
 ]);
 const MAXIMUM_FIT_STEPS = 3;
-
-function positive(value, name) {
-  const number = Number(value);
-  if (!Number.isFinite(number) || number <= 0) {
-    throw new RangeError(`${name} must be a positive number`);
-  }
-  return number;
-}
 
 function measureTrial(inspection, baselineTextLines) {
   const { layout } = inspection;
@@ -244,24 +237,16 @@ export async function recommendViewportFromInspection(
   const initialViewport = options.initialViewport ??
     { width: 1280, height: 720 };
   const limits = options.limits ?? {};
-  const minimumWidth = positive(limits.minimumWidth ?? 160, "minimumWidth");
-  const minimumHeight = positive(limits.minimumHeight ?? 90, "minimumHeight");
-  const maximumWidth = positive(limits.maximumWidth ?? 3840, "maximumWidth");
-  const maximumHeight = positive(limits.maximumHeight ?? 2160, "maximumHeight");
-  if (minimumWidth > maximumWidth || minimumHeight > maximumHeight) {
-    throw new RangeError(
-      "minimum viewport limits must not exceed maximum limits",
-    );
-  }
-  const initialWidth = positive(initialViewport.width, "initialViewport.width");
-  const initialHeight = positive(
-    initialViewport.height,
-    "initialViewport.height",
-  );
-  const clampWidth = (value) =>
-    Math.ceil(Math.min(maximumWidth, Math.max(minimumWidth, value)));
-  const clampHeight = (value) =>
-    Math.ceil(Math.min(maximumHeight, Math.max(minimumHeight, value)));
+  const limitValues = [limits.minimumWidth, limits.minimumHeight, limits.maximumWidth, limits.maximumHeight];
+  const output = core.status("output_viewport_limits",
+    limitValues.reduce((present, value, index) => present | (value == null ? 0 : 1 << index), 0),
+    ...limitValues.map((value) => value == null ? NaN : Number(value)),
+    Number(initialViewport.width), Number(initialViewport.height));
+  const limitView = new DataView(core.refreshBytes().buffer, output, 48);
+  const [minimumWidth, minimumHeight, maximumWidth, maximumHeight, initialWidth, initialHeight] =
+    [0, 1, 2, 3, 4, 5].map((index) => limitView.getFloat64(index * 8, true));
+  const clampWidth = (value) => core.exports.output_viewport_clamp(minimumWidth, maximumWidth, value);
+  const clampHeight = (value) => core.exports.output_viewport_clamp(minimumHeight, maximumHeight, value);
 
   const trials = [];
   const trialByKey = new Map();
@@ -428,7 +413,7 @@ export async function recommendViewportFromInspection(
 }
 
 // `scrollbarStyle` selects the scrollbar style of every analytical trial
-// (plans/PLAN-native-scrollbars.md, decision 1); the other options go to
+// (design/scrollbars.md, decision 1); the other options go to
 // recommendViewportFromInspection.
 export async function recommendViewport(
   preparedInput,

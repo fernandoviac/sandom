@@ -27,11 +27,11 @@ export class MediaQueryList {
     if (this._onchange) this.addEventListener("change", this._onchange);
   }
 
-  addEventListener(type, callback, options) {
+  addEventListener(type, callback, options = undefined) {
     addEventListener(this, type, callback, options);
   }
 
-  removeEventListener(type, callback, options) {
+  removeEventListener(type, callback, options = undefined) {
     removeEventListener(this, type, callback, options);
   }
 

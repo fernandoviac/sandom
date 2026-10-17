@@ -1,42 +1,10 @@
 import { instantiate } from "../wasm/motion-capture-binary.js";
 
-const SEQUENCE_ERRORS = new Map([
-  [1, "invalid frame-sequence input"],
-  [2, "WebAssembly memory limit exceeded"],
-  [3, "invalid frame-sequence lifecycle call"],
-]);
-const COLOR_ERRORS = new Map([
-  [17, "invalid palette levels"],
-  [18, "invalid alpha threshold"],
-  [19, "invalid palette span"],
-  [20, "invalid palette record"],
-]);
-const GIF_ERRORS = new Map([
-  [1, "invalid GIF dimensions"],
-  [2, "invalid GIF palette"],
-  [3, "invalid GIF palette index"],
-  [4, "invalid GIF frame"],
-  [5, "GIF frame delay exceeds 65535 centiseconds"],
-  [6, "GIF output buffer is too short"],
-  [7, "GIF memory limit exceeded"],
-  [8, "invalid GIF lifecycle call"],
-]);
-
+// The failure message of the last failed call (frame_sequence_error_message).
 function failureMessage(exports) {
-  const domain = exports.frame_sequence_error_domain();
-  const code = exports.frame_sequence_error_code();
-  const field = exports.frame_sequence_error_field();
-  const messages = domain === 1
-    ? SEQUENCE_ERRORS
-    : domain === 2
-    ? COLOR_ERRORS
-    : GIF_ERRORS;
-  const owner = domain === 1
-    ? "frame sequence"
-    : domain === 2
-    ? "Color"
-    : "GIF";
-  return `${messages.get(code) ?? `${owner} error ${code}`} (field ${field})`;
+  const length = exports.frame_sequence_error_message();
+  const pointer = exports.frame_sequence_error_text();
+  return new TextDecoder().decode(new Uint8Array(exports.memory.buffer, pointer, length));
 }
 
 function call(exports, operation, message) {

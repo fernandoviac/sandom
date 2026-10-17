@@ -61,6 +61,26 @@ export function loadColorKernel() {
     return vectorOperation(vector, () => exports.apply_matrix(index));
   }
 
+  function primaryMatrices(primaries) {
+    const matrices = GAMUT_DESTINATIONS[primaries];
+    if (matrices === undefined) throw new Error(`No kernel matrix for primaries "${primaries}"`);
+    return matrices;
+  }
+
+  // Linear-light RGB in a named primary set into XYZ at that set's own
+  // white point, and back.
+  function convertLinearRgbToXyz(primaries, rgb) {
+    return applyMatrix(primaryMatrices(primaries)[1], rgb);
+  }
+
+  function convertXyzToLinearRgb(primaries, xyz) {
+    return applyMatrix(primaryMatrices(primaries)[0], xyz);
+  }
+
+  function convertXyzD50ToXyzD65(xyz) {
+    return applyMatrix(KERNEL_MATRIX_INDEX.adaptD50ToD65, xyz);
+  }
+
   return {
     // Transfer functions.
     decodeSrgbTransfer: exports.srgb_decode,
@@ -76,6 +96,37 @@ export function loadColorKernel() {
 
     // Vector transforms.
     applyMatrix,
+    convertLinearRgbToXyz,
+    convertXyzToLinearRgb,
+    convertXyzD50ToXyzD65,
+    // One 3x3 matrix from a source primary set into a linear-light
+    // destination primary set, for GPU uniforms. Each basis vector goes
+    // through the kernel matrices: source to XYZ, Bradford adaptation of a
+    // D50 source to D65, Bradford adaptation to D50 for a D50 destination
+    // (prophoto-rgb), then XYZ to the destination.
+    linearRgbToWorkingMatrix(sourcePrimaries, destinationPrimaries) {
+      const destination = GAMUT_DESTINATIONS[destinationPrimaries];
+      if (destination === undefined) {
+        throw new Error(
+          `linearRgbToWorkingMatrix: unsupported destination "${destinationPrimaries}"`,
+        );
+      }
+      const columns = [[1, 0, 0], [0, 1, 0], [0, 0, 1]].map((basis) => {
+        if (sourcePrimaries === destinationPrimaries) return basis;
+        let xyz = basis;
+        if (sourcePrimaries !== 'xyz-d65' && sourcePrimaries !== 'xyz-d50') {
+          xyz = convertLinearRgbToXyz(sourcePrimaries, basis);
+        }
+        if (SOURCE_IS_D50[sourcePrimaries]) xyz = convertXyzD50ToXyzD65(xyz);
+        if (destination[2] === 1) xyz = applyMatrix(KERNEL_MATRIX_INDEX.adaptD65ToD50, xyz);
+        return convertXyzToLinearRgb(destinationPrimaries, xyz);
+      });
+      return [
+        [columns[0][0], columns[1][0], columns[2][0]],
+        [columns[0][1], columns[1][1], columns[2][1]],
+        [columns[0][2], columns[1][2], columns[2][2]],
+      ];
+    },
     convertXyzD65ToOklab(xyz) {
       return vectorOperation(xyz, () => exports.xyz_d65_to_oklab());
     },
@@ -106,8 +157,7 @@ export function loadColorKernel() {
     },
     // Working linear Rec. 2020 -> a destination primary set's linear RGB,
     // WITHOUT a gamut map: out-of-destination-gamut input produces
-    // extended (negative or above-one) components on purpose. Mirrors the
-    // reference workingToDestinationLinearRgb in src/color.js.
+    // extended (negative or above-one) components on purpose.
     convertWorkingToDestinationLinearRgb(destinationPrimaries, rgb) {
       if (destinationPrimaries === 'rec2020') return [rgb[0], rgb[1], rgb[2]];
       const destination = GAMUT_DESTINATIONS[destinationPrimaries];

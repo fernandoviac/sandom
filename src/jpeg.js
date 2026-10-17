@@ -1,8 +1,9 @@
 /**
  * JPEG decoder — bytes to RGBA8 pixels.
  *
- * JPEG sample decoding uses vendor/jpeg.wasm (zune-jpeg). PNG dispatch uses
- * the separately owned shared png-codec.wasm; neither has a JS fallback.
+ * JPEG sample decoding uses the @sandom/image-codecs JPEG module (zune-jpeg).
+ * PNG dispatch uses the separately owned @sandom/png codec; neither has a JS
+ * fallback.
  *
  * Returns the same { width, height, pixels } shape decodePNG does, so the
  * image pipeline in examples/render-scene.js branches on format exactly
@@ -11,10 +12,15 @@
 
 import { convertToSrgb, isSrgbLike, parseIccProfile, releaseIccProfile } from './color-profile.js';
 import { srgbRgba8ImageDescriptor } from './image-data.js';
-import { readBinaryFile } from './host.js';
+import { readPackageAsset } from './package-assets.js';
 import { isJXL } from './jpeg-xl-signature.js';
 import { createPngCodec } from './png-codec.js';
 import { encodePngOutputWithCodec } from './output/png.js';
+
+// Sandom's binding for the @sandom/image-codecs JPEG module. The library
+// import map resolves the package (a sibling checkout locally, the reviewed
+// library set or the installed npm package otherwise).
+const JPEG_WASM = '@sandom/image-codecs/jpeg.wasm';
 
 // The module imports NOTHING (verified: WebAssembly.Module.imports() is
 // empty) — no WASI, no env, no emscripten glue, unlike hb.wasm next door
@@ -29,7 +35,7 @@ async function ensureJpeg(state, getJpegBytes) {
   state.loading ??= (async () => {
     const wasmBytes = getJpegBytes
       ? await getJpegBytes()
-      : await readBinaryFile(new URL('../vendor/jpeg.wasm', import.meta.url));
+      : await readPackageAsset(new URL(import.meta.resolve(JPEG_WASM)));
     const { instance } = await WebAssembly.instantiate(wasmBytes, {});
     state.instance = instance;
     return instance;
@@ -39,9 +45,10 @@ async function ensureJpeg(state, getJpegBytes) {
   return await state.loading;
 }
 
-// Mirrors the shim's return codes (vendor/jpeg-wasm-rs/src/lib.rs). Spelled
-// out here rather than reported as a bare number because the three cases
-// mean genuinely different things to whoever hits them.
+// Mirrors the shim's return codes (jpeg-wasm-rs/src/lib.rs in
+// @sandom/image-codecs). Spelled out here rather than reported as a bare
+// number because the three cases mean genuinely different things to
+// whoever hits them.
 const DECODE_ERRORS = {
   '-1': 'internal error: decode() called before alloc()',
   '-2': 'not a decodable JPEG (truncated, corrupt, or an unsupported variant such as 12-bit or arithmetic-coded)',

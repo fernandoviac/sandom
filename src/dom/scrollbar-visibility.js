@@ -1,4 +1,4 @@
-// Overlay scrollbar visibility (plans/PLAN-native-scrollbars.md, decision 2).
+// Overlay scrollbar visibility (design/scrollbars.md, decision 2).
 //
 // An overlay bar is hidden while its scroller is at rest. A scroll position
 // change shows the thumb at once; a pointer in the bar's region shows it too

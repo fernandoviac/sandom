@@ -1,9 +1,12 @@
 import { domCoreForWrapper, sharedDomCore } from "../dom-wasm/core.js";
+import { scheduleFocusFixup } from "./input-activation.js";
 import {
   createCSSBindings,
   createDOMImplementationBinding,
   installDocumentConstructionBindings,
   installElementMarkupBindings,
+  installInnerTextBindings,
+  installOuterTextBindings,
   installFragmentMarkupBindings,
   installScriptBindings,
   installShadowMarkupBindings,
@@ -28,6 +31,8 @@ const properties = [
   "querySelector", "base[href]", "URL",
   "_assertMutationAllowed", "indexOf", ":", "slice", "withCustomElementReactions",
   "_setParsedAttribute", "_notifyMutation", "class", "attribute",
+  "renderedText", "setOuterText",
+  "_createPublicElement", "namespaceURI",
 ];
 const exceptionNames = { 3: "SyntaxError", 19: "NoModificationAllowedError" };
 
@@ -268,9 +273,141 @@ export function createCSSNamespace(runtime) {
   return Object.freeze(createCSSBindings(createMarkupLanguage(runtime)));
 }
 
+// The innerText and outerText getters (HTML): an element that is not being
+// rendered gives its descendant text; otherwise the rendered text
+// collection steps. The rendering state comes from the core
+// (element_rendered_state: bit 1 no box, 2 skipped contents, 4 visibility
+// not visible, 8 display: contents); the CSS values from computed style.
+const BLOCK_LEVEL_DISPLAYS = new Set(["block", "flow-root", "flex", "grid", "table", "list-item", "table-caption"]);
+function renderedState(element) {
+  return element._domCore.status("element_rendered_state", element._coreHandle);
+}
+// innerText and outerText update layout in Chrome, so they run the focus
+// check (scheduleFocusFixup).
+function renderedText(element) {
+  scheduleFocusFixup(element);
+  if (renderedState(element) & 3) return element.textContent;
+  const items = [];
+  for (const child of element.childNodes) collectRenderedText(child, items);
+  return joinRenderedText(items);
+}
+// One node's items: strings, as { text, collapsible }, and required line
+// break counts, as numbers.
+function collectRenderedText(node, items) {
+  if (node.nodeType === 3) {
+    const parent = node.parentElement;
+    // A text node renders only in a parent that has a box, is visible and
+    // does not skip its contents.
+    if (parent === null || (renderedState(parent) & 23)) return;
+    const style = parent.ownerDocument.getComputedStyle(parent);
+    const whiteSpace = style.getPropertyValue("white-space");
+    let text = node.data;
+    const collapsible = whiteSpace === "normal" || whiteSpace === "nowrap" || whiteSpace === "pre-line" || whiteSpace === "";
+    if (whiteSpace === "pre-line") text = text.replace(/[ \t]*\n[ \t]*/g, "\n").replace(/[ \t\r\f]+/g, " ");
+    else if (collapsible) text = text.replace(/[ \t\n\r\f]+/g, " ");
+    const transform = style.getPropertyValue("text-transform");
+    if (transform === "uppercase") text = text.toUpperCase();
+    else if (transform === "lowercase") text = text.toLowerCase();
+    else if (transform === "capitalize") text = text.replace(/(^|\s)(\S)/g, (_, space, letter) => space + letter.toUpperCase());
+    items.push({ text, collapsible });
+    return;
+  }
+  if (node.nodeType !== 1) return;
+  const state = renderedState(node);
+  if (state & 3) return;
+  const children = [];
+  for (const child of node.childNodes) collectRenderedText(child, children);
+  if ((state & 4) || (state & 8)) {
+    items.push(...children);
+    return;
+  }
+  const style = node.ownerDocument.getComputedStyle(node);
+  const display = style.getPropertyValue("display");
+  if (node.localName === "br") {
+    items.push({ text: "\n", collapsible: false });
+    return;
+  }
+  const nextBox = (wanted) => {
+    for (let sibling = node.nextElementSibling; sibling !== null; sibling = sibling.nextElementSibling) {
+      if (!(renderedState(sibling) & 3) && node.ownerDocument.getComputedStyle(sibling).getPropertyValue("display") === wanted) return true;
+    }
+    return false;
+  };
+  if (display === "table-cell" && nextBox("table-cell")) children.push({ text: "\t", collapsible: false });
+  if (display === "table-row" && nextBox("table-row")) children.push({ text: "\n", collapsible: false });
+  const breaks = node.localName === "p" ? 2 : BLOCK_LEVEL_DISPLAYS.has(display) ? 1 : 0;
+  if (breaks) items.push(breaks, ...children, breaks);
+  else items.push(...children);
+}
+// CSS white space processing across the items, then the required line
+// breaks: a collapsible space after a space or at the start of a block
+// goes, and so does one at the end of a block.
+function joinRenderedText(items) {
+  let blockStart = true;
+  let afterSpace = false;
+  for (const item of items) {
+    if (typeof item === "number") {
+      blockStart = true;
+      afterSpace = false;
+      continue;
+    }
+    if (item.collapsible && item.text.startsWith(" ") && (blockStart || afterSpace)) item.text = item.text.slice(1);
+    if (item.text === "") continue;
+    blockStart = false;
+    afterSpace = item.collapsible && item.text.endsWith(" ");
+  }
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    if (typeof item === "number" || !item.collapsible || !item.text.endsWith(" ")) continue;
+    let next = index + 1;
+    while (next < items.length && typeof items[next] !== "number" && items[next].text === "") next++;
+    if (next === items.length || typeof items[next] === "number") item.text = item.text.slice(0, -1);
+  }
+  let text = "";
+  let pendingBreaks = 0;
+  for (const item of items) {
+    if (typeof item === "number") {
+      if (text !== "") pendingBreaks = Math.max(pendingBreaks, item);
+      continue;
+    }
+    if (item.text === "") continue;
+    text += "\n".repeat(pendingBreaks) + item.text;
+    pendingBreaks = 0;
+  }
+  return text;
+}
+
+// The outerText setter (HTML): the element is replaced by the rendered
+// text fragment of the value, which merges with adjacent text.
+function setOuterText(element, value) {
+  const parent = element.parentNode;
+  if (parent === null) throw new DOMException("outerText: the element has no parent", "NoModificationAllowedError");
+  const document = element.ownerDocument;
+  const next = element.nextSibling;
+  const previous = element.previousSibling;
+  const fragment = document.createDocumentFragment();
+  String(value).split(/\r\n|\r|\n/).forEach((line, index) => {
+    if (index > 0) fragment.append(document.createElement("br"));
+    if (line !== "") fragment.append(document.createTextNode(line));
+  });
+  if (fragment.firstChild === null) fragment.append(document.createTextNode(""));
+  parent.replaceChild(fragment, element);
+  const merge = (node) => {
+    const following = node?.nextSibling;
+    if (node?.nodeType !== 3 || following?.nodeType !== 3) return;
+    node.data += following.data;
+    following.remove();
+  };
+  if (next?.nodeType === 3) merge(next.previousSibling);
+  if (previous?.nodeType === 3) merge(previous);
+}
+
 export function installMarkupBindings(prototypes, runtime) {
-  const language = createMarkupLanguage(runtime);
+  const language = createMarkupLanguage({ ...runtime, renderedText, setOuterText });
   installElementMarkupBindings(language, prototypes.element);
+  installInnerTextBindings(language, prototypes.htmlElement);
+  installInnerTextBindings(language, prototypes.script);
+  installOuterTextBindings(language, prototypes.htmlElement);
   installFragmentMarkupBindings(language, prototypes.fragment);
   installShadowMarkupBindings(language, prototypes.shadow);
   installDocumentConstructionBindings(language, prototypes.document);

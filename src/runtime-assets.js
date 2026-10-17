@@ -1,6 +1,6 @@
-import { readBinaryFile } from "./host.js";
+import { readPackageAsset } from "./package-assets.js";
 
-const RUNTIME_OPTION_KEYS = new Set(["assets", "resolveSystemFontFamily"]);
+const RUNTIME_OPTION_KEYS = new Set(["assets", "resolveSystemFontFamily", "bundledSystemFonts"]);
 const ASSET_KEYS = new Set(["harfbuzz", "msdfgen", "codecs"]);
 const CODEC_KEYS = new Set(["png", "jpeg", "webp", "jpegXl"]);
 
@@ -39,7 +39,7 @@ function normalizeAssetSource(source, name) {
 }
 
 export async function assetBytes(source) {
-  return source instanceof Uint8Array ? source : await readBinaryFile(source);
+  return source instanceof Uint8Array ? source : await readPackageAsset(source);
 }
 
 export function lazyAssetBytes(source, name) {
@@ -61,6 +61,16 @@ export async function prepareSandomRuntimeOptions(options = {}) {
     typeof options.resolveSystemFontFamily !== "function"
   ) {
     throw new TypeError("resolveSystemFontFamily must be a function");
+  }
+  // The generic faces of the runtime's font registry: the result of
+  // loadBundledSystemFonts() (src/system-fonts.js).
+  if (
+    options.bundledSystemFonts !== undefined &&
+    typeof options.bundledSystemFonts?.familyFor !== "function"
+  ) {
+    throw new TypeError(
+      `bundledSystemFonts must be the result of loadBundledSystemFonts(); it is ${options.bundledSystemFonts}`,
+    );
   }
   const explicitAssets = options.assets !== undefined;
   let harfbuzzSource = null;
@@ -109,6 +119,7 @@ export async function prepareSandomRuntimeOptions(options = {}) {
   return Object.freeze({
     explicitAssets,
     resolveSystemFontFamily: options.resolveSystemFontFamily ?? null,
+    bundledSystemFonts: options.bundledSystemFonts ?? null,
     harfbuzzSource,
     msdfgenSource,
     codecSources: Object.freeze(codecSources),

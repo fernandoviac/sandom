@@ -1,4 +1,6 @@
-import { readBinaryFile } from "../host.js";
+import { SandomHostError, validateSandomHost } from "../host/contract.js";
+import { createDocumentResourceLoader } from "./document-resources.js";
+import { validateClosedRecord } from "../closed-record.js";
 import { createGifRecorder } from "../output/gif.js";
 import { encodeImage, validateOutputRequest } from "../output/image.js";
 import { generateAdaptiveImage } from "../output/gain-map.js";
@@ -9,6 +11,7 @@ import {
   selectPreprocessor,
 } from "./input-preprocessors.js";
 import { createRenderSurface } from "./render-surface.js";
+import { documentClockFromOptions } from "./document-clock.js";
 import { assertScrollbarStyle } from "./scrollbar-visibility.js";
 import { SDDocument } from "./node.js";
 import { serializeToScene } from "./serialize.js";
@@ -113,7 +116,6 @@ export async function renderDocumentAnimation(document, options = {}) {
     frameBudget,
     durationMilliseconds,
     loopCount = 0,
-    resolveResource = null,
     adaptiveCodecOptions = {},
     graphicsBackend = "auto",
     scrollbarStyle = "overlay",
@@ -148,15 +150,16 @@ export async function renderDocumentAnimation(document, options = {}) {
     viewportWidth: width,
     viewportHeight: height,
     deviceScale,
-    resolveResource,
     renderMode: highDynamicRangeStillOutput ? "high-dynamic-range" : undefined,
     renderPrecision: highDynamicRangeStillOutput ? "rgba16float" : undefined,
     graphicsBackend,
     scrollbarStyle,
   });
   try {
-    const initialFrame = await surface.renderNow({ pixels: true });
+    // A one-shot render runs no loop: a loop frame on the real clock could
+    // otherwise race the explicit render.
     surface.stop();
+    const initialFrame = await surface.renderNow({ pixels: true });
     if (format !== "gif") {
       const frame = frameMetadata(initialFrame);
       const descriptor = {
@@ -265,19 +268,116 @@ export async function renderDocumentAnimation(document, options = {}) {
   }
 }
 
+// Primary-input media types that select a preprocessor without an explicit
+// name. A network input never selects by its path extension.
+const PREPROCESSOR_BY_MEDIA_TYPE = Object.freeze({
+  "text/html": "html",
+  "application/xhtml+xml": "html",
+  "text/javascript": "javascript",
+  "application/javascript": "javascript",
+});
+
+// A primary input that the host fetched over the network selects its
+// preprocessor by response media type. Supplied bytes carry a caller-chosen
+// URL, so they select by their media type when one is given, and otherwise by
+// the URL path extension, as a file input does.
+function selectInputPreprocessor(registry, inputURL, mediaType, explicitName, fetched) {
+  if (explicitName !== undefined && explicitName !== null) {
+    return selectPreprocessor(registry, inputURL, explicitName);
+  }
+  if (!fetched) {
+    const name = mediaType === null ? undefined : PREPROCESSOR_BY_MEDIA_TYPE[mediaType];
+    return selectPreprocessor(registry, inputURL, name);
+  }
+  if (inputURL.protocol === "http:" || inputURL.protocol === "https:") {
+    const name = mediaType === null ? undefined : PREPROCESSOR_BY_MEDIA_TYPE[mediaType];
+    if (name === undefined) {
+      throw new SandomHostError(
+        "response-media-type",
+        `Network input ${inputURL.href} has media type ${
+          mediaType === null ? "(absent)" : JSON.stringify(mediaType)
+        }; supported input media types are ${
+          Object.keys(PREPROCESSOR_BY_MEDIA_TYPE).join(", ")
+        }, or name a preprocessor`,
+        { details: { mediaType } },
+      );
+    }
+    return selectPreprocessor(registry, inputURL, name);
+  }
+  return selectPreprocessor(registry, inputURL, undefined);
+}
+
+// Obtains the primary input through the host as a document demand. The
+// demand's client is the input itself, as a top-level navigation is.
+async function requestPrimaryInput(host, inputURL) {
+  const loader = createDocumentResourceLoader({ host, documentURL: inputURL.href });
+  try {
+    const resource = await loader.resolveResource({
+      requestedURL: inputURL.href,
+      kind: "document",
+    });
+    return resource;
+  } finally {
+    await loader.release();
+  }
+}
+
+// `now`, `requestFrame`, `cancelFrame` and `timeOrigin` are the document's
+// clock (src/dom/document-clock.js), as for renderComponent; the host's
+// real clock when omitted. Every surface over the document runs on it.
+// Pass `timeOrigin` with `now`: it is the page's date at time 0, and
+// without it the page's `Date` starts at the Unix epoch; page scripts may
+// need the current date.
+const PREPARATION_OPTION_NAMES = new Set([
+  "preprocessors",
+  "preprocessor",
+  "host",
+  "now",
+  "requestFrame",
+  "cancelFrame",
+  "timeOrigin",
+]);
+
 export async function prepareRenderInput(input, options = {}) {
+  validateClosedRecord(options, PREPARATION_OPTION_NAMES, "prepareRenderInput options");
+  const {
+    preprocessors = [],
+    preprocessor: explicitPreprocessor,
+    host,
+  } = options;
+  validateSandomHost(host, "prepareRenderInput");
+  const clock = documentClockFromOptions(options, "prepareRenderInput options");
+  let requestedURL;
   let inputURL;
   let inputBytes;
+  let mediaType = null;
+  let inputDigest;
+  let provenance;
   if (input instanceof URL || typeof input === "string") {
-    inputURL = input instanceof URL ? new URL(input.href) : new URL(input);
-    inputBytes = await readBinaryFile(inputURL);
+    requestedURL = new URL(input);
+    const resource = await requestPrimaryInput(host, requestedURL);
+    inputURL = new URL(resource.finalURL);
+    inputBytes = resource.bytes;
+    mediaType = resource.mediaType;
+    inputDigest = resource.digest;
+    provenance = resource.provenance;
   } else if (input && typeof input === "object" && !Array.isArray(input)) {
-    inputURL = input.url instanceof URL
-      ? new URL(input.url.href)
-      : new URL(input.url);
-    inputBytes = input.bytes === undefined
-      ? await readBinaryFile(inputURL)
-      : input.bytes;
+    requestedURL = new URL(input.url);
+    if (input.bytes === undefined) {
+      const resource = await requestPrimaryInput(host, requestedURL);
+      inputURL = new URL(resource.finalURL);
+      inputBytes = resource.bytes;
+      mediaType = resource.mediaType;
+      inputDigest = resource.digest;
+      provenance = resource.provenance;
+    } else {
+      inputURL = requestedURL;
+      inputBytes = input.bytes;
+      if (input.mediaType !== undefined && input.mediaType !== null) {
+        mediaType = String(input.mediaType);
+      }
+      provenance = Object.freeze({ backend: "supplied-input" });
+    }
   } else {
     throw new TypeError(
       "input must be a URL, absolute URL string, or { url, bytes } object",
@@ -287,20 +387,18 @@ export async function prepareRenderInput(input, options = {}) {
     throw new TypeError("input.bytes must be a Uint8Array");
   }
 
-  const {
-    preprocessors = [],
-    preprocessor: explicitPreprocessor,
-    resolveResource: callerResolveResource = null,
-  } = options;
   const registry = createPreprocessorRegistry(preprocessors);
-  const selectedPreprocessor = selectPreprocessor(
+  const selectedPreprocessor = selectInputPreprocessor(
     registry,
     inputURL,
+    mediaType,
     explicitPreprocessor,
+    input.bytes === undefined,
   );
   const preparedDocument = await createPreparedDocument({
     url: inputURL,
-    resolveResource: callerResolveResource,
+    host,
+    clock,
   });
   const {
     document,
@@ -314,7 +412,7 @@ export async function prepareRenderInput(input, options = {}) {
       input: normalizedInput,
       document,
       window,
-      executeModule: createModuleExecutor(window),
+      executeModule: createModuleExecutor(document, window),
       resolveResource,
     }));
     if (preparationResult !== undefined) {
@@ -325,12 +423,18 @@ export async function prepareRenderInput(input, options = {}) {
       );
     }
     await document._readyForRendering();
+    // The prepared input is the loaded document: each image's load or
+    // error event has run, as the window load event waits for them.
+    await document._imagesLoaded();
     inputRecord = Object.freeze({
-      url: inputURL.href,
+      url: requestedURL.href,
       finalURL: inputURL.href,
+      mediaType,
       byteLength: inputBytes.byteLength,
-      digest: await digest(inputBytes),
+      digest: inputDigest ?? await digest(inputBytes),
       preprocessor: selectedPreprocessor.name,
+      provenance,
+      backend: host.backend,
     });
   } catch (preparationError) {
     try {
@@ -352,7 +456,6 @@ export async function prepareRenderInput(input, options = {}) {
   const state = {
     active: false,
     released: false,
-    resolveResource,
     preparedDocument,
     resourceRecords: () => preparedDocument.resources,
     diagnosticRecords: () => preparedDocument.diagnostics,
@@ -470,7 +573,6 @@ export async function renderPreparedInput(preparedInput, renderRequest = {}) {
       preparedInput.document,
       {
         ...exactRequest,
-        resolveResource: state.resolveResource,
       },
     );
     return Object.freeze({
@@ -490,7 +592,6 @@ export async function startPreparedRenderSurface(preparedInput, options = {}) {
   try {
     surface = createRenderSurface(preparedInput.document.documentElement, {
       ...options,
-      resolveResource: state.resolveResource,
     });
     await surface.renderNow();
     surface.start();
@@ -695,12 +796,22 @@ function immutableLayoutFacts(
   }
 }
 
+// A layout inspection lays out a broken image as an image that paints
+// nothing, as a render does. The DOM image loading fired its error event,
+// and the render surface records its diagnostic. An invalid host response
+// is a host defect and fails the inspection.
+function brokenImageInLayout({ error }) {
+  if (error.cause instanceof SandomHostError && error.cause.code === "invalid-host-response") {
+    throw error.cause;
+  }
+}
+
 export async function inspectDocumentLayout(
   renderRoot,
   viewport,
   {
     createArtifact = createLayoutArtifact,
-    resolveResource = null,
+    resolveResource = renderRoot.ownerDocument._resolveResource,
     scrollbarStyle = "overlay",
   } = {},
 ) {
@@ -739,6 +850,7 @@ export async function inspectDocumentLayout(
       imageSources: serialized.imageSources,
     }, {
       resolveResource,
+      onImageLoadError: brokenImageInLayout,
     });
     layout = immutableLayoutFacts(
       document,
@@ -807,7 +919,6 @@ export async function inspectPreparedInput(
         { width, height, deviceScale },
         {
           createArtifact,
-          resolveResource: state.resolveResource,
           scrollbarStyle,
         },
       );
@@ -826,23 +937,21 @@ export async function inspectPreparedInput(
 
     await document._readyForRendering();
 
+    // The inspection renders once at time 0 (prepareNow) on the document's
+    // clock, and never runs a frame: the surface stops before it prepares.
     const surface = createSurface(document.documentElement, {
       viewportWidth: width,
       viewportHeight: height,
       deviceScale,
-      now: () => 0,
-      requestFrame: () => 0,
-      cancelFrame: () => {},
-      resolveResource: state.resolveResource,
       initializePersistentRenderer: false,
       scrollbarStyle,
     });
     try {
-      const preparedState = await surface.prepareNow();
       surface.stop();
+      const preparedState = await surface.prepareNow();
       const artifact = await createArtifact(
         preparedState.scene,
-        { resolveResource: state.resolveResource },
+        { resolveResource: document._resolveResource, onImageLoadError: brokenImageInLayout },
       );
       const motion = surface.inspectMotion();
       return Object.freeze({
@@ -927,7 +1036,6 @@ export async function inspectAnimationPreparedInput(
         viewportWidth: width,
         viewportHeight: height,
         deviceScale,
-        resolveResource: state.resolveResource,
         renderMode: highDynamicRange ? "high-dynamic-range" : undefined,
         renderPrecision: highDynamicRange ? "rgba16float" : undefined,
         capturePaintArtifact: true,
@@ -936,8 +1044,9 @@ export async function inspectAnimationPreparedInput(
       },
     );
     try {
-      const frame = await surface.renderNow();
+      // A one-shot render runs no loop (as renderDocumentAnimation).
       surface.stop();
+      const frame = await surface.renderNow();
       if (!frame?.inspection) {
         throw new Error(
           "The render surface did not return inspection artifacts",

@@ -33,6 +33,7 @@
 //   exist here; instance data is uploaded with bufferData per draw.
 
 import { createNativeWebgl2Context } from "./native-webgl2-adapter.js";
+import { hostNow } from "./host-clock.js";
 
 import {
   BLEND_NORMAL,
@@ -66,7 +67,6 @@ import {
   BOX_SHADOW_INSTANCE_FLOATS,
   clipUniformFloats,
   createRasterPlanCursor,
-  dirtyTileRectangles,
   EMPTY_CLIP_STATE,
   filterPassReaches,
   filterRegionPadding,
@@ -74,6 +74,7 @@ import {
   RECT_INSTANCE_FLOATS,
 } from "./raster-plan.js";
 import { STANDARD_WORKING_COLOR_ENCODING } from "./color.js";
+import { createRasterRetention } from "./gpu-raster-binding.js";
 
 // Fixed width (texels) of the two gradient data textures. 4096 records ×
 // 3 texels = 12288 texels = 12 rows at this width; ES 3.0 guarantees a
@@ -1202,7 +1203,7 @@ ${CLIP_EVAL_GLSL}
   bool isPorterDuff = porterDuff > 0.5;
   vec4 src = targetTexel(srcTex);
   if (src.a < 0.001 && !isPorterDuff) { discard; }
-  src.rgb = clamp(src.rgb / max(src.a, 1e-6), vec3(0.0), vec3(1.0));
+  src.rgb = max(src.rgb, vec3(0.0)) / max(src.a, 1e-6);
   if (pathMaskInfo.x > 0.5) {
     // COMPOSITE_SHADER's path mask (see its comments).
     vec2 fromTranslation = gl_FragCoord.xy - pathMaskTranslation.xy;
@@ -1259,7 +1260,7 @@ ${CLIP_EVAL_GLSL}
   if (blendMode != ${BLEND_NORMAL}.0) {
     vec4 backdrop = targetTexel(backdropTex);
     vec3 backdropColor = backdrop.a > 0.0
-      ? clamp(backdrop.rgb / max(backdrop.a, 1e-6), vec3(0.0), vec3(1.0))
+      ? max(backdrop.rgb, vec3(0.0)) / max(backdrop.a, 1e-6)
       : vec3(0.0);
     vec3 blended;
     if (blendMode <= BLEND_EXCLUSION) {
@@ -1267,6 +1268,7 @@ ${CLIP_EVAL_GLSL}
     } else {
       blended = blendNonSeparable(blendMode, backdropColor, src.rgb);
     }
+    blended = max(blended, vec3(0.0));
     vec3 mixed = mix(src.rgb, blended, backdrop.a);
     color = vec4(mixed, src.a);
   }
@@ -1448,7 +1450,6 @@ out vec2 vUv;
 out vec4 vColor;
 out float vPxRange;
 out vec2 vPixelPos;
-out float vShadowSoft;
 out vec2 vLocalPerUv;
 void main() {
   vec2 localPixelPos = glyphPos + quadVertex * glyphSize;
@@ -1461,7 +1462,6 @@ void main() {
   vColor = color;
   vPxRange = params.x;
   vPixelPos = pixelPos;
-  vShadowSoft = params.y;
   vLocalPerUv = glyphSize / uvSize;
 }
 `;
@@ -1479,7 +1479,6 @@ in vec2 vUv;
 in vec4 vColor;
 in float vPxRange;
 in vec2 vPixelPos;
-in float vShadowSoft;
 in vec2 vLocalPerUv;
 out vec4 fragColor;
 
@@ -1497,19 +1496,8 @@ const vec2 SUBPIXEL_BOX_CENTRES[4] = vec2[4](
 void main() {
 ${CLIP_EVAL_GLSL}
 
-  vec4 msdf = texture(atlasTex, vUv);
-  float sd = median(msdf.r, msdf.g, msdf.b);
-  float screenPxDistance = (sd - 0.5) * vPxRange;
-  float fw = max(length(vec2(dFdx(screenPxDistance), dFdy(screenPxDistance))), 1e-4);
   vec2 uvdx = dFdx(vUv);
   vec2 uvdy = dFdy(vUv);
-  if (vShadowSoft > 0.0) {
-    float h = max(2.0 * vShadowSoft, 0.5 * fw);
-    float softAlpha = smoothstep(-h, h, screenPxDistance) * vColor.a * clipCoverage;
-    if (softAlpha < 0.001) { discard; }
-    fragColor = vec4(vColor.rgb, softAlpha);
-    return;
-  }
   // Pixel area coverage from four half-pixel boxes, screen distances
   // through the uv Jacobian (see the WebGPU text shader).
   float luma = dot(vColor.rgb, vec3(0.299, 0.587, 0.114));
@@ -2629,10 +2617,7 @@ export async function releaseSharedWebgl2State(
   gl.deleteTexture(shared.gradientRecordsTexture.texture);
   gl.deleteTexture(shared.gradientStopsTexture.texture);
   gl.deleteTexture(shared.placeholderTexture);
-  for (const entry of shared.atlasTextures.values()) {
-    entry.unsubscribeDestroy();
-    gl.deleteTexture(entry.texture);
-  }
+  for (const entry of shared.atlasTextures.values()) entry.close();
   shared.atlasTextures.clear();
   gl.deleteFramebuffer(shared.blitReadFramebuffer);
   gl.deleteFramebuffer(shared.blitDrawFramebuffer);
@@ -2658,6 +2643,7 @@ export async function createRenderContextWebgl2(options) {
   }
   const mainTarget = createCanvasTexture(shared.gl, width, height);
   let frameCount = 0;
+  let rasterRetention = null;
   return {
     kind: "webgl2",
     backendInfo: shared.backendInfo,
@@ -2678,8 +2664,11 @@ export async function createRenderContextWebgl2(options) {
     incrementFrameCount() {
       frameCount++;
     },
+    rasterRetentionFor(core) {
+      return rasterRetention ??= createRasterRetention(core, width, height, 4);
+    },
     destroy() {
-      this._releaseRasterRetention?.();
+      rasterRetention?.destroy();
       shared.gl.deleteFramebuffer(mainTarget.framebuffer);
       shared.gl.deleteTexture(mainTarget.texture);
     },
@@ -2818,10 +2807,9 @@ export function renderWebgl2(context, options = {}) {
     background = { r: 0, g: 0, b: 0, a: 0 },
     svgPathAtlas = null,
     planReader,
-    atlases = null,
+    atlasForIdentity,
     images = null,
     dirtyTiles = null,
-    tileSize = 64,
     deferReadback = false,
     readback = "float32",
     textThickening = { darkInk: 0, lightInk: 0 },
@@ -2858,8 +2846,8 @@ export function renderWebgl2(context, options = {}) {
   const blendLayerStack = [];
   const maskStack = [];
   const maskLayerStack = [];
-  const batch = createRasterPlanCursor(planReader, {
-    atlases,
+  const batch = createRasterPlanCursor(planReader, options.rasterPlan.exports, {
+    atlasForIdentity,
     svgPathAtlas,
     images,
   });
@@ -2961,53 +2949,72 @@ export function renderWebgl2(context, options = {}) {
     );
   }
 
-  // An MSDF atlas (text or svg path) as a GL texture, uploaded once per
-  // (atlas, revision) and held by the shared context until the atlas is
-  // destroyed or the context released — the WebGPU backend's
-  // WasmAtlas.deviceTexture rule.
+  // Each context acknowledges its own native change stream. Retained native
+  // revisions keep displaced textures alive until their final plan releases.
   function cachedAtlasTexture(atlas) {
-    const cached = atlasTextures.get(atlas);
-    if (cached !== undefined && cached.revision === atlas.revision) {
-      return cached.texture;
-    }
-    if (cached !== undefined) gl.deleteTexture(cached.texture);
-    const texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texStorage2D(
-      gl.TEXTURE_2D,
-      1,
-      gl.RGBA8,
-      atlas.atlasWidth,
-      atlas.atlasHeight,
-    );
-    gl.texSubImage2D(
-      gl.TEXTURE_2D,
-      0,
-      0,
-      0,
-      atlas.atlasWidth,
-      atlas.atlasHeight,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      atlas.uploadBytes(),
-    );
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    const unsubscribeDestroy = cached?.unsubscribeDestroy ??
-      atlas.onDestroy(() => {
-        const entry = atlasTextures.get(atlas);
-        if (entry === undefined) return;
-        atlasTextures.delete(atlas);
+    const owner = atlas.graphicsOwner;
+    let entry = atlasTextures.get(owner);
+    if (!entry) {
+      entry = { texture: null, revision: 0, identity: 0, sequence: 0, records: new Map() };
+      entry.consumer = owner.createUploadConsumer((identity) => {
+        const record = entry.records.get(identity);
+        if (!record) throw new Error(`Native atlas texture ${identity} is absent from its WebGL context`);
+        entry.records.delete(identity);
         gl.activate?.();
-        gl.deleteTexture(entry.texture);
+        gl.deleteTexture(record.texture);
       });
-    atlasTextures.set(atlas, {
-      revision: atlas.revision,
-      texture,
-      unsubscribeDestroy,
-    });
+      entry.close = () => {
+        if (!entry.consumer) return;
+        atlasTextures.delete(owner);
+        entry.unsubscribeDestroy();
+        if (entry.identity) owner.retireUploadTexture(entry.consumer, entry.revision, entry.identity);
+        owner.closeUploadConsumer(entry.consumer);
+        entry.consumer = 0;
+        gl.activate?.();
+      };
+      entry.unsubscribeDestroy = owner.onDestroy(entry.close);
+      atlasTextures.set(owner, entry);
+    }
+    if (entry.revision === atlas.revision) return entry.texture;
+    for (const record of entry.records.values()) {
+      if (record.revision === atlas.revision) return record.texture;
+    }
+    const changes = atlas.uploadChanges(entry.consumer);
+    let texture = entry.texture;
+    if (changes.replace) {
+      texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, atlas.atlasWidth, atlas.atlasHeight);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+    }
+    try {
+      for (const rectangle of changes.rectangles) {
+        const { data, bytesPerRow } = atlas.uploadRegion(rectangle);
+        gl.pixelStorei(gl.UNPACK_ROW_LENGTH, bytesPerRow / 4);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, rectangle.x, rectangle.y, rectangle.width, rectangle.height,
+          gl.RGBA, gl.UNSIGNED_BYTE, data);
+      }
+    } finally {
+      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    }
+    const previousIdentity = entry.identity;
+    const previousRevision = entry.revision;
+    entry.texture = texture;
+    entry.revision = atlas.revision;
+    if (changes.replace) {
+      entry.identity = ++entry.sequence;
+      entry.records.set(entry.identity, { texture, revision: atlas.revision });
+    } else {
+      entry.records.get(entry.identity).revision = atlas.revision;
+    }
+    atlas.acknowledgeUpload(entry.consumer);
+    if (changes.replace && previousIdentity) owner.retireUploadTexture(entry.consumer, previousRevision, previousIdentity);
+    gl.activate?.();
     return texture;
   }
 
@@ -3103,12 +3110,7 @@ export function renderWebgl2(context, options = {}) {
   } else {
     gl.enable(gl.SCISSOR_TEST);
     gl.clearColor(background.r, background.g, background.b, background.a);
-    for (const { x, y, w, h } of dirtyTileRectangles(
-      dirtyTiles,
-      width,
-      height,
-      tileSize,
-    )) {
+    for (const { x, y, w, h } of options.damageRectangles) {
       gl.scissor(x, y, w, h);
       gl.clear(gl.COLOR_BUFFER_BIT);
     }
@@ -3458,11 +3460,11 @@ export function renderWebgl2(context, options = {}) {
       if (batch.instances.length === 0) break;
       bindTarget(currentTarget);
       setStandardBlend();
-      const glyphUploadStartedAt = glyphPerformance ? performance.now() : 0;
+      const glyphUploadStartedAt = glyphPerformance ? hostNow() : 0;
       const atlasTexture = cachedAtlasTexture(batch.atlas);
       if (glyphPerformance) {
         glyphPerformance.phaseMilliseconds.gpuUploadMilliseconds +=
-          performance.now() - glyphUploadStartedAt;
+          hostNow() - glyphUploadStartedAt;
       }
       const text = programs.text;
       gl.useProgram(text.program);
@@ -3859,25 +3861,7 @@ export function renderWebgl2(context, options = {}) {
     };
   }
 
-  let dirtyRects = [{ x: 0, y: 0, w: width, h: height }];
-  if (incremental) {
-    const columns = Math.ceil(width / tileSize);
-    const rows = Math.ceil(height / tileSize);
-    dirtyRects = [];
-    for (let row = 0; row < rows; row++) {
-      for (let col = 0; col < columns; col++) {
-        if (!dirtyTiles[row * columns + col]) continue;
-        const tx = col * tileSize;
-        const ty = row * tileSize;
-        dirtyRects.push({
-          x: tx,
-          y: ty,
-          w: Math.min(tileSize, width - tx),
-          h: Math.min(tileSize, height - ty),
-        });
-      }
-    }
-  }
+  const dirtyRects = options.rasterFrame.dirtyRectangles();
 
   // readPixels is synchronous; the y-flipped clip-space convention above
   // makes framebuffer row 0 the image's TOP row, so the returned rows are

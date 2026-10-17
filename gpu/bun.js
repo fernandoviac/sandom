@@ -38,3 +38,7 @@ if (!globalThis.navigator?.gpu) {
     return adapter;
   };
 }
+
+// Sandom's GPU thread is a worker without this realm's globals. Its default
+// thread imports this module there before it reads `navigator.gpu`.
+globalThis[Symbol.for("sandom.gpuModule")] = import.meta.url;

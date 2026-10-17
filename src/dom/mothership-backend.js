@@ -1,6 +1,6 @@
 import { createRenderSurface as createDOMRenderSurface } from "./render-surface.js";
 import { CustomElementRegistry } from "./custom-elements.js";
-import { markHostEventListener } from "./events.js";
+import { markHostEventListener, normalizeListenerOptions } from "./events.js";
 import { SDDocument } from "./node.js";
 import { isStyleDeclaration, supportsStyleProperty } from "./style.js";
 
@@ -115,7 +115,7 @@ const MEMBERS = Object.freeze({
   "token-list": {
     data: new Set(["length", "value"]),
     writable: new Set(["value"]),
-    methods: new Set(["add", "remove", "contains", "toggle", "replace", "item"]),
+    methods: new Set(["add", "remove", "contains", "toggle", "replace", "item", "supports", "toString"]),
   },
   "element-internals": {
     data: new Set([
@@ -173,7 +173,7 @@ function resourceType(resource) {
   if (isStyleDeclaration(resource)) return "style-declaration";
   if (resource?.nodeType === 11) return resource.host ? "shadow-root" : "document-fragment";
   if (resource?.nodeType === 1) return "element";
-  if (constructorName === "SDDOMTokenList") return "token-list";
+  if (constructorName === "DOMTokenList") return "token-list";
   if (constructorName === "ElementInternals") return "element-internals";
   if (constructorName === "CustomStateSet") return "custom-state-set";
   if (constructorName?.includes("StyleSheet")) return "stylesheet";
@@ -334,7 +334,7 @@ export function createMothershipBackend({
       if (inspection.kind !== "data" || !inspection.writable) {
         throw new TypeError(`${resourceType(resource)}.${propertyName} is not writable`);
       }
-      return await runHostOperation(async () => {
+      return await runHostOperation(() => {
         resource[propertyName] = value;
         return { kind: "primitive", value };
       }, reactionContext);
@@ -343,7 +343,7 @@ export function createMothershipBackend({
       const inspection = inspectMember(resource, propertyName);
       if (inspection.kind !== "data" || !inspection.writable) return false;
       return await runHostOperation(
-        async () => delete resource[propertyName],
+        () => delete resource[propertyName],
         reactionContext,
       );
     },
@@ -378,12 +378,23 @@ export function createMothershipBackend({
       if (participant === null || participant === undefined) {
         throw new TypeError("Mothership event listeners require a participant");
       }
+      const capture = normalizeListenerOptions(options).capture;
       let byResource = listenerWrappers.get(callback);
       if (!byResource) {
         byResource = new WeakMap();
         listenerWrappers.set(callback, byResource);
       }
-      if (byResource.has(resource)) return;
+      let byEventName = byResource.get(resource);
+      if (!byEventName) {
+        byEventName = new Map();
+        byResource.set(resource, byEventName);
+      }
+      let byCapture = byEventName.get(eventName);
+      if (!byCapture) {
+        byCapture = new Map();
+        byEventName.set(eventName, byCapture);
+      }
+      if (byCapture.has(capture)) return;
       const wrapped = (event) => {
         const context = customElements._activeReactionContext();
         if (context === null) {
@@ -400,9 +411,9 @@ export function createMothershipBackend({
         participant,
         runHostOperation: runHostEventOperation,
       });
-      byResource.set(resource, wrapped);
+      byCapture.set(capture, wrapped);
       await runHostOperation(
-        async () => resource.addEventListener(eventName, wrapped, options),
+        () => resource.addEventListener(eventName, wrapped, options),
         reactionContext,
       );
     },
@@ -413,13 +424,18 @@ export function createMothershipBackend({
       options,
       { reactionContext = null } = {},
     ) {
-      const wrapped = listenerWrappers.get(callback)?.get(resource);
+      const capture = normalizeListenerOptions(options).capture;
+      const byEventName = listenerWrappers.get(callback)?.get(resource);
+      const byCapture = byEventName?.get(eventName);
+      const wrapped = byCapture?.get(capture);
       if (!wrapped) return;
       await runHostOperation(
-        async () => resource.removeEventListener(eventName, wrapped, options),
+        () => resource.removeEventListener(eventName, wrapped, options),
         reactionContext,
       );
-      listenerWrappers.get(callback).delete(resource);
+      byCapture.delete(capture);
+      if (byCapture.size === 0) byEventName.delete(eventName);
+      if (byEventName.size === 0) listenerWrappers.get(callback).delete(resource);
     },
     setCustomElementResolver(resolver) {
       if (customElementResolver !== null) {
@@ -461,7 +477,7 @@ export function createMothershipBackend({
       await customElements.abortHostConstruction(constructionToken, reactionContext);
     },
     async upgradeCustomElements(root, { reactionContext = null } = {}) {
-      return await runOperation(
+      return await runHostOperation(
         async (context) => await customElements.upgradeHost(root, context),
         reactionContext,
       );

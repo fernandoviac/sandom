@@ -8,7 +8,9 @@ import {
   createComponentEnvironment,
   normalizeComponentEnvironmentOptions,
 } from "./component-environment.js";
+import { closeComponentCode, enterComponentCode } from "./component-code.js";
 import { createSandomDOM } from "./sandom-dom.js";
+import { documentClockFromOptions } from "./document-clock.js";
 import { normalizeInputBatch } from "./interaction.js";
 import { createPreparedDocument } from "./prepared-document.js";
 import { SandomViewport } from "./viewport.js";
@@ -16,6 +18,9 @@ import { buildAccessibilitySnapshot } from "./accessibility.js";
 import { prepareNativeWebgl2Host } from "../native-webgl2-adapter.js";
 import { createSceneRenderer } from "../scene-renderer.js";
 import { validateClosedRecord } from "../closed-record.js";
+import { validateSandomHost } from "../host/contract.js";
+import { eraseEventListenersAndHandlers } from "./event-handlers.js";
+import { hostNow } from "../host-clock.js";
 
 function positiveDimension(value, name) {
   const number = Number(value);
@@ -65,6 +70,32 @@ function collectCleanupError(errors, error) {
   errors.push(...(error instanceof AggregateError ? error.errors : [error]));
 }
 
+const PREFERENCE_VALUES = Object.freeze({
+  colorScheme: ["light", "dark"],
+  reducedMotion: ["no-preference", "reduce"],
+});
+
+// The user's preferences, as prefers-color-scheme and prefers-reduced-motion
+// name them, to style-environment values. Absent keys stay unchanged.
+function preferenceEnvironment(preferences, name) {
+  if (!preferences || typeof preferences !== "object" || Array.isArray(preferences)) {
+    throw new TypeError(`${name} must be an object`);
+  }
+  const environment = {};
+  for (const [key, value] of Object.entries(preferences)) {
+    const allowed = PREFERENCE_VALUES[key];
+    if (allowed === undefined) {
+      throw new TypeError(`${name} contains unknown field ${key}; expected colorScheme or reducedMotion`);
+    }
+    if (!allowed.includes(value)) {
+      throw new RangeError(`${name}.${key} is ${JSON.stringify(value)}; expected ${allowed.map((entry) => JSON.stringify(entry)).join(" or ")}`);
+    }
+    if (key === "colorScheme") environment.colorScheme = value;
+    else environment.reducedMotion = value === "reduce";
+  }
+  return environment;
+}
+
 const COMPONENT_OPTION_NAMES = new Set([
   "mount",
   "width",
@@ -76,9 +107,14 @@ const COMPONENT_OPTION_NAMES = new Set([
   "graphicsBackend",
   "presentFrame",
   "display",
+  "preferences",
   "reportException",
   "environment",
-  "resolveResource",
+  "host",
+  "now",
+  "requestFrame",
+  "cancelFrame",
+  "timeOrigin",
 ]);
 
 export async function renderComponent(
@@ -86,6 +122,7 @@ export async function renderComponent(
   { createSandomDOM: createRuntimeDOM = createSandomDOM, core, fontRegistry } = {},
 ) {
   validateClosedRecord(options, COMPONENT_OPTION_NAMES, "renderComponent options");
+  validateSandomHost(options.host, "renderComponent");
   if (typeof options.mount !== "function") {
     throw new TypeError("renderComponent mount must be a function");
   }
@@ -138,6 +175,12 @@ export async function renderComponent(
       `Unknown display.dynamicRange ${JSON.stringify(displayDynamicRange)}`,
     );
   }
+  // The user's preferences that media queries read (prefers-color-scheme,
+  // prefers-reduced-motion); light and no-preference when absent.
+  const initialPreferences = preferenceEnvironment(
+    options.preferences ?? {},
+    "renderComponent preferences",
+  );
   const callerReportException = options.reportException ?? null;
   if (
     callerReportException !== null &&
@@ -153,7 +196,9 @@ export async function renderComponent(
   // left the session mute). By default the first one becomes a sticky
   // session failure: setup throws it, and every later session operation
   // rejects naming it. A caller-supplied reportException takes ownership
-  // instead.
+  // instead. The session claims only exceptions of component code that it
+  // enters (src/dom/component-code.js); the host program's own exceptions
+  // stay the runtime's.
   let backgroundException = null;
   const reportSessionException = callerReportException ?? ((error) => {
     backgroundException ??= error;
@@ -172,13 +217,19 @@ export async function renderComponent(
       `Unknown graphicsBackend ${JSON.stringify(graphicsBackend)}`,
     );
   }
+  // The session's clock: the document's clock (src/dom/document-clock.js),
+  // which its surface and its page read; the host's real clock when
+  // omitted. Pass `timeOrigin` with `now`: it is the page's date at time 0,
+  // and without it the page's `Date` starts at the Unix epoch; page scripts
+  // may need the current date.
+  const clock = documentClockFromOptions(options, "renderComponent options");
 
   const lifecycleSpans = [];
   const recordSpan = async (name, operation) => {
-    const startTime = performance.now();
+    const startTime = hostNow();
     try {
       const value = await operation();
-      const endTime = performance.now();
+      const endTime = hostNow();
       lifecycleSpans.push(Object.freeze({
         name,
         startTime,
@@ -188,7 +239,7 @@ export async function renderComponent(
       }));
       return value;
     } catch (error) {
-      const endTime = performance.now();
+      const endTime = hostNow();
       lifecycleSpans.push(Object.freeze({
         name,
         startTime,
@@ -201,13 +252,6 @@ export async function renderComponent(
   };
 
   if (graphicsBackend === "webgl2") await prepareNativeWebgl2Host();
-  if (
-    globalThis.process?.versions?.node &&
-    typeof fetch === "function"
-  ) {
-    const hostInitializationResponse = await fetch("data:,");
-    await hostInitializationResponse.arrayBuffer();
-  }
 
   const releaseAmbientOwnership = await acquireAmbientGlobalOwnership(
     "component-session",
@@ -238,8 +282,9 @@ export async function renderComponent(
           core,
           fontRegistry,
           url: documentURL,
-          resolveResource: options.resolveResource ?? null,
+          host: options.host,
           windowTarget: null,
+          clock,
           reportException: reportSessionException,
         }),
     );
@@ -252,6 +297,9 @@ export async function renderComponent(
           : { dynamicRange: displayDynamicRange }),
       });
     }
+    // Before the first style resolution: matchMedia during mount answers
+    // for the preferences.
+    document._styleSystem.setEnvironment(initialPreferences);
     const html = document.createElement("html");
     const head = document.createElement("head");
     const body = document.createElement("body");
@@ -289,7 +337,6 @@ export async function renderComponent(
     surface = backend.createRenderSurface(document.documentElement, {
       capturePaintArtifact: true,
       graphicsBackend,
-      resolveResource: preparedDocument.resolveResource,
       viewport: componentViewport,
       initializePersistentRenderer: false,
       // A high-dynamic-range display switches the working encoding to the
@@ -383,7 +430,7 @@ export async function renderComponent(
                     caretStops: geometry.caretStops,
                     selectionStart: geometry.selectionStart,
                     selectionEnd: geometry.selectionEnd,
-                    selectionRectangles: geometry.selectionRectangles,
+                    selectionRectangles: presentedFrame.selectionRectanglesByElement.get(element) ?? Object.freeze([]),
                   }),
               ),
             );
@@ -409,6 +456,8 @@ export async function renderComponent(
                     const changed = !preceding ||
                       preceding.value !== node.value ||
                       preceding.checked !== node.checked ||
+                      preceding.pressed !== node.pressed ||
+                      preceding.expanded !== node.expanded ||
                       preceding.selected !== node.selected ||
                       preceding.disabled !== node.disabled ||
                       preceding.focused !== node.focused;
@@ -417,6 +466,8 @@ export async function renderComponent(
                         nodeIdentifier: node.identifier,
                         value: node.value,
                         checked: node.checked,
+                        pressed: node.pressed,
+                        expanded: node.expanded,
                         selected: node.selected,
                         disabled: node.disabled,
                         focused: node.focused,
@@ -445,12 +496,14 @@ export async function renderComponent(
 
     let mountResult;
     await recordSpan("component mount", async () => {
-      mountResult = await mount(Object.freeze({
-        window: globalThis,
-        document,
-        container,
-        signal: abortController.signal,
-      }));
+      mountResult = await enterComponentCode(document, mount, undefined, [
+        Object.freeze({
+          window: globalThis,
+          document,
+          container,
+          signal: abortController.signal,
+        }),
+      ]);
     });
     if (
       mountResult && typeof mountResult === "object" &&
@@ -514,7 +567,7 @@ export async function renderComponent(
         if (backgroundException !== null) throw thrownBackgroundException();
         return currentFrame;
       } finally {
-        if (!disposeRequested) surface.start();
+        if (!disposeRequested && document.visibilityState === "visible") surface.start();
       }
     };
 
@@ -658,10 +711,76 @@ export async function renderComponent(
             nextHeight,
             nextDeviceScale,
           );
-          componentEnvironment.viewportDidResize();
-          globalThis.dispatchEvent(new Event("resize"));
-          globalThis.visualViewport.dispatchEvent(new Event("resize"));
+          enterComponentCode(document, () => {
+            componentEnvironment.viewportDidResize();
+            globalThis.dispatchEvent(new Event("resize"));
+            globalThis.visualViewport.dispatchEvent(new Event("resize"));
+          }, undefined, []);
           return await renderCurrentSurface();
+        });
+      },
+      // The user's preferences change, as when the user switches the
+      // system to dark mode: the styles follow, and each MediaQueryList
+      // whose result changes reads the new state and fires `change`.
+      setPreferences(preferences) {
+        return runOperation(async () => {
+          document._styleSystem.setEnvironment(
+            preferenceEnvironment(preferences, "setPreferences preferences"),
+          );
+          document._reevaluateMediaQueryLists?.();
+          return await renderCurrentSurface();
+        });
+      },
+      // Page visibility, as a browser tab: a hidden document runs no
+      // animation frames, and its live loop stays stopped. An operation
+      // still renders its frame on request. The page hears
+      // visibilitychange. The page's timers keep running on the session's
+      // clock.
+      setVisibility(state) {
+        return runOperation(async () => {
+          document._setVisibilityState(state);
+          if (state === "hidden") {
+            surface.stop();
+            await surface.whenIdle();
+          } else {
+            surface.start();
+          }
+        });
+      },
+      // The motion of the current state, after a frame renders it: the
+      // render surface's motion inspection (classification, finite
+      // duration).
+      inspectMotion() {
+        return runOperation(async () => {
+          await renderCurrentSurface();
+          return surface.inspectMotion();
+        });
+      },
+      // Captures the current motion on its own clock, as the render
+      // surface's captureFrames does: onFrame receives each frame, whose
+      // pixels are borrowed until the next frame, and its return value is
+      // ignored. The operation settles when the capture ends, with the
+      // document's time at the motion's end; no other operation interleaves.
+      captureFrames(request) {
+        return runOperation(async () => {
+          if (!request || typeof request !== "object" || Array.isArray(request)) {
+            throw new TypeError("captureFrames request must be an object");
+          }
+          const { frameBudget, durationMilliseconds, onFrame } = request;
+          if (typeof onFrame !== "function") {
+            throw new TypeError("captureFrames onFrame must be a function");
+          }
+          await renderCurrentSurface();
+          surface.stop();
+          await surface.whenIdle();
+          try {
+            for await (const frame of surface.captureFrames({ frameBudget, durationMilliseconds })) {
+              onFrame(frame);
+            }
+          } finally {
+            if (!disposeRequested && document.visibilityState === "visible") surface.start();
+          }
+          if (backgroundException !== null) throw thrownBackgroundException();
         });
       },
       subscribe(listener) {
@@ -719,7 +838,7 @@ export async function renderComponent(
         disposalPromise = (async () => {
           await operationChain;
           const cleanupErrors = [];
-          const disposeStartedAt = performance.now();
+          const disposeStartedAt = hostNow();
           abortController.abort();
           if (mountDispose) {
             try {
@@ -728,11 +847,28 @@ export async function renderComponent(
               collectCleanupError(cleanupErrors, error);
             }
           }
+          // The page closes: no task that its component code scheduled
+          // runs after this (src/dom/component-code.js).
+          try {
+            closeComponentCode(preparedDocument.document);
+          } catch (error) {
+            collectCleanupError(cleanupErrors, error);
+          }
           if (surface) {
             try {
               surface.stop();
               await surface.whenIdle();
               await surface.shutdown();
+            } catch (error) {
+              collectCleanupError(cleanupErrors, error);
+            }
+          }
+          // The realm's global object outlives the session's window: the
+          // listeners and handlers the page put on its window go with the
+          // session, so the next session's window starts with none.
+          if (globalsInstalled) {
+            try {
+              eraseEventListenersAndHandlers(globalThis, preparedDocument.document._domCore);
             } catch (error) {
               collectCleanupError(cleanupErrors, error);
             }
@@ -767,7 +903,7 @@ export async function renderComponent(
           } catch (error) {
             collectCleanupError(cleanupErrors, error);
           }
-          const disposeEndedAt = performance.now();
+          const disposeEndedAt = hostNow();
           lifecycleSpans.push(Object.freeze({
             name: "disposal",
             startTime: disposeStartedAt,
@@ -796,6 +932,13 @@ export async function renderComponent(
         collectCleanupError(cleanupErrors, error);
       }
     }
+    if (preparedDocument) {
+      try {
+        closeComponentCode(preparedDocument.document);
+      } catch (error) {
+        collectCleanupError(cleanupErrors, error);
+      }
+    }
     if (surface) {
       try {
         surface.stop();
@@ -808,6 +951,13 @@ export async function renderComponent(
     if (preparedDocument) {
       try {
         await preparedDocument.document._shutdownCanvasContexts();
+      } catch (error) {
+        collectCleanupError(cleanupErrors, error);
+      }
+    }
+    if (globalsInstalled && preparedDocument) {
+      try {
+        eraseEventListenersAndHandlers(globalThis, preparedDocument.document._domCore);
       } catch (error) {
         collectCleanupError(cleanupErrors, error);
       }

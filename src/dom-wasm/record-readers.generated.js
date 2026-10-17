@@ -1,4 +1,38 @@
 // Generated from dom-interfaces.json; do not edit.
+export const DomBatchResultSize = 64;
+export function readDomBatchResult(view, pointer) { return {
+  status: view.getUint32(pointer + 0, true),
+  operationIndex: view.getUint32(pointer + 4, true),
+  opcode: view.getUint32(pointer + 8, true),
+  effect: view.getUint32(pointer + 12, true),
+  effectHandle: view.getBigUint64(pointer + 16, true),
+  revision: view.getBigUint64(pointer + 24, true),
+  errorKind: view.getUint32(pointer + 32, true),
+  errorDetailA: view.getInt32(pointer + 36, true),
+  errorDetailB: view.getInt32(pointer + 40, true),
+  diagnosticPointer: view.getUint32(pointer + 44, true),
+  diagnosticLength: view.getUint32(pointer + 48, true),
+  returnedPointer: view.getUint32(pointer + 52, true),
+  returnedCount: view.getUint32(pointer + 56, true),
+  recordCount: view.getUint32(pointer + 60, true),
+}; }
+export function writeDomBatchResult(view, pointer, value) {
+  view.setUint32(pointer + 0, value.status ?? 0, true);
+  view.setUint32(pointer + 4, value.operationIndex ?? 0, true);
+  view.setUint32(pointer + 8, value.opcode ?? 0, true);
+  view.setUint32(pointer + 12, value.effect ?? 0, true);
+  view.setBigUint64(pointer + 16, value.effectHandle ?? 0n, true);
+  view.setBigUint64(pointer + 24, value.revision ?? 0n, true);
+  view.setUint32(pointer + 32, value.errorKind ?? 0, true);
+  view.setInt32(pointer + 36, value.errorDetailA ?? 0, true);
+  view.setInt32(pointer + 40, value.errorDetailB ?? 0, true);
+  view.setUint32(pointer + 44, value.diagnosticPointer ?? 0, true);
+  view.setUint32(pointer + 48, value.diagnosticLength ?? 0, true);
+  view.setUint32(pointer + 52, value.returnedPointer ?? 0, true);
+  view.setUint32(pointer + 56, value.returnedCount ?? 0, true);
+  view.setUint32(pointer + 60, value.recordCount ?? 0, true);
+}
+export const DomBatchResultFields = Object.freeze({"status":0,"operationIndex":4,"opcode":8,"effect":12,"effectHandle":16,"revision":24,"errorKind":32,"errorDetailA":36,"errorDetailB":40,"diagnosticPointer":44,"diagnosticLength":48,"returnedPointer":52,"returnedCount":56,"recordCount":60});
 export const SceneBuildBoxSize = 72;
 export function readSceneBuildBox(view, pointer) { return {
   kind: view.getUint8(pointer + 0, true),
@@ -131,44 +165,24 @@ export function writeDirectSceneValue(view, pointer, value) {
   view.setUint32(pointer + 28, value.keyLength ?? 0, true);
 }
 export const DirectSceneValueFields = Object.freeze({"keyHash":0,"kind":4,"payload":8,"count":12,"number":16,"key":24,"keyLength":28});
-export const EngineFrameResolutionSize = 96;
+export const EngineFrameResolutionSize = 24;
 export function readEngineFrameResolution(view, pointer) { return {
   flags: view.getUint32(pointer + 0, true),
   fontIndex: view.getUint32(pointer + 4, true),
   imageIndex: view.getUint32(pointer + 8, true),
-  pathIndex: view.getUint32(pointer + 12, true),
-  strokePathIndex: view.getUint32(pointer + 16, true),
-  backgroundImages: view.getUint32(pointer + 20, true),
-  backgroundImageCount: view.getUint32(pointer + 24, true),
-  reserved: view.getUint32(pointer + 28, true),
-  fillBounds0: view.getFloat64(pointer + 32, true),
-  fillBounds1: view.getFloat64(pointer + 40, true),
-  fillBounds2: view.getFloat64(pointer + 48, true),
-  fillBounds3: view.getFloat64(pointer + 56, true),
-  strokeBounds0: view.getFloat64(pointer + 64, true),
-  strokeBounds1: view.getFloat64(pointer + 72, true),
-  strokeBounds2: view.getFloat64(pointer + 80, true),
-  strokeBounds3: view.getFloat64(pointer + 88, true),
+  backgroundImages: view.getUint32(pointer + 12, true),
+  backgroundImageCount: view.getUint32(pointer + 16, true),
+  reserved: view.getUint32(pointer + 20, true),
 }; }
 export function writeEngineFrameResolution(view, pointer, value) {
   view.setUint32(pointer + 0, value.flags ?? 0, true);
   view.setUint32(pointer + 4, value.fontIndex ?? 0, true);
   view.setUint32(pointer + 8, value.imageIndex ?? 0, true);
-  view.setUint32(pointer + 12, value.pathIndex ?? 0, true);
-  view.setUint32(pointer + 16, value.strokePathIndex ?? 0, true);
-  view.setUint32(pointer + 20, value.backgroundImages ?? 0, true);
-  view.setUint32(pointer + 24, value.backgroundImageCount ?? 0, true);
-  view.setUint32(pointer + 28, value.reserved ?? 0, true);
-  view.setFloat64(pointer + 32, value.fillBounds0 ?? 0, true);
-  view.setFloat64(pointer + 40, value.fillBounds1 ?? 0, true);
-  view.setFloat64(pointer + 48, value.fillBounds2 ?? 0, true);
-  view.setFloat64(pointer + 56, value.fillBounds3 ?? 0, true);
-  view.setFloat64(pointer + 64, value.strokeBounds0 ?? 0, true);
-  view.setFloat64(pointer + 72, value.strokeBounds1 ?? 0, true);
-  view.setFloat64(pointer + 80, value.strokeBounds2 ?? 0, true);
-  view.setFloat64(pointer + 88, value.strokeBounds3 ?? 0, true);
+  view.setUint32(pointer + 12, value.backgroundImages ?? 0, true);
+  view.setUint32(pointer + 16, value.backgroundImageCount ?? 0, true);
+  view.setUint32(pointer + 20, value.reserved ?? 0, true);
 }
-export const EngineFrameResolutionFields = Object.freeze({"flags":0,"fontIndex":4,"imageIndex":8,"pathIndex":12,"strokePathIndex":16,"backgroundImages":20,"backgroundImageCount":24,"reserved":28,"fillBounds0":32,"fillBounds1":40,"fillBounds2":48,"fillBounds3":56,"strokeBounds0":64,"strokeBounds1":72,"strokeBounds2":80,"strokeBounds3":88});
+export const EngineFrameResolutionFields = Object.freeze({"flags":0,"fontIndex":4,"imageIndex":8,"backgroundImages":12,"backgroundImageCount":16,"reserved":20});
 export const EngineFrameFactSize = 16;
 export function readEngineFrameFact(view, pointer) { return {
   flags: view.getUint32(pointer + 0, true),
@@ -277,8 +291,35 @@ export function writeEngineFrameOutput(view, pointer, value) {
   view.setUint32(pointer + 84, value.borderImagePoolLength ?? 0, true);
 }
 export const EngineFrameOutputFields = Object.freeze({"count":0,"records":4,"facts":8,"reserved":12,"gridPool":16,"gridPoolLength":20,"backgroundPool":24,"backgroundPoolLength":28,"stopPool":32,"stopPoolLength":36,"shadowPool":40,"shadowPoolLength":44,"geometryPool":48,"geometryPoolLength":52,"filterPool":56,"filterPoolLength":60,"clipPool":64,"clipPoolLength":68,"maskPool":72,"maskPoolLength":76,"borderImagePool":80,"borderImagePoolLength":84});
-export const coreTransportMaximumEntries = 2796202;
+export const DomBatchHeaderSize = 40;
+export function readDomBatchHeader(view, pointer) { return {
+  magic: view.getUint32(pointer + 0, true),
+  version: view.getUint16(pointer + 4, true),
+  headerBytes: view.getUint16(pointer + 6, true),
+  flags: view.getUint32(pointer + 8, true),
+  handleCount: view.getUint32(pointer + 12, true),
+  localCount: view.getUint32(pointer + 16, true),
+  operationCount: view.getUint32(pointer + 20, true),
+  operationBytes: view.getUint32(pointer + 24, true),
+  stringBytes: view.getUint32(pointer + 28, true),
+  fontCatalog: view.getBigUint64(pointer + 32, true),
+}; }
+export function writeDomBatchHeader(view, pointer, value) {
+  view.setUint32(pointer + 0, value.magic ?? 0, true);
+  view.setUint16(pointer + 4, value.version ?? 0, true);
+  view.setUint16(pointer + 6, value.headerBytes ?? 0, true);
+  view.setUint32(pointer + 8, value.flags ?? 0, true);
+  view.setUint32(pointer + 12, value.handleCount ?? 0, true);
+  view.setUint32(pointer + 16, value.localCount ?? 0, true);
+  view.setUint32(pointer + 20, value.operationCount ?? 0, true);
+  view.setUint32(pointer + 24, value.operationBytes ?? 0, true);
+  view.setUint32(pointer + 28, value.stringBytes ?? 0, true);
+  view.setBigUint64(pointer + 32, value.fontCatalog ?? 0n, true);
+}
+export const DomBatchHeaderFields = Object.freeze({"magic":0,"version":4,"headerBytes":6,"flags":8,"handleCount":12,"localCount":16,"operationCount":20,"operationBytes":24,"stringBytes":28,"fontCatalog":32});
+export const coreTransportMaximumEntries = 11184810;
 export const coreTransportMaximumBytes = 268435456;
 export const coreTransportFlags = Object.freeze({"HAS_TEXT_SOURCE":1,"ELLIPSIS_ELIGIBLE":2,"BOX":4,"BACKGROUND":8,"BOX_SHADOW":16,"SVG":32,"MASK":64,"BORDER_IMAGE":128,"FUSED_GRADIENT":256,"TEXT_SHADOW":512,"FILTER":1024,"BACKDROP_FILTER":2048,"CLIP_PATH":4096});
 export const coreTransportPoolKinds = Object.freeze({"GRID":13,"BACKGROUND":14,"GRADIENT_STOPS":3,"SHADOW":16,"SVG_GEOMETRY":15,"FILTER":17,"CLIP_PATH":18,"MASK":19,"BORDER_IMAGE":20});
 export const coreTransportLegacyPoolByKind = Object.freeze({"3":3,"13":1,"14":2,"15":5,"16":4,"17":6,"18":7,"19":8,"20":9});
+export const domBatchLayout = Object.freeze({"magic":1128416339,"version":1,"headerBytes":40,"limits":{"bytes":16777216,"operations":262144,"handles":65536,"locals":65536},"operandKinds":{"local":1,"node":2,"optional-node":3,"string":4,"returned-local":5},"opcodes":{"CREATE_ELEMENT":{"code":1,"bytes":24,"operands":["local","string","string"]},"CREATE_TEXT":{"code":2,"bytes":16,"operands":["local","string"]},"CREATE_COMMENT":{"code":3,"bytes":16,"operands":["local","string"]},"CREATE_FRAGMENT":{"code":4,"bytes":8,"operands":["local"]},"INSERT_BEFORE":{"code":16,"bytes":16,"operands":["node","node","optional-node"]},"REMOVE_CHILD":{"code":17,"bytes":12,"operands":["node","node"]},"REPLACE_CHILD":{"code":18,"bytes":16,"operands":["node","node","node"]},"SET_ATTRIBUTE":{"code":32,"bytes":32,"operands":["node","string","string","string"]},"REMOVE_ATTRIBUTE":{"code":33,"bytes":16,"operands":["node","string"]},"REMOVE_ATTRIBUTE_NS":{"code":34,"bytes":24,"operands":["node","string","string"]},"SET_DATA":{"code":48,"bytes":16,"operands":["node","string"]},"SET_STYLE_PROPERTY":{"code":64,"bytes":32,"operands":["node","string","string","string"]},"REMOVE_STYLE_PROPERTY":{"code":65,"bytes":16,"operands":["node","string"]},"SET_STYLE_TEXT":{"code":66,"bytes":16,"operands":["node","string"]},"RETURN":{"code":112,"bytes":8,"operands":["returned-local"]}}});

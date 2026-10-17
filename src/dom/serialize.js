@@ -1,5 +1,5 @@
 // Tree-to-scene serializer: a live SDElement tree (src/dom/node.js) walked
-// into a flat scene node array, the shape examples/scenes.js's hand-authored
+// into a flat scene node array, the shape test/fixtures/scenes.js's hand-authored
 // scenes use, so the renderScenePixels/sandomTreeBoxes pipeline
 // consumes a DOM-backed tree unchanged.
 //
@@ -9,14 +9,12 @@
 // record is published from its typed native SceneBuildBox; a scene node here
 // carries only what the host adds: the box reference, its display name,
 // text, host resources (image sources, canvas paint sources), and scroll
-// requests. An svg path box also carries its path definition, which the
-// renderer resolves through its path atlas; an element that declares
-// transitions keeps its resolved transition definitions and its resolved
-// CSS transform for the renderer's transition diff.
+// requests. SVG diagnostics read retained native path definitions and bounds.
+// An element that declares transitions keeps its resolved transition
+// definitions and CSS transform for the renderer's transition diff.
 
 import { animationTransitionDefinitions } from "../dom-wasm/animation.js";
-import { gradientFor, shapeBounds } from "./svg-image.js";
-import { svgShapeToPathDef } from "../svg-shape-path.js";
+import { readSceneRowStyle, recordSceneStyleGeneration } from "../dom-wasm/scene-style.js";
 import { resolvedElementFields } from "./style.js";
 
 // The scene display name of an svg shape box (scene display 22) by its
@@ -28,76 +26,12 @@ const SVG_SHAPE_DISPLAY = {
   ellipse: "svg-ellipse",
   line: "svg-line",
   g: "svg-group",
+  use: "svg-group",
   path: "svg-path",
   polygon: "svg-polygon",
   polyline: "svg-polyline",
 };
 
-const SVG_NS = "http://www.w3.org/2000/svg";
-
-// The element a url() fill (which 0) or stroke (which 1) names, or null:
-// a same-document fragment, looked up in the element's own tree.
-function svgPaintServerElement(core, element, which) {
-  const url = core.sceneSvgPaintServer(element._coreHandle, which);
-  if (url === null || !url.startsWith("#")) return null;
-  return core.elementById(element.getRootNode()._coreHandle, url.slice(1));
-}
-
-// The outline of a rect, circle, ellipse or line box whose record the core
-// lowered to a path, from the geometry the record resolved; "" for a shape
-// with no outline, which renders nothing. Null for a record that keeps its
-// own shape: an undashed solid stroke, no stroke, or a group.
-function loweredSvgOutline(core, element, box) {
-  const geometry = core.engineSvgShapeGeometry(box.stableId, box.sourceRevision);
-  if (geometry === null) return null;
-  const [a, b, c, d, e, f] = geometry;
-  const display = SVG_SHAPE_DISPLAY[element.localName];
-  const shape = display === "svg-rect" ? { display, x: a, y: b, width: c, height: d, rx: e, ry: f }
-    : display === "svg-circle" ? { display, cx: a, cy: b, r: c }
-    : display === "svg-ellipse" ? { display, cx: a, cy: b, rx: c, ry: d }
-    : display === "svg-line" ? { display, x1: a, y1: b, x2: c, y2: d }
-    : null;
-  if (shape === null) {
-    throw new Error(`serializeToScene: the core lowered <${element.localName}> to a path, which has no shape outline`);
-  }
-  return svgShapeToPathDef(shape) ?? "";
-}
-
-// The linearGradient or radialGradient a url() fill (which 0) or stroke
-// (which 1) names, or null when it names no element.
-function svgGradientServer(core, element, which) {
-  const server = svgPaintServerElement(core, element, which);
-  if (server === null) return null;
-  if (server.namespaceURI !== SVG_NS || (server.localName !== "linearGradient" && server.localName !== "radialGradient")) {
-    throw new Error(`serializeToScene: unsupported SVG paint server <${server.localName} id="${server.id}">`);
-  }
-  return server;
-}
-
-// An SVG shape or text whose paint names a paint server (SceneBuildBox.host
-// bits 4 and 8). The core paints the reference's fallback, or none, into
-// the record, which is what SVG 2 13.2 paints when the reference names no
-// element. A linearGradient or radialGradient fill or stroke becomes the
-// node's svgFillPaintServer or svgStrokePaintServer, read as an SVG image
-// reads it (src/dom/svg-image.js) with the shape's bounding box when its
-// geometry gives one; the renderer resolves it against the path's measured
-// box otherwise (resolveSvgPaintServers in src/scene-renderer.js). A line
-// has no fill. Every other named server, and a server on text, is refused
-// by name.
-function svgPaintServers(core, element, box, node) {
-  const fill = box.host & 4 ? svgGradientServer(core, element, 0) : null;
-  const stroke = box.host & 8 ? svgGradientServer(core, element, 1) : null;
-  if (fill === null && stroke === null) return;
-  if (box.display !== 22) {
-    const server = fill ?? stroke;
-    throw new Error(`serializeToScene: unsupported SVG ${fill ? "fill" : "stroke"} paint server <${server.localName} id="${server.id}"> on <${element.localName}>`);
-  }
-  const bounds = shapeBounds(element, node);
-  if (stroke !== null) node.svgStrokePaintServer = { gradient: gradientFor(stroke, core), bounds };
-  if (fill !== null && element.localName !== "line") {
-    node.svgFillPaintServer = { gradient: gradientFor(fill, core), bounds };
-  }
-}
 
 // css-display §2.7: outer-display blockification applied to flex and
 // grid items (and through display:contents).
@@ -155,11 +89,6 @@ const TRANSFORM_NONE = Object.freeze({
   ]),
   cssText: "none",
 });
-const TRANSLATE_NONE = Object.freeze({
-  x: Object.freeze({ pixels: 0, percentage: 0 }),
-  y: Object.freeze({ pixels: 0, percentage: 0 }),
-  cssText: "none",
-});
 
 
 // The core builds the box tree (src/dom-wasm/scene-build.watpart): which
@@ -197,32 +126,43 @@ function elementPath(element) {
   return steps.join(" > ");
 }
 
+// The message of a font-family list whose text no face can draw: the list,
+// the first element that needs it, and every remedy. A render throws it
+// (unboundFontError) and inspection reports it (inspectHTML).
+export function unsuppliedFontFaceMessage(family, element) {
+  return `No font face for font-family: ${family || "(the initial family)"}, first needed by ` +
+    `${element ? elementPath(element) : "the document root"}. Declare an @font-face for one ` +
+    "of these families, register a font with runtime.loadFont(), give the font registry a " +
+    "system font resolver, or install the bundled system fonts (installBundledSystemFonts()).";
+}
+
 function unboundFontError(core, box, cause) {
   if (!box) throw cause;
   const node = core.wrapperFor(box.handle);
   const element = node?.nodeType === 1 ? node : node?.parentElement;
   const family = box.font ? core.string("font_face_css", box.font) : "";
-  return new Error(
-    `No font face for font-family: ${family || "(the initial family)"}, first needed by ` +
-      `${element ? elementPath(element) : "the document root"}. Declare an @font-face for one ` +
-      "of these families, register a font with runtime.loadFont(), give the font registry a " +
-      "system font resolver, or install the bundled system fonts (installBundledSystemFonts()).",
-    { cause },
-  );
+  return new Error(unsuppliedFontFaceMessage(family, element), { cause });
 }
 
+// `viewportWidth` and `viewportHeight` set the viewport of the root's
+// document, which its lengths resolve against (SDDocument._setViewport);
+// without them the document keeps its viewport.
 export function serializeToScene(
   root,
   {
-    viewportWidth = 1280,
-    viewportHeight = 720,
+    viewportWidth,
+    viewportHeight,
     generatedContent = null,
     viewport: renderViewport = null,
   } = {},
 ) {
   const core = root._domCore;
-  const styleSystem = root.ownerDocument?._styleSystem;
-  core.lengthViewport(viewportWidth, viewportHeight);
+  const document = root.nodeType === 9 ? root : root.ownerDocument;
+  const styleSystem = document._styleSystem;
+  if (viewportWidth !== undefined || viewportHeight !== undefined) {
+    document._setViewport(viewportWidth ?? document._viewport.width, viewportHeight ?? document._viewport.height,
+      renderViewport?.deviceScale);
+  }
   if (styleSystem) {
     core.mediaEnvironmentSet(styleSystem.environment);
     styleSystem.answerDeclaredFontFamilies(root);
@@ -236,7 +176,22 @@ export function serializeToScene(
       );
     }
   }
-  const publicationRef = { core, handle: 0, boxes: null, toJSON: jsonAbsent };
+  // The font registry whose catalog binds the faces of the publication: a
+  // renderer lays it out only with that registry's engine sources.
+  const ownerDocument = root.nodeType === 9 ? root : root.ownerDocument;
+  const publicationRef = {
+    core,
+    handle: 0,
+    boxes: null,
+    fontRegistry: ownerDocument?._sandomFontRegistry ?? null,
+    documentURL: ownerDocument?.URL ?? null,
+    documentHandle: ownerDocument?._coreHandle ?? 0n,
+    toJSON: jsonAbsent,
+  };
+  // The scroll owner whose states give this build's rows their requested
+  // offsets: the core records them in the publication as this build reads
+  // them (engine_record_publish), and publishes them from there.
+  const scrollOwner = root._renderSurface?._scrollOwner ?? 0n;
   let { boxes, expansions, rootContext } = core.sceneBuild(
     root._coreHandle,
     renderViewport !== null,
@@ -244,7 +199,7 @@ export function serializeToScene(
   );
   // Resolving one family may expose another inherited/descendant value on
   // the next build. Drain the native request queue before publishing boxes.
-  while (styleSystem && core.fontFamilyRequests().length) {
+  while (styleSystem && core.fontFamilyRequests(ownerDocument).length) {
     styleSystem.answerFontFamilyRequests();
     ({ boxes, expansions, rootContext } = core.sceneBuild(
       root._coreHandle,
@@ -254,24 +209,19 @@ export function serializeToScene(
   }
   const rootWriting = rootContext;
   const canvasBackground = core.sceneCanvasBackground();
-  const textBytesOf = (box) =>
-    box.textLength === 0
-      ? undefined
-      : core.engineRecordPublicationText(publication).slice(
-        box.textOffset, box.textOffset + box.textLength,
-      );
   // Every box is lowered natively now, under this serialization's media
   // environment, into one core-retained publication. Frames relocate its
   // rows (engine_record_frame); the serialization owns the handle and
   // releases it when replaced or collected. Nodes reference it through one
   // shared object that never enters the renderer's JSON node signature.
-  (root.nodeType === 9 ? root : root.ownerDocument)?._sandomFontRegistry?.prepareNativeFontPublication(root);
+  ownerDocument?._sandomFontRegistry?.prepareNativeFontPublication(root);
   let publication;
   try {
     publication = core.engineRecordPublish(
       root._coreHandle,
       renderViewport?.width ?? 0,
       renderViewport?.height ?? 0,
+      scrollOwner,
     );
   } catch (error) {
     if (!String(error?.message).startsWith(UNBOUND_FONT_FACE_MESSAGE)) throw error;
@@ -320,7 +270,6 @@ export function serializeToScene(
   // Requested scroll offsets live in the surface's scroll states. Read them
   // once from the owner rather than searching it per element: an element
   // without a state (nearly all of them) requests nothing.
-  const scrollOwner = root._renderSurface?._scrollOwner ?? 0n;
   const scrollRequests = new Map();
   for (let index = 0; scrollOwner; index += 1) {
     const state = core.status("scroll_owner_state", scrollOwner, index);
@@ -371,7 +320,15 @@ export function serializeToScene(
       case 1: {
         const element = core.wrapperFor(box.handle);
         indexOf.set(element, index);
-        nodes[index] = elementScene(element, box);
+        nodes[index] = elementScene(element, box, index);
+        break;
+      }
+      case 18: {
+        const element = core.wrapperFor(box.context);
+        const node = elementScene(element, box, index);
+        node.generatedOwnerIndex = box.owner;
+        generatedBoxRows.push(index);
+        nodes[index] = node;
         break;
       }
       case 2: {
@@ -451,7 +408,7 @@ export function serializeToScene(
         if (box.children.length) node.children = box.children;
         if (box.host & 2) {
           const imageLayers = core.sceneResourceLayers(box.handle, box.kind - 13);
-          if (imageLayers.length) node.backgroundImages = imageLayers;
+          if (imageLayers) Object.assign(node, imageLayers);
         }
         node.generatedOwnerIndex = box.owner;
         generatedBoxRows.push(index);
@@ -463,25 +420,64 @@ export function serializeToScene(
         nodes[index] = node;
         break;
       }
+      case 16:
+      case 17: {
+        // The alternative text container (16) or broken image icon (17) of
+        // an img or an image input: the core lays both out from records it
+        // synthesizes. The icon paints the renderer's broken image icon.
+        const node = { display: DISPLAY_CODE_NAMES[box.display], bfc: true };
+        if (box.flags & BOX_INLINE_CONTEXT) node.inlineCtx = true;
+        if (box.children.length) node.children = box.children;
+        if (box.kind === 17) node.brokenImageIcon = true;
+        node._coreBox = box.kind | (box.flags << 8) | (box.display << 24);
+        node._corePublication = publicationRef;
+        node._coreFont = box.font;
+        node._coreFontCss = faceCssOf(box.font);
+        node._coreBoxHandle = Number(box.context);
+        nodes[index] = node;
+        break;
+      }
       default:
+        if (box.kind >= 32 && box.kind <= 48) {
+          // A page box (CSS Paged Media 3, 3 and 5): a page-margin box or the
+          // page background. The core lays it out from the root element's
+          // page-box pseudo-element record; the engine places it.
+          const node = { display: DISPLAY_CODE_NAMES[box.display] };
+          if (box.flags & BOX_BFC) node.bfc = true;
+          if (box.flags & BOX_INLINE_CONTEXT) node.inlineCtx = true;
+          if (box.children.length) node.children = box.children;
+          // Its url() background layers bind under the root element's
+          // handle and the page box's pseudo kind, its box kind.
+          if (box.host & 2) {
+            const imageLayers = core.sceneResourceLayers(box.handle, box.kind);
+            if (imageLayers) Object.assign(node, imageLayers);
+          }
+          node.generatedOwnerIndex = box.owner;
+          node._coreBox = box.kind | (box.flags << 8) | (box.display << 24);
+          node._corePublication = publicationRef;
+          node._coreFont = box.font;
+          node._coreFontCss = faceCssOf(box.font);
+          node._coreBoxHandle = Number(box.context);
+          nodes[index] = node;
+          break;
+        }
+        // A page box's text.
+        if (box.kind >= 64 && box.kind <= 80) {
+          nodes[index] = textBox(box);
+          break;
+        }
         throw new Error(`serializeToScene: unknown box kind ${box.kind}`);
     }
     nodes[index]._corePublication = publicationRef;
     nodes[index]._corePublicationIndex = index;
   }
 
-  function elementScene(el, box) {
-    // An svg shape's name comes from its tag; a path, polygon, or polyline
-    // carries its path definition (the box text) for the host's path
-    // atlas; svg text carries its text.
-    // A rect, circle, ellipse or line whose stroke dashes or names a paint
-    // server is a path record (engine-svg.watpart $engineSvgShape): its
-    // outline is the path this box draws.
-    const outline = box.display === 22 && box.text === null
-      ? loweredSvgOutline(core, el, box)
+  function elementScene(el, box, index) {
+    const nativeSvg = box.display === 22
+      ? readSceneRowStyle(core, { _corePublication: publicationRef, _corePublicationIndex: index }).svg
       : null;
     const display = box.display === 22
-      ? outline === null ? SVG_SHAPE_DISPLAY[el.localName] : "svg-path"
+      ? nativeSvg.path ? "svg-path" : SVG_SHAPE_DISPLAY[el.localName]
       : DISPLAY_CODE_NAMES[box.display];
     // background-image url() layers are host resources: the renderer
     // resolves each URL to an image index and writes it into the record's
@@ -490,25 +486,15 @@ export function serializeToScene(
     // layer is its gradient stroke (src/dom-wasm/engine-paint.watpart).
     const imageLayers = box.host & 2 && box.display !== 22
       ? core.sceneResourceLayers(el._coreHandle, 0)
-      : [];
+      : null;
     let pathDefinition = null;
-    if (box.display === 22 && (box.text !== null || outline !== null)) {
-      const pathText = outline ?? box.text;
-      const request = core.engineSvgRequest(
-        box.stableId,
-        box.sourceRevision,
-        outline === null ? textBytesOf(box) : new TextEncoder().encode(outline),
-        box.stableId,
-      );
-      // The request's uint64 identity is carried as its decimal string:
-      // every identity bit stays in the renderer's node signature, which
-      // is plain JSON.
+    if (nativeSvg?.path) {
       pathDefinition = {
-        d: pathText,
-        identity: request.identity.toString(),
-        resourceRevision: request.resourceRevision,
-        fillRule: ["nonzero", "evenodd"][request.fillRule],
-        stroke: request.stroke,
+        d: nativeSvg.path.pathDef,
+        identity: box.stableId.toString(),
+        resourceRevision: core.status("resource_revision"),
+        fillRule: nativeSvg.path.fillRule,
+        stroke: nativeSvg.strokeParameters ?? null,
       };
     }
     const resource = box.host & 1 ? core.sceneResourceNode(el._coreHandle) : 0n;
@@ -535,7 +521,6 @@ export function serializeToScene(
       );
       const fields = resolvedElementFields(el);
       node.transform = fields.transform ?? TRANSFORM_NONE;
-      node.translate = fields.translate ?? TRANSLATE_NONE;
       if (fields.transformOrigin !== undefined) {
         node.transformOrigin = fields.transformOrigin;
       }
@@ -572,8 +557,7 @@ export function serializeToScene(
       node.d = pathDefinition.d;
       node._coreSvgRequest = pathDefinition;
     }
-    if (box.host & 12) svgPaintServers(core, el, box, node);
-    if (imageLayers.length) node.backgroundImages = imageLayers;
+    if (imageLayers) Object.assign(node, imageLayers);
     if (scrollOwner && !el._scrollState) {
       const request = scrollRequests.get(node._coreHandle);
       node.scrollLeft = request === undefined ? 0 : request[0];
@@ -589,6 +573,7 @@ export function serializeToScene(
   }
 
   core.attachSceneResources(nodes, root._coreHandle);
+  recordSceneStyleGeneration(nodes, styleSystem?.generation ?? 0);
   let released = false;
   const serialized = {
     nodes,

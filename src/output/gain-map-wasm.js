@@ -1,10 +1,10 @@
-import { readBinaryFile } from "../host.js";
+import { readPackageAsset } from "../package-assets.js";
 
 const GAIN_MAP_WASM =
   "@sandom/gain-map/gain-map.wasm";
 
 const gainMapWasm = globalThis[Symbol.for("sandom.gainMapBytes")] ??
-  await readBinaryFile(new URL(import.meta.resolve(GAIN_MAP_WASM)));
+  await readPackageAsset(new URL(import.meta.resolve(GAIN_MAP_WASM)));
 
 const module = new WebAssembly.Module(gainMapWasm);
 const instance = new WebAssembly.Instance(module, {

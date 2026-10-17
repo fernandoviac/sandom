@@ -5,7 +5,7 @@ import {
   createCSSStyleSheetClass, installComputedStyleBindings,
   installCSSRuleBindings, installCSSStyleRuleBindings,
   installCSSMediaRuleBindings, installCSSSupportsRuleBindings,
-  installCSSFontFaceRuleBindings, installCSSKeyframeRuleBindings,
+  installCSSFontFaceRuleBindings, installCSSFontFeatureValuesRuleBindings, installCSSKeyframeRuleBindings,
   installCSSKeyframesRuleBindings, installStyleDeclarationBindings, installRuleStyleDeclarationBindings,
 } from "./dom-bindings.generated.js";
 import {
@@ -17,121 +17,15 @@ import {
 import {
   defaultFontRegistry,
   fontFaceStyleDescriptor,
-  fontFamilyCssValue,
-  fontStackKeysForCssValue,
   registerRuntimeFont,
   unregisterRuntimeFont,
-  zeroAdvanceRatioFor,
 } from "../font-registry.js";
 import { decodeWebFont } from "../web-font.js";
 import { resolveElementStyle } from "./resolve-style.js";
 import { containingShadowRoot, flatTreeParent } from "./shadow.js";
 import { withLiveGeometry } from "./live-geometry.js";
+import { scheduleFocusFixup } from "./input-activation.js";
 
-const USER_AGENT_SOURCE = `
-head, base, link, meta, title, style, script, template, [hidden] { display: none; }
-input[type=hidden i] { display: none !important; }
-html, body, div, main, section, article, header, footer, nav, aside, p, form,
-ul, ol, menu, dir, center, h1, h2, h3, h4, h5, h6, blockquote { display: block; }
-[dir=ltr i] { direction: ltr; }
-[dir=rtl i] { direction: rtl; }
-[dir=auto i]:dir(ltr), bdi:dir(ltr), input[type=tel i]:dir(ltr) { direction: ltr; }
-[dir=auto i]:dir(rtl), bdi:dir(rtl) { direction: rtl; }
-[dir=ltr i], [dir=rtl i], [dir=auto i] { unicode-bidi: isolate; }
-bdi, output { unicode-bidi: isolate; }
-bdo, bdo[dir] { unicode-bidi: isolate-override; }
-textarea[dir=auto i], pre[dir=auto i] { unicode-bidi: plaintext; }
-rp, noframes { display: none; }
-li { display: list-item; }
-ul, ol, menu, dir { margin: 1em 0; padding-left: 40px; }
-menu, dir { list-style-type: disc; }
-ul { list-style-type: disc; }
-ol { list-style-type: decimal; }
-ul ul, ol ul { list-style-type: circle; }
-ol ol ul, ol ul ul, ul ol ul, ul ul ul { list-style-type: square; }
-ul ul, ul ol, ol ol, ol ul, ul dl, ol dl, dl ul, dl ol, dl dl { margin-top: 0; margin-bottom: 0; }
-table { display: table; box-sizing: border-box; }
-caption { display: table-caption; text-align: center; }
-colgroup { display: table-column-group; }
-col { display: table-column; }
-thead { display: table-header-group; vertical-align: middle; }
-tbody { display: table-row-group; vertical-align: middle; }
-tfoot { display: table-footer-group; vertical-align: middle; }
-table > tr { vertical-align: middle; }
-tr { display: table-row; vertical-align: inherit; }
-td, th { display: table-cell; vertical-align: inherit; }
-th { font-weight: 700; text-align: center; }
-/* a is inline by its tag default: a rule here would also match MathML's a,
-   which is block math (the selector engine has no @namespace). */
-span, b, strong, i, em, label, br { display: inline; }
-address, figure, figcaption, dl, dt, dd, fieldset, legend, hr, pre,
-details, summary, dialog, search { display: block; }
-slot { display: contents; }
-figure { margin: 1em 40px; }
-dl { margin: 1em 0; }
-dd { margin-left: 40px; }
-pre { white-space: pre; margin: 1em 0; }
-p { margin: 1em 0; }
-blockquote { margin: 1em 40px; }
-center { text-align: center; }
-hr { display: block; margin: 0.5em auto; border-style: inset; border-width: 1px; color: gray; overflow: hidden; }
-sub { vertical-align: sub; font-size: smaller; }
-sup { vertical-align: super; font-size: smaller; }
-small { font-size: smaller; }
-big { font-size: larger; }
-code, kbd, samp, tt, pre, listing, xmp, plaintext { font-family: monospace; }
-cite, var, dfn, address { font-style: italic; }
-u, ins { text-decoration: underline; }
-s, strike, del { text-decoration: line-through; }
-mark { background-color: yellow; color: black; }
-h1 { font-size: 2em; font-weight: 700; margin: 0.67em 0; }
-h2 { font-size: 1.5em; font-weight: 700; margin: 0.83em 0; }
-h3 { font-size: 1.17em; font-weight: 700; margin: 1em 0; }
-h4 { font-weight: 700; margin: 1.33em 0; }
-h5 { font-size: 0.83em; font-weight: 700; margin: 1.67em 0; }
-h6 { font-size: 0.67em; font-weight: 700; margin: 2.33em 0; }
-b, strong { font-weight: 700; }
-i, em { font-style: italic; }
-input { border: 2px inset #767676; padding: 1px 2px; background-color: #ffffff; overflow: clip; appearance: auto; }
-input[type=checkbox i], input[type=radio i] {
-  box-sizing: border-box; width: 13px; height: 13px; padding: 0;
-  border: 1px solid #767676; border-radius: 2px; background-color: #ffffff;
-}
-input[type=checkbox i] { margin: 3px 3px 3px 4px; }
-input[type=radio i] { margin: 3px 3px 0 5px; border-radius: 50%; }
-textarea {
-  font-family: monospace; font-size: 13.333333px; line-height: normal;
-  letter-spacing: 0px; text-transform: none; color: #000000;
-  border: 1px solid #767676; padding: 2px; background-color: #ffffff;
-  overflow: auto; white-space: pre-wrap; overflow-wrap: break-word;
-}
-textarea[wrap=off i] { white-space: pre; overflow-wrap: normal; }
-select {
-  display: inline-block; box-sizing: border-box; align-items: center;
-  border: 1px solid #767676; background-color: #ffffff; color: #000000;
-  white-space: pre; appearance: auto;
-}
-select:not([multiple]):not([size]), select:not([multiple])[size="0"],
-select:not([multiple])[size="1"] { line-height: normal !important; }
-details > summary:first-of-type { display: list-item; list-style-type: disclosure-closed; list-style-position: inside; }
-details[open] > summary:first-of-type { list-style-type: disclosure-open; }
-a[href] { color: #0000ee; text-decoration: underline; cursor: pointer; }
-math {
-  direction: ltr; text-indent: 0; letter-spacing: normal; line-height: normal;
-  word-spacing: normal; font-size: inherit; font-style: normal; font-weight: normal;
-  display: inline math;
-}
-math[display="block" i] { display: block math; }
-math[display="inline" i] { display: inline math; }
-semantics > :not(:first-child), maction > :not(:first-child) { display: none; }
-merror { border: 1px solid red; background-color: lightyellow; }
-mphantom { visibility: hidden; }
-mi { text-transform: math-auto; }
-mtable { display: inline-table; }
-mtr { display: table-row; }
-mtd { display: table-cell; text-align: center; padding: 0.5ex 0.4em; }
-mfrac { padding-left: 1px; padding-right: 1px; }
-`;
 
 function liveCollection(items, name) {
   return new Proxy(items, {
@@ -153,14 +47,16 @@ export function supportsCondition(text) {
 
 export const CSS = createCSSNamespace({ supportsCondition });
 
-// An @font-face font-weight descriptor: one weight, or a range of two
-// (CSS Fonts 4, 4.4), as [minimum, maximum]. A decreasing range swaps its
-// ends. An absent, auto or invalid descriptor is the normal weight.
+// An @font-face font-weight descriptor: "auto" (absent, auto or invalid),
+// one weight, or a range of two (CSS Fonts 4, 4.4) as [minimum, maximum].
+// A decreasing range swaps its ends.
 function fontFaceWeightDescriptor(text) {
-  const weights = String(text ?? "").trim().toLowerCase().split(/\s+/).map((token) =>
+  const trimmed = String(text ?? "").trim().toLowerCase();
+  if (trimmed === "" || trimmed === "auto") return "auto";
+  const weights = trimmed.split(/\s+/).map((token) =>
     token === "normal" ? 400 : token === "bold" ? 700 : /^[+]?(\d+\.?\d*|\.\d+)$/.test(token) ? Number(token) : NaN
   );
-  if (weights.length > 2 || !weights.every((weight) => weight >= 1 && weight <= 1000)) return 400;
+  if (weights.length > 2 || !weights.every((weight) => weight >= 1 && weight <= 1000)) return "auto";
   if (weights.length === 1) return weights[0];
   return [Math.min(weights[0], weights[1]), Math.max(weights[0], weights[1])];
 }
@@ -261,6 +157,11 @@ installStyleDeclarationBindings({
   readText: readStyleDeclarationText,
   requireWritable: requireStyleDeclarationWritable,
 }, SDStyleDeclaration.prototype);
+// CSSStyleDeclaration has an indexed getter, so its @@iterator is
+// %Array.prototype.values% (Web IDL).
+Object.defineProperty(SDStyleDeclaration.prototype, Symbol.iterator, {
+  value: Array.prototype.values, writable: true, enumerable: false, configurable: true,
+});
 
 function coreHandleCache(caches, core) {
   let cache = caches.get(core);
@@ -288,6 +189,15 @@ class ComputedStyleDeclaration extends SDStyleDeclaration {
     this._coreView = handle;
     this._refreshComputed = refresh;
   }
+  // Chrome gives a computed declaration an empty cssText: it reads no
+  // property, so it neither serializes values nor updates layout. Setting
+  // it throws, as a write to any read-only declaration does.
+  get cssText() {
+    return "";
+  }
+  set cssText(value) {
+    requireStyleDeclarationWritable(false);
+  }
   _getLength() {
     this._refreshComputed();
     return this._domCore.status("computed_view_count", this._coreView);
@@ -305,8 +215,10 @@ class ComputedStyleDeclaration extends SDStyleDeclaration {
   _readNormalized(name) {
     this._refreshComputed();
     const core = this._domCore;
-    const input = core.input(name);
-    if (core.status("computed_value_needs_geometry", this._coreView, ...input)) {
+    // A read of a layout-dependent property updates layout in Chrome, so it
+    // runs the focus check, also when the value needs no geometry.
+    if (core.status("computed_value_updates_layout", this._coreView, ...core.input(name))) scheduleFocusFixup(this._element);
+    if (core.status("computed_value_needs_geometry", this._coreView, ...core.input(name))) {
       return withLiveGeometry(this._element, undefined, ({ handle }) =>
         core.string("computed_value_text", this._coreView, ...core.input(name), handle) ?? "");
     }
@@ -418,9 +330,15 @@ export class CSSRule {
 export class CSSStyleRule extends CSSRule {
   constructor(sheet, handle, core = sheet?._domCore ?? sharedDomCore) {
     super(sheet, handle, core);
-    // This remains an ordinary binding property, not a new live selector setter.
-    this.selectorText = core.string("css_rule_prelude", handle) ?? "";
     this.style = new RuleStyleDeclaration(this);
+  }
+  get selectorText() {
+    return this._domCore.string("css_rule_prelude", this._coreRuleHandle) ?? "";
+  }
+  set selectorText(value) {
+    const core = this._domCore;
+    core.status("css_rule_set_selector_text", this._coreRuleHandle, ...core.input(String(value)));
+    this._changed();
   }
 }
 
@@ -457,6 +375,9 @@ export class CSSFontFaceRule extends CSSRule {
   }
 }
 
+export class CSSFontFeatureValuesRule extends CSSRule {
+}
+
 export class CSSKeyframeRule extends CSSStyleRule {
 }
 
@@ -475,6 +396,7 @@ installCSSStyleRuleBindings(ruleBindingRuntime, CSSStyleRule.prototype);
 installCSSMediaRuleBindings(ruleBindingRuntime, CSSMediaRule.prototype);
 installCSSSupportsRuleBindings(ruleBindingRuntime, CSSSupportsRule.prototype);
 installCSSFontFaceRuleBindings(ruleBindingRuntime, CSSFontFaceRule.prototype);
+installCSSFontFeatureValuesRuleBindings(ruleBindingRuntime, CSSFontFeatureValuesRule.prototype);
 installCSSKeyframeRuleBindings(ruleBindingRuntime, CSSKeyframeRule.prototype);
 installCSSKeyframesRuleBindings(ruleBindingRuntime, CSSKeyframesRule.prototype);
 
@@ -494,6 +416,8 @@ function ruleObject(sheet, handle, core = sheet?._domCore ?? sharedDomCore) {
       return new CSSKeyframeRule(sheet, handle, core);
     case 12:
       return new CSSSupportsRule(sheet, handle, core);
+    case 14:
+      return new CSSFontFeatureValuesRule(sheet, handle, core);
     default:
       return new CSSRule(sheet, handle, core);
   }
@@ -546,6 +470,10 @@ class CSSStyleSheetRuntime {
     this._snapshotRevision = -1;
     this._snapshotValue = null;
     this._cssRules = liveCollection([], "CSSRuleList");
+    // The CSSOM origin-clean flag: unset for a sheet from an opaque
+    // response. The sheet still applies; a script cannot read or change
+    // its rules.
+    this._originClean = true;
     if (coreHandle) {
       this._coreSheetHandle = coreHandle;
     } else {
@@ -582,7 +510,15 @@ class CSSStyleSheetRuntime {
     }
     return this._snapshotValue;
   }
+  _requireOriginClean(message) {
+    if (!this._originClean) throw new DOMException(message, "SecurityError");
+  }
   _getRules() {
+    this._requireOriginClean("Cannot access rules");
+    return this._ruleList();
+  }
+  // The rule list without the origin-clean check, for Sandom's own reads.
+  _ruleList() {
     this._snapshot;
     return this._cssRules;
   }
@@ -619,22 +555,17 @@ class CSSStyleSheetRuntime {
     this._snapshot;
     for (const document of this._adopters) document._invalidateStyles();
   }
-  // CSSOM mutation entry points reject malformed rule boundaries. The core
-  // retains the source and all rule/declaration records for each revision.
-  _setSource(source, rejectMalformed = false) {
+  // The core retains the source and all rule/declaration records for each
+  // revision. `constructed`: the replace of a constructed sheet, whose
+  // @import rules are ignored (CSSOM replaceSync()).
+  _setSource(source, constructed = false) {
     this._domCore.parseStylesheet(
       this._coreSheetHandle,
       source,
-      rejectMalformed,
+      constructed,
     );
     this._snapshot;
     for (const document of this._adopters) document._invalidateStyles();
-  }
-  _checkReplaceSource(source) {
-    return this._domCore.status(
-      "stylesheet_check_source",
-      ...this._domCore.input(source),
-    );
   }
   _replaceSyncTransport(source) {
     this._setSource(source, true);
@@ -646,7 +577,8 @@ class CSSStyleSheetRuntime {
     });
   }
   _defaultInsertIndex(index) {
-    return index === undefined ? this.cssRules.length : index;
+    this._requireOriginClean("Cannot access StyleSheet to insertRule");
+    return index === undefined ? this._ruleList().length : index;
   }
   _checkInsertIndex(index) {
     return this._domCore.status(
@@ -657,6 +589,7 @@ class CSSStyleSheetRuntime {
     );
   }
   _checkDeleteIndex(index) {
+    this._requireOriginClean("Cannot access StyleSheet to deleteRule");
     return this._domCore.status(
       "stylesheet_check_index",
       this._coreSheetHandle,
@@ -689,17 +622,12 @@ class CSSStyleSheetRuntime {
 
 export const CSSStyleSheet = createCSSStyleSheetClass({ CSSStyleSheetRuntime });
 
-const UNAUTHORED_SELECTION_HIGHLIGHT = Object.freeze({
-  authored: false,
-  backgroundColor: null,
-  color: null,
-});
-
 // The native cascade's pseudo-element discriminators.
 const CASCADE_PSEUDO_KINDS = new Map([
   ["::before", 1],
   ["::after", 2],
   ["::selection", 4],
+  ["::placeholder", 5],
 ]);
 
 function cascadeFor(system, element, pseudoElement) {
@@ -730,20 +658,35 @@ function cascadeFor(system, element, pseudoElement) {
   };
   // Font families are host state: the core lists the font-family values it
   // met without an answer, the registry keys them, and the element resolves
-  // again with the answers in place.
+  // again with the answers in place. A math script size reads the MATH
+  // table of the face, so a record also waits on the renderer font binding
+  // of its document, which a layout makes; a read before any layout makes
+  // it here.
   let result = resolve();
   let context = core.computedContext();
+  let fontsBound = false;
   while (context.pending) {
-    system.answerFontFamilyRequests();
+    if (core.fontFamilyRequests(element.ownerDocument).length !== 0) {
+      system.answerFontFamilyRequests();
+    } else if (!fontsBound) {
+      fontsBound = true;
+      system.bindRendererFonts();
+    } else {
+      // A record waits only on an unanswered value of its own document or
+      // on the face binding; a pending record with neither would resolve
+      // the same way forever.
+      throw new Error(
+        `The style of <${element.localName}>${pseudoElement ?? ""} waits on a font, and its document has no ` +
+          "unanswered font-family value and its faces are bound: a record it inherits from is stale",
+      );
+    }
     result = resolve();
     context = core.computedContext();
   }
   // A font-family value no family matches inherits; the inherited family is
   // the fallback the failed resource diagnostic reports.
   for (const [property, value] of result.declarations) {
-    if (property === "fontFamily" && system._unresolvedFamilies.has(value)) {
-      system.recordFontFallback(value, context.fontFamily);
-    }
+    if (property === "fontFamily") system.recordInheritedFontFamily(value, context.fontFamily);
   }
   return {
     authoredValues: new Map(result.declarations),
@@ -779,12 +722,13 @@ function wrapSheet(core, handle) {
 
 export function createDocumentStyleSystem(document, environment = {}) {
   const core = document._domCore;
-  const userAgentSheet = new CSSStyleSheet({ baseURL: "sandom:user-agent", document });
-  userAgentSheet._setSource(USER_AGENT_SOURCE);
-  core.setUserAgentStylesheet(
-    document._coreHandle,
-    userAgentSheet._coreSheetHandle,
-  );
+  // The core installs its user-agent sheet in every document it creates.
+  const wrapUserAgentSheet = () => new CSSStyleSheet({
+    baseURL: "sandom:user-agent",
+    document,
+    coreHandle: core.userAgentStylesheet(document._coreHandle),
+  });
+  let userAgentSheet = wrapUserAgentSheet();
   const ownedSheets = new Set();
   const resolved = new WeakMap();
   function resolutionFor(system, element) {
@@ -797,56 +741,8 @@ export function createDocumentStyleSystem(document, environment = {}) {
     const value = resolveElementStyle(
       element.style,
       parentContext,
-      system.environment,
     );
     resolved.set(element, { generation: system.generation, value });
-    return value;
-  }
-  // ::selection is a highlight pseudo-element: an element's highlight style
-  // inherits every property it does not declare from its flat-tree parent's
-  // highlight style. Measured in Chrome 151: `body::selection {
-  // background-color }` reaches the text of a <p>, a span's own `color`
-  // combines with an ancestor's background, and a rule on a shadow host
-  // reaches the text of its shadow root. `authored` records whether any rule
-  // on the chain declares background-color or color; without one the
-  // user-agent highlight colours apply, and with one an undeclared
-  // background is transparent and an undeclared colour leaves the text's own.
-  const selectionHighlights = new WeakMap();
-  function selectionHighlightFor(system, element) {
-    const cached = selectionHighlights.get(element);
-    if (cached?.generation === system.generation) return cached.value;
-    const parent = flatTreeParent(element);
-    const inherited = parent?.nodeType === 1
-      ? selectionHighlightFor(system, parent)
-      : UNAUTHORED_SELECTION_HIGHLIGHT;
-    const { fields, declarations } = resolveElementStyle(
-      element.style,
-      resolutionFor(system, element).childContext,
-      system.environment,
-      "::selection",
-    );
-    let { authored, backgroundColor, color } = inherited;
-    let backgroundIsCurrentColor = false;
-    for (const [property, value] of declarations) {
-      if (property === "color") {
-        color = fields.color;
-        authored = true;
-      } else if (property === "background" || property === "backgroundColor") {
-        backgroundColor = fields.bg ?? null;
-        backgroundIsCurrentColor =
-          String(value).trim().toLowerCase() === "currentcolor";
-        authored = true;
-      }
-    }
-    // currentcolor is the highlight's own colour, which may itself be
-    // inherited from an ancestor's highlight rather than declared here.
-    if (backgroundIsCurrentColor) backgroundColor = color;
-    const value = authored === inherited.authored &&
-        backgroundColor === inherited.backgroundColor &&
-        color === inherited.color
-      ? inherited
-      : Object.freeze({ authored, backgroundColor, color });
-    selectionHighlights.set(element, { generation: system.generation, value });
     return value;
   }
   const adopted = [];
@@ -855,7 +751,6 @@ export function createDocumentStyleSystem(document, environment = {}) {
     const relations = (element.getAttribute("rel") ?? "").toLowerCase().split(
       /\s+/,
     );
-    const type = element.getAttribute("type");
     return element.isConnected &&
       relations.includes("stylesheet") &&
       !element.disabled &&
@@ -955,11 +850,8 @@ export function createDocumentStyleSystem(document, environment = {}) {
     signal,
     ancestors = [],
   ) {
-    if (!document._resolveStylesheet) {
-      throw new DOMException(
-        `No stylesheet resolver is configured for ${requestedURL}`,
-        "NetworkError",
-      );
+    if (!document._resolveResource) {
+      throw new TypeError(`The document of stylesheet ${requestedURL} has no resource loader`);
     }
     const absoluteURL = new URL(requestedURL, baseURL).href;
     if (ancestors.includes(absoluteURL)) {
@@ -968,12 +860,11 @@ export function createDocumentStyleSystem(document, environment = {}) {
         "NetworkError",
       );
     }
-    const response = await document._resolveStylesheet({
+    const response = await document._resolveResource({
       requestedURL: absoluteURL,
       authoredURL: requestedURL,
       baseURL,
       kind: "stylesheet",
-      document,
       signal,
     });
     if (signal.aborted) throw signal.reason;
@@ -989,6 +880,10 @@ export function createDocumentStyleSystem(document, environment = {}) {
     });
     const importedSources = [];
     const importedRanges = [];
+    // A sheet is opaque when its response is opaque. Sandom inlines each
+    // imported sheet into the importing source, so an opaque import makes
+    // the whole flattened sheet opaque: its rules are no longer separable.
+    let opaque = response.opaque === true;
     for (const rule of parsedSource.rules) {
       if (rule.name !== "import") continue;
       // The rule's first URL is the one it imports; the media query list
@@ -1003,6 +898,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
         signal,
         [...ancestors, absoluteURL],
       );
+      opaque ||= imported.opaque;
       importedSources.push(
         media
           ? `@media ${media} { ${imported.source} }\n`
@@ -1025,6 +921,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
       source: importedSources.join("") +
         absolutizeResourceURLs(localSource, finalURL),
       finalURL,
+      opaque,
     };
   }
 
@@ -1043,7 +940,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
       dynamicRange: "standard",
       hoverCapability: "hover",
       pointerAccuracy: "fine",
-      // "overlay" or "classic" (plans/PLAN-native-scrollbars.md): set by
+      // "overlay" or "classic" (design/scrollbars.md): set by
       // the render surface; a classic bar takes layout space.
       scrollbarStyle: "overlay",
       ...environment,
@@ -1052,12 +949,17 @@ export function createDocumentStyleSystem(document, environment = {}) {
       ensureFontRegistry();
       return core.styleGeneration(document._coreHandle);
     },
+    // The viewport of the environment is also the document's viewport, which
+    // its lengths resolve against (SDDocument._setViewport).
     setEnvironment(values) {
       let changed = false;
       for (const [name, value] of Object.entries(values)) {
         if (this.environment[name] === value) continue;
         this.environment[name] = value;
         changed = true;
+      }
+      if ("viewportWidth" in values || "viewportHeight" in values) {
+        document._setViewport(this.environment.viewportWidth, this.environment.viewportHeight);
       }
       if (changed) this.invalidate();
     },
@@ -1168,7 +1070,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
           href,
           document.baseURI,
           controller.signal,
-        ).then(({ source, finalURL }) => {
+        ).then(({ source, finalURL, opaque }) => {
           if (
             controller.signal.aborted ||
             linkedResources.get(element) !== resource
@@ -1178,6 +1080,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
             ownerNode: element,
           });
           sheet.href = finalURL;
+          sheet._originClean = !opaque;
           sheet._setSource(source);
           sheet.media = element.getAttribute("media") ?? "";
           sheet._adopters.add(document);
@@ -1248,29 +1151,14 @@ export function createDocumentStyleSystem(document, environment = {}) {
               family,
               requestedURL: authoredURL,
               finalURL: null,
-              selectedFallbackKeys: new Set(),
             });
             publishFontResource(rule, fontResources.get(rule), 2);
             continue;
           }
-          if (!document._resolveStylesheet) {
-            fontResources.set(rule, {
-              state: "failed",
-              error: new DOMException(
-                `No stylesheet resolver is configured for ${requestedURL}`,
-                "NetworkError",
-              ),
-              family,
-              requestedURL,
-              finalURL: null,
-              selectedFallbackKeys: new Set(),
-            });
-            publishFontResource(rule, fontResources.get(rule), 2);
-            continue;
-          }
+
           // A rule with a valid unicode-range descriptor stays unloaded
           // until a shaped text needs a scalar of its range
-          // (plans/PLAN-font-unicode-range.md decision 3); Chrome ignores
+          // (design/text-rendering.md, "unicode-range faces", item 3); Chrome ignores
           // an invalid descriptor, and the rule then loads at once with
           // the range U+0-10FFFF, as a rule without the descriptor does.
           const rangeText = declarations.get("unicode-range");
@@ -1282,18 +1170,17 @@ export function createDocumentStyleSystem(document, environment = {}) {
             family,
             requestedURL,
             finalURL: null,
-            selectedFallbackKeys: new Set(),
           };
           // Starts the load of the rule. The promise settles after the face
           // registers, or rejects with the cause of a failed load.
           const load = () => {
             resource.state = "pending";
-            const pending = Promise.resolve(document._resolveStylesheet({
+            const pending = Promise.resolve(document._resolveResource({
               requestedURL,
               authoredURL,
               baseURL,
               kind: "font",
-              document,
+              signal: controller.signal,
             })).then(async (response) => {
               if (
                 controller.signal.aborted || fontResources.get(rule) !== resource
@@ -1331,6 +1218,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
                 unicodeRange,
                 finalURL,
                 owner: resource,
+                document,
               });
               Object.assign(resource, {
                 state: "loaded",
@@ -1383,6 +1271,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
               unicodeRange,
               owner: resource,
               load: () => loading ??= load(),
+              document,
             });
           }
         }
@@ -1406,33 +1295,15 @@ export function createDocumentStyleSystem(document, environment = {}) {
       if (fontResources.size !== 0) fontStateChanged();
       fontResources.clear();
     },
-    _unresolvedFamilies: new Set(),
+    // The core answers the font-family values it requested; the registry
+    // supplies the host's family records and faces (font_answer_next).
     answerFontFamilyRequests() {
-      const registry = document._sandomFontRegistry;
-      const stackKeys = registry?.fontStackKeysForCssValue ??
-        fontStackKeysForCssValue;
-      const ratioFor = registry?.zeroAdvanceRatioFor ?? zeroAdvanceRatioFor;
-      // Resolving a key or a zero-advance ratio can publish a family or a
-      // face to the font catalog, and a catalog change clears the core's
-      // family table. Every key and ratio is resolved first and the answers
-      // are written after, so no publication erases an answer of this batch.
-      const answers = core.fontFamilyRequests().map((cssValue) => {
-        let keys = [];
-        try {
-          keys = stackKeys(cssValue, {
-            isUnavailable: (family) => this.fontFamilyIsUnavailable(family),
-          });
-        } catch {
-          // No registered or system family matches: the value inherits.
-        }
-        if (keys.length !== 0) this.recordFontFallback(cssValue, keys[0]);
-        if (keys.length === 0) this._unresolvedFamilies.add(cssValue);
-        else this._unresolvedFamilies.delete(cssValue);
-        return { cssValue, keys, ratio: keys.length === 0 ? 0 : ratioFor(keys[0]) };
-      });
-      for (const { cssValue, keys, ratio } of answers) {
-        core.setFontFamily(cssValue, keys, ratio);
-      }
+      (document._sandomFontRegistry ?? defaultFontRegistry).answerFontFamilies(document);
+    },
+    // Binds the face catalog of the document's registry to its renderer, as
+    // the publication of a layout does (serializeToScene).
+    bindRendererFonts() {
+      (document._sandomFontRegistry ?? defaultFontRegistry).prepareNativeFontPublication(document);
     },
     // Answers, before the first resolution of a frame, every family value
     // the cascade of the root's scope declares. An answer given after
@@ -1441,7 +1312,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
     // values are still requested when an element resolves. While a font
     // resource of the document has failed, only the values elements
     // resolve against are answered, so the fallbacks its diagnostic names
-    // (recordFontFallback) stay the ones elements use.
+    // (font_answer_inherited) stay the ones elements use.
     answerDeclaredFontFamilies(root) {
       for (const resource of fontResources.values()) {
         if (resource.state === "failed") return;
@@ -1451,40 +1322,30 @@ export function createDocumentStyleSystem(document, environment = {}) {
         this.answerFontFamilyRequests();
       }
     },
-    fontFamilyIsUnavailable(familyName) {
-      return core.status(
-        "font_catalog_unavailable", ensureFontRegistry().fontCatalogHandle,
-        document._coreHandle, ...core.input(String(familyName)),
-      ) !== 0;
-    },
-    recordFontFallback(authoredFontFamily, selectedFamilyKey) {
-      for (const resource of fontResources.values()) {
-        if (
-          resource.state === "failed" &&
-          core.status(
-            "font_family_list_contains", ...core.input(String(authoredFontFamily)),
-            ...core.input(resource.family),
-          ) !== 0
-        ) {
-          resource.selectedFallbackKeys.add(selectedFamilyKey);
-        }
-      }
+    // Records the family a value that matched no family inherits as the
+    // fallback of the failed font resources the value names.
+    recordInheritedFontFamily(authoredFontFamily, inheritedFamilyKey) {
+      core.status(
+        "font_answer_inherited", ensureFontRegistry().fontCatalogHandle, document._coreHandle,
+        ...core.input(String(authoredFontFamily)), ...core.input(String(inheritedFamilyKey ?? "")),
+      );
     },
     get resourceDiagnostics() {
+      const registry = ensureFontRegistry();
       return Object.freeze(
         [...fontResources.values()]
           .filter((resource) => resource.state === "failed")
           .map((resource) => {
+            const count = core.status(
+              "font_fallback_count", registry.fontCatalogHandle, document._coreHandle, resource.catalogID,
+            );
             const selectedFallbacks = Object.freeze(
-              [...resource.selectedFallbackKeys].map((familyKey) =>
-                Object.freeze({
-                  familyKey,
-                  fontFamily: (
-                    document._sandomFontRegistry?.fontFamilyCssValue ??
-                      fontFamilyCssValue
-                  )(familyKey),
-                })
-              ),
+              Array.from({ length: count }, (_, index) => {
+                const familyKey = core.string(
+                  "font_fallback_at", registry.fontCatalogHandle, document._coreHandle, resource.catalogID, index,
+                ) ?? "";
+                return Object.freeze({ familyKey, fontFamily: registry.fontFamilyCssValue(familyKey) });
+              }),
             );
             const fallbackMessage = selectedFallbacks.length === 0
               ? ""
@@ -1516,6 +1377,38 @@ export function createDocumentStyleSystem(document, environment = {}) {
           }),
       );
     },
+    // The linked style sheets that are loading now, settled. A parser-
+    // blocking script waits for them (HTML, "has a style sheet that is
+    // blocking scripts"); a failed load unblocks it as a loaded one does.
+    // The parser inserts links without a mutation notification, so the
+    // links are walked again here.
+    async linkedSheetsSettled() {
+      this._reconcileOwed = true;
+      this.reconcile();
+      await Promise.all(
+        [...linkedResources.values()]
+          .map((resource) => resource.pending)
+          .filter(Boolean),
+      );
+    },
+    hasLoadingLinkedSheets() {
+      this._reconcileOwed = true;
+      this.reconcile();
+      for (const resource of linkedResources.values()) {
+        if (resource.state === "pending") return true;
+      }
+      return false;
+    },
+    // A document with scripting enabled hides `noscript`, whose content its
+    // parser keeps as text (HTML, "Rendering", 15.3.1): the core gives it
+    // the scripting user-agent sheet.
+    enableScripting() {
+      core.status("document_scripting_enable", document._coreHandle);
+      userAgentSheet._adopters.delete(document);
+      userAgentSheet = wrapUserAgentSheet();
+      userAgentSheet._adopters.add(document);
+      this.invalidate();
+    },
     async ready() {
       this.reconcile();
       await Promise.all(
@@ -1537,12 +1430,12 @@ export function createDocumentStyleSystem(document, environment = {}) {
       await Promise.all([...fontPending]);
     },
     activeSheets(scopeRoot = document) {
-      return core.activeStylesheets(scopeRoot._coreHandle).map((
-        handle,
-      ) => ({
-        sheet: wrapSheet(core, handle),
-        origin: handle === userAgentSheet._coreSheetHandle ? 0 : 1,
-      }));
+      // Every document wraps the core's shared user-agent sheet itself.
+      return core.activeStylesheets(scopeRoot._coreHandle).map((handle) =>
+        handle === userAgentSheet._coreSheetHandle
+          ? { sheet: userAgentSheet, origin: 0 }
+          : { sheet: wrapSheet(core, handle), origin: 1 }
+      );
     },
     cascadedFor(element, pseudoElement = null) {
       ensureFontRegistry();
@@ -1564,6 +1457,24 @@ export function createDocumentStyleSystem(document, environment = {}) {
       return this.activeSheets(scopeRoot).some(({ sheet }) =>
         snapshotDeclaresKeyframes(sheet._snapshot)
       );
+    },
+    // The document's @page rules in cascade order, each { prelude,
+    // declarations, rules }, rules being its margin rules ({ name,
+    // declarations }): rules of the active sheets in sheet order, inside
+    // matching @media and @supports rules (src/dom/page-rules.js resolves
+    // them).
+    pageRules() {
+      const rules = [];
+      for (const { sheet } of this.activeSheets()) {
+        for (const rule of activeNamedRules(sheet._snapshot.rules, "page", this.environment)) {
+          rules.push({
+            prelude: rule.prelude,
+            declarations: rule.declarations,
+            rules: (rule.rules ?? []).map(({ name, declarations }) => ({ name, declarations })),
+          });
+        }
+      }
+      return rules;
     },
     keyframesFor(name, scopeRoot = document) {
       let matching = null;
@@ -1605,14 +1516,6 @@ export function createDocumentStyleSystem(document, environment = {}) {
         left.offset - right.offset
       );
     },
-    // The resolved ::selection highlight of an element: `{ authored,
-    // backgroundColor, color }`, colours as rgba or null when undeclared.
-    selectionHighlight(element) {
-      if (!element || element.nodeType !== 1) {
-        throw new TypeError("selectionHighlight requires an Element");
-      }
-      return selectionHighlightFor(this, element);
-    },
     animationDefinitions(element, pseudoElement = null) {
       // resolutionFor memoizes per element per generation and reuses the
       // parent's cached childContext - the same resolution serialization
@@ -1625,7 +1528,6 @@ export function createDocumentStyleSystem(document, environment = {}) {
         : resolveElementStyle(
           element.style,
           elementResolution.childContext,
-          this.environment,
           pseudoElement,
         );
       const names = fields.animationName ?? ["none"];
@@ -1644,7 +1546,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
       return names.flatMap((name, listIndex) => {
         if (name === "none") return [];
         const authoredKeyframes = this.keyframesFor(name, scopeRoot);
-        if (!authoredKeyframes || authoredKeyframes.length < 2) return [];
+        if (!authoredKeyframes) return [];
         const defaultEasing = repeatedListValue(timingFunctions, listIndex);
         const keyframes = authoredKeyframes.map((frame) => ({
           ...frame,
@@ -1654,6 +1556,10 @@ export function createDocumentStyleSystem(document, environment = {}) {
           name,
           listIndex,
           keyframes,
+          // A keyframe that the rule lacks at 0% or 100% takes the
+          // animation's timing function and replaces the underlying value
+          // (css-animations-1 section 3).
+          implicitKeyframe: { easing: defaultEasing, composite: "replace" },
           composition: repeatedListValue(compositions, listIndex),
           timing: {
             duration: repeatedListValue(durations, listIndex),
@@ -1683,6 +1589,24 @@ export function createDocumentStyleSystem(document, environment = {}) {
         throw new TypeError("resolvedFields requires an Element");
       }
       return resolutionFor(this, element).fields;
+    },
+    // The element's computed values without its animation effects: the
+    // underlying values of web-animations-1 section 5.3.4. `read(name)`
+    // returns the computed text of a property; `release()` gives the view
+    // back.
+    underlyingComputedValues(element) {
+      const core = element._domCore;
+      const registry = element.ownerDocument?._sandomFontRegistry ?? defaultFontRegistry;
+      const handle = core.status(
+        "computed_view_get", element._coreHandle,
+        ...core.input(""), registry.fontCatalogHandle,
+      );
+      this.cascadedFor(element, null);
+      core.status("computed_view_capture", handle, registry.fontCatalogHandle, 0);
+      return {
+        read: (name) => core.string("computed_value_text", handle, ...core.input(name), 0n) ?? "",
+        release: () => core.status("computed_view_release", handle),
+      };
     },
     computedStyle(element, pseudoElement = null) {
       if (!element || element.nodeType !== 1) {

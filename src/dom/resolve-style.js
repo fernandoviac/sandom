@@ -45,18 +45,11 @@ function engineAppliesValue(property, value) {
 export function resolveElementStyle(
   style,
   parentContext = {},
-  viewport = {},
   pseudoElement = null,
 ) {
   const element = style._element;
   const core = element?._domCore ?? sharedDomCore;
   const styleSystem = element?.ownerDocument?._styleSystem;
-  // The rendering viewport for vw/vh units; the media environment supplies
-  // it when the caller passes none.
-  core.lengthViewport(
-    viewport.viewportWidth ?? 0,
-    viewport.viewportHeight ?? 0,
-  );
   // The core owns the computed stage and the field store: cascade winners
   // resolve against the flat-tree parent's record (custom properties, var()
   // substitution, CSS-wide keywords, the element context), the field record

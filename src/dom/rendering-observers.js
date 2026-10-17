@@ -3,6 +3,7 @@ import {
   createIntersectionObserverClass,
   createResizeObserverClass,
 } from "./dom-bindings.generated.js";
+import { enterComponentCode } from "./component-code.js";
 const geometryStateFinalizer = new FinalizationRegistry(({ core, handle }) => {
   core.exports.geometry_observer_release(handle);
 });
@@ -268,7 +269,9 @@ export function deliverRenderingObservers(
           } else {
             entries = observer._gather(serialized, boxes, viewport, time);
           }
-          if (entries.length) observer._callback(entries, observer);
+          if (entries.length) {
+            enterComponentCode(observer._document, observer._callback, observer, [entries, observer]);
+          }
           delivered += entries.length;
         }
       } catch (error) {

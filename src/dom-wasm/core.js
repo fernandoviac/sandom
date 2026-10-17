@@ -1,5 +1,6 @@
 import { scheduleMutationObservers } from "../dom/mutation-observer.js";
 import { instantiateRendererCore } from "../wasm/renderer-core-binary.js";
+import { hostNow } from "../host-clock.js";
 import {
   ANIMATION_RECORD_SIZE, LAYOUT_NODE_SIZE,
   LAYOUT_NODE_OFFSET_BORDER_BOTTOM, LAYOUT_NODE_OFFSET_BORDER_LEFT,
@@ -61,30 +62,35 @@ export function domCoreForWrapper(wrapper) {
 export function observeMemoryGrowth(memory, exports, notify) {
   let buffer = memory.buffer;
   const wrapped = {};
+  const observe = () => {
+    const nextBuffer = memory.buffer;
+    if (nextBuffer !== buffer) {
+      buffer = nextBuffer;
+      notify();
+    }
+  };
   for (const [name, value] of Object.entries(exports)) {
     if (typeof value !== "function") {
       wrapped[name] = value;
       continue;
     }
     wrapped[name] = function () {
-      let exportThrew = true;
+      let result;
       try {
-        const result = applyNative(value, null, arguments);
-        exportThrew = false;
-        return result;
-      } finally {
-        const nextBuffer = memory.buffer;
-        if (nextBuffer !== buffer) {
-          buffer = nextBuffer;
-          try {
-            notify();
-          } catch (error) {
-            // The export's own failure has precedence. After a normal
-            // return, notification is the only failure and remains visible.
-            if (!exportThrew) throw error;
-          }
+        result = applyNative(value, null, arguments);
+      } catch (error) {
+        // The export's own failure has precedence over a failure of the
+        // notification. After a normal return, a notification failure is
+        // the only failure and remains visible.
+        try {
+          observe();
+        } catch {
+          // The export's failure below is the failure of the call.
         }
+        throw error;
       }
+      observe();
+      return result;
     };
   }
   return Object.freeze(wrapped);
@@ -114,6 +120,9 @@ const ERROR_NAMES = new Map([
   [16, "WrongDocumentError"],
   [17, "InvalidNodeTypeError"],
   [19, "NoModificationAllowedError"],
+  [20, "InvalidCharacterError"],
+  [21, "InUseAttributeError"],
+  [22, "InvalidAccessError"],
 ]);
 
 const RADIAL_SIZES = [
@@ -275,80 +284,6 @@ function attributeMetadata(core, handle, index) {
   };
 }
 
-export class DomCoreAttributeMap {
-  constructor(core, handle) {
-    this.core = core;
-    this.handle = handle;
-  }
-
-  get size() {
-    return this.core.attributeCount(this.handle);
-  }
-
-  get(name) {
-    return this.core.getAttribute(this.handle, name);
-  }
-
-  has(name) {
-    return this.core.hasAttribute(this.handle, name);
-  }
-
-  set(name, value) {
-    this.core.setAttribute(this.handle, null, name, value);
-    return this;
-  }
-
-  delete(name) {
-    return this.core.removeAttribute(this.handle, name);
-  }
-
-  clear() {
-    for (const name of [...this.keys()]) this.delete(name);
-  }
-
-  *keys() {
-    const count = this.size;
-    for (let index = 0; index < count; index += 1) {
-      yield this.core.attributeStringAt(
-        "attribute_name_at",
-        this.handle,
-        index,
-      );
-    }
-  }
-
-  *values() {
-    const count = this.size;
-    for (let index = 0; index < count; index += 1) {
-      yield this.core.attributeStringAt(
-        "attribute_value_at",
-        this.handle,
-        index,
-      );
-    }
-  }
-
-  *entries() {
-    const count = this.size;
-    for (let index = 0; index < count; index += 1) {
-      yield [
-        this.core.attributeStringAt("attribute_name_at", this.handle, index),
-        this.core.attributeStringAt("attribute_value_at", this.handle, index),
-      ];
-    }
-  }
-
-  [Symbol.iterator]() {
-    return this.entries();
-  }
-
-  forEach(callback, thisArgument = undefined) {
-    for (const [name, value] of this) {
-      callback.call(thisArgument, value, name, this);
-    }
-  }
-}
-
 export class DomCoreAttributeMetadataMap {
   constructor(core, handle) {
     this.core = core;
@@ -405,41 +340,6 @@ export class DomCoreAttributeMetadataMap {
 
   [Symbol.iterator]() {
     return this.entries();
-  }
-}
-
-export class DomCoreClassSet {
-  constructor(core, handle) {
-    this.core = core;
-    this.handle = handle;
-  }
-
-  has(token) {
-    return this.core.classContains(this.handle, token);
-  }
-
-  *values() {
-    const count = this.core.classCount(this.handle);
-    for (let index = 0; index < count; index += 1) {
-      yield this.core.classItem(this.handle, index);
-    }
-  }
-
-  keys() {
-    return this.values();
-  }
-
-  entries() {
-    const values = [...this.values()];
-    return values.map((value) => [value, value])[Symbol.iterator]();
-  }
-
-  [Symbol.iterator]() {
-    return this.values();
-  }
-
-  get size() {
-    return this.core.classCount(this.handle);
   }
 }
 
@@ -696,7 +596,7 @@ export class DomCore {
     const pointer = this.exports.abi_output_pointer();
     const length = this.exports.abi_output_length();
     const measurement = globalThis[measurementKey];
-    const start = measurement ? performance.now() : 0;
+    const start = measurement ? hostNow() : 0;
     const result = this.decoder.decode(
       this.refreshBytes().subarray(pointer, pointer + length),
     );
@@ -707,7 +607,7 @@ export class DomCore {
         direction: "core-to-host",
         bytes: length,
         allocations: 1,
-        milliseconds: performance.now() - start,
+        milliseconds: hostNow() - start,
       });
     }
     return result;
@@ -742,6 +642,16 @@ export class DomCore {
     const native = this.exports;
     const result = applyNative(native[exportName], native, parameters);
     this.throwIfError();
+    return result;
+  }
+
+  // As status(), for an operation whose error message names its reason
+  // and limit itself: the caller adds the subject and the observed value,
+  // so the message carries no detail numbers.
+  statusRaw(exportName, ...parameters) {
+    const native = this.exports;
+    const result = applyNative(native[exportName], native, parameters);
+    this.throwIfError(true);
     return result;
   }
 
@@ -830,6 +740,83 @@ export class DomCore {
       fragmentHandle,
       ...this.input(source),
     );
+  }
+
+  // The record-driven HTML parser (src/dom/html.js beginHTMLDocumentParse).
+  // Strings enter as UTF-8; the insertion point is the number of input
+  // bytes after it, or -1 when it is undefined.
+  htmlParserBegin(documentHandle, scripting) {
+    return this.status("html_parser_begin", documentHandle, scripting ? 1 : 0);
+  }
+
+  htmlParserAppend(parser, source) {
+    return this.status("html_parser_append", parser, ...this.input(source));
+  }
+
+  htmlParserInsert(parser, source) {
+    return this.status("html_parser_insert", parser, ...this.input(source));
+  }
+
+  htmlParserEnd(parser) {
+    return this.status("html_parser_end", parser);
+  }
+
+  htmlParserRun(parser, toInsertionPoint) {
+    return this.status("html_parser_run", parser, toInsertionPoint ? 1 : 0);
+  }
+
+  htmlParserScript(parser) {
+    return this.handle("html_parser_script", parser);
+  }
+
+  // 1-based line and 0-based UTF-16 column of the paused script's text.
+  htmlParserScriptPosition(parser) {
+    return {
+      line: this.status("html_parser_script_line", parser),
+      column: this.status("html_parser_script_column", parser),
+    };
+  }
+
+  // The parser's position after its last token: 1-based line, 0-based
+  // UTF-16 column.
+  htmlParserPosition(parser) {
+    const line = this.status("html_parser_line", parser);
+    return { line, column: this.status("html_parser_column", parser) };
+  }
+
+  // The elements with event handler attributes that the parser created
+  // since the last call, each with the position after its start tag.
+  htmlParserTakeHandlerElements(parser) {
+    const count = this.status("html_parser_take_handler_elements", parser);
+    if (count === 0) return [];
+    const view = new DataView(this.memory.buffer, this.exports.abi_output_pointer(), count * 16);
+    // Copy the numbers before wrapper materialization can grow memory.
+    const entries = Array.from({ length: count }, (_, index) => ({
+      handle: view.getBigUint64(index * 16, true),
+      line: view.getUint32(index * 16 + 8, true),
+      column: view.getUint32(index * 16 + 12, true),
+    }));
+    return entries.map(({ handle, line, column }) => ({ element: this.wrapperFor(handle), line, column }));
+  }
+
+  htmlParserMarkInsertionPoint(parser) {
+    return this.status("html_parser_mark_insertion_point", parser);
+  }
+
+  htmlParserInsertionPoint(parser) {
+    return this.status("html_parser_insertion_point", parser);
+  }
+
+  htmlParserSetInsertionPoint(parser, bytesAfter) {
+    return this.status("html_parser_set_insertion_point", parser, bytesAfter);
+  }
+
+  htmlParserOpen(parser, handle) {
+    return this.status("html_parser_open", parser, handle) === 1;
+  }
+
+  htmlParserAbort(parser) {
+    return this.status("html_parser_abort", parser);
   }
 
   parseXmlDocument(documentHandle, source) {
@@ -952,12 +939,20 @@ export class DomCore {
     return this.status("document_set_xml", documentHandle, value ? 1 : 0);
   }
 
-  createElement(documentHandle, namespaceURI, qualifiedName) {
+  createElement(documentHandle, namespaceURI, localName) {
     return this.handle(
-      "node_create_element",
+      "node_create_element_local",
       documentHandle,
       ...this.nullableInput(namespaceURI),
-      ...this.input(qualifiedName),
+      ...this.input(localName),
+    );
+  }
+
+  createPublicElement(documentHandle, namespaceURI, name, contentType, namespaceAware) {
+    return this.handle(
+      "node_create_element_public", documentHandle,
+      ...this.nullableInput(namespaceURI), ...this.input(name),
+      ...this.input(contentType), namespaceAware ? 1 : 0,
     );
   }
 
@@ -1017,15 +1012,22 @@ export class DomCore {
   // separate; these IDs remain stable across builds and shared renderers.
   sceneResourceLayers(handle, pseudo) {
     const count = this.status("scene_resource_layers", handle, pseudo);
-    const layers = new Array(count);
-    for (let index = 0; index < count; index += 1) {
-      const resource = this.handle("scene_resource_layer", handle, pseudo, index);
-      layers[index] = resource === 0n ? {} : {
-        src: this.resourceKey(resource),
-        resourceIdentifier: this.resourceId(resource),
-      };
+    if (count === 0) return null;
+    const counts = Array.from(new Uint32Array(this.refreshBytes().buffer, this.exports.abi_output_pointer(), 3));
+    const result = {};
+    let index = 0;
+    for (const [kind, name] of ["backgroundImages", "masks", "borderImage"].entries()) {
+      const layers = new Array(counts[kind]);
+      for (let layer = 0; layer < layers.length; layer++, index++) {
+        const resource = this.handle("scene_resource_layer", handle, pseudo, index);
+        layers[layer] = resource === 0n ? {} : {
+          src: this.resourceKey(resource),
+          resourceIdentifier: this.resourceId(resource),
+        };
+      }
+      if (layers.length) result[name] = kind === 2 ? layers[0] : layers;
     }
-    return layers;
+    return result;
   }
 
   wrapperCache(handle) {
@@ -1083,7 +1085,8 @@ export class DomCore {
   registerWrapper(wrapper, handle, retained = true) {
     this.wrapperHandles.set(wrapper, handle);
     wrapperCores.set(wrapper, this);
-    const reference = new WeakRef(wrapper);
+    const existingReference = this.wrapperByHandle.get(handle);
+    const reference = existingReference?.deref() === wrapper ? existingReference : new WeakRef(wrapper);
     this.wrapperByHandle.set(handle, reference);
     this.wrapperCache(handle).set(handle, reference);
     if (wrapperFinalizer && retained) {
@@ -1247,6 +1250,10 @@ export class DomCore {
     );
   }
 
+  moveBefore(parentHandle, nodeHandle, childHandle) {
+    return this.status("node_move_before", parentHandle, nodeHandle, childHandle);
+  }
+
   removeChild(parentHandle, nodeHandle) {
     return this.status("node_remove_child", parentHandle, nodeHandle);
   }
@@ -1390,6 +1397,8 @@ export class DomCore {
     return this.status("style_has", handle, ...this.input(name)) === 1;
   }
 
+  // `document`: the owner document of the element, whose @font-face
+  // families a font-family value can name; null for none.
   styleSet(
     handle,
     name,
@@ -1397,6 +1406,7 @@ export class DomCore {
     priority = "",
     mode = 0,
     registry = this.defaultFontRegistry,
+    document = null,
   ) {
     const operation = this.handle(
       "style_set",
@@ -1407,7 +1417,7 @@ export class DomCore {
       mode,
       registry.fontCatalogHandle,
     );
-    return this.runStyleMutation(operation, registry, mode);
+    return this.runStyleMutation(operation, registry, mode, document);
   }
 
   styleSetPriority(handle, name, important) {
@@ -1459,6 +1469,7 @@ export class DomCore {
     source,
     attributeReplay = false,
     registry = this.defaultFontRegistry,
+    document = null,
   ) {
     const operation = this.handle(
       "style_replace",
@@ -1467,28 +1478,27 @@ export class DomCore {
       registry.fontCatalogHandle,
       attributeReplay ? 1 : 0,
     );
-    return this.runStyleMutation(operation, registry, attributeReplay ? 3 : 2);
+    return this.runStyleMutation(operation, registry, attributeReplay ? 3 : 2, document);
   }
 
-  runStyleMutation(operation, registry, mode) {
+  runStyleMutation(operation, registry, mode, document) {
     try {
       while (true) {
         const step = this.status("style_mutation_next", operation);
         if (step === 0) return this.status("style_mutation_result", operation);
-        if (step < 0) {
-          const message = this.outputString();
-          const kind = this.status("style_mutation_error_kind", operation);
-          if (kind === 2) throw new TypeError(message);
-          if (kind === 14) throw new RangeError(message);
-          throw new Error(message);
-        }
+        // A rejected value completes the mutation; a fault (-1) sets the
+        // ABI error registers, which status() throws.
+        if (step !== 1) throw new Error(`style_mutation_next returned ${step} without an ABI error`);
         const family = this.string("style_mutation_family", operation);
         const token = this.handle("style_mutation_token", operation);
         let failure;
         let outcome = 0;
         let message = "";
+        // The host learns of each family the value names. A value whose
+        // families are all unavailable still applies, as in Chrome: text
+        // in it draws with the initial family's face.
         try {
-          registry.fontStackKeysForCssValue(family);
+          registry.availableFontStackKeys(family, { document });
         } catch (error) {
           failure = error;
           outcome = error instanceof Error ? 1 : 2;
@@ -1590,12 +1600,12 @@ export class DomCore {
     this.status("stylesheet_dispose", sheetHandle);
   }
 
-  parseStylesheet(sheetHandle, source, rejectMalformed = false) {
+  parseStylesheet(sheetHandle, source, constructed = false) {
     this.status(
       "stylesheet_replace",
       sheetHandle,
       ...this.input(source),
-      rejectMalformed ? 1 : 0,
+      constructed ? 1 : 0,
     );
   }
 
@@ -1866,11 +1876,10 @@ export class DomCore {
     ) === 1;
   }
 
-  setUserAgentStylesheet(documentHandle, sheetHandle) {
-    this.status(
-      "document_user_agent_stylesheet_set",
+  userAgentStylesheet(documentHandle) {
+    return this.status(
+      "document_user_agent_stylesheet",
       documentHandle,
-      sheetHandle,
     );
   }
 
@@ -2050,10 +2059,42 @@ export class DomCore {
     );
   }
 
+  // The page-margin boxes of the next scene builds of the root element
+  // `rootHandle` (src/dom/page-rules.js pageMarginBoxes: sixteen
+  // { declarations, content }), or null for none. Other roots' builds have
+  // none; null for a root that does not hold them changes nothing. A call
+  // that repeats the boxes the core holds does nothing.
+  setPageMargins(rootHandle, boxes) {
+    const root = String(rootHandle);
+    if (boxes === null && this._pageMarginsRoot !== root) return;
+    const state = boxes === null ? null : JSON.stringify(boxes);
+    if (this._pageMarginsRoot === root && state === this._pageMarginsState) return;
+    if (!this.exports.page_margins_set(BigInt(rootHandle), boxes === null ? 0 : 1)) this.throwIfError();
+    this._pageMarginsRoot = boxes === null ? undefined : root;
+    this._pageMarginsState = state;
+    if (boxes === null) return;
+    for (const [index, { declarations, content }] of boxes.entries()) {
+      if (!this.exports.page_margin_box(index, ...this.input(declarations), ...this.input(content))) {
+        this._pageMarginsRoot = undefined;
+        this.throwIfError();
+      }
+    }
+  }
+
   // A CSS color as encoded sRGB {r, g, b, a}, "currentColor" for the
-  // keyword, or null for an invalid value.
-  parseColor(text) {
-    const status = this.exports.color_parse(...this.input(text));
+  // keyword, or null for an invalid value. `currentColor` ({r, g, b, a},
+  // encoded sRGB) resolves currentcolor inside a color-mix(); without it the
+  // element context's currentcolor applies.
+  parseColor(text, currentColor = null) {
+    const status = currentColor === null
+      ? this.exports.color_parse(...this.input(text))
+      : this.exports.color_parse_with_current(
+        ...this.input(text),
+        currentColor.r,
+        currentColor.g,
+        currentColor.b,
+        currentColor.a,
+      );
     this.throwIfError();
     if (status === 1) return "currentColor";
     if (status !== 0) return null;
@@ -2064,6 +2105,31 @@ export class DomCore {
       g: view.getFloat64(pointer + 8, true),
       b: view.getFloat64(pointer + 16, true),
       a: view.getFloat64(pointer + 24, true),
+    };
+  }
+
+  // Chrome's serialization of the color the last parseColor() returned when
+  // it is outside the legacy sRGB forms (lab(), lch(), oklab(), oklch(),
+  // color(), color-mix()), or null for a keyword, hex, rgb(), hsl() or
+  // hwb() color, which serializes from its 8-bit components.
+  parsedColorText() {
+    return this.exports.color_parsed_text() === 0 ? null : this.outputString();
+  }
+
+  // Blink's stop of a gradient that interpolates in OKLab for the color the
+  // last parseColor() returned, when it was not currentcolor: `stop`, the
+  // color through OKLab and back to encoded sRGB, and `own`, its own
+  // encoded sRGB, which Blink copies to offset 0, each [r, g, b]. A
+  // keyword, hex or rgb() color enters as the given 8-bit encoded r, g, b.
+  parsedOklabStop(r, g, b) {
+    this.exports.color_parsed_oklab_stop(r, g, b);
+    this.throwIfError();
+    const pointer = this.exports.abi_output_pointer();
+    const view = new DataView(this.memory.buffer);
+    const component = (index) => view.getFloat64(pointer + index * 8, true);
+    return {
+      stop: [component(0), component(1), component(2)],
+      own: [component(3), component(4), component(5)],
     };
   }
 
@@ -2261,11 +2327,11 @@ export class DomCore {
     return this.handle("scene_resource_node", node);
   }
 
-  // The URL that an SVG element's fill (which 0) or stroke (which 1) names
-  // as its paint server, escapes decoded, or null when that paint names
-  // none (SceneBuildBox.host bits 4 and 8).
-  sceneSvgPaintServer(node, which) {
-    return this.status("scene_svg_paint_server", node, which)
+  // The URL that a captured SVG row's fill (which 0) or stroke (which 1)
+  // names as its paint server, with instance inheritance and escapes
+  // resolved, or null (SceneBuildBox.host bits 4 and 8).
+  sceneSvgPaintServer(stableId, sourceRevision, which) {
+    return this.status("scene_svg_paint_server", stableId, sourceRevision, which)
       ? this.outputString()
       : null;
   }
@@ -2276,6 +2342,10 @@ export class DomCore {
 
   resourceEngineBind(scope, resource, index, variant = 0) {
     this.status("resource_engine_bind", scope, resource, index, variant);
+  }
+
+  resourceEngineUnbind(scope, resource, variant = 0) {
+    return this.status("resource_engine_unbind", scope, resource, variant);
   }
 
   resourceEngineIndex(scope, id, variant = 0) {
@@ -2339,6 +2409,10 @@ export class DomCore {
 
   resourceRelease(handle) {
     return this.status("resource_release", handle);
+  }
+
+  releaseDocumentResourceBindings(documentHandle) {
+    return this.status("resource_release_document_bindings", documentHandle);
   }
 
   get resourceRevision() {
@@ -2584,16 +2658,11 @@ export class DomCore {
     return customProperties;
   }
 
-  // Length resolution runs in the core against the current context. The
-  // result carries pixel and percentage parts as numbers.
-  lengthViewport(width, height) {
-    if (
-      this._lengthViewportWidth === width &&
-      this._lengthViewportHeight === height
-    ) return;
-    this._lengthViewportWidth = width;
-    this._lengthViewportHeight = height;
-    this.exports.length_viewport_set(width, height);
+  // The viewport that vw, vh, vmin and vmax of the document of `handle`
+  // resolve against. A change makes the document's computed records resolve
+  // again.
+  documentViewport(handle, width, height, deviceScale) {
+    this.status("document_viewport_set", handle, width, height, deviceScale);
   }
 
   // Returns a keyword string, a pixel number, a "N%" string, a
@@ -2640,13 +2709,13 @@ export class DomCore {
     return context;
   }
 
-  // Font-family values the core met without an answer; the binding keys
-  // them through its registry and answers with setFontFamily.
-  fontFamilyRequests() {
-    const count = this.status("font_family_request_count");
+  // Font-family values the resolutions of `document` met without an
+  // answer; the binding keys them through its registry and answers them.
+  fontFamilyRequests(document) {
+    const count = this.status("font_family_request_count", document._coreHandle);
     const requests = new Array(count);
     for (let index = 0; index < count; index += 1) {
-      requests[index] = this.string("font_family_request_at", index);
+      requests[index] = this.string("font_family_request_at", document._coreHandle, index);
     }
     return requests;
   }
@@ -2801,12 +2870,16 @@ export class DomCore {
   // Lowers every row of the last build into a retained publication and
   // returns its handle. The caller releases it (engineRecordRelease). A
   // failure carries `sceneRow`, the index of the build row that failed.
-  engineRecordPublish(rootHandle, viewportWidth, viewportHeight) {
+  // `scrollOwner` is the scroll owner of the render surface the build is
+  // for (0n without one): the publication records each row's requested
+  // scroll offsets from it.
+  engineRecordPublish(rootHandle, viewportWidth, viewportHeight, scrollOwner) {
     const native = this.exports;
     const handle = applyNative(native.engine_record_publish, native, [
       rootHandle,
       viewportWidth,
       viewportHeight,
+      scrollOwner,
     ]);
     if (native.abi_error_kind() !== 0) {
       const sceneRow = native.abi_error_detail_a();
@@ -2938,6 +3011,52 @@ export class DomCore {
           dashPhase: request.dashPhase,
         }
         : null,
+    };
+  }
+
+  svgPathRegister(path, fillRule, stroke = null) {
+    const input = this.input(path);
+    const dashArray = Float64Array.from(stroke?.dashArray ?? []);
+    const dashes = dashArray.length
+      ? this.byteInput(new Uint8Array(dashArray.buffer))[0]
+      : 0;
+    return this.status("svg_path_register", ...input, Number(fillRule === "evenodd"),
+      Number(stroke !== null), stroke?.width ?? 0, stroke?.cap ?? 0,
+      stroke?.join ?? 0, stroke?.miterLimit ?? 4, dashes, dashArray.length,
+      stroke?.dashPhase ?? 0);
+  }
+
+  svgPathDefinition(pathIndex) {
+    this.status("svg_path_definition", pathIndex);
+    const pointer = this.exports.abi_output_pointer();
+    const view = new DataView(this.refreshBytes().buffer);
+    const pathPointer = view.getUint32(pointer + 4, true);
+    const pathLength = view.getUint32(pointer + 8, true);
+    return {
+      pathIndex,
+      pathDef: this.decoder.decode(this.bytes.subarray(pathPointer, pathPointer + pathLength)),
+      fillRule: view.getUint32(pointer + 12, true) === 1 ? "evenodd" : "nonzero",
+      stroke: view.getUint32(pointer + 16, true) ? {
+        width: view.getFloat32(pointer + 20, true),
+        cap: view.getUint32(pointer + 24, true),
+        join: view.getUint32(pointer + 28, true),
+        miterLimit: view.getFloat32(pointer + 32, true),
+        dashArray: Array.from(new Float32Array(this.memory.buffer,
+          view.getUint32(pointer + 36, true), view.getUint32(pointer + 40, true))),
+        dashPhase: view.getFloat32(pointer + 44, true),
+      } : null,
+    };
+  }
+
+  sceneSvgPathBounds(publication, index) {
+    if (!this.status("scene_svg_path_bounds", publication, index)) return null;
+    const pointer = this.exports.abi_output_pointer();
+    const view = new DataView(this.refreshBytes().buffer);
+    return {
+      xMin: view.getFloat64(pointer, true),
+      yMin: view.getFloat64(pointer + 8, true),
+      xMax: view.getFloat64(pointer + 16, true),
+      yMax: view.getFloat64(pointer + 24, true),
     };
   }
 
@@ -3110,12 +3229,22 @@ export class DomCore {
         };
         slot.shadow = true;
       } else if (valueKind === 20) {
+        // An unresolved stop: `position`, the fraction of the gradient
+        // line, and `pixels`, a length the painted tile resolves. A stop
+        // without either is unpositioned; the paint fixes it up. A colour
+        // hint (flag bit 3) has no colour.
+        const position = view.getFloat64(offset + 8, true);
+        const pixels = view.getFloat64(offset + 16, true);
+        const hint = (view.getFloat64(offset + 24, true) & 8) !== 0;
         slot.value = {
-          position: view.getFloat64(offset + 8, true),
-          color: rgba(
-            new DataView(this.memory.buffer),
-            view.getUint32(offset + 52, true),
-          ),
+          ...(Number.isNaN(position) ? {} : { position }),
+          ...(pixels !== 0 ? { pixels } : {}),
+          ...(hint ? { hint: true } : {
+            color: rgba(
+              new DataView(this.memory.buffer),
+              view.getUint32(offset + 52, true),
+            ),
+          }),
         };
         slot.gradient = 3;
       } else if (valueKind === 7) {
@@ -3189,8 +3318,11 @@ export class DomCore {
           : RADIAL_SIZES[sizeKind];
         slot.gradient = 2;
       } else if (valueKind === 13) {
+        const position = view.getFloat64(offset + 8, true);
+        const pixels = view.getFloat64(offset + 16, true);
         slot.value = {
-          position: view.getFloat64(offset + 8, true),
+          ...(Number.isNaN(position) ? {} : { position }),
+          ...(pixels !== 0 ? { pixels } : {}),
           color: text(
             view.getUint32(offset + 52, true),
             view.getUint32(offset + 56, true),
@@ -3231,15 +3363,15 @@ export class DomCore {
     return slots;
   }
 
-  // Parse a transform list outside a cascade. Returns the component list
-  // or throws for an invalid list.
   // Field slots for one declaration outside a cascade, or null when the
-  // core has no entry for the property.
-  declarationSlots(property, value) {
+  // core has no entry for the property. With $element, its lengths compute
+  // against the element's font sizes and the rendering viewport.
+  declarationSlots(property, value, element = null) {
     const count = this.status(
       "field_declaration_parse",
       ...this.input(property),
       ...this.input(value),
+      element?._coreHandle ?? 0n,
     );
     if (count < 0) return null;
     return this.decodeFieldSlots(count);
@@ -3269,8 +3401,11 @@ export class DomCore {
     return fields;
   }
 
-  transformComponents(text) {
-    const count = this.status("transform_parse", ...this.input(text));
+  // Parse a transform list outside a cascade. Returns the component list
+  // or throws for an invalid list. With $element, its lengths compute
+  // against the element's font sizes and the rendering viewport.
+  transformComponents(text, element = null) {
+    const count = this.status("transform_parse", ...this.input(text), element?._coreHandle ?? 0n);
     const slots = this.decodeFieldSlots(count);
     if (count === 0 || slots[0].kind === 1) {
       throw new TypeError(`Invalid transform list: ${String(text).trim()}`);
@@ -3369,6 +3504,7 @@ export class DomCore {
       const offset = index * recordSize;
       records.push({
         kind: view.getUint32(offset, true),
+        moved: (view.getUint32(offset + 4, true) & 2) !== 0,
         target: view.getBigUint64(offset + 8, true),
         relatedA: view.getBigUint64(offset + 16, true),
         relatedB: view.getBigUint64(offset + 24, true),

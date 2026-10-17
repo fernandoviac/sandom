@@ -4,24 +4,12 @@
 // The host supplies only what it alone knows: text geometry (carets and
 // glyphs), scrollbar descriptors, revisions and the viewport. The live
 // layout pass that feeds a synchronous read lives in live-geometry.js.
-import { boxSnapshotFor, encodeGeometrySuccessorTail, encodeGeometryTail, GEOMETRY_FRAGMENT_SIZE, textWireBlocks, writeGlyph } from "../dom-wasm/geometry-wire.js";
+import { boxSnapshotFor, encodeGeometrySuccessorTail, encodeGeometryTail, GEOMETRY_FRAGMENT_SIZE, textWireBlocks } from "../dom-wasm/geometry-wire.js";
 
 const measurement = Symbol.for("sandom.domCore.measurement");
 const geometryFinalizer = new FinalizationRegistry(({ core, handle }) => {
   core.exports.geometry_release(handle);
 });
-
-function appendTextGlyphs(output, node, geometry) {
-  for (const glyph of geometry.glyphs ?? []) {
-    output.push({
-      handle: node._coreHandle, recordIndex: -1,
-      sourceStart: glyph.sourceStart, sourceEnd: glyph.sourceEnd,
-      x: glyph.x, top: glyph.top, bottom: glyph.bottom, width: glyph.width,
-      translationX: geometry.translationX ?? 0,
-      translationY: geometry.translationY ?? 0,
-    });
-  }
-}
 
 // The revisions a snapshot is stamped with. Callers on a frame pass the
 // frame's; a standalone query reads the current ones.
@@ -45,22 +33,16 @@ export function snapshotTextGeometry(textGeometryByNode, textGeometryByElement) 
   return textGeometryByNode;
 }
 
-// The text geometry of a frame that moved every text node alike (it
-// scrolled only the viewport): the text geometry `base` of an earlier frame
-// under one text shift, subtracted from each translation, instead of a new
-// entry per text node. An entry is made on its first read. `overrides`
-// holds the entries the frame finished itself (a text control's, with its
-// live selection), read in place of the shifted base entry. It answers the
-// read-only Map interface; the snapshot of its frame shares the text block
-// written from `base` under the same shift, and the core subtracts it the
-// same way (geometry.watpart $geometryShiftTranslation).
-export class ShiftedTextGeometry {
-  #entries = new Map();
-
-  constructor(base, shiftX, shiftY, overrides) {
+// The text geometry of a frame that kept every text node's geometry (it
+// only scrolled, or restyled without moving text): the text geometry
+// `base` of an earlier frame, with `overrides` holding the entries the
+// frame finished itself (a text control's, with its live selection), read
+// in place of the base entry. A translation holds no scroll (the geometry
+// records carry it), so a scroll needs no new entry. It answers the
+// read-only Map interface.
+export class TextGeometryView {
+  constructor(base, overrides) {
     this.base = base;
-    this.shiftX = shiftX;
-    this.shiftY = shiftY;
     this.overrides = overrides;
     Object.freeze(this);
   }
@@ -74,23 +56,7 @@ export class ShiftedTextGeometry {
   }
 
   get(node) {
-    const override = this.overrides.get(node);
-    if (override !== undefined) return override;
-    let entry = this.#entries.get(node);
-    if (entry !== undefined) return entry;
-    const geometry = this.base.get(node);
-    if (geometry === undefined) return undefined;
-    const translationX = (geometry.translationX ?? 0) - this.shiftX;
-    const translationY = (geometry.translationY ?? 0) - this.shiftY;
-    entry = Object.freeze({
-      caretStops: geometry.caretStops,
-      glyphs: geometry.glyphs,
-      anchors: geometry.anchors,
-      translationX,
-      translationY,
-    });
-    this.#entries.set(node, entry);
-    return entry;
+    return this.overrides.get(node) ?? this.base.get(node);
   }
 
   keys() {
@@ -147,7 +113,7 @@ function buildAnsweringFontFamilies(document, revisions, tail, buildOnce) {
   let handle;
   for (let attempt = 0;; attempt++) {
     handle = once();
-    if (handle < GEOMETRY_HANDLE_MINIMUM || !styleSystem || attempt > 8 || core.fontFamilyRequests().length === 0) break;
+    if (handle < GEOMETRY_HANDLE_MINIMUM || !styleSystem || attempt > 8 || core.fontFamilyRequests(document).length === 0) break;
     core.status("geometry_release", handle);
     styleSystem.answerFontFamilyRequests();
   }
@@ -196,10 +162,10 @@ export function buildGeometry({ root, boxes, publication, viewport, viewportInde
 }
 
 // The host tail of a successor: this frame's scrollbars, and without
-// `textShift` each text node's translation in the text geometry's order.
-function successorTail(scrollbars, textGeometry, textShift) {
+// `shareText` each text node's translation in the text geometry's order.
+function successorTail(scrollbars, textGeometry, shareText) {
   const textTranslations = [];
-  if (textShift === null) {
+  if (!shareText) {
     for (const [node, geometry] of textGeometry) {
       textTranslations.push({
         handle: node._coreHandle,
@@ -208,7 +174,7 @@ function successorTail(scrollbars, textGeometry, textShift) {
       });
     }
   }
-  return encodeGeometrySuccessorTail({ scrollbars, textTranslations, textShift });
+  return encodeGeometrySuccessorTail({ scrollbars, textTranslations, shareText });
 }
 
 // The work a successor reported (its standard output, six u32): element
@@ -232,15 +198,15 @@ function successorWork(core) {
 // buildGeometry produces when the predecessor's tree, publication, element
 // facts and text geometry still hold, which the caller establishes. Only
 // the boxes, the scrollbars and the text translations are this frame's.
-// With `textShift` ({ previousX, previousY, x, y }) the snapshot keeps the
-// predecessor's carets and glyphs under the frame's text shift (`x`, `y`),
-// the predecessor's being `previousX`, `previousY`; without it each text
-// node's translation is written. Returns the geometry and the successor's
+// With `shareText` the snapshot keeps the predecessor's carets and glyphs
+// (the frame's text geometry is the predecessor's); without it each text
+// node's translation is written. A translation holds no scroll: the
+// geometry records carry it. Returns the geometry and the successor's
 // `work`.
-export function buildGeometrySuccessor({ predecessor, root, boxes, revision, scrollbars, textGeometry, textShift = null, sourceRevisions }) {
+export function buildGeometrySuccessor({ predecessor, root, boxes, revision, scrollbars, textGeometry, shareText = false, sourceRevisions }) {
   const document = root.ownerDocument;
   const core = document._domCore;
-  const tail = successorTail(scrollbars, textGeometry, textShift);
+  const tail = successorTail(scrollbars, textGeometry, shareText);
   const snapshot = boxSnapshotFor(boxes, core);
   let work = null;
   let handle;
@@ -262,16 +228,16 @@ export function buildGeometrySuccessor({ predecessor, root, boxes, revision, scr
 // (geometry_restyle_successor): the predecessor's records with this
 // frame's boxes, scrollbars and revisions, and the facts of each element
 // whose record the restyle changed built again. The caller establishes
-// that the viewport and the text geometry are the predecessor's, the text
-// at most translated (`textShift` as for buildGeometrySuccessor). The core
+// that the viewport and the text geometry are the predecessor's, at most
+// with other translations (`shareText` as for buildGeometrySuccessor). The core
 // proves the tree, the rows and the fragment counts; when one differs it
 // refuses, and this returns no geometry and the refusal ("tree", "rows" or
 // "fragments") for the caller to build instead. `work`: the successor's
 // work (successorWork), null after a refusal.
-export function buildGeometryRestyleSuccessor({ predecessor, root, boxes, publication, viewportIndex, revision, scrollbars, textGeometry, textShift = null, sourceRevisions }) {
+export function buildGeometryRestyleSuccessor({ predecessor, root, boxes, publication, viewportIndex, revision, scrollbars, textGeometry, shareText = false, sourceRevisions }) {
   const document = root.ownerDocument;
   const core = document._domCore;
-  const tail = successorTail(scrollbars, textGeometry, textShift);
+  const tail = successorTail(scrollbars, textGeometry, shareText);
   const snapshot = boxSnapshotFor(boxes, core);
   // The document element with a live surface is the viewport's client.
   const viewportClient = document.documentElement === root && Boolean(root._renderSurface);
@@ -331,6 +297,48 @@ export function geometryClientRects(core, handle, node) {
   return rectangles;
 }
 
+// The rectangles of `range` (Range.getClientRects), or with `bounding` its
+// bounding rectangle (Range.getBoundingClientRect), from a snapshot with
+// text geometry (live-geometry.js withLiveTextGeometry).
+export function geometryRangeRects(core, handle, range, bounding) {
+  const count = core.status("geometry_range_rects", handle, range._handle, bounding ? 1 : 0);
+  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * GEOMETRY_FRAGMENT_SIZE);
+  const rectangles = [];
+  for (let index = 0; index < count; index++) {
+    const at = index * GEOMETRY_FRAGMENT_SIZE;
+    rectangles.push(rectangle(
+      view.getFloat64(at, true),
+      view.getFloat64(at + 8, true),
+      view.getFloat64(at + 16, true),
+      view.getFloat64(at + 24, true),
+    ));
+  }
+  return bounding ? rectangles[0] : rectangles;
+}
+
+// The caret position at viewport point (x, y) (caretPositionFromPoint)
+// from a snapshot with text geometry: { node, offset }, or null when no
+// element is at the point. The handle is copied out before the wrapper is
+// made, since making one can run another core operation.
+export function geometryCaretPosition(core, handle, x, y) {
+  if (core.status("geometry_caret_position", handle, x, y) === 0) return null;
+  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 16);
+  const node = view.getBigUint64(0, true);
+  const offset = view.getFloat64(8, true);
+  return { node: core.wrapperFor(node), offset };
+}
+
+// The nodes at a viewport point, topmost first, the root element last
+// (geometry_hits_test). The handles are copied out before any wrapper is
+// made, since making one can run another core operation.
+export function geometryHits(core, handle, x, y) {
+  const count = core.status("geometry_hits_test", handle, x, y);
+  const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * 8);
+  const handles = [];
+  for (let index = 0; index < count; index++) handles.push(view.getBigUint64(index * 8, true));
+  return handles.map((node) => core.wrapperFor(node));
+}
+
 const noSelectionRectangles = Object.freeze([]);
 
 function writeSelectionSpan(view, offset, span) {
@@ -357,6 +365,10 @@ function readSelectionRectangles(core, count) {
   return Object.freeze(rectangles);
 }
 
+// The rectangles of text spans `spans` ({ node, start, end }; a text node or
+// a text control with offsets into its value) in presented frame `snapshot`
+// (a surface's `presentedFrame`): viewport CSS px, or device px with
+// `physical`. A public export of `sandom/dom`.
 export function selectionRectangles(snapshot, spans, {
   physical = false, deviceScale = snapshot?.viewport.deviceScale ?? 1,
 } = {}) {
@@ -372,6 +384,9 @@ export function selectionRectangles(snapshot, spans, {
   return readSelectionRectangles(core, count);
 }
 
+// The caret rectangle at `position` in `node` (a text node or a text
+// control) in presented frame `snapshot`, in viewport device px, or null
+// where the frame has no caret position. A public export of `sandom/dom`.
 export function caretRectangle(snapshot, node, position, {
   deltaX = 0, deltaY = 0, deviceScale = snapshot?.viewport.deviceScale ?? 1,
 } = {}) {
@@ -382,26 +397,17 @@ export function caretRectangle(snapshot, node, position, {
   return count === 0 ? null : readSelectionRectangles(core, count)[0];
 }
 
-export function selectionRectanglesForText(node, textGeometry, start, end) {
-  const core = node._domCore;
-  if (!core.status("geometry_selection_nonempty", start, end)) {
-    return noSelectionRectangles;
-  }
-  const glyphs = [];
-  appendTextGlyphs(glyphs, node, textGeometry);
-  const glyphBytes = glyphs.length * 80;
-  const pointer = core.status("abi_allocate", glyphBytes + 40);
-  const view = new DataView(core.refreshBytes().buffer, pointer, glyphBytes + 40);
-  for (let index = 0; index < glyphs.length; index++) {
-    writeGlyph(view, index * 80, glyphs[index]);
-  }
-  writeSelectionSpan(view, glyphBytes, {
-    node, start: Math.min(start, end), end: Math.max(start, end),
-  });
-  const count = core.status("geometry_selection_rects_from_glyphs",
-    node.ownerDocument._coreHandle, pointer, glyphs.length,
-    pointer + glyphBytes, 1, 0, 1);
-  return readSelectionRectangles(core, count);
+// The selection rectangles of text control `element` in presented frame
+// `frame`, for its text geometry entry `geometry` (which carries the
+// control's selection): CSS px, with the control's scroll and its
+// ancestors' scrolls, as the frame's geometry answers them.
+export function controlSelectionRectangles(frame, element, geometry) {
+  const start = geometry.selectionStart;
+  const end = geometry.selectionEnd;
+  if (start === end) return noSelectionRectangles;
+  return selectionRectangles(frame, [
+    { node: element, start: Math.min(start, end), end: Math.max(start, end) },
+  ]);
 }
 
 // A text node's glyph and caret geometry from the previous frame, valid

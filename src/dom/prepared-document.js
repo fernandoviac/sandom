@@ -1,21 +1,7 @@
-import { readBinaryFile } from "../host.js";
+import { validateSandomHost } from "../host/contract.js";
 import { installComponentGlobals } from "./component-globals.js";
+import { enterDocumentRealm, installDocumentFetch } from "./document-realm.js";
 import { SDDocument } from "./node.js";
-
-export class InvalidResourceResponseError extends TypeError {}
-
-const textEncoder = new TextEncoder();
-
-async function digest(bytes) {
-  const digestBytes = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", bytes),
-  );
-  return `sha256:${
-    Array.from(digestBytes, (byte) => byte.toString(16).padStart(2, "0")).join(
-      "",
-    )
-  }`;
-}
 
 function normalizeStylesheets(stylesheets, documentURL) {
   if (!Array.isArray(stylesheets)) {
@@ -51,7 +37,7 @@ function normalizeStylesheets(stylesheets, documentURL) {
 }
 
 // Every MathML element's unsupported MathML, as recoverable warnings that
-// name the element (plans/layout/PLAN-mathml-layout.md, Acceptance).
+// name the element (docs/design/mathml-layout.md, Diagnostics).
 const MATHML_NAMESPACE = "http://www.w3.org/1998/Math/MathML";
 function mathmlDiagnostics(document) {
   const diagnostics = [];
@@ -70,147 +56,51 @@ function mathmlDiagnostics(document) {
   return diagnostics;
 }
 
-export async function createPreparedDocument({
+// Creates one document whose every resource demand goes to `host`. The
+// host is mandatory: Sandom has no provider of its own. `clock` is the
+// document's clock (src/dom/document-clock.js), or null for the host's
+// real clock. The document is made synchronously; the promise keeps the
+// contract, and a throw becomes its rejection.
+export function createPreparedDocument(options) {
+  return Promise.try(preparedDocument, options);
+}
+
+function preparedDocument({
   url = "about:blank",
-  resolveResource: callerResolveResource = null,
+  host,
   windowTarget = {},
   reportException = null,
   core,
   fontRegistry,
+  clock = null,
 } = {}) {
+  validateSandomHost(host, "createPreparedDocument");
   const documentURL = new URL(url).href;
-  if (
-    callerResolveResource !== null &&
-    typeof callerResolveResource !== "function"
-  ) {
-    throw new TypeError("resolveResource must be a function or null");
-  }
   if (reportException !== null && typeof reportException !== "function") {
     throw new TypeError("reportException must be a function or null");
   }
-  const resourcesByURL = new Map();
-  const ownedResourceReleases = new Set();
-  const generatedStylesheetSources = new Map();
-  let cachedResourceRecords = null;
   let released = false;
-
-  const resolveResource = async (
-    {
-      requestedURL,
-      authoredURL = requestedURL,
-      baseURL: resourceBaseURL,
-      kind,
-    },
-  ) => {
-    if (released) throw new Error("prepared document has been released");
-    const baseURL = resourceBaseURL ?? document.baseURI;
-    const requestedFinalURL = new URL(requestedURL, baseURL).href;
-    let resource = resourcesByURL.get(requestedFinalURL);
-    if (resource) return resource;
-
-    const generatedSource = kind === "stylesheet"
-      ? generatedStylesheetSources.get(requestedFinalURL)
-      : undefined;
-    const resolved = generatedSource !== undefined
-      ? {
-        bytes: textEncoder.encode(generatedSource),
-        source: generatedSource,
-        finalURL: requestedFinalURL,
-        ownership: "caller",
-      }
-      : callerResolveResource
-      ? await callerResolveResource({
-        requestedURL: authoredURL,
-        baseURL,
-        finalURL: requestedFinalURL,
-        kind,
-      })
-      : {
-        bytes: await readBinaryFile(new URL(requestedFinalURL)),
-        finalURL: requestedFinalURL,
-      };
-    if (!(resolved?.bytes instanceof Uint8Array)) {
-      throw new InvalidResourceResponseError(
-        "resolveResource must return Uint8Array bytes",
-      );
-    }
-    if (
-      resolved.ownership !== undefined &&
-      !["caller", "prepared-input"].includes(resolved.ownership)
-    ) {
-      throw new TypeError(
-        'resolveResource ownership must be "caller" or "prepared-input"',
-      );
-    }
-    if (
-      resolved.ownership === "prepared-input" &&
-      typeof resolved.release !== "function"
-    ) {
-      throw new TypeError(
-        "prepared-input resource ownership requires a release function",
-      );
-    }
-    const resolvedFinalURL = new URL(
-      resolved.finalURL ?? requestedFinalURL,
-    ).href;
-    resource = Object.freeze({
-      bytes: resolved.bytes,
-      source: resolved.source ?? (
-        kind === "stylesheet"
-          ? new TextDecoder().decode(resolved.bytes)
-          : undefined
-      ),
-      requestedFinalURL,
-      finalURL: resolvedFinalURL,
-      cacheKey: resolvedFinalURL,
-      contentType: resolved.contentType ?? null,
-      byteLength: resolved.bytes.byteLength,
-      digest: await digest(resolved.bytes),
-      kind,
-    });
-    resourcesByURL.set(requestedFinalURL, resource);
-    resourcesByURL.set(resolvedFinalURL, resource);
-    cachedResourceRecords = null;
-    if (resolved.ownership === "prepared-input") {
-      ownedResourceReleases.add(resolved.release);
-    }
-    return resource;
-  };
 
   const document = new SDDocument({
     core,
     fontRegistry,
     url: documentURL,
-    resolveStylesheet: resolveResource,
+    host,
     reportException,
+    enterRealm: enterDocumentRealm,
+    clock,
   });
-  // Surfaces created directly from this document use the same locator,
-  // ownership and cache as stylesheets and prepared-input operations.
-  document._resolveResource = resolveResource;
+  const resources = document._resources;
   const window = windowTarget === null
     ? null
     : installComponentGlobals(windowTarget, document);
-  const resourceRecords = () => {
-    if (cachedResourceRecords) return cachedResourceRecords;
-    cachedResourceRecords = Object.freeze(
-      [...new Set(resourcesByURL.values())].map((resource) =>
-        Object.freeze({
-          requestedFinalURL: resource.requestedFinalURL,
-          finalURL: resource.finalURL,
-          contentType: resource.contentType,
-          byteLength: resource.byteLength,
-          digest: resource.digest,
-          kind: resource.kind,
-        })
-      ),
-    );
-    return cachedResourceRecords;
-  };
+  if (window !== null) installDocumentFetch(window, document);
 
   return Object.freeze({
     document,
     window,
-    resolveResource,
+    host,
+    resolveResource: document._resolveResource,
     attachStylesheets(stylesheets) {
       if (released) throw new Error("prepared document has been released");
       if (!document.head) {
@@ -218,7 +108,7 @@ export async function createPreparedDocument({
       }
       const normalized = normalizeStylesheets(stylesheets, documentURL);
       for (const stylesheet of normalized) {
-        generatedStylesheetSources.set(stylesheet.url, stylesheet.source);
+        resources.supplyStylesheetSource(stylesheet.url, stylesheet.source);
         const link = document.createElement("link");
         link.setAttribute("rel", "stylesheet");
         link.setAttribute("href", stylesheet.url);
@@ -231,32 +121,46 @@ export async function createPreparedDocument({
       await document._readyForRendering();
     },
     get resources() {
-      return resourceRecords();
+      return resources.records;
     },
     get diagnostics() {
       return Object.freeze([
         ...document._styleSystem.resourceDiagnostics,
         ...document._brokenImageDiagnostics.values(),
+        ...[...document._unanimatedPropertyDiagnostics.values()].flatMap((properties) => [...properties.values()]),
         ...mathmlDiagnostics(document),
+        ...(document._scriptProcessing?.diagnostics ?? []),
       ]);
     },
     async release() {
       if (released) return;
       released = true;
       const errors = [];
+      // The document's scripts stop, and its window bindings leave the
+      // realm that holds them.
+      try {
+        document._scriptProcessing?.release();
+      } catch (error) {
+        errors.push(...(error instanceof AggregateError ? error.errors : [error]));
+      }
       try {
         document._styleSystem.releaseFonts();
       } catch (error) {
         errors.push(error);
       }
-      for (const release of ownedResourceReleases) {
-        try {
-          await release();
-        } catch (error) {
-          errors.push(error);
-        }
+      try {
+        await resources.release();
+      } catch (error) {
+        errors.push(...(error instanceof AggregateError ? error.errors : [error]));
       }
-      ownedResourceReleases.clear();
+      // The document's nodes give back the resources they bind now, rather
+      // than when the garbage collector finalizes the document, so a
+      // long-lived renderer can reclaim their image indices at once.
+      try {
+        document._domCore.releaseDocumentResourceBindings(document._coreHandle);
+      } catch (error) {
+        errors.push(error);
+      }
       if (errors.length > 0) {
         throw new AggregateError(
           errors,

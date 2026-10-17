@@ -1,4 +1,16 @@
 // Native semantics; host only reads language values and decodes immutable data.
+// Nodes are the document, elements with an implicit or explicit role, and
+// text runs (role "StaticText"). checked and pressed are true, false,
+// "mixed", or null where the role has no such state; level is a heading's.
+// A node Chrome exposes without a DOM node of its own (a text control's
+// inner editor and its value, a menulist's popup, a list marker) is a part
+// of its host element: its identifier is the host's with a suffix, and it
+// is no action target.
+const PART_NAMES = ["", "editor", "text", "line-break", "popup", "marker"];
+const partSuffix = (part) => {
+  const kind = part & 255;
+  return kind === 2 || kind === 3 ? `:${PART_NAMES[kind]}-${part >>> 8}` : `:${PART_NAMES[kind]}`;
+};
 export function buildAccessibilitySnapshot({ root, presentedFrame, identify, documentRevision, interactionRevision, presentationRevision, accessibilityRevision }) {
   if (!presentedFrame || typeof identify !== "function") {
     throw new TypeError("Accessibility snapshots require a presented frame and identifier function");
@@ -60,12 +72,15 @@ export function buildAccessibilitySnapshot({ root, presentedFrame, identify, doc
       const flags = result.getUint32(offset + 48, true);
       const actions = result.getUint32(offset + 52, true);
       decoded.push({ node: result.getBigUint64(offset, true), parent: result.getBigUint64(offset + 8, true),
+        part: result.getUint32(offset + 104, true), parentPart: result.getUint32(offset + 108, true),
         role: text(16), name: text(24), value: flags & 256 ? text(32) : null,
         description: flags & 1024 ? text(40) : null,
-        checked: flags & 64 ? Boolean(flags & 2) : null,
+        checked: flags & 64 ? (flags & 8192 ? "mixed" : Boolean(flags & 2)) : null,
+        pressed: flags & 2048 ? (flags & 16384 ? "mixed" : Boolean(flags & 4096)) : null,
         selected: flags & 128 ? Boolean(flags & 4) : null,
         expanded: flags & 16 ? Boolean(flags & 32) : null,
         disabled: Boolean(flags & 1), focused: Boolean(flags & 8),
+        level: result.getUint32(offset + 68, true) || null,
         selection: flags & 512 ? Object.freeze({ start: result.getUint32(offset + 56, true), end: result.getUint32(offset + 60, true), direction: ["none", "forward", "backward"][result.getUint32(offset + 64, true)] }) : null,
         bounds: Object.freeze({ x: result.getFloat64(offset + 72, true), y: result.getFloat64(offset + 80, true), width: result.getFloat64(offset + 88, true), height: result.getFloat64(offset + 96, true) }),
         actions: Object.freeze(["focus", "press", "set-value", "selection"].filter((_, bit) => actions & (1 << bit))) });
@@ -73,13 +88,15 @@ export function buildAccessibilitySnapshot({ root, presentedFrame, identify, doc
     const nodeByIdentifier = new Map();
     const identifiers = new Map();
     for (const record of decoded) {
+      if (record.part !== 0) continue;
       const element = core.wrapperFor(record.node);
       const identifier = identify(element);
       identifiers.set(record.node, identifier);
       nodeByIdentifier.set(identifier, element);
     }
-    const nodes = decoded.map(({ node, parent, ...record }) => ({ ...record,
-      identifier: identifiers.get(node), parentIdentifier: parent === 0n ? null : identifiers.get(parent), childIdentifiers: [] }));
+    const identifierOf = (node, part) => part === 0 ? identifiers.get(node) : `${identifiers.get(node)}${partSuffix(part)}`;
+    const nodes = decoded.map(({ node, parent, part, parentPart, ...record }) => ({ ...record,
+      identifier: identifierOf(node, part), parentIdentifier: parent === 0n ? null : identifierOf(parent, parentPart), childIdentifiers: [] }));
     const byIdentifier = new Map(nodes.map((node) => [node.identifier, node]));
     for (const node of nodes) if (node.parentIdentifier !== null) byIdentifier.get(node.parentIdentifier)?.childIdentifiers.push(node.identifier);
     const frozenNodes = nodes.map((node) => Object.freeze({ ...node, childIdentifiers: Object.freeze(node.childIdentifiers) }));

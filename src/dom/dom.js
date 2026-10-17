@@ -14,11 +14,6 @@ export {
 } from "./render-planning.js";
 export { renderInBrowserWorker } from "./browser-render-client.js";
 export {
-  defineSandomRenderer,
-  SandomRendererElement,
-  selectSandomRendererInput,
-} from "./renderer-element.js";
-export {
   BROWSER_RENDER_ERROR_KIND,
   BROWSER_RENDER_PROTOCOL_VERSION,
   BROWSER_RENDER_READY_KIND,
@@ -29,16 +24,17 @@ export {
   installBrowserRenderWorker,
   renderBrowserWorkerRequest,
 } from "./browser-render-worker-runtime.js";
-export { evaluateComponentModule } from "./input-preprocessors.js";
-export { SDDocument as SandomDocument } from "./node.js";
+export { createInputWindow, evaluateComponentModule } from "./input-preprocessors.js";
+export { DOMParser, SDDocument as SandomDocument } from "./node.js";
 export { createSandomDOM } from "./sandom-dom.js";
+export { caretRectangle, selectionRectangles } from "./geometry.js";
 // Public Sandom DOM facade. This module owns document construction,
 // interaction, layout inspection, rendering surfaces, and render planning.
 // Product adapters belong in separate modules.
 
 import { DOMParser } from "./node.js";
 import { DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH } from "./live-geometry.js";
-import { serializeToScene } from "./serialize.js";
+import { serializeToScene, unsuppliedFontFaceMessage } from "./serialize.js";
 import { createLayoutArtifact } from "../scene-renderer.js";
 import { CSSKeyframesRule } from "./stylesheet.js";
 
@@ -74,7 +70,7 @@ export async function inspectHTML(source, {
       children: [],
     };
     if (node.nodeType === 1) {
-      record.attributes = Object.fromEntries(node.attributes);
+      record.attributes = Object.fromEntries(node.getAttributeNames().map((name) => [name, node.getAttribute(name)]));
       for (
         const [attribute, kind] of [
           ["src", node.localName === "script" ? "script" : "image"],
@@ -107,7 +103,7 @@ export async function inspectHTML(source, {
   const styleDiagnostics = [];
   for (const styleSheet of styleSheets) {
     styleDiagnostics.push(...styleSheet.diagnostics);
-    const rules = [...styleSheet.cssRules];
+    const rules = [...styleSheet._ruleList()];
     while (rules.length > 0) {
       const rule = rules.pop();
       if (rule instanceof CSSKeyframesRule) keyframeRuleCount++;
@@ -144,6 +140,7 @@ export async function inspectHTML(source, {
       })),
     });
   }
+  const fontDiagnostics = unsuppliedFontDiagnostics(document, domNodes);
 
   return Object.freeze({
     kind: "html-inspection",
@@ -179,6 +176,56 @@ export async function inspectHTML(source, {
       references: Object.freeze(resourceReferences),
     }),
     layout: layoutRecord,
-    diagnostics: Object.freeze([]),
+    diagnostics: Object.freeze(fontDiagnostics),
   });
+}
+
+// The font-family lists of the document that no face can draw, each once,
+// with the first element in document order whose text needs it. The lists
+// resolve against the registry the document renders with, as a render
+// does: the first family of the list with a face, else the face of the
+// initial family. A render of such a list throws the same message.
+function unsuppliedFontDiagnostics(document, domNodes) {
+  const registry = document._sandomFontRegistry;
+  const nodeIndices = new Map(domNodes.map((node, index) => [node, index]));
+  const hasFace = (key) => {
+    try {
+      return registry.fontFileFor(key, 400) !== null;
+    } catch {
+      return false;
+    }
+  };
+  const keysOf = (list) => {
+    try {
+      return registry.fontStackKeysForCssValue(list, { document });
+    } catch {
+      return [];
+    }
+  };
+  const initialHasFace = keysOf("sans-serif").some(hasFace);
+  const checked = new Set();
+  const diagnostics = [];
+  for (const element of document.querySelectorAll("*")) {
+    const drawsText = [...element.childNodes].some((child) => child.nodeType === 3 && child.data.trim() !== "");
+    if (!drawsText) continue;
+    // Text inside display: none (the head, a hidden subtree) draws nothing.
+    let hidden = false;
+    for (let node = element; node !== null && !hidden; node = node.parentElement) {
+      hidden = document.getComputedStyle(node).display === "none";
+    }
+    if (hidden) continue;
+    const family = document.getComputedStyle(element).fontFamily;
+    if (checked.has(family)) continue;
+    checked.add(family);
+    if (initialHasFace || keysOf(family).some(hasFace)) continue;
+    diagnostics.push(Object.freeze({
+      code: "font-face-unsupplied",
+      severity: "error",
+      recoverable: false,
+      message: unsuppliedFontFaceMessage(family, element),
+      fontFamily: family,
+      nodeIndex: nodeIndices.get(element),
+    }));
+  }
+  return diagnostics;
 }

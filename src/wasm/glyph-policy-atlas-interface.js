@@ -1,4 +1,4 @@
-// Generated from glyph-policy-atlas-interface.json; do not edit.
+// Handwritten binding for glyph-policy-atlas-interface.json.
 export const ABI_VERSION = 1;
 export const STATE_WRITABLE = 1;
 export const STATE_PUBLISHED = 2;
@@ -24,7 +24,6 @@ export const FIELD_BATCH = 9;
 export const FIELD_ATLAS = 10;
 export const MODE_KEYS = 1;
 export const MODE_RESIDENCY = 2;
-export const MODE_RAW_RESIDENCY = 3;
 export const MODE_PLACEMENTS = 4;
 export const INPUT_SIZE = 40;
 export const INPUT_GLYPH_ID_OFFSET = 0;

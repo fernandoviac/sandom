@@ -6,7 +6,7 @@
 // `encodeImage` runs the central transform (src/output/color-transform.js)
 // and dispatches the still-image encoder. Animated GIF output has its own
 // recorder (`src/output/gif.js`); Sandom offers no video output — see
-// `plans/PLAN-native-vp9-webm-output.md`.
+// `@sandom/vp9-webm` (`../sandom-vp9-webm/plans/PLAN-native-vp9-webm-output.md`).
 
 import {
   REFERENCE_WHITE_LUMINANCE,

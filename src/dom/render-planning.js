@@ -502,13 +502,13 @@ export async function renderInput(input, options = {}) {
   const {
     preprocessors = [],
     preprocessor,
-    resolveResource = null,
+    host,
     ...planningRequest
   } = options;
   const preparedInput = await prepareRenderInput(input, {
     preprocessors,
     preprocessor,
-    resolveResource,
+    host,
   });
   const session = new DocumentSession(preparedInput);
   try {

@@ -1,4 +1,5 @@
 import { createEvent, dispatchEvent } from "./events.js";
+import { documentScripts } from "./scripts.js";
 
 // Only values with JavaScript identity (including nonnumeric direct selection
 // assignments) live here. Numeric positions, dirty flags and strings live in core.
@@ -14,9 +15,25 @@ function status(node, operation, ...args) {
 function string(node, operation) {
   return node._domCore.string(`input_control_${operation}`, node._coreHandle);
 }
-function clamp(node, value, length, minimum = 0) {
-  // Unary + is ToNumber, unlike Number() it rejects BigInt as Math.min does.
-  return node._domCore.status("input_control_clamp", +value, +length, minimum);
+// WebIDL unsigned long (no [EnforceRange] or [Clamp]): ToNumber, then
+// modulo 2^32. Unary + is ToNumber; it rejects a BigInt as WebIDL does.
+function unsignedLong(value) {
+  const number = +value;
+  return Number.isFinite(number) ? Math.trunc(number) >>> 0 : 0;
+}
+// HTML "set the selection range" ends: the core answers 2 when the
+// selection APIs do not apply, 1 when the selection changed. A change
+// queues one select event, as Chrome does.
+function selectionChanged(node, result) {
+  if (result === 2) {
+    throw new DOMException("The input element's type does not support selection.", "InvalidStateError");
+  }
+  if (result !== 1) return;
+  node._notifyMutation("selection");
+  documentScripts(node.ownerDocument).queueTask(() => dispatchEvent(node, createEvent("select", { bubbles: true })));
+}
+export function controlSelectionQueued(node) {
+  selectionChanged(node, 1);
 }
 export function copyControlIdentities(source, clone) {
   // Native node_clone has already copied portable state. These ordered public
@@ -27,9 +44,41 @@ export function copyControlIdentities(source, clone) {
   clone._checkedDirty = source._checkedDirty;
   clone._selected = source._selected;
   clone._selectedDirty = source._selectedDirty;
-  clone.selectionStart = source.selectionStart;
-  clone.selectionEnd = source.selectionEnd;
-  clone.selectionDirection = source.selectionDirection;
+  // Selection offsets and direction are portable core state that
+  // node_clone has already copied.
+}
+// The other radio buttons of a radio button's group (HTML radio button
+// group): inputs of type radio in the same tree, with the same form owner
+// and the same non-empty name, compared case-sensitively, as in Chrome.
+function radioGroupOthers(node) {
+  if (node.localName !== "input" || string(node, "type") !== "radio") return [];
+  const name = node.getAttribute("name");
+  if (!name) return [];
+  const root = node.getRootNode();
+  if (root === node) return [];
+  const form = status(node, "form");
+  return Array.prototype.filter.call(root.querySelectorAll("input"), (other) =>
+    other !== node && string(other, "type") === "radio" && other.getAttribute("name") === name &&
+    status(other, "form") === form
+  );
+}
+// The core set a text control's value as the user edits it, with its
+// selection and direction none (input run state 6, the core invalidated a
+// changed value's style). The realm identities of those fields no longer
+// apply; a dropped value identity is a change the core cannot see.
+export function controlValueEdited(node, valueChanged, selectionChanged) {
+  const fields = identities.get(node);
+  const identityValue = fields?.has("_value") ?? false;
+  for (const field of ["_value", "_valueDirty"]) fields?.delete(field);
+  if (valueChanged) node._notifyMutation("property", undefined, null, true);
+  else if (identityValue) node._notifyMutation("property");
+  if (selectionChanged) node._notifyMutation("selection");
+}
+// The core set a text control's selection as setSelectionRange does (input
+// run state 7): the select event follows.
+export function controlSelectionSet(node) {
+  dispatchEvent(node, createEvent("select", { bubbles: true }));
+  node._notifyMutation("selection");
 }
 export const inputControlRuntime = {
   options(node) {
@@ -52,12 +101,21 @@ export const inputControlRuntime = {
     const source = status(node, "value_source");
     if (source === 1) return string(node, "value");
     if (source === 2) return node._value;
+    if (source === 3 && status(node, "is_textarea")) return string(node, "value");
     const authored = node.getAttribute("value");
+    if (typeof authored === "string") {
+      return node._domCore.string("input_control_sanitize_value", node._coreHandle, ...node._domCore.input(authored));
+    }
     if (authored !== null) return authored;
-    return source === 3 ? node.textContent : "";
+    // An option without a value attribute has its text (HTML option value).
+    if (source === 3) return string(node, "option_text");
+    // A checkbox or radio button without one has "on" (the default/on mode).
+    const type = node.localName === "input" ? string(node, "type") : "";
+    return type === "checkbox" || type === "radio" ? "on" : "";
   },
   setValue(node, value) {
-    const normalized = String(value);
+    // A textarea's API value has CR LF and CR as LF.
+    const normalized = status(node, "is_textarea") ? String(value).replace(/\r\n?/g, "\n") : String(value);
     if (status(node, "is_select")) {
       let state = 0;
       for (const option of node.options) {
@@ -84,23 +142,6 @@ export const inputControlRuntime = {
       node._notifyMutation("property");
     }
   },
-  editValue(node, value, selectionStart, selectionEnd = selectionStart) {
-    const normalized = String(value);
-    const nextStart = clamp(node, selectionStart, normalized.length);
-    const nextEnd = clamp(node, selectionEnd, normalized.length, nextStart);
-    const valueChanged = status(node, "value_differs", ...node._domCore.input(normalized)) ||
-      identities.get(node)?.has("_value");
-    const selectionChanged = node.selectionStart !== nextStart ||
-      node.selectionEnd !== nextEnd || node.selectionDirection !== "none";
-    status(node, "value_set", ...node._domCore.input(normalized));
-    identities.get(node)?.delete("_value");
-    identities.get(node)?.delete("_valueDirty");
-    node.selectionStart = nextStart;
-    node.selectionEnd = nextEnd;
-    node.selectionDirection = "none";
-    if (valueChanged) node._notifyMutation("property");
-    if (selectionChanged) node._notifyMutation("selection");
-  },
   defaultValue(node) {
     return status(node, "is_textarea") ? node.textContent : node.getAttribute("value") ?? "";
   },
@@ -121,6 +162,11 @@ export const inputControlRuntime = {
       identities.get(node)?.delete("_checkedDirty");
       node._notifyMutation("state", "checked");
     }
+    // A radio button that is checked unchecks the others of its group.
+    if (!value) return;
+    for (const other of radioGroupOthers(node)) {
+      if (inputControlRuntime.checked(other)) inputControlRuntime.setChecked(other, false);
+    }
   },
   selected(node) {
     const source = status(node, "state_source", 1);
@@ -139,47 +185,32 @@ export const inputControlRuntime = {
   setTabIndex(node, value) { node.setAttribute("tabindex", String(Number(value))); },
   type(node) { return string(node, "type"); },
   setType(node, value) { node.setAttribute("type", String(value)); },
+  // selectionStart and selectionEnd: null when the selection APIs do not
+  // apply to the control.
   selection(node, field) {
-    const tag = status(node, "selection_tag", field);
-    if (tag === 0) return null;
-    if (tag === 2) return identities.get(node)?.get(field);
-    return status(node, "selection_get", field);
+    return status(node, "selection_applies") ? status(node, "selection_get", field) : null;
   },
+  // The setters take unsigned long? (null as 0).
   setSelection(node, field, value) {
-    if (value === null) {
-      status(node, "selection_set", field, 0, 0);
-      identities.get(node)?.delete(field);
-    } else if (typeof value === "number") {
-      status(node, "selection_set", field, 1, value);
-      identities.get(node)?.delete(field);
-    } else {
-      status(node, "selection_set", field, 2, 0);
-      identityFields(node).set(field, value);
-    }
+    const offset = value === null || value === undefined ? 0 : unsignedLong(value);
+    selectionChanged(node, status(node, "selection_field_set", field, offset, 0, 0));
   },
   direction(node) {
+    if (!status(node, "selection_applies")) return null;
     const token = status(node, "direction");
-    return token === 0 ? "none" : token === 1 ? "forward" : token === 2 ? "backward" : identities.get(node)?.get("direction");
+    return token === 1 ? "forward" : token === 2 ? "backward" : "none";
   },
   setDirection(node, value) {
-    const token = value === "none" ? 0 : value === "forward" ? 1 : value === "backward" ? 2 : 3;
-    status(node, "direction_set", token);
-    if (token === 3) identityFields(node).set("direction", value);
-    else identities.get(node)?.delete("direction");
+    const text = value === null ? "" : String(value);
+    selectionChanged(node, status(node, "selection_field_set", 2, 0, ...node._domCore.input(text)));
   },
-  setSelectionRange(node, start, end, direction = "none") {
-    const value = typeof node.value === "string" ? node.value : node.textContent ?? "";
-    // Do not normalize end before publishing start: its conversion can throw or
-    // reenter and must observe the already-assigned start. Clamp independently.
-    node.selectionStart = clamp(node, start, value.length);
-    node.selectionEnd = clamp(node, end, value.length);
-    node.selectionDirection = direction;
-    dispatchEvent(node, createEvent("select", { bubbles: true }));
-    node._notifyMutation("selection");
-  },
-  select(node) {
-    const value = typeof node.value === "string" ? node.value : node.textContent ?? "";
-    node.setSelectionRange(0, value.length);
+  // setSelectionRange(unsigned long start, unsigned long end, optional
+  // DOMString direction).
+  setSelectionRange(node, start, end, direction = undefined) {
+    const startOffset = unsignedLong(start);
+    const endOffset = unsignedLong(end);
+    const text = direction === undefined ? "" : String(direction);
+    selectionChanged(node, status(node, "selection_range_set", startOffset, endOffset, ...node._domCore.input(text)));
   },
   raw(node, name, field) {
     const fields = identities.get(node);

@@ -8,7 +8,7 @@ export function createPathStrokeService(module) {
   if (existing) return existing;
   const ownerIdentity = resourceOwnerIdentity(module);
   const nativeError = () => {
-    const detail = ABI.readError(new DataView(module.HEAPU8.buffer), module._atlas_strokes_error_ptr());
+    const detail = ABI.readError(new DataView(module.memory.buffer), module.exports.atlas_strokes_error_ptr());
     return Object.assign(new Error(`Native stroke operation failed (${detail.code}, field ${detail.field}, record ${detail.recordIndex})`), { nativeFailure: Object.freeze(detail) });
   };
   const service = Object.freeze({
@@ -20,22 +20,22 @@ export function createPathStrokeService(module) {
         throw new TypeError("Stroke input requires Input64 bytes and a Float64Array dash arena");
       }
       // Only same-owner inputs need a copy before an allocating call can detach them.
-      const input = inputBytes.buffer === module.HEAPU8.buffer ? inputBytes.slice() : inputBytes;
-      const dashInput = dashes.buffer === module.HEAPU8.buffer ? dashes.slice() : dashes;
+      const input = inputBytes.buffer === module.memory.buffer ? inputBytes.slice() : inputBytes;
+      const dashInput = dashes.buffer === module.memory.buffer ? dashes.slice() : dashes;
       const count = input.byteLength / ABI.INPUT_SIZE;
-      const batch = module._atlas_strokes_create(count, dashInput.length);
+      const batch = module.exports.atlas_strokes_create(count, dashInput.length);
       if (!batch) throw nativeError();
       try {
-        if (input.byteLength) module.HEAPU8.set(input, module._atlas_strokes_input_ptr(batch));
+        if (input.byteLength) new Uint8Array(module.memory.buffer).set(input, module.exports.atlas_strokes_input_ptr(batch));
         if (dashInput.length) {
-          const pointer = module._atlas_strokes_dash_ptr(batch);
-          const view = new DataView(module.HEAPU8.buffer);
+          const pointer = module.exports.atlas_strokes_dash_ptr(batch);
+          const view = new DataView(module.memory.buffer);
           for (let index = 0; index < dashInput.length; index++) view.setFloat64(pointer + index * 8, dashInput[index], true);
         }
-        if (module._atlas_strokes_execute(batch) !== 1) throw nativeError();
-        const pointer = module._atlas_strokes_output_ptr(batch);
-        const byteLength = module._atlas_strokes_output_length(batch);
-        const output = ABI.readStrokeOutput(new DataView(module.HEAPU8.buffer), pointer, byteLength);
+        if (module.exports.atlas_strokes_execute(batch) !== 1) throw nativeError();
+        const pointer = module.exports.atlas_strokes_output_ptr(batch);
+        const byteLength = module.exports.atlas_strokes_output_length(batch);
+        const output = ABI.readStrokeOutput(new DataView(module.memory.buffer), pointer, byteLength);
         if (output.count !== count) throw new Error("Native stroke output count mismatch");
         let released = false;
         const live = () => {
@@ -48,23 +48,23 @@ export function createPathStrokeService(module) {
           byteLength,
           view() {
             live();
-            return new Uint8Array(module.HEAPU8.buffer, pointer, byteLength);
+            return new Uint8Array(module.memory.buffer, pointer, byteLength);
           },
           blob(index) {
             live();
             if (!Number.isInteger(index) || index < 0 || index >= count) throw new RangeError("Stroke output index out of bounds");
-            const view = new DataView(module.HEAPU8.buffer, pointer, byteLength);
+            const view = new DataView(module.memory.buffer, pointer, byteLength);
             const entry = ABI.readOutputEntry(view, ABI.OUTPUT_BATCH_SIZE + index * ABI.OUTPUT_ENTRY_SIZE);
             return ABI.readCanonicalBlob(view, entry.offset, entry.byteLength);
           },
           release() {
             if (released) return;
-            if (module._atlas_strokes_destroy(batch) !== 1) throw nativeError();
+            if (module.exports.atlas_strokes_destroy(batch) !== 1) throw nativeError();
             released = true;
           },
         });
       } catch (error) {
-        if (module._atlas_strokes_destroy(batch) !== 1) {
+        if (module.exports.atlas_strokes_destroy(batch) !== 1) {
           throw new AggregateError([error, nativeError()], "Stroke operation and native cleanup failed");
         }
         throw error;

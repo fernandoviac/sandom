@@ -1,4 +1,4 @@
-import { readBinaryFile } from "../host.js";
+import { readPackageAsset } from "../package-assets.js";
 
 // Isolated workers seed the bytes through the reviewed module graph; other
 // hosts resolve the package through the library import map (Deno maps the
@@ -6,7 +6,7 @@ import { readBinaryFile } from "../host.js";
 const COLOR_WASM = "@sandom/color/color.wasm";
 
 const colorWasmBytes = globalThis[Symbol.for("sandom.colorBytes")] ??
-  await readBinaryFile(new URL(import.meta.resolve(COLOR_WASM)));
+  await readPackageAsset(new URL(import.meta.resolve(COLOR_WASM)));
 
 let runtime;
 

@@ -1,9 +1,17 @@
+// The same-device compositor binding (docs/specifications/gpu-command-stream.md).
+// Renderer-core (src/wasm/gpu-compositor.watpart) owns layer
+// uniforms, instance packing, glyph quads, buffer capacity, bind groups, and
+// the composition pass. This module validates the public records, shapes
+// text, leases glyph atlases, and transports their values.
 import { GlyphResourceManager } from "./glyph-resource-manager.js";
 import { validateClosedRecord } from "./closed-record.js";
-import { clipUniformFloats } from "./gpu-composition-clip.js";
-import { createGpuCompositionOperations } from "./rasterize.js";
+import { createGpuBinding } from "./gpu-binding.js";
+import { createGpuPipelineLibrary } from "./gpu-pipeline-library.js";
 import { shapeFontText } from "./shaping.js";
 import { decodeWebFont } from "./web-font.js";
+import { instantiateRendererCore } from "./wasm/renderer-core-binary.js";
+
+let compositorCore;
 
 const IDENTITY_TRANSFORM = Object.freeze({
   a: 1,
@@ -206,111 +214,21 @@ function normalizeTextRecord(record, previous = null) {
   });
 }
 
-function clipState(clipRectangle) {
-  if (clipRectangle === null) return { entries: [] };
-  return {
-    entries: [{
-      x: clipRectangle.x,
-      y: clipRectangle.y,
-      w: clipRectangle.width,
-      h: clipRectangle.height,
-      radiiX: [0, 0, 0, 0],
-      radiiY: [0, 0, 0, 0],
-      mode: 1,
-      axisBits: 3,
-      inverseAffine: [1, 0, 0, 1, 0, 0],
-    }],
-  };
+function writeTransform(view, offset, transform) {
+  view.setFloat64(offset, transform.a, true);
+  view.setFloat64(offset + 8, transform.b, true);
+  view.setFloat64(offset + 16, transform.c, true);
+  view.setFloat64(offset + 24, transform.d, true);
+  view.setFloat64(offset + 32, transform.e, true);
+  view.setFloat64(offset + 40, transform.f, true);
 }
 
-function transformFloats(transform) {
-  return [
-    transform.a,
-    transform.b,
-    transform.c,
-    transform.d,
-    transform.e,
-    transform.f,
-  ];
-}
-
-function textureInstance(record) {
-  const rectangle = record.destinationRectangle;
-  return new Float32Array([
-    rectangle.x,
-    rectangle.y,
-    rectangle.width,
-    rectangle.height,
-    0,
-    0,
-    1,
-    1,
-    ...transformFloats(record.transform),
-    0,
-    0,
-    0,
-    0,
-  ]);
-}
-
-function textInstances(record, shaped, atlas) {
-  const instances = [];
-  const fontScale = record.fontSize / shaped.upem;
-  const range = 6;
-  let penX = 0;
-  let penY = 0;
-  for (let index = 0; index < shaped.glyphs.length; index++) {
-    const glyph = shaped.glyphs[index];
-    const information = atlas.glyphInfo(
-      glyph.g,
-      record.weight,
-      record.opticalSize,
-      record.fontSize,
-    );
-    if (information && information.w > 0 && information.h > 0) {
-      const boundingWidth = information.metrics.bboxXMax - information.metrics.bboxXMin;
-      const boundingHeight = information.metrics.bboxYMax - information.metrics.bboxYMin;
-      const maximumDimension = Math.max(boundingWidth, boundingHeight);
-      const usableTexels = Math.max(information.w, information.h) - 2 * range;
-      const shrinkage = maximumDimension / usableTexels;
-      const quadLeft = information.metrics.bboxXMin - range * shrinkage;
-      const quadRight = information.metrics.bboxXMin +
-        (information.w - range) * shrinkage;
-      const quadBottom = information.metrics.bboxYMin - range * shrinkage;
-      const quadTop = information.metrics.bboxYMin +
-        (information.h - range) * shrinkage;
-      const glyphX = record.baselinePosition.x +
-        (penX + glyph.dx) * fontScale + index * record.letterSpacing;
-      const glyphBaseline = record.baselinePosition.y -
-        (penY + glyph.dy) * fontScale;
-      const x0 = glyphX + quadLeft * fontScale;
-      const x1 = glyphX + quadRight * fontScale;
-      const y0 = glyphBaseline - quadTop * fontScale;
-      const y1 = glyphBaseline - quadBottom * fontScale;
-      const screenSize = Math.max(x1 - x0, y1 - y0);
-      const textureSize = Math.max(information.w, information.h);
-      instances.push(
-        x0,
-        y0,
-        x1 - x0,
-        y1 - y0,
-        information.u,
-        information.v,
-        information.uW,
-        information.vH,
-        record.color[0],
-        record.color[1],
-        record.color[2],
-        record.color[3] * record.opacity,
-        range * (screenSize / textureSize),
-        0,
-        ...transformFloats(record.transform),
-      );
-    }
-    penX += glyph.ax;
-    penY += glyph.ay;
-  }
-  return new Float32Array(instances);
+function writeClip(view, offset, clipRectangle) {
+  view.setFloat64(offset, clipRectangle === null ? 0 : 1, true);
+  view.setFloat64(offset + 8, clipRectangle?.x ?? 0, true);
+  view.setFloat64(offset + 16, clipRectangle?.y ?? 0, true);
+  view.setFloat64(offset + 24, clipRectangle?.width ?? 0, true);
+  view.setFloat64(offset + 32, clipRectangle?.height ?? 0, true);
 }
 
 export async function createGpuCompositor(options) {
@@ -327,15 +245,14 @@ export async function createGpuCompositor(options) {
     throw new TypeError("GPU compositor device must be a GPUDevice");
   }
 
-  const operations = await createGpuCompositionOperations({
-    colorFormat: "rgba16float",
-    device,
-  });
-  const texturePipeline = operations.getImagePipeline();
-  const textPipeline = operations.textPipeline;
+  const library = await createGpuPipelineLibrary(device, "rgba16float");
+  const core = compositorCore ??= instantiateRendererCore().exports;
+  const gpu = createGpuBinding(core, device, { pipeline: library.pipeline });
+  const compositorState = core.gpu_compositor_create(gpu.stream);
+  gpu.execute();
   const glyphResourceManager = new GlyphResourceManager();
   const layers = new Set();
-  const layerEncoders = new WeakMap();
+  const layerSources = new WeakMap();
   let disposed = false;
 
   function requireActive() {
@@ -351,89 +268,57 @@ export async function createGpuCompositor(options) {
     }
     return await promise;
   }
+
+  function writeTextureLayer(handle, record) {
+    const view = gpu.input(128);
+    const rectangle = record.destinationRectangle;
+    view.setFloat64(0, rectangle.x, true);
+    view.setFloat64(8, rectangle.y, true);
+    view.setFloat64(16, rectangle.width, true);
+    view.setFloat64(24, rectangle.height, true);
+    view.setFloat64(32, record.opacity, true);
+    writeTransform(view, 40, record.transform);
+    writeClip(view, 88, record.clipRectangle);
+    core.gpu_compositor_texture_layer_set(handle, view.byteOffset);
+  }
+
   function createTextureLayer(record) {
     requireActive();
     let current = normalizeTextureRecord(record);
     let layerDisposed = false;
-    const uniformBuffer = device.createBuffer({
-      size: 656,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    const instanceBuffer = device.createBuffer({
-      size: 18 * 4,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-    const sampler = device.createSampler({
-      magFilter: "linear",
-      minFilter: "linear",
-      mipmapFilter: "linear",
-      addressModeU: "clamp-to-edge",
-      addressModeV: "clamp-to-edge",
-    });
-    let bindGroup = null;
-    let instanceData = textureInstance(current);
-    const uniformData = new Float32Array(164);
-    function updateUniformData() {
-      const clip = clipState(current.clipRectangle);
-      uniformData[2] = clip.entries.length;
-      uniformData[3] = current.opacity;
-      uniformData.set(clipUniformFloats(clip), 4);
-    }
-    updateUniformData();
+    const handle = core.gpu_compositor_layer_create(compositorState, 0);
+    gpu.execute();
+    writeTextureLayer(handle, current);
 
     const layer = Object.freeze({
       kind: "texture",
       update(changes) {
         requireActive();
         if (layerDisposed) throw new Error("texture layer is disposed");
-        const next = normalizeTextureRecord(changes, current);
-        if (next.textureView !== current.textureView) bindGroup = null;
-        current = next;
-        instanceData = textureInstance(current);
-        updateUniformData();
+        current = normalizeTextureRecord(changes, current);
+        writeTextureLayer(handle, current);
       },
-      async dispose() {
-        if (layerDisposed) return;
-        layerDisposed = true;
-        layers.delete(layer);
-        uniformBuffer.destroy();
-        instanceBuffer.destroy();
-        current = null;
-        bindGroup = null;
-        instanceData = null;
+      // The layer contract returns a promise; the release is synchronous.
+      dispose() {
+        if (!layerDisposed) {
+          layerDisposed = true;
+          layers.delete(layer);
+          core.gpu_compositor_layer_destroy(handle);
+          gpu.execute();
+          current = null;
+        }
+        return Promise.resolve();
       },
     });
-    layerEncoders.set(layer, (renderPass, width, height) => {
+    layerSources.set(layer, () => {
       if (layerDisposed) throw new Error("texture layer is disposed");
-      if (bindGroup === null) {
-        bindGroup = device.createBindGroup({
-          layout: texturePipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: uniformBuffer } },
-            { binding: 1, resource: current.textureView },
-            { binding: 2, resource: sampler },
-          ],
-        });
-      }
-      uniformData[0] = width;
-      uniformData[1] = height;
-      device.queue.writeBuffer(uniformBuffer, 0, uniformData);
-      device.queue.writeBuffer(instanceBuffer, 0, instanceData);
-      renderPass.setPipeline(texturePipeline);
-      renderPass.setBindGroup(0, bindGroup);
-      renderPass.setVertexBuffer(0, operations.quadBuffer);
-      renderPass.setVertexBuffer(1, instanceBuffer);
-      renderPass.draw(6, 1);
+      return [handle, gpu.importResource(current.textureView)];
     });
     layers.add(layer);
     return layer;
   }
 
   const textLayerStates = new Map();
-  const textSampler = device.createSampler({
-    magFilter: "linear",
-    minFilter: "linear",
-  });
   let textResourceRevision = 0;
   let preparedTextResourceRevision = -1;
   let sharedTextLease = null;
@@ -460,40 +345,63 @@ export async function createGpuCompositor(options) {
     return operation;
   }
 
-  function updateTextUniformData(state) {
-    const clip = clipState(state.current.clipRectangle);
-    state.uniformData.fill(0);
-    state.uniformData[2] = clip.entries.length;
-    state.uniformData[5] = 1;
-    state.uniformData.set(clipUniformFloats(clip), 8);
-  }
-
-  function updateTextInstances(state) {
+  // Transports the run, its atlas entries, and the layer values.
+  function writeTextLayer(state) {
     if (state.atlas === null) {
-      state.instances = new Float32Array(0);
+      core.gpu_compositor_text_layer_clear(state.handle);
       return;
     }
-    const instances = textInstances(
-      state.current,
-      state.shaped,
-      state.atlas,
-    );
-    if (instances.byteLength > state.instanceCapacity) {
-      state.instanceBuffer.destroy();
-      state.instanceCapacity = instances.byteLength;
-      state.instanceBuffer = device.createBuffer({
-        size: state.instanceCapacity,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      });
+    const record = state.current;
+    const glyphs = state.shaped.glyphs;
+    const view = gpu.input(168 + glyphs.length * 120);
+    view.setFloat64(0, record.fontSize, true);
+    view.setFloat64(8, state.shaped.upem, true);
+    view.setFloat64(16, record.baselinePosition.x, true);
+    view.setFloat64(24, record.baselinePosition.y, true);
+    view.setFloat64(32, record.letterSpacing, true);
+    for (let channel = 0; channel < 4; channel++) {
+      view.setFloat64(40 + channel * 8, record.color[channel], true);
     }
-    state.instances = instances;
+    view.setFloat64(72, record.opacity, true);
+    writeTransform(view, 80, record.transform);
+    writeClip(view, 128, record.clipRectangle);
+    for (let index = 0; index < glyphs.length; index++) {
+      const glyph = glyphs[index];
+      const offset = 168 + index * 120;
+      const information = state.atlas.glyphInfo(
+        glyph.g,
+        record.weight,
+        record.opticalSize,
+        record.fontSize,
+      );
+      const present = Boolean(information && information.w > 0 && information.h > 0);
+      view.setFloat64(offset, present ? 1 : 0, true);
+      if (present) {
+        view.setFloat64(offset + 8, information.w, true);
+        view.setFloat64(offset + 16, information.h, true);
+        view.setFloat64(offset + 24, information.u, true);
+        view.setFloat64(offset + 32, information.v, true);
+        view.setFloat64(offset + 40, information.uW, true);
+        view.setFloat64(offset + 48, information.vH, true);
+        view.setFloat64(offset + 56, information.metrics.bboxXMin, true);
+        view.setFloat64(offset + 64, information.metrics.bboxXMax, true);
+        view.setFloat64(offset + 72, information.metrics.bboxYMin, true);
+        view.setFloat64(offset + 80, information.metrics.bboxYMax, true);
+      }
+      view.setFloat64(offset + 88, glyph.dx, true);
+      view.setFloat64(offset + 96, glyph.dy, true);
+      view.setFloat64(offset + 104, glyph.ax, true);
+      view.setFloat64(offset + 112, glyph.ay, true);
+    }
+    core.gpu_compositor_text_layer_set(state.handle, view.byteOffset, glyphs.length);
+    gpu.execute();
   }
 
   function releaseSharedTextResources() {
     for (const state of textLayerStates.values()) {
       state.atlas = null;
-      state.bindGroup = null;
-      state.instances = new Float32Array(0);
+      state.atlasTexture = null;
+      writeTextLayer(state);
     }
     // Atlas textures are owned by the atlases (WasmAtlas.deviceTexture);
     // releasing the lease is what retires them.
@@ -537,25 +445,15 @@ export async function createGpuCompositor(options) {
         const state = states[index];
         const atlas = lease.atlases[index];
         state.atlas = atlas;
-        state.bindGroup = device.createBindGroup({
-          layout: textPipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: state.uniformBuffer } },
-            {
-              binding: 1,
-              resource: atlas.deviceTexture(device).createView(),
-            },
-            { binding: 2, resource: textSampler },
-          ],
-        });
-        updateTextInstances(state);
+        state.atlasTexture = atlas.deviceTexture(device);
+        writeTextLayer(state);
       }
     } catch (error) {
       lease.release();
       for (const state of states) {
         state.atlas = null;
-        state.bindGroup = null;
-        state.instances = new Float32Array(0);
+        state.atlasTexture = null;
+        writeTextLayer(state);
       }
       throw error;
     }
@@ -573,22 +471,13 @@ export async function createGpuCompositor(options) {
       decodedFontBytes: shapedRecord.decodedFontBytes,
       shaped: shapedRecord.shaped,
       atlas: null,
-      bindGroup: null,
-      instances: new Float32Array(0),
-      instanceCapacity: 4,
-      instanceBuffer: device.createBuffer({
-        size: 4,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      }),
-      uniformBuffer: device.createBuffer({
-        size: 672,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      }),
-      uniformData: new Float32Array(168),
+      atlasTexture: null,
+      handle: core.gpu_compositor_layer_create(compositorState, 1),
       disposed: false,
       settledUpdate: Promise.resolve(),
     };
-    updateTextUniformData(state);
+    gpu.execute();
+    writeTextLayer(state);
 
     const layer = Object.freeze({
       kind: "text",
@@ -613,9 +502,8 @@ export async function createGpuCompositor(options) {
             textResourceRevision++;
           } else {
             state.current = next;
-            updateTextInstances(state);
+            writeTextLayer(state);
           }
-          updateTextUniformData(state);
         });
         state.settledUpdate = operation.then(
           () => undefined,
@@ -630,11 +518,10 @@ export async function createGpuCompositor(options) {
         await state.settledUpdate;
         textLayerStates.delete(layer);
         textResourceRevision++;
-        state.instanceBuffer.destroy();
-        state.uniformBuffer.destroy();
+        core.gpu_compositor_layer_destroy(state.handle);
+        gpu.execute();
         state.atlas = null;
-        state.bindGroup = null;
-        state.instances = new Float32Array(0);
+        state.atlasTexture = null;
         state.current = null;
         state.decodedFontBytes = null;
         state.shaped = null;
@@ -642,25 +529,9 @@ export async function createGpuCompositor(options) {
     });
     textLayerStates.set(layer, state);
     textResourceRevision++;
-    layerEncoders.set(layer, (renderPass, width, height) => {
+    layerSources.set(layer, () => {
       if (state.disposed) throw new Error("text layer is disposed");
-      if (state.instances.byteLength === 0) return;
-      if (state.bindGroup === null) {
-        throw new Error("text layer resources are not prepared");
-      }
-      state.uniformData[0] = width;
-      state.uniformData[1] = height;
-      device.queue.writeBuffer(
-        state.uniformBuffer,
-        0,
-        state.uniformData,
-      );
-      device.queue.writeBuffer(state.instanceBuffer, 0, state.instances);
-      renderPass.setPipeline(textPipeline);
-      renderPass.setBindGroup(0, state.bindGroup);
-      renderPass.setVertexBuffer(0, operations.quadBuffer);
-      renderPass.setVertexBuffer(1, state.instanceBuffer);
-      renderPass.draw(6, state.instances.length / 20);
+      return [state.handle, state.atlasTexture === null ? 0 : gpu.importResource(state.atlasTexture)];
     });
     layers.add(layer);
     return layer;
@@ -703,25 +574,23 @@ export async function createGpuCompositor(options) {
       device.pushErrorScope("validation");
       let synchronousError = null;
       try {
-        const commandEncoder = device.createCommandEncoder();
-        const renderPass = commandEncoder.beginRenderPass({
-          colorAttachments: [{
-            view: record.targetView,
-            clearValue: {
-              r: clearColor[0],
-              g: clearColor[1],
-              b: clearColor[2],
-              a: clearColor[3],
-            },
-            loadOp: "clear",
-            storeOp: "store",
-          }],
-        });
-        for (const layer of record.layers) {
-          layerEncoders.get(layer)(renderPass, record.width, record.height);
+        gpu.beginFrame();
+        const view = gpu.input(56 + record.layers.length * 8);
+        view.setUint32(0, gpu.importResource(record.targetView), true);
+        view.setUint32(4, record.width, true);
+        view.setUint32(8, record.height, true);
+        view.setUint32(12, record.layers.length, true);
+        view.setUint32(16, gpu.importResource(library.quadBuffer), true);
+        for (let channel = 0; channel < 4; channel++) {
+          view.setFloat64(24 + channel * 8, clearColor[channel], true);
         }
-        renderPass.end();
-        device.queue.submit([commandEncoder.finish()]);
+        for (let index = 0; index < record.layers.length; index++) {
+          const [layerHandle, sourceHandle] = layerSources.get(record.layers[index])();
+          view.setUint32(56 + index * 8, layerHandle, true);
+          view.setUint32(60 + index * 8, sourceHandle, true);
+        }
+        core.gpu_compositor_compose(compositorState, view.byteOffset);
+        gpu.execute();
       } catch (error) {
         synchronousError = error;
       }
@@ -767,7 +636,13 @@ export async function createGpuCompositor(options) {
         errors.push(error);
       }
       try {
-        operations.dispose();
+        core.gpu_compositor_destroy(compositorState);
+        gpu.close();
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        library.destroy();
       } catch (error) {
         errors.push(error);
       }

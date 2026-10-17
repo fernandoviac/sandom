@@ -1,4 +1,4 @@
-// Sandom's own scrollbar design (plans/PLAN-native-scrollbars.md, slice 4;
+// Sandom's own scrollbar design (design/scrollbars.md, "Drawing";
 // design/interaction.md, "Scrollbars"). The descriptor (scroll.watpart
 // $scrollbarBuild) gives the bar's box at rest and the thumb's place along
 // the axis; this module turns a descriptor and its visibility record into the

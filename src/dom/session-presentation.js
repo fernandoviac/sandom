@@ -18,6 +18,11 @@
 import { createCanvasPresenter } from "../canvas-presentation.js";
 import { quantizeWorkingPixels } from "../output/color-transform.js";
 
+// The host's own OffscreenCanvas and ImageData, taken before a component
+// realm on this global installs Sandom's (src/dom/component-globals.js).
+const HostOffscreenCanvas = globalThis.OffscreenCanvas;
+const HostImageData = globalThis.ImageData;
+
 // Wide gamut and HDR only when the platform grants them: probe rgba16float
 // canvas configuration on a THROWAWAY canvas. A canvas grants one context
 // kind for life, and Firefox throws on rgba16float canvases — the format
@@ -25,7 +30,7 @@ import { quantizeWorkingPixels } from "../output/color-transform.js";
 // canvas. A platform without OffscreenCanvas refuses the same way.
 export function probeExtendedRange(device) {
   try {
-    const probe = new OffscreenCanvas(1, 1);
+    const probe = new HostOffscreenCanvas(1, 1);
     const context = probe.getContext("webgpu");
     context.configure({
       device,
@@ -120,7 +125,7 @@ export function createPresentationDelivery({
         quantized.byteOffset,
         quantized.length,
       );
-    fallbackContext.putImageData(new ImageData(encoded, width, height), 0, 0);
+    fallbackContext.putImageData(new (HostImageData ?? ImageData)(encoded, width, height), 0, 0);
     return { width, height };
   };
 }

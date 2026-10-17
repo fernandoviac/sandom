@@ -1,4 +1,4 @@
-// The glyph-position check (plans/PLAN-text-ink-approval.md, "Check 2"):
+// The glyph-position check (plans/text/PLAN-text-ink-approval.md, "Check 2"):
 // every glyph advance and position of a display list against the font's
 // own data.
 //
@@ -13,6 +13,9 @@
 // display list: the shaper stores each advance and each kerning value in
 // whole 1/512 font units (FONT_UNIT_SUBDIVISION), each rounded to nearest
 // on its own, and the painter accumulates pen positions in f32 font units.
+// Letter spacing adds truncated 1/512-font-unit steps to each advance,
+// with the same f32 conversion as the shaper. Collapsed spaces and the
+// standalone ellipsis marker have no added spacing.
 // A glyph passes only when Sandom's advance and position equal the truth
 // under that rule exactly.
 
@@ -173,6 +176,9 @@ export async function textPositionTruthDiff({ displayList, resolveFontBytes }) {
       const collapsed = !marker && command.advances[index] === 0 &&
         COLLAPSIBLE_BYTES.has(sourceBytes[command.clusters[index].start]);
       const kerning = marker || collapsed ? 0 : kerned.glyphs[index].ax - unkerned.glyphs[index].ax;
+      const spacing = marker || collapsed ? 0 : Math.trunc(f32(
+        f32(f32(command.letterSpacing ?? 0) * f32(upem * FONT_UNIT_SUBDIVISION)) / command.fontSize,
+      ));
       const scaled = collapsed ? 0 : advances[index] * FONT_UNIT_SUBDIVISION;
       // Near a rounding tie either neighbouring step is the format's value
       // (NEAR_TIE_STEPS); the pen then follows the step Sandom stored.
@@ -183,8 +189,8 @@ export async function textPositionTruthDiff({ displayList, resolveFontBytes }) {
       const truthPosition = marker
         ? Math.ceil(pixels(cursor) * 64) / 64
         : pixels(f32(cursor + kerned.glyphs[index].dx / FONT_UNIT_SUBDIVISION));
-      const chosen = candidates.find((steps) => pixels(f32((steps + kerning) / FONT_UNIT_SUBDIVISION)) === command.advances[index]);
-      const advance = f32(((chosen ?? nearest) + kerning) / FONT_UNIT_SUBDIVISION);
+      const chosen = candidates.find((steps) => pixels(f32((steps + kerning + spacing) / FONT_UNIT_SUBDIVISION)) === command.advances[index]);
+      const advance = f32(((chosen ?? nearest) + kerning + spacing) / FONT_UNIT_SUBDIVISION);
       const truthAdvance = pixels(advance);
       // The marker's stored position passes through f32 font units, so it
       // matches the snapped LayoutUnit at f32 precision.
@@ -195,7 +201,7 @@ export async function textPositionTruthDiff({ displayList, resolveFontBytes }) {
         failures.push({
           command: command.commandIndex, text: command.text, index, glyphId: command.glyphIds[index],
           sandom: { advance: command.advances[index], position: command.glyphPositions[index] },
-          truth: { advance: truthAdvance, position: truthPosition, exactAdvance: pixels(advances[index] + kerning / FONT_UNIT_SUBDIVISION) },
+          truth: { advance: truthAdvance, position: truthPosition, exactAdvance: pixels(advances[index] + (kerning + spacing) / FONT_UNIT_SUBDIVISION) },
         });
       }
       cursor = f32(cursor + advance);

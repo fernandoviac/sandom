@@ -1,10 +1,23 @@
-import {
+import { REFERENCE_WHITE_LUMINANCE } from "../color.js";
+import { loadColorKernel } from "../wasm/color-kernel.js";
+import { canvasFrameSource } from "./canvas-gpu-binding.js";
+import { isGpuThreadDevice } from "./webgpu-facade.js";
+import { getDefaultGpu } from "../gpu-thread.js";
+
+// A realm that cannot host a GPU thread (a browser main thread, a page that
+// is not cross-origin isolated) renders with its native WebGPU, so its
+// canvases take the native device the scene renderer uses.
+function isNativeGpuDevice(device) {
+  return getDefaultGpu() === null && typeof globalThis.GPUDevice === "function" &&
+    device instanceof globalThis.GPUDevice;
+}
+
+const {
   convertLinearRgbToXyz,
   convertXyzToLinearRgb,
   decodeSrgbTransfer,
   encodeSrgbTransfer,
-  REFERENCE_WHITE_LUMINANCE,
-} from "../color.js";
+} = loadColorKernel();
 
 const MAXIMUM_READBACKS = 4;
 
@@ -140,13 +153,9 @@ export class SandomGPUCanvasContext {
       );
     }
     const device = candidate.device;
-    if (
-      !device || typeof device.createTexture !== "function" ||
-      typeof device.createBuffer !== "function" ||
-      typeof device.queue?.submit !== "function"
-    ) {
+    if (!isGpuThreadDevice(device) && !isNativeGpuDevice(device)) {
       throw new TypeError(
-        "GPUCanvasContext.configure: device must be a GPUDevice",
+        "GPUCanvasContext.configure: device must be a GPU-thread facade, or the native GPUDevice on a realm without a GPU thread; supply native devices elsewhere through a GPU-thread provider module",
       );
     }
     const format = String(candidate.format ?? "");
@@ -308,6 +317,20 @@ export class SandomGPUCanvasContext {
       this._resourceHandle, readiness, this.paintSource.width, this.paintSource.height,
       contentChanged, failure,
     );
+  }
+
+  // The canvas as a Canvas 2D image source (drawImage(), createPattern(),
+  // createImageBitmap()): a copy of the current texture, taken now on its
+  // device in the bitmap format (src/dom/canvas-gpu-binding.js), or null when
+  // the canvas has no current texture. As in Chrome, the texture that a
+  // frame presented is not a source: its canvas reads as transparent.
+  _imageSource() {
+    if (this._shutdown || this._failure !== null || this._currentFrame === null) return null;
+    return canvasFrameSource(this._currentFrame);
+  }
+
+  get [Symbol.toStringTag]() {
+    return "GPUCanvasContext";
   }
 
   resetBitmap(sizeChanged = true) {

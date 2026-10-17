@@ -1,3 +1,4 @@
+import { hostNow } from "../host-clock.js";
 import {
   inspectAnimationPreparedInput,
   inspectDocumentLayout,
@@ -91,7 +92,7 @@ function normalizeMutationChange(node, record, identify) {
 
 export class DocumentSession {
   // `scrollbarStyle` ("overlay" or "classic") is the style of every surface
-  // and layout the session creates (plans/PLAN-native-scrollbars.md,
+  // and layout the session creates (design/scrollbars.md,
   // decision 1). An inspect, plan, or renderOnce request that names its
   // own scrollbarStyle overrides it for that request.
   constructor(preparedInput, { scrollbarStyle } = {}) {
@@ -1188,7 +1189,7 @@ export class DocumentSession {
   }) {
     const state = requiredState(this);
     const operation = async () => {
-      const operationStartedAt = performance.now();
+      const operationStartedAt = hostNow();
       const target = state.targets.get(String(targetIdentifier));
       if (!target) {
         throw new RangeError(`Unknown raster target: ${targetIdentifier}`);
@@ -1278,7 +1279,7 @@ export class DocumentSession {
         });
         instance.interactionBackends.set(bindingKey, backend);
       }
-      const layoutCompletedAt = performance.now();
+      const layoutCompletedAt = hostNow();
       if (
         target.surfaces[placementIndex] === undefined ||
         target.surfaces[placementIndex]._shutdown
@@ -1337,7 +1338,7 @@ export class DocumentSession {
           },
         });
       }, { instance: placement.instance });
-      const mutationCompletedAt = performance.now();
+      const mutationCompletedAt = hostNow();
       const affectedTargets = [...state.targets.values()].filter((candidate) =>
         candidate.placements.some(({ instance: candidateInstance }) =>
           candidateInstance === placement.instance
@@ -1359,7 +1360,7 @@ export class DocumentSession {
           outputs.push(await this.render(candidate.identifier, frameTransaction));
         }
         await commitFrameTransaction(frameTransaction);
-        renderCompletedAt = performance.now();
+        renderCompletedAt = hostNow();
       } catch (error) {
         if (!frameTransaction.committed) {
           await abortFrameTransaction(frameTransaction);
@@ -1398,6 +1399,8 @@ export class DocumentSession {
         const changed = !preceding ||
           preceding.value !== node.value ||
           preceding.checked !== node.checked ||
+          preceding.pressed !== node.pressed ||
+          preceding.expanded !== node.expanded ||
           preceding.selected !== node.selected ||
           preceding.disabled !== node.disabled ||
           preceding.focused !== node.focused;
@@ -1406,6 +1409,8 @@ export class DocumentSession {
             nodeIdentifier: node.identifier,
             value: node.value,
             checked: node.checked,
+            pressed: node.pressed,
+            expanded: node.expanded,
             selected: node.selected,
             disabled: node.disabled,
             focused: node.focused,
@@ -1558,7 +1563,7 @@ export class DocumentSession {
               caretStops: geometry.caretStops,
               selectionStart: geometry.selectionStart,
               selectionEnd: geometry.selectionEnd,
-              selectionRectangles: geometry.selectionRectangles,
+              selectionRectangles: surface.presentedFrame.selectionRectanglesByElement.get(element) ?? Object.freeze([]),
             }),
           ),
         ),
@@ -1782,18 +1787,18 @@ export async function createDocumentSession(input, options = {}) {
 
 // One-shot entries over one DocumentSession. They live beside the session
 // so render-animation.js, which the session builds on, never imports it
-// back (test/module_graph_test.js).
+// back (test/dom-core/module_graph_test.js).
 export async function renderAnimationInput(input, options = {}) {
   const {
     preprocessors = [],
     preprocessor,
-    resolveResource = null,
+    host,
     ...renderRequest
   } = options;
   const preparedInput = await prepareRenderInput(input, {
     preprocessors,
     preprocessor,
-    resolveResource,
+    host,
   });
   const session = new DocumentSession(preparedInput);
   try {
@@ -1807,13 +1812,13 @@ export async function inspectAnimationInput(input, options = {}) {
   const {
     preprocessors = [],
     preprocessor,
-    resolveResource = null,
+    host,
     ...inspectionRequest
   } = options;
   const preparedInput = await prepareRenderInput(input, {
     preprocessors,
     preprocessor,
-    resolveResource,
+    host,
   });
   const session = new DocumentSession(preparedInput);
   try {

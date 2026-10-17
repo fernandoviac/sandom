@@ -16,8 +16,7 @@
 // holding a long-lived view registers one listener (this loader's own
 // bytes/u32/f32, src/scene-renderer.js, src/animations.js).
 
-import { RENDERER_CORE_HB_IMPORTS } from './renderer-core-binary.js';
-import { readBinaryFile } from '../host.js';
+import { readPackageAsset } from '../package-assets.js';
 import { createTextPreparationRuntime } from '../text-preparation.js';
 import { createAllocatorCore, observeMemoryGrowth } from '../dom-wasm/core.js';
 import {
@@ -59,9 +58,19 @@ const TRAP_SITE_NAMES = new Map([
   [13, "layout-cache hit on a collapsed table with moved pristine positions"],
   [14, "multi-column fragment pool exhausted"],
   [15, "color glyph paint operation without a command"],
-  [16, "command buffer exhausted by color glyph commands"],
+  [16, "command space exhausted: a command writer needs more bytes than the command buffer (or the stream it writes) holds"],
   [17, "color glyph path slots exhausted"],
   [18, "color glyph bitmap slots exhausted"],
+  [19, "page break state ungrowable"],
+  [20, "page made no progress: it ends at the break it started from"],
+  [21, "page groups nested past the page group limit"],
+  [22, "a box's face is not in the font table; register its face with register_font"],
+  [23, "a table has more columns than u16 column indices hold; split the table"],
+  [24, "the allocator refused the table scratch for the largest table; free memory or split the table"],
+  [25, "a table has more rows than u16 row ordinals hold; split the table"],
+  [27, "a table is larger than the table scratch that layout entry sized ($tableScratchEnsure missed it)"],
+  [28, "a collapsed-border table needs more edge records than the collapsed arena holds; reserve more node tables"],
+  [29, "the paint walk nested past the scroll save stack's frames; the page nests too many clipping or scrolling boxes"],
 ]);
 
 // Trap site 15 carries the glyph in trap_value and the operation in
@@ -83,6 +92,10 @@ const COMPOSITE_MODE_NAMES = [
 ];
 
 function trapMessage(name, site, observed, limit) {
+  if (site === 22) {
+    return `sandom engine trap in ${name}: a box's face is font index ${observed}, ` +
+      `but the font table holds ${limit} face(s); register the face with register_font (trap site 22)`;
+  }
   if (site === 15) {
     const operation = limit === 400
       ? "an sbix graphic type other than 'png ' (and 'dupe')"
@@ -92,7 +105,7 @@ function trapMessage(name, site, observed, limit) {
       ? `pop_group with composite mode ${COMPOSITE_MODE_NAMES[limit - 100] ?? limit - 100}`
       : COLOR_GLYPH_OPERATION_NAMES.get(limit) ?? `operation ${limit}`;
     return `sandom engine trap in ${name}: color glyph ${observed} paints ${operation}, ` +
-      "which no command expresses (trap site 15); see plans/PLAN-color-glyphs.md";
+      "which no command expresses (trap site 15); see plans/text/PLAN-color-glyphs.md";
   }
   return `sandom engine trap in ${name}: ${
     TRAP_SITE_NAMES.get(site) ?? "unnamed guard"
@@ -103,7 +116,7 @@ function trapMessage(name, site, observed, limit) {
 
 function attributeEngineTraps(exports) {
   const attributed = { ...exports };
-  for (const name of ["layout", "emit_commands"]) {
+  for (const name of ["layout", "emit_commands", "scene_layout", "scene_emit_commands", "page_advance"]) {
     const call = exports[name];
     attributed[name] = function () {
       try {
@@ -148,10 +161,35 @@ export function makeHbImports(memory, allocator) {
   };
 }
 
+// Links an hb.wasm instance to renderer-core exports, from the interface the
+// core publishes itself: renderer_hb_names names the hb.wasm export of each
+// renderer_hb_table entry, and harfbuzz_callback_table holds the core
+// functions HarfBuzz calls back. Returns the HarfBuzz function-table index of
+// the first callback, for harfbuzz_callbacks_initialize after init.
+export function linkHarfBuzz(coreExports, hb, memory) {
+  const count = coreExports.renderer_hb_names();
+  const names = new TextDecoder().decode(new Uint8Array(memory.buffer,
+    coreExports.abi_output_pointer(), coreExports.abi_output_length())).split("\0");
+  if (names.length !== count) {
+    throw new Error(`renderer_hb_names lists ${names.length} names for ${count} renderer_hb_table entries`);
+  }
+  for (const [index, name] of names.entries()) {
+    const binding = hb.exports[name];
+    if (typeof binding !== "function") throw new Error(`vendor/hb.wasm does not export ${name}, renderer_hb_table entry ${index}`);
+    coreExports.renderer_hb_table.set(index, binding);
+  }
+  const callbacks = coreExports.harfbuzz_callback_table;
+  const hbTable = hb.exports.__indirect_function_table;
+  const base = hbTable.length;
+  hbTable.grow(callbacks.length);
+  for (let index = 0; index < callbacks.length; index++) hbTable.set(base + index, callbacks.get(index));
+  return base;
+}
+
 export async function loadHb(memory, allocator, harfbuzzBytes) {
   const wasmBytes = harfbuzzBytes ??
     globalThis[Symbol.for('sandom.hbBytes')] ??
-    await readBinaryFile(new URL('../../vendor/hb.wasm', import.meta.url));
+    await readPackageAsset(new URL('../../vendor/hb.wasm', import.meta.url));
 
   const module = await WebAssembly.compile(
     wasmBytes instanceof Uint8Array ? wasmBytes : new Uint8Array(wasmBytes),
@@ -215,66 +253,7 @@ async function initializeEngine(core, harfbuzzBytes) {
     );
   }
 
-  for (let index = 0; index < RENDERER_CORE_HB_IMPORTS.length; index++) {
-    allocator.renderer_hb_table.set(index, hb.exports[RENDERER_CORE_HB_IMPORTS[index]]);
-  }
-  const glyphHarfBuzzImports = [
-    "hb_font_get_face",
-    "hb_draw_funcs_create",
-    "hb_draw_funcs_set_move_to_func",
-    "hb_draw_funcs_set_line_to_func",
-    "hb_draw_funcs_set_quadratic_to_func",
-    "hb_draw_funcs_set_cubic_to_func",
-    "hb_draw_funcs_set_close_path_func",
-    "hb_font_draw_glyph",
-    "hb_font_get_glyph_h_advance",
-    "hb_ot_var_get_axis_infos",
-  ];
-  for (let index = 0; index < glyphHarfBuzzImports.length; index++) {
-    allocator.glyph_hb_table.set(index, hb.exports[glyphHarfBuzzImports[index]]);
-  }
-  const callbackBase = hb.exports.__indirect_function_table.length;
-  const outlineCallbacks = [
-    "glyph_outline_move_to",
-    "glyph_outline_line_to",
-    "glyph_outline_quadratic_to",
-    "glyph_outline_cubic_to",
-    "glyph_outline_close_path",
-  ];
-  hb.exports.__indirect_function_table.grow(outlineCallbacks.length);
-  for (let index = 0; index < outlineCallbacks.length; index++) {
-    hb.exports.__indirect_function_table.set(
-      callbackBase + index,
-      allocator[outlineCallbacks[index]],
-    );
-  }
-  // Color glyph callbacks, in the order color_glyph_initialize expects.
-  const colorGlyphCallbackBase = hb.exports.__indirect_function_table.length;
-  const colorGlyphCallbacks = [
-    "color_glyph_draw_move_to",
-    "color_glyph_draw_line_to",
-    "color_glyph_draw_quadratic_to",
-    "color_glyph_draw_cubic_to",
-    "color_glyph_paint_push_transform",
-    "color_glyph_paint_pop_transform",
-    "color_glyph_paint_push_clip_glyph",
-    "color_glyph_paint_push_clip_rectangle",
-    "color_glyph_paint_pop_clip",
-    "color_glyph_paint_color",
-    "color_glyph_paint_image",
-    "color_glyph_paint_linear_gradient",
-    "color_glyph_paint_radial_gradient",
-    "color_glyph_paint_sweep_gradient",
-    "color_glyph_paint_push_group",
-    "color_glyph_paint_pop_group",
-  ];
-  hb.exports.__indirect_function_table.grow(colorGlyphCallbacks.length);
-  for (let index = 0; index < colorGlyphCallbacks.length; index++) {
-    hb.exports.__indirect_function_table.set(
-      colorGlyphCallbackBase + index,
-      allocator[colorGlyphCallbacks[index]],
-    );
-  }
+  const callbackBase = linkHarfBuzz(allocator, hb, memory);
   const observed = observeMemoryGrowth(memory, allocator, () => core.notifyGrowth());
   const measurement = globalThis[Symbol.for("sandom.domCore.measurement")];
   const exports = attributeEngineTraps(
@@ -283,8 +262,7 @@ async function initializeEngine(core, harfbuzzBytes) {
 
   exports.init();
   verifyLayout(exports);
-  exports.glyph_outline_initialize(callbackBase);
-  exports.color_glyph_initialize(colorGlyphCallbackBase);
+  exports.harfbuzz_callbacks_initialize(callbackBase);
 
   const engine = {
     memory,

@@ -1,10 +1,10 @@
-import { importFreshModule, readBinaryFile } from "../host.js";
 import { sharedDomCore } from "../dom-wasm/core.js";
 import {
   acquireAmbientGlobalOwnership,
   installComponentGlobals,
 } from "./component-globals.js";
 import { parseHTMLDocument } from "./html.js";
+import { loadHTMLDocument, reportScriptingDisabled } from "./scripts.js";
 import { parseXMLDocument } from "./xml.js";
 import { exceedsInputBound } from "./interaction.js";
 import { SDDocument } from "./node.js";
@@ -153,7 +153,10 @@ function descriptorsForAmbientWindow(window) {
     ]);
 }
 
-async function executeModuleWithComponentGlobals(input, window) {
+// Installs the document window as the ambient realm globals for one host
+// module evaluation and restores the prior globals afterwards. The host
+// module session evaluates; Sandom only supplies the environment.
+async function withComponentGlobals(window, evaluate) {
   const releaseOwnership = await acquireAmbientGlobalOwnership(
     "file-preparation",
   );
@@ -174,7 +177,7 @@ async function executeModuleWithComponentGlobals(input, window) {
       Object.defineProperty(ambientGlobal, name, descriptor);
       installedNames.push(name);
     }
-    moduleExports = await importFreshModule(input.url, input.bytes);
+    moduleExports = await evaluate();
   } catch (error) {
     evaluationError = error;
   } finally {
@@ -207,31 +210,96 @@ async function executeModuleWithComponentGlobals(input, window) {
   return moduleExports;
 }
 
+function validateModuleRequest(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new TypeError("executeModule requires a { reference, baseURL, source, preprocessor } object");
+  }
+  if (typeof request.reference !== "string" || request.reference.length === 0) {
+    throw new TypeError(
+      `executeModule reference must be a non-empty string; received ${String(request.reference)}`,
+    );
+  }
+  const source = request.source ?? null;
+  if (source !== null && !(source instanceof Uint8Array)) {
+    throw new TypeError("executeModule source must be a Uint8Array or null");
+  }
+  return Object.freeze({
+    reference: request.reference,
+    baseURL: new URL(request.baseURL).href,
+    source,
+    preprocessor: request.preprocessor ?? "javascript",
+    importMaps: Object.freeze((request.importMaps ?? []).map(({ text, baseURL }) =>
+      Object.freeze({ text: String(text), baseURL: new URL(baseURL).href })
+    )),
+  });
+}
+
+// Asks the document's host module session to execute one module entry
+// against the document window. The host resolves, requests, links, and
+// evaluates the module graph. `request.realm` is the document realm when
+// the document's scripts run in a realm of their own: the host evaluates
+// the graph in it, where the window bindings already are.
+function executeDocumentModule(document, window, request, signal) {
+  const moduleRequest = validateModuleRequest(request);
+  const moduleSession = document._resources.moduleSession;
+  const realm = request.realm ?? null;
+  if (realm !== null) {
+    return moduleSession.execute(Object.freeze({
+      ...moduleRequest,
+      globalEnvironment: realm.globalObject,
+      scriptRealm: realm.session,
+      signal,
+    }));
+  }
+  // Once the document's classic scripts hold the module realm's global
+  // object, a module evaluates against it as it is.
+  if (document._realm && document._realm.globalObject === globalThis) {
+    return moduleSession.execute(Object.freeze({
+      ...moduleRequest,
+      globalEnvironment: globalThis,
+      signal,
+    }));
+  }
+  return withComponentGlobals(
+    window,
+    () =>
+      moduleSession.execute(Object.freeze({
+        ...moduleRequest,
+        globalEnvironment: window,
+        signal,
+      })),
+  );
+}
+
+// Evaluates one component module with the host of `document`. `input` is
+// the module locator, or `{ url, bytes }` with the entry source supplied.
 export async function evaluateComponentModule(input, document) {
   if (!(document instanceof SDDocument)) {
     throw new TypeError("evaluateComponentModule requires a SandomDocument");
   }
 
-  let moduleURL;
-  let moduleBytes;
+  let request;
   if (input instanceof URL || typeof input === "string") {
-    moduleURL = input instanceof URL ? new URL(input.href) : new URL(input);
-    moduleBytes = await readBinaryFile(moduleURL);
+    const moduleURL = new URL(input).href;
+    request = { reference: moduleURL, baseURL: moduleURL, source: null };
   } else if (input && typeof input === "object" && !Array.isArray(input)) {
-    moduleURL = input.url instanceof URL
-      ? new URL(input.url.href)
-      : new URL(input.url);
-    moduleBytes = input.bytes === undefined
-      ? await readBinaryFile(moduleURL)
-      : input.bytes;
+    const moduleURL = new URL(input.url).href;
+    if (input.bytes !== undefined && !(input.bytes instanceof Uint8Array)) {
+      throw new TypeError("input.bytes must be a Uint8Array");
+    }
+    request = {
+      reference: moduleURL,
+      baseURL: moduleURL,
+      source: input.bytes ?? null,
+    };
   } else {
     throw new TypeError(
       "input must be a URL, absolute URL string, or { url, bytes } object",
     );
   }
-  if (!(moduleBytes instanceof Uint8Array)) {
-    throw new TypeError("input.bytes must be a Uint8Array");
-  }
+  const preprocessor = new URL(request.reference).pathname.endsWith(".jsx")
+    ? "jsx"
+    : "javascript";
 
   const window = document.defaultView ?? installComponentGlobals({}, document);
   if (
@@ -242,39 +310,63 @@ export async function evaluateComponentModule(input, document) {
       "SandomDocument defaultView must belong to the evaluated document",
     );
   }
-  return await executeModuleWithComponentGlobals(
-    Object.freeze({ url: moduleURL, bytes: moduleBytes }),
+  return await executeDocumentModule(
+    document,
     window,
+    { ...request, preprocessor },
+    undefined,
   );
 }
 
 export const htmlPreprocessor = Object.freeze({
   name: "html",
   extensions: Object.freeze([".html", ".htm"]),
-  async prepare({ input, document, executeModule, resolveResource }) {
-    parseHTMLDocument(textDecoder.decode(input.bytes), () => document);
+  async prepare({ input, document, executeModule }) {
+    const text = textDecoder.decode(input.bytes);
+    // A host with a classic-script session gives the document scripting:
+    // the parser stops at each script, and classic, module and inserted
+    // scripts run in the standard's order (src/dom/scripts.js).
+    if (document._resources.scriptingEnabled) {
+      await loadHTMLDocument(document, text, { inputURL: input.url, executeModule });
+      return;
+    }
+    parseHTMLDocument(text, () => document);
+    reportScriptingDisabled(document);
+    // Import maps are document declarations; the host module session
+    // applies them.
+    const importMapScripts = document.querySelectorAll('script[type="importmap"]');
+    const importMaps = [];
+    for (let index = 0; index < importMapScripts.length; index += 1) {
+      importMaps.push({
+        text: importMapScripts[index].textContent,
+        baseURL: document.baseURI,
+      });
+    }
     const moduleScripts = document.querySelectorAll('script[type="module"]');
     for (let index = 0; index < moduleScripts.length; index += 1) {
       const script = moduleScripts[index];
       const source = script.getAttribute("src");
       if (source !== null) {
-        const resource = await resolveResource({
-          requestedURL: source,
-          baseURL: input.url,
-          kind: "module",
-        });
         await executeModule({
-          url: new URL(resource.finalURL),
-          bytes: resource.bytes,
+          reference: source,
+          baseURL: document.baseURI,
+          source: null,
+          preprocessor: "javascript",
+          importMaps,
         });
         continue;
       }
+      // An inline module has a stable synthetic identity under the
+      // document locator.
       const moduleURL = new URL(input.url);
       moduleURL.pathname += `.inline-${index + 1}.js`;
       moduleURL.hash = `inline-module-${index + 1}`;
       await executeModule({
-        url: moduleURL,
-        bytes: textEncoder.encode(script.textContent),
+        reference: moduleURL.href,
+        baseURL: document.baseURI,
+        source: textEncoder.encode(script.textContent),
+        preprocessor: "javascript",
+        importMaps,
       });
     }
   },
@@ -285,7 +377,12 @@ export const javascriptPreprocessor = Object.freeze({
   extensions: Object.freeze([".js", ".mjs"]),
   async prepare({ input, document, executeModule }) {
     createHTMLStructure(document);
-    await executeModule(input);
+    await executeModule({
+      reference: input.url.href,
+      baseURL: input.url.href,
+      source: input.bytes,
+      preprocessor: "javascript",
+    });
   },
 });
 
@@ -294,7 +391,12 @@ export const jsxPreprocessor = Object.freeze({
   extensions: Object.freeze([".jsx"]),
   async prepare({ input, document, executeModule }) {
     createHTMLStructure(document);
-    await executeModule(input);
+    await executeModule({
+      reference: input.url.href,
+      baseURL: input.url.href,
+      source: input.bytes,
+      preprocessor: "jsx",
+    });
   },
 });
 
@@ -305,7 +407,7 @@ const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 export const svgPreprocessor = Object.freeze({
   name: "svg",
   extensions: Object.freeze([".svg"]),
-  async prepare({ input, document }) {
+  prepare({ input, document }) {
     parseXMLDocument(
       textDecoder.decode(input.bytes),
       "image/svg+xml",
@@ -457,6 +559,6 @@ export function createInputWindow(document) {
   return installComponentGlobals({}, document);
 }
 
-export function createModuleExecutor(window) {
-  return (input) => executeModuleWithComponentGlobals(input, window);
+export function createModuleExecutor(document, window, signal) {
+  return (request) => executeDocumentModule(document, window, request, signal);
 }

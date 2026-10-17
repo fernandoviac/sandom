@@ -1,6 +1,6 @@
 // The public Sandom surface: one entry per job. Everything here is retained,
 // incremental, and delivers GPU texture frames by default; CPU pixels and
-// file encodings are explicit requests. test/public_surface_test.js pins
+// file encodings are explicit requests. test/output-and-cli/public_surface_test.js pins
 // this export list.
 //
 // Frames:        createRenderSurface(root, options) → surface.renderNow()
@@ -8,8 +8,9 @@
 // Presentation:  presentFrame option + createCanvasPresenter(...).present()
 // Projected:     createTexturePresenter(...).presentFrame + bindProjectedInput
 // Files:         encodeImage(frame, { format }), createGifRecorder
-// Video:         not offered; plans/PLAN-native-vp9-webm-output.md owns it
+// Video:         not offered; @sandom/vp9-webm owns it
 // Direct scenes: createSceneRenderer({ width, height }).renderTexture(scene)
+// Devices:       createGpuThread(options, { reply, throw })
 
 export {
   createLayoutArtifact,
@@ -37,6 +38,8 @@ export {
   SandomDocument,
 } from "./dom/dom.js";
 export { loadFont } from "./font-registry.js";
+// The glyph outlines of a font's bytes, from the shaper Sandom renders with.
+export { createGlyphOutlineSource } from "./shaping.js";
 export { createCanvasPresenter } from "./canvas-presentation.js";
 export {
   bindProjectedInput,
@@ -44,6 +47,7 @@ export {
   projectOntoRectangle,
 } from "./dom/projected-surface.js";
 export { createGpuCompositor } from "./gpu-compositor.js";
+export { createGpuThread } from "./gpu-thread.js";
 export {
   encodeImage,
   OUTPUT_FORMATS,

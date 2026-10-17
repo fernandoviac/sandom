@@ -5,11 +5,13 @@
 // Every validator throws with one precise reason.
 
 import {
-  linearRgbToWorkingMatrix,
   REFERENCE_WHITE_LUMINANCE,
   validateColorEncoding,
   validateRenderMode,
 } from './color.js';
+import { loadColorKernel } from './wasm/color-kernel.js';
+
+const { linearRgbToWorkingMatrix } = loadColorKernel();
 
 // Sample types with their required typed-array constructor and the byte size
 // of one sample. float16 carries IEEE 754 binary16 bits in Uint16Array

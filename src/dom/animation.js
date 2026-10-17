@@ -1,6 +1,20 @@
-import { canonicalizeAnimationKeyframes, resolvedElementFields } from "./style.js";
-import { parseCSSEasing, serializeCSSEasing } from "../dom-wasm/easing.js";
-import { deferAnimationBinding } from "../dom-wasm/animation.js";
+import {
+  addImplicitKeyframes,
+  animationKeyframeContext,
+  canonicalizeAnimationKeyframes,
+  recordUnanimatedProperty,
+  resolvedElementFields,
+} from "./style.js";
+import { parseCSSEasing, serializeAnimationEasing } from "../dom-wasm/easing.js";
+import {
+  animationComputedTiming,
+  animationProperty,
+  deferAnimationBinding,
+  arrangeKeyframes,
+  keyframeValueText,
+  normalizeAnimationOffsets,
+} from "../dom-wasm/animation.js";
+import { addEventListener, dispatchEvent, removeEventListener } from "./events.js";
 import {
   installAnimationBindings,
   installCSSAnimationBindings,
@@ -8,14 +22,6 @@ import {
   createAnimationEffectBindings,
 } from "./dom-bindings.generated.js";
 
-const STATES = ["idle", "running", "paused", "finished"];
-const FILL_MODES = ["none", "forwards", "backwards", "both"];
-// A transition's track reports the same start, end and cancel lifecycle as
-// an animation's.
-const LIFECYCLE = {
-  animationstart: 1, animationend: 2, animationcancel: 3,
-  transitionstart: 1, transitionend: 2, transitioncancel: 3,
-};
 const MEASUREMENT = Symbol.for("sandom.domCore.measurement");
 const animationFinalizer = new FinalizationRegistry(({ core, handle, keyframes }) => {
   core.status("animation_release", handle);
@@ -37,18 +43,81 @@ function decodeCanonicalNumber(_key, value) {
 // Animations created by script sort by creation in composite order.
 let nextAnimationSequence = 0;
 
-export class SDAnimation {
+// The CSS text of an effect or keyframe easing, a string or a parsed record.
+function easingText(easing) {
+  return easing === undefined ? "linear" : serializeAnimationEasing(easing);
+}
+
+// Web Animations 1, section 6.6.1 "process a keyframes argument": the
+// keyframes of an array or of a property-indexed object, each with its
+// offset (null when absent), easing, composite and property values.
+function processKeyframes(keyframes) {
+  if (keyframes === null || keyframes === undefined) return [];
+  if (typeof keyframes !== "object") throw new TypeError("keyframes must be an object or an array");
+  if (Array.isArray(keyframes)) {
+    return keyframes.map(({ offset = null, easing = "linear", composite = "auto", ...values }) =>
+      ({ offset, easing, composite, values }));
+  }
+  const { offset: offsets = [], easing: easings = [], composite: composites = [], ...properties } = keyframes;
+  const list = (value) => Array.isArray(value) ? value : [value];
+  const pairs = Object.keys(properties).map((name) => [name, list(properties[name])]);
+  const offsetList = list(offsets), easingList = list(easings), compositeList = list(composites);
+  const { frames, assignments } = arrangeKeyframes(pairs, offsetList.length, easingList.length, compositeList.length);
+  const result = frames.map(({ offsetIndex, easingIndex, compositeIndex }) => ({
+    offset: offsetIndex < 0 ? null : offsetList[offsetIndex],
+    easing: easingIndex < 0 ? "linear" : easingList[easingIndex],
+    composite: compositeIndex < 0 ? "auto" : compositeList[compositeIndex],
+    values: {},
+  }));
+  for (const [pairIndex, valueIndex, frameIndex] of assignments) {
+    result[frameIndex].values[pairs[pairIndex][0]] = pairs[pairIndex][1][valueIndex];
+  }
+  return result;
+}
+// A processed keyframe in the shape canonicalizeAnimationKeyframes reads:
+// absent members stay absent.
+function engineKeyframe({ offset, easing, composite, values }) {
+  return {
+    ...(offset === null ? {} : { offset }),
+    ...(easing === "linear" ? {} : { easing }),
+    ...(composite === "auto" ? {} : { composite }),
+    ...values,
+  };
+}
+
+// The script-visible Animation interface (Web Animations 1, section 6.4).
+export class Animation {
   constructor(surface, element, keyframes, timing, engineDeclarationOptions = {}) {
     this._surface = surface;
     this._element = element;
     this._core = element._domCore;
     this._sequence = nextAnimationSequence++;
-    // A surface is a timeline; a PendingAnimationTimeline is not. An
-    // animation created before any surface claimed the element holds at its
-    // current time until one adopts it and resolves its start time.
-    this._timelinePending = false;
-    const canonicalKeyframes = canonicalizeAnimationKeyframes(keyframes);
-    this._inputKeyframes = structuredClone(keyframes);
+    // A pending animation holds at its current time until a frame of its
+    // surface resolves its start time: one created between frames, and one
+    // created before any surface claimed the element (a
+    // PendingAnimationTimeline is not a timeline). `ready` settles then.
+    // Its current time is the one at the time of its timeline when it
+    // became pending.
+    this._timelinePending = engineDeclarationOptions.timelinePending === true;
+    this._pendingSince = surface.currentTime;
+    this._resetReadyPromise();
+    this._processedKeyframes = processKeyframes(keyframes);
+    // The engine's keyframes: computed values of the element, with the
+    // implicit keyframes of the underlying values. A CSS animation's
+    // implicit keyframe takes its timing function and replaces the
+    // underlying value; a script animation's is linear.
+    const context = animationKeyframeContext(element);
+    let canonicalKeyframes;
+    try {
+      canonicalKeyframes = addImplicitKeyframes(
+        canonicalizeAnimationKeyframes(this._processedKeyframes.map(engineKeyframe),
+          (property) => recordUnanimatedProperty(element, property, "keyframes"), context),
+        context,
+        engineDeclarationOptions.implicitKeyframe ?? {},
+      );
+    } finally {
+      context.release();
+    }
     this._timing = typeof timing === "number" ? { duration: timing } : { ...timing };
     this._timelineOption = this._timing.timeline;
     this._rangeStartOption = this._timing.rangeStart;
@@ -57,7 +126,11 @@ export class SDAnimation {
     delete this._timing.rangeStart;
     delete this._timing.rangeEnd;
     this._engineDeclarationOptions = engineDeclarationOptions;
-    this._timing.duration = Number(this._timing.duration ?? 0);
+    // getTiming() reports the authored duration and fill; "auto" stands for
+    // an absent member.
+    this._authoredDuration = this._timing.duration ?? "auto";
+    this._authoredFill = this._timing.fill ?? "auto";
+    this._timing.duration = this._authoredDuration === "auto" ? 0 : Number(this._authoredDuration);
     this._timing.delay = Number(this._timing.delay ?? 0);
     this._timing.iterations = this._timing.iterations ?? 1;
     const scroll = this._isScrollDriven();
@@ -70,18 +143,28 @@ export class SDAnimation {
       category: "animation", operation: "animation.timing-defaults",
       direction: "core-to-host", bytes: 12, allocations: 1,
     });
-    if (defaultFill && this._timing.fill === undefined) this._timing.fill = FILL_MODES[defaultFill];
-    this._animationId = this._core.handle("animation_create", element._coreHandle,
-      this._timing.duration, this._timing.delay, Number(this._timing.iterations),
-      Number(this._timing.startTime ?? engineDeclarationOptions.startTime ?? surface.currentTime), scroll ? 1 : 0);
+    if (defaultFill && this._timing.fill === undefined) {
+      this._timing.fill = this._core.string("animation_enumeration_name", 1, defaultFill);
+    }
+    const startTime = Number(this._timing.startTime ?? engineDeclarationOptions.startTime ?? surface.currentTime);
+    try {
+      this._animationId = this._core.statusRaw("animation_create", element._coreHandle,
+        this._timing.duration, this._timing.delay, Number(this._timing.iterations), startTime, scroll ? 1 : 0);
+    } catch (error) {
+      if (!(error instanceof TypeError || error instanceof RangeError)) throw error;
+      throw new error.constructor(`The animation timing (duration ${this._timing.duration}, delay ${this._timing.delay}, ` +
+        `iterations ${this._timing.iterations}, start time ${startTime}): ${error.message}`, { cause: error });
+    }
     try {
       this._keyframesHandle = this._core.handle("animation_keyframes_create",
         ...this._core.input(JSON.stringify(canonicalKeyframes, encodeCanonicalNumber)));
-      this._ready = Promise.resolve(this);
       this._resetFinishedPromise();
       this.effect = Object.freeze(createAnimationEffectBindings({
-        cloneAuthoredKeyframes: () => structuredClone(this._inputKeyframes),
-        cloneAuthoredTiming: () => ({ ...this._timing }),
+        reportKeyframes: () => this._reportedKeyframes(),
+        reportTiming: () => this._effectTiming(),
+        readTarget: () => this._element,
+        readComposite: () => this._timing.composite ?? "replace",
+        computeTiming: () => this._computedTiming(),
       }));
       this._replaceEngineHandle();
     } catch (error) {
@@ -96,6 +179,46 @@ export class SDAnimation {
 
   get _canonicalKeyframes() {
     return JSON.parse(this._core.string("animation_keyframes_export", this._keyframesHandle), decodeCanonicalNumber);
+  }
+  // getKeyframes() of a script animation: the processed keyframes with
+  // their specified values and computed offsets (Web Animations 1, 6.6.3).
+  _reportedKeyframes() {
+    const computedOffsets = [];
+    for (const { offset, index } of normalizeAnimationOffsets(
+      this._processedKeyframes.map(({ offset }, index) => ({ offset, index })),
+    )) computedOffsets[index] = offset;
+    return this._processedKeyframes.map(({ offset, easing, composite, values }, index) => {
+      const frame = { offset, easing: easingText(easing), composite };
+      for (const name of Object.keys(values).sort()) frame[name] = String(values[name]);
+      frame.computedOffset = computedOffsets[index];
+      return frame;
+    });
+  }
+  // The EffectTiming dictionary of getTiming() (Web Animations 1, section 6.5).
+  _effectTiming() {
+    const timing = this._timing;
+    return {
+      delay: timing.delay,
+      direction: timing.direction ?? "normal",
+      duration: this._authoredDuration,
+      easing: easingText(timing.easing),
+      endDelay: Number(timing.endDelay ?? 0),
+      fill: this._authoredFill,
+      iterationStart: Number(timing.iterationStart ?? 0),
+      iterations: timing.iterations,
+    };
+  }
+  // The ComputedEffectTiming dictionary of getComputedTiming(): the effect
+  // timing with "auto" resolved, then the core's computed timing.
+  _computedTiming() {
+    const timing = this._effectTiming();
+    timing.duration = timing.duration === "auto" ? 0 : timing.duration;
+    timing.fill = timing.fill === "auto" ? "none" : timing.fill;
+    const easing = typeof this._timing.easing === "string" ? parseCSSEasing(this._timing.easing) : this._timing.easing;
+    return {
+      ...timing,
+      ...animationComputedTiming(this._animationId, this._surface.currentTime, { ...timing, easing: easing ?? "linear" }),
+    };
   }
 
   _value(field) {
@@ -112,11 +235,73 @@ export class SDAnimation {
     // an unobserved rejection must not become a host-level failure.
     this._finishedPromise.catch(() => {});
   }
-  _replaceEngineHandle() {
-    let direction = this._timing.direction ?? "normal";
-    if (this._value(9)) {
-      direction = { normal: "reverse", reverse: "normal", alternate: "alternate-reverse", "alternate-reverse": "alternate" }[direction];
+  // Web Animations 1, section 5.5: the replace state, which the frame
+  // that removes a replaced animation sets (removeReplacedAnimations).
+  get replaceState() { return this._core.string("animation_enumeration_name", 2, this._value(13)); }
+  persist() { this._control(12); }
+  // An animation is the event target of its playback events (remove).
+  get onremove() { return this._onremove ?? null; }
+  set onremove(callback) {
+    if (this._onremove) this.removeEventListener("remove", this._onremove);
+    this._onremove = typeof callback === "function" ? callback : null;
+    if (this._onremove) this.addEventListener("remove", this._onremove);
+  }
+  addEventListener(type, callback, options) { addEventListener(this, type, callback, options); }
+  removeEventListener(type, callback, options) { removeEventListener(this, type, callback, options); }
+  dispatchEvent(event) { return dispatchEvent(this, event); }
+  // The bits of the animation property ids that the effect targets.
+  get _targetProperties() {
+    if (this._targetPropertyBits === undefined) {
+      let bits = 0n;
+      for (const keyframe of this._canonicalKeyframes) {
+        for (const name of Object.keys(keyframe)) {
+          if (name === "offset" || name === "easing" || name === "composite") continue;
+          const property = animationProperty(name);
+          if (property === null) {
+            throw new TypeError(`A keyframe of the animation targets ${name}, which the core does not animate`);
+          }
+          bits |= 1n << BigInt(property.id);
+        }
+      }
+      this._targetPropertyBits = bits;
     }
+    return this._targetPropertyBits;
+  }
+  // A replaced animation that the frame removed: its effect leaves the
+  // effect stack, and its engine track with it. commitStyles() then writes
+  // the values that it had as the frame removed it.
+  _removeFromEffectStack() {
+    this._engineHandle.cancelSilently();
+    this._engineHandle = deferAnimationBinding(declareWithoutRenderer).handle;
+  }
+  // For each target property, its canonical name and the value of the
+  // effect stack composed through this animation's track at `now`; null
+  // when no renderer lays out the target.
+  _committedValues(now) {
+    const surface = this._surface;
+    const renderer = surface._persistentRenderer;
+    if (!renderer || surface._shutdown || surface._indexOfElement?.get(this._element) === undefined) return null;
+    return this._engineHandle.trackIndices.map((track) => renderer.sampleAnimationThrough(track, now));
+  }
+  // Web Animations 1, section 6.4: the animation's value of each target
+  // property goes into the target's inline style.
+  commitStyles() {
+    const values = this._value(13) === 1 ? this._removedValues : this._committedValues(this._surface.currentTime);
+    if (values === null) {
+      throw new DOMException("commitStyles() needs a rendered target element", "InvalidStateError");
+    }
+    for (const { propertyName, value } of values) {
+      this._element.style.setProperty(propertyName, keyframeValueText(value, propertyName));
+    }
+  }
+  _replaceEngineHandle() {
+    if (this._timelinePending || this._value(13) === 1) {
+      this._engineHandle = deferAnimationBinding(declareWithoutRenderer).handle;
+      return;
+    }
+    const reversed = this._value(9) ? 1 : 0;
+    const direction = this._core.string("animation_track_direction",
+      ...this._core.input(String(this._timing.direction ?? "normal")), reversed) || undefined;
     this._engineHandle = this._surface._declareAnimation(this._element, this._canonicalKeyframes, {
       ...this._timing,
       direction,
@@ -131,7 +316,7 @@ export class SDAnimation {
       this._surface._animationCancelingThroughEngine = this;
       try { this._engineHandle.cancel(); }
       finally { this._surface._animationCancelingThroughEngine = null; }
-      this._applyActions(this._core.status("animation_control", this._animationId, 10, generation, this._surface.currentTime));
+      this._applyActions(this._core.statusRaw("animation_control", this._animationId, 10, generation, this._surface.currentTime));
     }
     if (actions & 1) this._engineHandle.cancelSilently();
     if (actions & 16) this._rejoinHost();
@@ -140,13 +325,30 @@ export class SDAnimation {
     if (actions & 8) this._engineHandle.resume(this._surface.currentTime);
     if (actions & 2048) this._engineHandle.seek(this._value(11), this._surface.currentTime);
     if (actions & 32) this._leaveHost();
-    if (actions & 64) this._rejectFinished(new DOMException("Animation canceled", "AbortError"));
+    if (actions & 64) {
+      this._rejectFinished(new DOMException("Animation canceled", "AbortError"));
+      // Cancelling a pending animation rejects its ready promise; an idle
+      // animation's ready promise is a resolved one (Web Animations 1,
+      // section 4.4.14).
+      if (this._timelinePending) {
+        this._timelinePending = false;
+        this._rejectReady(new DOMException("Animation canceled", "AbortError"));
+        this._ready = Promise.resolve(this);
+      }
+    }
     if (actions & 128) this._resolveFinished(this);
     if (actions & 256) this._surface._scheduleAnimationFrame(this._element);
     return actions !== 0;
   }
   _control(operation, value = 0) {
-    return this._applyActions(this._core.status("animation_control", this._animationId, operation, value, this._surface.currentTime));
+    let actions;
+    try {
+      actions = this._core.statusRaw("animation_control", this._animationId, operation, value, this._surface.currentTime);
+    } catch (error) {
+      if (!(error instanceof TypeError || error instanceof RangeError)) throw error;
+      throw new error.constructor(`Animation control operation ${operation} with value ${value}: ${error.message}`, { cause: error });
+    }
+    return this._applyActions(actions);
   }
   _leaveHost() { this._surface._removeAnimation(this); }
   _rejoinHost() { this._surface._restoreAnimation(this); }
@@ -155,16 +357,44 @@ export class SDAnimation {
   _ownsEngineAnimationId(animationId) { return animationId === this._animationId; }
   // The surface that adopted this animation has reached a frame, so its
   // timeline finally has a time. The animation held at the current time it
-  // reached without a timeline (0 unless the host seeked or paused it), so
+  // reached while pending (0 unless the host seeked or paused it), so
   // replaying that time against the live clock starts it at exactly that
   // sample and declares the engine track the pending binding stood in for.
   _resolveTimeline() {
     this._timelinePending = false;
+    this._resolveReady(this);
     const state = this._value(3);
     if (state === 0) return;
-    const held = this._core.status("animation_value", this._animationId, 0, 0);
+    const held = this._core.status("animation_value", this._animationId, 0, this._pendingSince);
     this._control(1, Number.isNaN(held) ? 0 : held);
     if (state === 3) this._control(7);
+  }
+  // The surface shut down. Chrome keeps a script animation whose element
+  // has no timeline (an element of a detached document) at its current
+  // time, pending: the animation moves to its document's pending timeline,
+  // where the next surface that claims its element adopts it.
+  _moveToPendingTimeline() {
+    const state = this._value(3);
+    const time = this._value(0);
+    this._engineHandle.cancelSilently();
+    const timeline = elementAnimationHost(this._element, null);
+    this._surface = timeline;
+    this._pendingSince = timeline.currentTime;
+    timeline._adoptAnimation(this);
+    this._engineHandle = deferAnimationBinding(declareWithoutRenderer).handle;
+    if (state !== 1 && state !== 2) return;
+    this._timelinePending = true;
+    this._resetReadyPromise();
+    // A scroll-driven animation's time is unresolved without its scroller.
+    if (!Number.isNaN(time)) this._control(1, time);
+  }
+  _resetReadyPromise() {
+    this._ready = new Promise((resolve, reject) => {
+      this._resolveReady = resolve;
+      this._rejectReady = reject;
+    });
+    // As with `finished`, an unobserved rejection is not a host failure.
+    this._ready.catch(() => {});
   }
   _timelineValue() {
     return this._timelineOption ?? resolvedElementFields(this._element).animationTimeline?.[0] ?? "auto";
@@ -176,8 +406,7 @@ export class SDAnimation {
     return this._rangeEndOption ?? resolvedElementFields(this._element).animationRangeEnd?.[0] ?? "normal";
   }
   _isScrollDriven() {
-    const value = this._timelineValue();
-    return value !== "auto" && value !== "none";
+    return this._core.exports.animation_timeline_scroll_driven(...this._core.input(String(this._timelineValue()))) !== 0;
   }
   _sampleScrollTimeline(progress) { return this._control(9, progress === null ? NaN : progress); }
   _needsFrame() { return this._value(10) !== 0; }
@@ -190,7 +419,7 @@ export class SDAnimation {
   }
   _beginEngineLifecycle(record) {
     const handle = this._core.handle("animation_feedback_begin", this._animationId,
-      record.trackGeneration, LIFECYCLE[record.type], this._surface.currentTime);
+      record.trackGeneration, this._lifecycleKind(record.type), this._surface.currentTime);
     if (!handle) return null;
     return { handle, token: this._core.handle("animation_feedback_next", handle) };
   }
@@ -200,7 +429,10 @@ export class SDAnimation {
     } finally { this._core.status("animation_feedback_release", feedback.handle); }
   }
   _elapsedTimeForEvent(type) {
-    return this._core.status("animation_elapsed", this._animationId, LIFECYCLE[type] ?? 0, this._surface.currentTime);
+    return this._core.status("animation_elapsed", this._animationId, this._lifecycleKind(type), this._surface.currentTime);
+  }
+  _lifecycleKind(type) {
+    return this._core.exports.animation_lifecycle_kind(...this._core.input(String(type)));
   }
 }
 installAnimationBindings({
@@ -212,7 +444,9 @@ installAnimationBindings({
     const value = animation._value(field);
     return Number.isNaN(value) ? null : value;
   },
-  readState(animation) { return STATES[animation._value(3)]; },
+  readState(animation) { return animation._core.string("animation_enumeration_name", 0, animation._value(3)); },
+  // An animation is pending until the frame that resolves its start time.
+  readPending(animation) { return animation._timelinePending && animation._value(3) !== 0; },
   currentTimeInput(value) {
     if (value === null) throw new TypeError("currentTime cannot be null");
     const time = Number(value);
@@ -229,81 +463,105 @@ installAnimationBindings({
     if (!Number.isFinite(rate)) throw new TypeError("playbackRate must be finite");
     return rate;
   },
-}, SDAnimation.prototype);
+}, Animation.prototype);
 
 // A CSS animation: the animation a keyframes rule names in an element's
 // animation-name list (css-animations-2 §4.1).
-export class CSSAnimation extends SDAnimation {
+export class CSSAnimation extends Animation {
   constructor(surface, element, keyframes, timing, engineDeclarationOptions) {
     super(surface, element, keyframes, timing, engineDeclarationOptions);
     this._cssAnimationName = engineDeclarationOptions.diagnosticAnimationName;
   }
+  // A CSS animation reports its keyframes with computed values
+  // (css-animations-2 section 4.1): the core's canonical values.
+  _reportedKeyframes() {
+    return this._canonicalKeyframes.map(({ offset, easing, composite = "auto", ...values }) => {
+      const frame = { offset, easing: easingText(easing), composite };
+      for (const [propertyName, value] of Object.entries(values)) {
+        frame[idlName(propertyName)] = keyframeValueText(value, propertyName);
+      }
+      frame.computedOffset = offset;
+      return frame;
+    });
+  }
 }
 installCSSAnimationBindings({}, CSSAnimation.prototype);
 
-function transitionKeyframeValue(value) {
-  const number = (amount) => String(Math.round(amount * 1e6) / 1e6);
-  const length = ({ pixels, percentage }) =>
-    percentage === 0 ? `${number(pixels)}px`
-      : pixels === 0 ? `${number(percentage)}%`
-      : `calc(${number(percentage)}% + ${number(pixels)}px)`;
-  if (typeof value === "string") return value;
-  switch (value?.kind) {
-    case "scalar": return number(value.value);
-    case "lengthPercentage": return length(value);
-    case "color": {
-      const [red, green, blue, alpha] = value.value.map((channel, index) =>
-        index < 3 ? Math.round(channel * 255) : Math.round(channel * 1000) / 1000
-      );
-      return alpha === 1 ? `rgb(${red}, ${green}, ${blue})` : `rgba(${red}, ${green}, ${blue}, ${alpha})`;
-    }
-    case "lineHeight":
-      return value.unit === "normal" ? "normal" : value.unit === "length" ? `${number(value.value)}px` : number(value.value);
-    case "translate":
-      return `${length(value.x)} ${length(value.y)}`;
-    default: return null;
-  }
+function idlName(propertyName) {
+  return propertyName.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
 }
 
-// A running CSS transition (css-transitions-2 §6.1): the Web Animations
-// object over the track the renderer declared for it. Its timing is the
-// core's animation record; its controls drive that same engine track.
-export class CSSTransition extends SDAnimation {
+// A CSS transition (css-transitions-2 §6.1): the Web Animations object over
+// the track the renderer declared for it. Its timing is the core's
+// animation record; its controls drive that same engine track. A record
+// without an engine handle is a transition that a read between frames
+// found a style change to start: it is pending, and its handle queues the
+// host's commands for the track that the next frame declares
+// (_adoptDeclaredTrack).
+export class CSSTransition extends Animation {
   constructor(surface, element, propertyName, record, generation) {
+    const transitionTrack = {
+      propertyName,
+      easing: record.easing,
+      keyframes: [
+        { offset: 0, value: record.trackStartValue },
+        { offset: 1, value: record.endValue },
+      ],
+    };
     super(surface, element, [], {
       delay: record.delay,
       direction: "normal",
       duration: record.duration,
-      easing: typeof record.easing === "string" ? record.easing : serializeCSSEasing(record.easing),
+      easing: record.easing,
       endDelay: 0,
       fill: "backwards",
       iterationStart: 0,
       iterations: 1,
-    }, {
-      startTime: record.startTimeMilliseconds,
-      adoptedEngineHandle: record.engineHandle,
-      transitionTrack: {
-        propertyName,
-        easing: record.easing,
-        keyframes: [
-          { offset: 0, value: record.trackStartValue },
-          { offset: 1, value: record.endValue },
-        ],
-      },
-    });
+    }, record.engineHandle === undefined
+      ? { timelinePending: true, awaitingDeclaration: true, transitionTrack }
+      : { startTime: record.startTimeMilliseconds, adoptedEngineHandle: record.engineHandle, transitionTrack });
     this._transitionProperty = propertyName;
     this._transitionRecord = record;
     this._transitionGeneration = generation;
     this._trackAnimationId = record.animationId;
-    const camelName = propertyName.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
-    this._inputKeyframes = [record.trackStartValue, record.endValue].map((value, index) => {
-      const text = transitionKeyframeValue(value);
-      return {
-        offset: index, easing: "linear", composite: "auto",
-        ...(text === null ? {} : { [camelName]: text }),
-        computedOffset: index,
-      };
-    });
+    // The frame that declares a transition starts it.
+    if (!this._timelinePending) this._resolveReady(this);
+  }
+  // The frame that starts a pending transition declared its track with this
+  // object's identity and timing (DOMRenderSurface._heldTransitionDeclaration).
+  // The transition runs on that track from now on, with the start value
+  // that the engine took and the duration that the declaration gave it (a
+  // reversal shortens it); the commands queued while it was pending reach
+  // the track.
+  _adoptDeclaredTrack(record, generation) {
+    const { transitionTrack } = this._engineDeclarationOptions;
+    transitionTrack.keyframes = [
+      { offset: 0, value: record.trackStartValue },
+      { offset: 1, value: record.endValue },
+    ];
+    this._engineDeclarationOptions = { transitionTrack };
+    this._transitionRecord = record;
+    this._transitionGeneration = generation;
+    this._trackAnimationId = record.animationId;
+    // The core holds the iteration duration; field 7 is it over the rate.
+    if (record.duration !== this._value(7)) {
+      this._core.statusRaw("animation_control", this._animationId, 11,
+        record.duration * (Math.abs(this._value(2)) || 1), this._surface.currentTime);
+    }
+    const binding = this._declarationBinding;
+    this._declarationBinding = null;
+    this._engineHandle = record.engineHandle;
+    binding.bind(null, 0);
+  }
+  // A transition's keyframes are its start and end values; its timing
+  // function is the effect's easing.
+  _reportedKeyframes() {
+    const record = this._transitionRecord;
+    return [record.trackStartValue, record.endValue].map((value, index) => ({
+      offset: index, easing: "linear", composite: "auto",
+      [idlName(this._transitionProperty)]: keyframeValueText(value, this._transitionProperty),
+      computedOffset: index,
+    }));
   }
   _timelineValue() { return "auto"; }
   // Whether the transition's track still moves on the clock: running at a
@@ -313,9 +571,16 @@ export class CSSTransition extends SDAnimation {
     return animationId === this._animationId || animationId === this._trackAnimationId;
   }
   // The renderer's own track serves the first declaration; a change of
-  // time, rate or direction declares the transition's track again.
+  // time, rate or direction declares the transition's track again. Until
+  // the frame declares a pending transition's track, a deferred binding
+  // queues the commands for it.
   _replaceEngineHandle() {
-    const { adoptedEngineHandle, transitionTrack } = this._engineDeclarationOptions;
+    const { adoptedEngineHandle, awaitingDeclaration, transitionTrack } = this._engineDeclarationOptions;
+    if (awaitingDeclaration) {
+      this._declarationBinding = deferAnimationBinding(() => this._transitionRecord.engineHandle);
+      this._engineHandle = this._declarationBinding.handle;
+      return;
+    }
     if (adoptedEngineHandle) {
       this._engineDeclarationOptions = { transitionTrack };
       this._engineHandle = adoptedEngineHandle;
@@ -328,15 +593,18 @@ export class CSSTransition extends SDAnimation {
       }, { animationId: this._animationId, trackGeneration: this._value(5) },
     );
   }
+  // A pending transition is in the surface's pending transitions, not in
+  // its registry, until the frame declares its track.
+  get _awaitingDeclaration() { return this._engineDeclarationOptions.awaitingDeclaration === true; }
   _leaveHost() { this._surface._unregisterTransition(this); }
-  _rejoinHost() { this._surface._registerTransitionAnimation(this); }
+  _rejoinHost() { if (!this._awaitingDeclaration) this._surface._registerTransitionAnimation(this); }
   _applyActions(actions) {
     const applied = super._applyActions(actions);
     // The registry holds the timing the track runs: a running or paused
     // transition is registered (play() after its end registers it again),
     // at the start, duration and delay of its current track.
     const state = this._value(3);
-    if (state === 1 || state === 2) this._surface._registerTransitionAnimation(this);
+    if (!this._awaitingDeclaration && (state === 1 || state === 2)) this._surface._registerTransitionAnimation(this);
     const record = this._transitionRecord;
     record.startTimeMilliseconds = this._value(6);
     record.duration = this._value(7);
@@ -348,78 +616,104 @@ export class CSSTransition extends SDAnimation {
   // The engine replaced this transition's track before the registry saw
   // its cancel: settle the record as cancelled without touching a track.
   _settleReplaced() {
-    this._core.status("animation_control", this._animationId, 6, 0, this._surface.currentTime);
-    this._applyActions(this._core.status("animation_control", this._animationId, 10, this._value(12), this._surface.currentTime));
+    this._core.statusRaw("animation_control", this._animationId, 6, 0, this._surface.currentTime);
+    this._applyActions(this._core.statusRaw("animation_control", this._animationId, 10, this._value(12), this._surface.currentTime));
   }
 }
 installCSSTransitionBindings({}, CSSTransition.prototype);
 
 export function createDOMAnimation(surface, element, keyframes, timing, engineDeclarationOptions = {}) {
   return engineDeclarationOptions.diagnosticAnimationName == null
-    ? new SDAnimation(surface, element, keyframes, timing, engineDeclarationOptions)
+    ? new Animation(surface, element, keyframes, timing, engineDeclarationOptions)
     : new CSSAnimation(surface, element, keyframes, timing, engineDeclarationOptions);
 }
 
-// Shadow-including tree order: a shadow root follows its host and precedes
-// the host's children.
-function treePath(node) {
-  const path = [];
-  for (let current = node; current; current = current.parentNode ?? current.host ?? null) path.push(current);
-  return path.reverse();
-}
-function compareTreeOrder(first, second, paths) {
-  if (first === second) return 0;
-  if (!paths.has(first)) paths.set(first, treePath(first));
-  if (!paths.has(second)) paths.set(second, treePath(second));
-  const a = paths.get(first);
-  const b = paths.get(second);
-  let depth = 0;
-  while (depth < a.length && depth < b.length && a[depth] === b[depth]) depth++;
-  if (depth === a.length) return -1;
-  if (depth === b.length) return 1;
-  if (a[depth].nodeType === 11) return -1;
-  if (b[depth].nodeType === 11) return 1;
-  for (let sibling = a[depth].nextSibling; sibling; sibling = sibling.nextSibling) {
-    if (sibling === b[depth]) return -1;
-  }
-  return 1;
-}
 function compositeClass(animation) {
   return animation instanceof CSSTransition ? 0 : animation instanceof CSSAnimation ? 1 : 2;
 }
-// Web Animations composite order as Chrome orders getAnimations(): CSS
-// transitions by owning element in tree order, then transition generation,
-// then property name; CSS animations by owning element, then position in
-// animation-name; script animations by creation.
+// Web Animations composite order as Chrome orders getAnimations()
+// (animation_composite_order).
 function sortInCompositeOrder(animations) {
-  const paths = new Map();
-  const animationNameIndex = (animation) =>
-    animation._surface._cssAnimations?.get(animation._element)
-      ?.findIndex((record) => record.animation === animation) ?? -1;
-  return animations.sort((first, second) => {
-    const kind = compositeClass(first) - compositeClass(second);
-    if (kind !== 0) return kind;
-    if (compositeClass(first) === 2) return first._sequence - second._sequence;
-    const tree = compareTreeOrder(first._element, second._element, paths);
-    if (tree !== 0) return tree;
-    if (compositeClass(first) === 1) return animationNameIndex(first) - animationNameIndex(second);
-    if (first._transitionGeneration !== second._transitionGeneration) {
-      return first._transitionGeneration - second._transitionGeneration;
-    }
-    return first._transitionProperty < second._transitionProperty ? -1 : 1;
-  });
+  if (animations.length < 2) return animations;
+  const native = animations[0]._element._domCore;
+  const properties = animations.map((animation) => native.input(String(animation._transitionProperty ?? "")));
+  const rows = native.exports.abi_allocate(animations.length * 40);
+  const view = new DataView(native.refreshBytes().buffer);
+  for (let index = 0; index < animations.length; index++) {
+    const animation = animations[index];
+    const row = rows + index * 40;
+    view.setBigUint64(row, BigInt(animation._element._coreHandle ?? 0n), true);
+    view.setUint32(row + 8, compositeClass(animation), true);
+    view.setInt32(row + 12, animation._surface._cssAnimations?.get(animation._element)
+      ?.findIndex((record) => record.animation === animation) ?? -1, true);
+    view.setFloat64(row + 16, Number(animation._sequence), true);
+    view.setFloat64(row + 24, Number(animation._transitionGeneration), true);
+    view.setUint32(row + 32, properties[index][0], true);
+    view.setUint32(row + 36, properties[index][1], true);
+  }
+  const count = native.status("animation_composite_order", rows, animations.length);
+  const output = native.exports.abi_output_pointer();
+  const order = new DataView(native.refreshBytes().buffer);
+  const sorted = Array.from({ length: count }, (_, index) => animations[order.getUint32(output + index * 4, true)]);
+  for (let index = 0; index < count; index++) animations[index] = sorted[index];
+  return animations;
 }
 
 // An animation getAnimations() reports (Web Animations §5.1, relevant
-// animations): one that is not idle, and once finished only while its fill
-// keeps it in effect. A transition fills backwards, so its end leaves it out.
+// animations): one that is not idle or removed, and once finished only
+// while its fill keeps it in effect. A transition fills backwards, so its
+// end leaves it out.
 function reportedAnimation(animation) {
   const state = animation.playState;
-  if (state === "idle") return false;
+  if (state === "idle" || animation._value(13) === 1) return false;
   if (state !== "finished") return true;
   const fill = animation._timing.fill;
   return fill === "both" ||
     fill === (animation.playbackRate < 0 ? "backwards" : "forwards");
+}
+
+// Removing replaced animations (Web Animations 1, section 5.5) at `now`:
+// the script animations among `animations` that later script animations
+// of the same target replace. The core decides which, one target at a
+// time (animation_remove_replaced); their effects leave the effect stack.
+// CSS animations and transitions are neither replaced nor replace others,
+// and a pending animation has no time on its timeline yet. Returns the
+// removed animations in composite order.
+export function removeReplacedAnimations(animations, now) {
+  const byTarget = new Map();
+  for (const animation of animations) {
+    if (animation instanceof CSSAnimation || animation instanceof CSSTransition || animation._timelinePending) continue;
+    let list = byTarget.get(animation._element);
+    if (list === undefined) byTarget.set(animation._element, list = []);
+    list.push(animation);
+  }
+  const removed = [];
+  for (const list of byTarget.values()) {
+    // Measured in Chrome: an animation without target properties is
+    // removed under a later replaceable animation, never alone.
+    if (list.length < 2) continue;
+    list.sort((first, second) => first._sequence - second._sequence);
+    const input = new DataView(new ArrayBuffer(list.length * 32));
+    for (let index = 0; index < list.length; index++) {
+      const animation = list[index];
+      input.setBigUint64(index * 32, animation._animationId, true);
+      input.setBigUint64(index * 32 + 8, animation._targetProperties, true);
+      input.setFloat64(index * 32 + 16, Number(animation._timing.endDelay ?? 0), true);
+      input.setUint32(index * 32 + 24,
+        animation._core.exports.animation_fill_mode(...animation._core.input(String(animation._timing.fill))), true);
+    }
+    const core = list[0]._core;
+    const [pointer] = core.byteInput(new Uint8Array(input.buffer));
+    const count = core.status("animation_remove_replaced", pointer, list.length, now);
+    const output = core.exports.abi_output_pointer();
+    const view = new DataView(core.refreshBytes().buffer);
+    for (let index = 0; index < count; index++) removed.push(list[view.getUint32(output + index * 4, true)]);
+  }
+  // commitStyles() of a removed animation writes the values it had here;
+  // each is sampled before any removed track leaves its stack.
+  for (const animation of removed) animation._removedValues = animation._committedValues(now);
+  for (const animation of removed) animation._removeFromEffectStack();
+  return removed.sort((first, second) => first._sequence - second._sequence);
 }
 
 export function animationsForElement(animations, element, subtree) {
@@ -440,11 +734,13 @@ export function animationsForElement(animations, element, subtree) {
 
 // document.getAnimations(): the animations of every element of the
 // document, from the surface that owns each element (the primary surface
-// of its root) or the document's pending timeline.
+// of its root) or the document's pending timeline. Each surface updates
+// its style first, as the element form does.
 export function documentAnimations(document) {
   const candidates = [];
   for (const surface of document._liveRenderSurfaces ?? []) {
     if (surface._shutdown || surface._root._renderSurface !== surface) continue;
+    surface._startStyleChangeAnimations();
     candidates.push(...surface._animationCandidates());
   }
   const pending = pendingAnimationTimelines.get(document);
@@ -463,12 +759,13 @@ export function documentAnimations(document) {
 // timeline, which has no clock: each one holds at its current time the way a
 // play-pending animation does in Chrome, and the surface that adopts the
 // element resolves their start times on its next frame
-// (DOMRenderSurface._adoptPendingAnimations and SDAnimation._resolveTimeline).
+// (DOMRenderSurface._adoptPendingAnimations and Animation._resolveTimeline).
 const pendingAnimationTimelines = new WeakMap();
 
-// A pending animation's engine handle is a deferred binding, which queues
-// the host's commands natively; the adopting surface declares the real
-// track from the core's own state, so this is never reached.
+// A pending or removed animation's engine handle is a deferred binding,
+// which queues the host's commands natively; the frame that resolves a
+// pending animation's start time, and persist() on a removed one, declare
+// the real track from the core's own state, so this is never reached.
 function declareWithoutRenderer() {
   throw new Error("a pending animation has no renderer to declare against");
 }
@@ -484,19 +781,18 @@ class PendingAnimationTimeline {
     return 0;
   }
   _createAnimation(element, keyframes, options) {
-    const animation = createDOMAnimation(this, element, keyframes, options);
-    animation._timelinePending = true;
+    const animation = createDOMAnimation(this, element, keyframes, options, { timelinePending: true });
+    this._adoptAnimation(animation);
+    return animation;
+  }
+  _adoptAnimation(animation) {
     this._animations.push(animation);
-    const forElement = this._animationsByElement.get(element);
+    const forElement = this._animationsByElement.get(animation._element);
     if (forElement === undefined) {
-      this._animationsByElement.set(element, [animation]);
+      this._animationsByElement.set(animation._element, [animation]);
     } else {
       forElement.push(animation);
     }
-    return animation;
-  }
-  _declareAnimation() {
-    return deferAnimationBinding(declareWithoutRenderer).handle;
   }
   _animationsForElement(element, subtree) {
     return animationsForElement(this._animations, element, subtree);

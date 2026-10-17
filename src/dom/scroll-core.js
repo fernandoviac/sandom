@@ -29,9 +29,15 @@ export function scrollState(target) {
   if (surface?._scrollOwner) core.status("scroll_attach", surface._scrollOwner, target._scrollState);
   return target._scrollState;
 }
+// Reparenting retains the state but releases its old surface owner. Queries
+// attach an existing state before serialization reads the native owner list.
+export function attachKnownScrollState(target) {
+  return knownScrollState(target) ? scrollState(target) : 0n;
+}
 export function scrollRead(target, slot) {
-  if (!knownScrollState(target)) return 0;
-  return scrollCore(target).status("scroll_value", scrollState(target), slot);
+  const state = attachKnownScrollState(target);
+  if (!state) return 0;
+  return scrollCore(target).status("scroll_value", state, slot);
 }
 export function scrollStore(target, slot, value) {
   if (!target._scrollState && value === 0) return;
@@ -51,7 +57,7 @@ function isScrollContainer(element) {
   return !(["visible", "clip"].includes(overflow.x) && ["visible", "clip"].includes(overflow.y));
 }
 
-function isQuirksMode(document) {
+export function isQuirksMode(document) {
   return document._domCore.documentMode(document._coreHandle) === 1;
 }
 
@@ -252,16 +258,6 @@ export class NativeScrollSuppression {
   constructor(surface, flag) { this.surface = surface; this.flag = flag; }
   delete(node) { this.surface._root._domCore.status("scroll_suppression_clear", this.surface._scrollOwner, node._coreHandle, this.flag); }
   clear() { this.surface._root._domCore.status("scroll_suppression_clear", this.surface._scrollOwner, 0n, this.flag); }
-}
-
-export function scrollScrollbar(surface, target, axis, value, relative, frozenValue, minimum, maximum) {
-  const changed = surface._root._domCore.status("scroll_scrollbar", surface._scrollOwner, target === surface.viewport ? 0n : target._coreHandle, axis, value, relative ? 1 : 0, frozenValue, minimum, maximum);
-  if (changed) {
-    surface._snapCheckPending = true;
-    surface._dirty = true;
-    surface._schedule();
-  }
-  return !!changed;
 }
 
 export class NativeScrollCapture {

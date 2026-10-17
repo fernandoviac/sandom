@@ -3,24 +3,28 @@
  *
  * Same shape and same reasoning as src/jpeg.js: WebP is a real codec (VP8
  * for lossy, an entirely separate VP8L for lossless), so it is vendored
- * rather than hand-written — vendor/webp.wasm, built from
- * vendor/webp-wasm-rs/ (image-webp behind a thin shim, see its build.sh).
+ * rather than hand-written — the @sandom/image-codecs WebP module
+ * (image-webp behind a thin shim, see the package's webp-wasm-rs/).
  *
  * Returns the same { width, height, pixels } shape decodePNG and
  * decodeJPEG do, so the image pipeline branches on format exactly once
  * (decodeImage in src/jpeg.js) and nowhere downstream.
  *
- * NOT related to src/output/webp.js, which is an animation ENCODER. They
- * share a name and nothing else; the plan (plans/PLAN-native-image-support.md
- * N2) calls out keeping them apart explicitly.
+ * The images epic (plans/images/README.md) owns the format decisions; the
+ * ground rules there forbid decoding an animated file as a still.
  */
 
 import { srgbRgba8ImageDescriptor } from './image-data.js';
-import { readBinaryFile } from './host.js';
+import { readPackageAsset } from './package-assets.js';
+
+// Sandom's binding for the @sandom/image-codecs WebP module. The library
+// import map resolves the package (a sibling checkout locally, the reviewed
+// library set or the installed npm package otherwise).
+const WEBP_WASM = '@sandom/image-codecs/webp.wasm';
 
 // The module imports NOTHING (verified: WebAssembly.Module.imports() is
 // empty) even though it is a std build, so instantiation takes no imports
-// and there is no __wasm_call_ctors to run — same as vendor/jpeg.wasm.
+// and there is no __wasm_call_ctors to run — same as the JPEG module.
 export function createWebPDecoder({ webpBytes, getWebPBytes = null } = {}) {
 let webpInstance = null;
 
@@ -30,16 +34,17 @@ async function ensureWebp() {
   const wasmBytes = getWebPBytes
     ? await getWebPBytes()
     : webpBytes ??
-      await readBinaryFile(new URL('../vendor/webp.wasm', import.meta.url));
+      await readPackageAsset(new URL(import.meta.resolve(WEBP_WASM)));
 
   const { instance } = await WebAssembly.instantiate(wasmBytes, {});
   webpInstance = instance;
   return instance;
 }
 
-// Mirrors the shim's return codes (vendor/webp-wasm-rs/src/lib.rs). -4 is
-// the one that is not a failure of the file: an animated WebP is a valid
-// image this slice deliberately does not handle, so its message says so
+// Mirrors the shim's return codes (webp-wasm-rs/src/lib.rs in
+// @sandom/image-codecs). -4 is the one that is not a failure of the file:
+// an animated WebP is a valid image this slice deliberately does not
+// handle, so its message says so
 // and names the frame count rather than reading as corruption.
 const DECODE_ERRORS = {
   '-1': 'internal error: decode() called before alloc()',
@@ -52,9 +57,9 @@ const DECODE_ERRORS = {
  * alpha — to RGBA8.
  *
  * Throws on an animated WebP naming its frame count. That is the ground
- * rule from plans/PLAN-native-image-support.md: rendering frame 1 of an
- * animation as though it were a still is the half-support the plan
- * forbids, and animation belongs to Slice N4.
+ * rule of plans/images/README.md: rendering frame 1 of an animation as
+ * though it were a still is forbidden, and animation belongs to
+ * plans/images/PLAN-animated-images.md.
  */
 async function decodeWebP(bytes) {
   const wasm = await ensureWebp();
@@ -68,7 +73,7 @@ async function decodeWebP(bytes) {
     const frameCount = status === -4 ? frames() : 0;
     release();
     if (status === -4) {
-      throw new Error(`decodeWebP: animated WebP (${frameCount} frames) is not supported — animation is Slice N4 of plans/PLAN-native-image-support.md, and decoding frame 1 as a still would be silently wrong`);
+      throw new Error(`decodeWebP: animated WebP (${frameCount} frames) is not supported — animation is plans/images/PLAN-animated-images.md, and decoding frame 1 as a still would be silently wrong`);
     }
     throw new Error(`decodeWebP failed (${status}): ${DECODE_ERRORS[String(status)] ?? 'unknown decoder status'}`);
   }
@@ -83,7 +88,7 @@ async function decodeWebP(bytes) {
 
   // No ICC/EXIF pass here, unlike decodeJPEG. WebP CAN carry both in
   // optional chunks, and this decoder ignores them — see the slice notes
-  // in plans/PLAN-native-image-support.md rather than assuming it is handled.
+  // in plans/images/README.md rather than assuming it is handled.
   return srgbRgba8ImageDescriptor(w, h, out);
 }
 

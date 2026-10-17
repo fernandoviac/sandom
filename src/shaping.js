@@ -1,4 +1,5 @@
 import { DomCore, sharedDomCore } from "./dom-wasm/core.js";
+import { acquireFontByteSource } from "./dom-wasm/font-byte-binding.js";
 import { loadEngine } from "./wasm/loader.js";
 
 const textEncoder = new TextEncoder();
@@ -7,11 +8,9 @@ const textEncoder = new TextEncoder();
 export function createShapingRuntime({
   engine: suppliedEngine = null,
   core = suppliedEngine?.core ?? new DomCore(),
-  registerFont = null,
 } = {}) {
   let engine = suppliedEngine;
   let loading = null;
-  const registeredFonts = new WeakMap();
 
   async function preload() {
     if (!engine) {
@@ -30,70 +29,49 @@ export function createShapingRuntime({
     return pointer;
   }
 
-  function fontIndexFor(fontBytes, faceIndex = 0) {
+  function fontIndexFor(fontBytes, faceIndex, mode) {
     if (Number.isInteger(fontBytes)) return fontBytes;
     if (!(fontBytes instanceof Uint8Array)) {
       throw new TypeError("Native font operations require a registered font index or Uint8Array font bytes");
     }
-    let faces = registeredFonts.get(fontBytes);
-    if (!faces) {
-      faces = new Map();
-      registeredFonts.set(fontBytes, faces);
-    }
-    let fontIndex = faces.get(faceIndex);
-    if (fontIndex === undefined) {
-      if (registerFont) {
-        fontIndex = registerFont(fontBytes, faceIndex);
-      } else {
-        const pointer = allocate(fontBytes.byteLength);
-        new Uint8Array(engine.memory.buffer, pointer, fontBytes.byteLength).set(fontBytes);
-        fontIndex = engine.exports.register_font(pointer, fontBytes.byteLength, faceIndex, 0, 0, 0);
-        if (fontIndex < 0) {
-          throw new Error(
-            `The engine font table is full: font_table_count() is ${engine.exports.font_table_count()}, ` +
-              "the FONT_TABLE_MAX_ENTRIES limit of src/wasm/layout.js. Raise FONT_TABLE_MAX_ENTRIES and FONT_TABLE_SIZE together.",
-          );
-        }
-      }
-      faces.set(faceIndex, fontIndex);
-    }
-    return fontIndex;
+    return acquireFontByteSource(core, fontBytes, "font_outline_acquire", [
+      typeof faceIndex === "number" ? faceIndex : 0,
+      faceIndex === undefined ? 0 : typeof faceIndex === "number" ? 1 : 2,
+      mode,
+    ]);
   }
 
   function encodeTags(records, features = false) {
-    const stride = features ? 16 : 8;
-    for (const [tag, value] of records) {
-      if (typeof tag !== "string" || tag.length !== 4 || !Number.isFinite(value) ||
-        (features && (!Number.isInteger(value) || value < 0))) {
-        throw new TypeError(`Native font ${features ? "feature" : "variation"} requires a four-character tag and ${features ? "non-negative integer" : "finite"} value, got ${JSON.stringify([tag, value])}`);
+    const pointer = allocate(records.length * 24);
+    try {
+      const view = new DataView(engine.memory.buffer);
+      for (let index = 0; index < records.length; index++) {
+        const [tag, value] = records[index];
+        const offset = pointer + index * 24;
+        const string = typeof tag === "string";
+        const number = typeof value === "number";
+        for (let unit = 0; unit < 4; unit++) {
+          view.setUint16(offset + unit * 2, string ? tag.charCodeAt(unit) : 0, true);
+        }
+        view.setUint32(offset + 8, string ? tag.length : 0, true);
+        view.setUint32(offset + 12, Number(string) | (Number(number) << 1), true);
+        view.setFloat64(offset + 16, number ? value : NaN, true);
       }
+      core.status("font_tags_encode", pointer, records.length, Number(features));
+      return pointer;
+    } catch (error) {
+      engine.exports.abi_free(pointer);
+      throw error;
     }
-    const pointer = allocate(records.length * stride);
-    const view = new DataView(engine.memory.buffer);
-    for (let index = 0; index < records.length; index++) {
-      const [tag, value] = records[index];
-      const offset = pointer + index * stride;
-      view.setUint32(offset, ((tag.charCodeAt(0) << 24) | (tag.charCodeAt(1) << 16) |
-        (tag.charCodeAt(2) << 8) | tag.charCodeAt(3)) >>> 0, true);
-      if (features) {
-        view.setUint32(offset + 4, value, true);
-        view.setUint32(offset + 8, 0, true);
-        view.setUint32(offset + 12, 0xFFFFFFFF, true);
-      } else {
-        view.setFloat32(offset + 4, value, true);
-      }
-    }
-    return pointer;
   }
 
   async function shapeFontText(fontBytes, text, _fontSize, {
-    variations = [], features = [], unitScale = 1, faceIndex = 0,
+    variations = [], features = [], unitScale, faceIndex,
   } = {}) {
-    if (!Number.isInteger(unitScale) || unitScale < 1 || unitScale > 0x7FFFFFFF) {
-      throw new RangeError(`Native shaping unitScale must be a positive i32, got ${unitScale}`);
-    }
+    unitScale = core.status("font_shape_scale", typeof unitScale === "number" ? unitScale : 0,
+      unitScale === undefined ? 0 : typeof unitScale === "number" ? 1 : 2);
     await preload();
-    const fontIndex = fontIndexFor(fontBytes, faceIndex);
+    const fontIndex = fontIndexFor(fontBytes, faceIndex, 0);
     const encodedText = textEncoder.encode(text);
     let textPointer = 0;
     let variationPointer = 0;
@@ -147,9 +125,14 @@ export function createShapingRuntime({
     }
   }
 
-  async function createGlyphOutlineSource(fontBytes, { faceIndex = 0 } = {}) {
+  async function createGlyphOutlineSource(fontBytes, { faceIndex } = {}) {
     await preload();
-    const fontIndex = fontIndexFor(fontBytes, faceIndex);
+    return createGlyphOutlineSourceSync(fontBytes, { faceIndex });
+  }
+
+  function createGlyphOutlineSourceSync(fontBytes, { faceIndex } = {}) {
+    if (!engine) throw new Error("Native glyph outlines require preload before synchronous use");
+    const fontIndex = fontIndexFor(fontBytes, faceIndex, 1);
     const metadataPointer = allocate(20);
     engine.exports.font_outline_metadata(fontIndex, metadataPointer);
     const metadata = new DataView(engine.memory.buffer, metadataPointer, 20);
@@ -191,7 +174,30 @@ export function createShapingRuntime({
     };
   }
 
-  return Object.freeze({ preload, shapeFontText, shapeGlyphIds, createGlyphOutlineSource,
+  // The outlines of `glyphIds` of the registered font `fontIndex` at
+  // `variations`, as glyph_outline_extract's verb streams. Synchronous: it
+  // needs an engine that is already loaded, as the renderer's is when it
+  // has shaped the glyphs (Canvas 2D text, src/dom/canvas-2d-text.js).
+  function glyphOutlinesSync(fontIndex, variations, glyphIds) {
+    if (!engine) throw new Error("glyphOutlinesSync needs a loaded engine");
+    const variationPointer = encodeTags(variations);
+    let font;
+    try {
+      font = engine.exports.glyph_outline_font_create(fontIndex, variationPointer, variations.length, 1);
+    } finally {
+      engine.exports.abi_free(variationPointer);
+    }
+    try {
+      return glyphIds.map((glyphId) => {
+        const pointer = engine.exports.glyph_outline_extract(font, glyphId);
+        return new Uint8Array(engine.memory.buffer, pointer, engine.exports.glyph_outline_length()).slice();
+      });
+    } finally {
+      engine.exports.glyph_outline_font_destroy(font);
+    }
+  }
+
+  return Object.freeze({ preload, shapeFontText, shapeGlyphIds, createGlyphOutlineSource, createGlyphOutlineSourceSync, glyphOutlinesSync,
     instanceIdentity: () => engine?.hb ?? null,
   });
 }

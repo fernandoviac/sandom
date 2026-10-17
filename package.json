@@ -1,6 +1,6 @@
 {
   "name": "sandom",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Experimental in-process rendering engine: DOM-like tree in, WebAssembly layout, WebGPU rasterization, pixels out.",
   "type": "module",
   "license": "Apache-2.0",
@@ -11,36 +11,38 @@
     ".": "./src/mod.js",
     "./runtime": "./src/runtime.js",
     "./dom": "./src/dom/dom.js",
-    "./web-component": "./src/dom/renderer-element.js",
     "./font-registry": "./src/font-registry.js",
+    "./system-fonts": "./src/system-fonts.js",
+    "./host": "./src/host/contract.js",
+    "./host/local": "./src/host/local-command-host.js",
+    "./host/supplied-resources": "./src/host/supplied-resource-host.js",
+    "./host/browser": "./src/host/browser-host.js",
     "./gpu-compositor": "./src/gpu-compositor.js",
     "./adaptive-jpeg": "./src/adaptive-jpeg.js",
     "./output": "./src/output/image.js",
     "./color-transform": "./src/output/color-transform.js",
     "./jsx-runtime": "./src/dom/jsx-runtime.js",
-    "./adapters/vite": "./src/adapters/vite.js",
-    "./adapters/compiled-application": "./src/adapters/compiled-application.js",
-    "./adapters/next": "./src/adapters/next.js",
-    "./component-adapter-result": "./src/adapters/component-adapter-result.js",
-    "./component-adapter-realm-protocol": "./src/adapters/component-adapter-realm-protocol.js",
+    "./dom/node": "./src/dom/node.js",
+    "./dom-wasm/core": "./src/dom-wasm/core.js",
     "./gpu": {
       "bun": "./gpu/bun.js",
+      "deno": "./gpu/default.js",
       "node": "./gpu/node.js",
       "default": "./gpu/default.js"
     },
     "./src/*.js": "./src/*.js"
   },
   "dependencies": {
-    "@sandom/gain-map": "0.1.0",
-    "@sandom/font-metrics": "0.1.0",
-    "@sandom/color": "0.2.0",
+    "@sandom/gain-map": "0.2.0",
+    "@sandom/png": "0.1.0",
+    "@sandom/image-codecs": "0.1.0",
+    "@sandom/color": "0.3.0",
     "woff-lib": "^0.0.3"
   },
   "peerDependencies": {
     "es-module-lexer": "^1.7.0",
     "webgpu": "^0.4.0",
     "bun-webgpu": "^0.1.7",
-    "next": ">=16.3.1 <17",
     "native-gles": "^0.6.1"
   },
   "peerDependenciesMeta": {
@@ -48,9 +50,6 @@
       "optional": true
     },
     "bun-webgpu": {
-      "optional": true
-    },
-    "next": {
       "optional": true
     },
     "native-gles": {

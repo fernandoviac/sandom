@@ -1,5 +1,6 @@
 import { DocumentSession } from "./document-session.js";
 import { prepareRenderInput } from "./render-animation.js";
+import { createSuppliedResourceHost } from "../host/supplied-resource-host.js";
 import {
   BROWSER_RENDER_ERROR_KIND,
   BROWSER_RENDER_PROTOCOL_VERSION,
@@ -12,6 +13,7 @@ export function serializeBrowserWorkerError(error) {
   return {
     name: error?.name ?? "Error",
     message: error?.message ?? String(error),
+    code: error?.code ?? null,
     stack: error?.stack ?? null,
     details: error?.details ?? null,
     errors: error instanceof AggregateError
@@ -49,26 +51,18 @@ export async function prepareBrowserRenderInput(message) {
     if (resources.has(resourceURL)) {
       throw new TypeError(`Duplicate browser render resource ${resourceURL}`);
     }
-    resources.set(resourceURL, resource);
+    resources.set(resourceURL, {
+      bytes: resource.bytes,
+      mediaType: resource.contentType ?? null,
+    });
   }
+  // The transferred resources are the complete resource set: the worker
+  // reads nothing else.
   return await prepareRenderInput(
     { url: baseURL, bytes: message.input.bytes },
     {
       preprocessor: message.input.preprocessor,
-      resolveResource({ finalURL }) {
-        const resource = resources.get(finalURL);
-        if (!resource) {
-          throw new Error(
-            `Browser render resource is unavailable: ${finalURL}`,
-          );
-        }
-        return {
-          bytes: resource.bytes,
-          contentType: resource.contentType,
-          finalURL,
-          ownership: "caller",
-        };
-      },
+      host: createSuppliedResourceHost({ resources }),
     },
   );
 }

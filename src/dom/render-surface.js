@@ -1,6 +1,8 @@
 import { serializeToScene } from "./serialize.js";
-import { InvalidResourceResponseError } from "./prepared-document.js";
+import { SandomHostError } from "../host/contract.js";
 import { validateClosedRecord } from "../closed-record.js";
+import { hostNow, hostTimeOrigin } from "../host-clock.js";
+import { assertClockOptions, DocumentClock, documentTimeline, realClockSource } from "./document-clock.js";
 import {
   createSceneRenderer,
   engineCounters,
@@ -13,15 +15,20 @@ import {
 import {
   animationsForElement,
   createDOMAnimation,
+  CSSAnimation,
   CSSTransition,
+  removeReplacedAnimations,
   takePendingAnimations,
 } from "./animation.js";
-import { createEvent, dispatchEvent } from "./events.js";
+import { createEvent, dispatchEvent, SDAnimationPlaybackEvent } from "./events.js";
+import { scheduleFocusFixup } from "./input-activation.js";
 import { SandomViewport } from "./viewport.js";
 import { computeScrollbars, snapshotScrollbars } from "./scrollbars.js";
 import { paintScrollbars } from "./scrollbar-paint.js";
 import { assertScrollbarStyle, ScrollbarVisibility } from "./scrollbar-visibility.js";
 import { sampleScrollTimeline } from "./scroll-timeline.js";
+import { pageBox, pageCounters, pageMarginBoxes, parsePageRules, releasePageRules } from "./page-rules.js";
+import { PAGE_MARGIN_BOXES } from "../wasm/layout.js";
 import {
   NativeScrollCapture,
   NativeScrollCollection,
@@ -43,11 +50,11 @@ import { buildInteractionSnapshot } from "./presented-frame.js";
 import {
   keptTextGeometryFor,
   sameTextGeometryValues,
-  selectionRectanglesForText,
-  ShiftedTextGeometry,
+  selectionRectangles,
+  TextGeometryView,
   uniqueCaretStops,
 } from "./geometry.js";
-import { resolvedElementFields } from "./style.js";
+import { recordUnanimatedProperty, resolvedElementFields, resolvedOverflowAxes } from "./style.js";
 import {
   animationCSSInsertion,
   deferAnimationBinding,
@@ -57,18 +64,24 @@ import {
 import { normalizeOffsets } from "../animations.js";
 import { instantiate as instantiateMotionCapture } from "../wasm/motion-capture-binary.js";
 import { createFrameBindings } from "./dom-bindings.generated.js";
-import { flatTreeParent, shadowIncludingParent } from "./shadow.js";
+import { shadowIncludingParent } from "./shadow.js";
 
-// Rendered text in a shadow tree under the surface root is document text:
-// it paints in the flat tree, so it takes the text cursor and selection.
-function isShadowIncludingInclusiveDescendant(node, ancestor) {
-  for (let current = node; current !== null; current = shadowIncludingParent(current)) {
-    if (current === ancestor) return true;
-  }
-  return false;
+// A page of a page frame as surface.page describes it.
+function describePage({ index, name, side, blank, groups, box }) {
+  return {
+    index,
+    name,
+    side,
+    blank,
+    groups: Object.freeze(groups.map((group) => Object.freeze({ ...group }))),
+    width: box.width,
+    height: box.height,
+    margin: Object.freeze({ ...box.margin }),
+    area: Object.freeze({ ...box.area }),
+  };
 }
 
-// The same question for many nodes under one ancestor: a walk stops at the
+// Root membership for many nodes: a walk stops at the
 // first node an earlier walk passed, and every node it passes takes the
 // answer, so a frame's text owners cost one walk per distinct ancestor
 // rather than one per text operation.
@@ -101,18 +114,6 @@ const restyleRefusalCounters = Object.freeze({
   fragments: "geometryRestyleRefusedFragments",
 });
 
-const requestHostAnimationFrame =
-  typeof globalThis.requestAnimationFrame === "function"
-    ? globalThis.requestAnimationFrame.bind(globalThis)
-    : (callback) => setTimeout(() => callback(performance.now()), 0);
-const renderSurfaceNow = globalThis.performance.now.bind(
-  globalThis.performance,
-);
-const cancelHostAnimationFrame =
-  typeof globalThis.cancelAnimationFrame === "function"
-    ? globalThis.cancelAnimationFrame.bind(globalThis)
-    : (request) => clearTimeout(request);
-
 const MOTION_CLASSIFICATIONS = ["static", "finite", "unbounded", "external"];
 function freezeMotionValue(value) {
   if (Array.isArray(value)) {
@@ -129,38 +130,6 @@ function freezeMotionValue(value) {
     );
   }
   return value;
-}
-
-// Chrome 151's active selection background, measured through the oracle:
-// over white, rgb(46, 55, 100) and rgb(40, 160, 90) the selected band
-// composites to rgb(179, 215, 254), rgb(95, 135, 192) and rgb(93, 177, 188),
-// which is rgb(128, 188, 253) at alpha 153/255 (the platform highlight
-// blended with white) painted behind unchanged glyphs. The same colour
-// paints in <input> and <textarea>. An unfocused page paints
-// rgb(196, 196, 196) at the same alpha; a Sandom document has no inactive
-// window state, so its selection is always the active one.
-const DEFAULT_SELECTION_BACKGROUND = Object.freeze({
-  r: 128 / 255,
-  g: 188 / 255,
-  b: 253 / 255,
-  a: 153 / 255,
-});
-const DEFAULT_SELECTION_PAINT = Object.freeze({
-  background: DEFAULT_SELECTION_BACKGROUND,
-  color: null,
-});
-// The selection paint of text whose originating element is `element`: the
-// element's ::selection highlight when any rule on its chain declares a
-// background or colour, otherwise the default highlight over the text's
-// own colour. A null background paints no band; a null colour keeps the
-// glyphs' own.
-function selectionPaint(element) {
-  if (element?.nodeType !== 1) return DEFAULT_SELECTION_PAINT;
-  const highlight = element.ownerDocument._styleSystem.selectionHighlight(
-    element,
-  );
-  if (!highlight.authored) return DEFAULT_SELECTION_PAINT;
-  return { background: highlight.backgroundColor, color: highlight.color };
 }
 
 // The pseudo-class states whose change only restyles: the scene build
@@ -186,19 +155,6 @@ const SCENE_RESTYLE_REFUSALS = [
   "sceneRestyleRefusedContents",
   "sceneRestyleRefusedStructure",
 ];
-
-// A caret blinks, and the blink is the engine's, not a host timer: half a
-// second shown, half a second hidden, which is what every browser does
-// (Chrome's `kCaretBlinkInterval`). Activity restarts the cycle shown, so
-// the caret is never invisible at the moment it moves — a caret that
-// vanished mid-word would read as a dropped keystroke.
-const CARET_BLINK_MILLISECONDS = 500;
-function caretVisibleInPhase(anchorMilliseconds, timeMilliseconds) {
-  if (anchorMilliseconds === null) return true;
-  const elapsed = timeMilliseconds - anchorMilliseconds;
-  if (!(elapsed > 0)) return true;
-  return Math.floor(elapsed / CARET_BLINK_MILLISECONDS) % 2 === 0;
-}
 
 // Each presented frame's reading of the engine's layout work
 // (layout_compute_total) when its boxes were read; absent for a frame
@@ -270,7 +226,7 @@ function createMotionModel(surface) {
     if (animation.playState === "idle" || animation.playState === "finished") {
       continue;
     }
-    const timing = animation.effect.getTiming();
+    const timing = animation.effect.getComputedTiming();
     const keyframes = normalizeOffsets(animation._canonicalKeyframes);
     const propertyNames = [
       ...new Set(
@@ -784,6 +740,27 @@ function pixelsDifferInRectangles(previous, current, width, rectangles) {
   return false;
 }
 
+// Layout box kinds by the scene's box kind code (scene-build.watpart).
+const LAYOUT_BOX_KINDS = Object.freeze([
+  undefined, "element", "text", "anonymous inline", "::before text", "::after text",
+  "line feed", "form value", "placeholder", "list marker", "marker wrapper",
+  "contents root", "anonymous table box", "viewport", "::before", "::after",
+  "alternative text container", "broken image icon",
+  ...Array(14),
+  // Page boxes (32-48) and their text (64-80): the page-margin boxes in
+  // PAGE_MARGIN_BOXES order, then the page background.
+  ...PAGE_MARGIN_BOXES.map((name) => `@${name}`), "@page",
+  ...Array(15),
+  ...PAGE_MARGIN_BOXES.map((name) => `@${name} text`), "@page text",
+]);
+
+// What identifies a planned transition across reads: its endpoints and
+// timing. A read that plans the same transition again keeps its pending
+// CSSTransition.
+function transitionPlanKey({ definition, startValue, endValue }) {
+  return JSON.stringify([definition.duration, definition.delay, definition.easing, startValue, endValue]);
+}
+
 // The node at each scene row of a serialization, built once per index map:
 // every frame that reuses the scene (scroll-only, transform-only, clean)
 // shares the serialization's map and so shares this array. Frozen: it is
@@ -813,7 +790,6 @@ const SURFACE_OPTION_NAMES = new Set([
   "renderMode",
   "renderPrecision",
   "background",
-  "resolveResource",
   "presentFrame",
   "capturePaintArtifact",
   "textSelection",
@@ -826,17 +802,34 @@ const SURFACE_OPTION_NAMES = new Set([
   "scrollbarStyle",
 ]);
 
+// `now` and `requestFrame` are one clock (assertClockOptions). A surface
+// over a document whose clock is fixed runs on that clock: it takes it when
+// the caller supplies none, and refuses another one, so a page never reads
+// one clock while its surface renders on another.
+function surfaceClockSource(options, ownerDocument) {
+  const documentClock = ownerDocument?._clock ?? null;
+  if (documentClock === null) {
+    return options.now === undefined
+      ? { ...realClockSource, real: true }
+      : { now: options.now, requestFrame: options.requestFrame, cancelFrame: options.cancelFrame ?? (() => {}), real: false };
+  }
+  if (options.now !== undefined && options.now !== documentClock.source.now) {
+    throw new TypeError(
+      `render surface options: the document of this root runs on the ${documentClock.real ? "host's real clock" : "clock its host injected"}, and a surface over it runs on that clock; omit now, requestFrame and cancelFrame, or give the clock to the document when you create it (renderComponent, prepareRenderInput or createSandomDOM: now, requestFrame, cancelFrame, timeOrigin)`,
+    );
+  }
+  return { ...documentClock.source, real: documentClock.real };
+}
+
 class DOMRenderSurface {
   constructor(root, options = {}) {
     validateClosedRecord(options, SURFACE_OPTION_NAMES, "render surface options");
+    assertClockOptions(options, "render surface options");
     const {
       viewportWidth = 1280,
       viewportHeight = 720,
       deviceScale = 1,
       viewport = null,
-      now = () => performance.now(),
-      requestFrame = requestHostAnimationFrame,
-      cancelFrame = cancelHostAnimationFrame,
       // The persistent renderer shares the document runtime's scene
       // renderer (one WASM engine, glyph manager, and WebGPU device across
       // every surface of that runtime) with a per-surface renderer and
@@ -847,7 +840,6 @@ class DOMRenderSurface {
       renderMode = undefined,
       renderPrecision = undefined,
       background = undefined,
-      resolveResource = null,
       presentFrame = null,
       capturePaintArtifact = false,
       textSelection = true,
@@ -868,7 +860,7 @@ class DOMRenderSurface {
       // exact outline.
       textThickening = undefined,
       // "overlay" (the default) or "classic"
-      // (plans/PLAN-native-scrollbars.md, decision 1). An overlay bar takes
+      // (design/scrollbars.md, decision 1). An overlay bar takes
       // no layout space and shows only while the scroller moves or the
       // pointer is in it; a classic bar is always shown and takes its
       // thickness from the scroller's content box.
@@ -915,6 +907,7 @@ class DOMRenderSurface {
       }
       root = documentElement;
     }
+    const clock = surfaceClockSource(options, root.ownerDocument);
     this.viewport = viewport ?? new SandomViewport({
       width: viewportWidth,
       height: viewportHeight,
@@ -982,14 +975,31 @@ class DOMRenderSurface {
     // not: a stylesheet change reaches each one (SDDocument._invalidateStyles).
     this._document = surfaceDocument(root);
     (this._document._liveRenderSurfaces ??= new Set()).add(this);
-    this._now = now;
-    this._requestFrame = requestFrame;
-    this._cancelFrame = cancelFrame;
+    this._now = clock.now;
+    // A surface on the host's real clock lets the document's page timers
+    // arm a host timer instead of waiting for this surface's frames
+    // (src/dom/document-timers.js).
+    this._nowIsHostTime = clock.real;
+    this._requestFrame = clock.requestFrame;
+    this._cancelFrame = clock.cancelFrame;
     this._glyphResourceManager = glyphResourceManager;
     const sceneRendererRuntime = ownerDocument?._sandomSceneRendererRuntime ??
       null;
+    // A caller-supplied factory chooses its own device. Otherwise the
+    // renderer adopts the device the document's canvases already use (a
+    // WebGPU context's configured device, or the one a Canvas 2D toBlob()
+    // requested before the first paint), read when the renderer is created,
+    // as render-component does, so a canvas bitmap and the renderer that
+    // paints it are on one device. A document without one adopts the
+    // renderer's (_startPersistentRenderer).
+    const sceneRendererFactory = sceneRendererRuntime?.createSceneRenderer ??
+      createSceneRenderer;
     const persistentRendererFactory = createPersistentRenderer ??
-      sceneRendererRuntime?.createSceneRenderer ?? createSceneRenderer;
+      ((rendererOptions) =>
+        sceneRendererFactory({
+          ...rendererOptions,
+          graphicsDevice: this._document._preferredCanvasDevice ?? undefined,
+        }));
     const layoutScene = sceneRendererRuntime?.layoutTreeBoxes ??
       layoutTreeBoxes;
     this._engineCounters = sceneRendererRuntime?.engineCounters ??
@@ -1007,24 +1017,19 @@ class DOMRenderSurface {
       ...(glyphResourceManager === null ? {} : { glyphResourceManager }),
     });
     this._animationEventUnsubscribe = null;
-    this._persistentRendererPromise = initializePersistentRenderer
-      ? persistentRendererFactory({
-          width: this.viewport.width,
-          height: this.viewport.height,
-          deviceScale: this.viewport.deviceScale,
-          ...this._persistentRendererOptions,
-        }).then((renderer) => {
-          this._persistentRenderer = renderer;
-          this._animationEventUnsubscribe = renderer.onAnimationEvent(
-            (record) => this._dispatchEngineAnimationEvent(record),
-          );
-          return renderer;
-        })
-        : null;
-    this._resolveResource = resolveResource ?? ownerDocument?._resolveResource ?? null;
-    this.imageLoadFailures = new Map();
+    this._persistentRendererPromise = null;
+    if (initializePersistentRenderer) this._startPersistentRenderer(this.viewport);
+    // The surface demands images through its document's host resource
+    // session; it has no provider of its own.
+    this._resolveResource =
+      (root.nodeType === 9 ? root : ownerDocument)?._resolveResource ?? null;
+    // A broken image is a diagnostic of the render. Its error event is the
+    // DOM image loading's (src/dom/images.js), not the render's.
     this._onImageLoadError = ({ node, property, requestedURL, failure, error }) => {
-      if (error.cause instanceof InvalidResourceResponseError) {
+      if (
+        error.cause instanceof SandomHostError &&
+        error.cause.code === "invalid-host-response"
+      ) {
         throw error.cause;
       }
       // A ::before or ::after box has no element handle: its owner is the
@@ -1038,20 +1043,14 @@ class DOMRenderSurface {
         );
       if (!element) return;
       recordBrokenImageDiagnostic(element, node, property, requestedURL, failure, error);
-      if (property !== "src") return;
-      const previous = this.imageLoadFailures.get(element);
-      if (previous?.resourceIdentifier === node.resourceIdentifier) return;
-      this.imageLoadFailures.set(element, Object.freeze({
-        requestedURL,
-        resourceIdentifier: node.resourceIdentifier,
-        error,
-      }));
-      dispatchEvent(element, createEvent("error"));
     };
     this._capturePaintArtifact = capturePaintArtifact;
     this._textSelectionEnabled = Boolean(textSelection);
+    // Set when the presented text geometry carries a viewport offset the
+    // engine since clamped; the next frame rebuilds it.
+    this._textGeometryStale = false;
     this._touchPanning = touchPanning;
-    this._layoutTreeBoxes = async (scene, svgImageTimings = null) => {
+    this._layoutTreeBoxes = async (scene) => {
       this._stageCounters.layoutPasses++;
       // Over the tree this surface renders, under its own claim: the
       // engine relayouts only the rows whose records changed and keeps the
@@ -1061,7 +1060,6 @@ class DOMRenderSurface {
       const boxes = await layoutScene(scene, {
         resolveResource: this._resolveResource,
         onImageLoadError: this._onImageLoadError,
-        svgImageTimings,
         ...(engineWriteOwner === null ? {} : { engineWriteOwner }),
       });
       this._stageCounters.nodesLaidOut +=
@@ -1141,6 +1139,11 @@ class DOMRenderSurface {
       // frame that scrolls only the viewport shifts the reused geometry as
       // a whole and writes only its text controls' entries.
       translatedTextGeometryEntries: 0,
+      // The text geometry grouping's work: the text operations of the
+      // command stream it visited, and the text owners it asked the core
+      // for a scroll shift of.
+      textGeometryOperationsGrouped: 0,
+      textGeometryOwnersGrouped: 0,
       // Work counters, totals over the surface's frames. Restyles are the
       // core's element and pseudo-element records resolved during a frame;
       // scene rows those of the frame's scene builds, lowered rows those its
@@ -1200,21 +1203,27 @@ class DOMRenderSurface {
     this._elementAtIndex = [];
     this._computedSamples = root._domCore.status("computed_samples_create");
     this._lastBoxes = [];
+    // Paged media: the page index setPage() selected, or null for the
+    // continuous document; and the last rendered frame's page record.
+    this._page = null;
+    this._pageFrame = null;
+    // The page boxes of the last count, { key, boxes }, and whether the last
+    // page frame targeted another box than its page's.
+    this._pageBoxes = null;
+    this._pageTargetStale = false;
+    // The JSON of the page-margin boxes the DOM core holds.
+    this._pageMarginsKey = "null";
+    // The page index the last rendered frame requested.
+    this._renderedPage = null;
     this._presentedFrame = null;
     // The element whose cursor follows the document, and the value last
     // written there so an unchanged cursor is not re-assigned.
     this._cursorTarget = cursorTarget;
     this._appliedCursor = null;
-    // Caret blink: the time the current caret last became visible, the
-    // caret identity the anchor belongs to (element plus offset), and the
-    // phase the presented frame carries. A surface with a caret keeps
-    // waking so the phase can flip; nothing else about the document
-    // changes, so those frames reuse the retained scene.
-    this._caretBlinkAnchorMilliseconds = null;
-    this._caretBlinkElement = null;
-    this._caretBlinkOffset = -1;
-    this._caretBlinkVisible = true;
     this._preparedState = null;
+    // The box tree layoutTree() built, and the prepared frame it is for.
+    this._layoutTree = null;
+    this._layoutTreeFor = null;
     this._syncLayout = null;
     // Style-generation checkpoints (frame-incrementality): the style system
     // bumps its generation on EVERY DOM mutation and on stylesheet, font,
@@ -1260,6 +1269,11 @@ class DOMRenderSurface {
     this._anchoringSuppressionProperties = new NativeScrollSuppression(this, 1);
     this._positionSuppressionNodes = new NativeScrollSuppression(this, 2);
     this._forceFullInvalidation = false;
+    // A forced rebuild that also repaints the whole target. A structural
+    // mutation rebuilds the scene and owes only the damage the engine
+    // derives from its rows (the predecessor of each row pairs a moved
+    // row with its old place).
+    this._forceFullDamage = false;
     this._preservedScrollMetrics = null;
     // Visible-region rasterization (raster-scale plan, slice 3): the
     // CSS-px rectangle of the scene the raster target covers; null
@@ -1273,6 +1287,17 @@ class DOMRenderSurface {
     // The time the renderer last ticked the engine's tracks at: every
     // transition that time reached the end of has ended by then.
     this._transitionTickMilliseconds = null;
+    // The transitions that a read between frames (getAnimations()) found
+    // a style change to start, by element and property. Each is a pending
+    // CSSTransition until the next frame declares its track
+    // (_startStyleChangeAnimations, _registerStartedTransition). A
+    // cancelled one stays until then, so that the frame starts nothing in
+    // its place. The key holds the frame sequence and style generation
+    // that the transitions were planned for.
+    this._pendingTransitions = new Map();
+    this._pendingTransitionsKey = null;
+    // The pending transitions of the frame in progress.
+    this._frameHeldTransitions = null;
     this._animations = [];
     // Animations this surface adopted from a document's pending timeline
     // (element.animate() before any surface existed). They hold until the
@@ -1284,6 +1309,7 @@ class DOMRenderSurface {
     this._pendingScrollSources = new NativeScrollCollection(this, 0);
     this._pendingScrollEndTargets = new NativeScrollCollection(this, 1);
     this._capturingFrames = false;
+    this._advancingDocumentClock = false;
     this._pendingSnapOrigins = new NativeScrollCollection(this, 2);
     this._snappedTargets = new NativeScrollCollection(this, 3);
     this._snapCheckPending = false;
@@ -1297,9 +1323,14 @@ class DOMRenderSurface {
     this._smoothScrolls = new NativeScrollMotions(this);
     this._scrollbars = [];
     // Overlay scrollbar visibility on the surface clock (decision 2 of
-    // plans/PLAN-native-scrollbars.md). Each published descriptor carries
+    // design/scrollbars.md). Each published descriptor carries
     // the visibility it was painted with.
     this._scrollbarVisibility = new ScrollbarVisibility(this.scrollbarStyle);
+    // Tool overlay (an inspector's highlight): rectangles painted above
+    // the document and its scrollbars. `Rendered` is the list the last
+    // rendered frame painted.
+    this._toolHighlights = Object.freeze([]);
+    this._toolHighlightsRendered = this._toolHighlights;
     this._pendingAnimationDeclarations = [];
     this._animationFrameCore = root._domCore;
     this._animationFrameOwner = this._animationFrameCore.status(
@@ -1320,6 +1351,11 @@ class DOMRenderSurface {
     this._snapCheckOwed = true;
     if (root._renderSurfaces.size === 1) this._connectSubtree(root);
     this._schedule();
+    // The document's page timers now follow this surface's clock when it
+    // drives the document.
+    if (ownerDocument?._componentRenderSurface === this) {
+      ownerDocument._documentTimers?.driverChanged();
+    }
   }
 
   get root() {
@@ -1336,6 +1372,82 @@ class DOMRenderSurface {
 
   get elementAtIndex() {
     return this._elementAtIndex;
+  }
+
+  // The box tree of the last prepared frame, for inspection: one entry per
+  // layout box in tree order, as laid out. Each entry is { index, parent
+  // (an index, or -1), children (indices), kind, display, node (the DOM
+  // node the box comes from, the originating element of a ::before or
+  // ::after box, or null for an anonymous box), text (a text box's text),
+  // rect, content }. `kind` names the box: "element", "text", "anonymous
+  // inline", "::before", "::after", "::before text", "::after text", "line
+  // feed", "form value", "placeholder", "list marker", "marker wrapper",
+  // "contents root", "anonymous table box" or "viewport". `rect` and
+  // `content` are the border and content boxes in viewport CSS pixels of
+  // the frame as scrolled, without transforms. A text node's box takes the
+  // union of its glyph runs in the presented frame; generated text, which
+  // has no node of its own, has a null rect. The same frame returns the same
+  // frozen array.
+  layoutTree() {
+    const prepared = this._preparedState;
+    if (prepared === null) return Object.freeze([]);
+    if (this._layoutTreeFor === prepared) return this._layoutTree;
+    const { nodes } = prepared.serialized;
+    const boxes = this._lastBoxes;
+    const parents = new Array(nodes.length).fill(-1);
+    for (let index = 0; index < nodes.length; index++) {
+      for (const child of nodes[index].children ?? []) parents[child] = index;
+    }
+    const entries = new Array(nodes.length);
+    const frame = this._presentedFrame;
+    // Nodes on other pages have no geometry on this one.
+    const offPage = new Set(this._pageFrame?.offPageNodes ?? []);
+    for (let index = 0; index < nodes.length; index++) {
+      const node = nodes[index];
+      const box = offPage.has(index) ? null : boxes[index];
+      const parent = parents[index];
+      const kindCode = (node._coreBox ?? (node.display === "text" ? 2 : 0)) & 0xff;
+      const kind = LAYOUT_BOX_KINDS[kindCode];
+      if (kind === undefined) {
+        throw new Error(`layoutTree: box ${index} has kind ${kindCode}, which has no name; add it to LAYOUT_BOX_KINDS`);
+      }
+      let domNode = this._elementAtIndex[index] ?? null;
+      if (domNode === null && node.generatedOwnerIndex !== undefined) {
+        domNode = this._elementAtIndex[node.generatedOwnerIndex] ?? null;
+      }
+      const rectangle = (x, y, w, h) => Object.freeze({ x, y, width: w, height: h });
+      let rect = null;
+      let content = null;
+      if (node.display !== "text" || (domNode?.nodeType !== 3 && box && box.w > 0 && box.h > 0)) {
+        if (box) {
+          rect = rectangle(box.x, box.y, box.w, box.h);
+          content = rectangle(box.cx, box.cy, box.cw, box.ch);
+        }
+      } else if (domNode?.nodeType === 3 && frame !== null && domNode.length > 0) {
+        const runs = selectionRectangles(frame, [{ node: domNode, start: 0, end: domNode.length }]);
+        if (runs.length > 0) {
+          const left = Math.min(...runs.map((run) => run.x));
+          const top = Math.min(...runs.map((run) => run.y));
+          const right = Math.max(...runs.map((run) => run.x + run.width));
+          const bottom = Math.max(...runs.map((run) => run.y + run.height));
+          rect = content = rectangle(left, top, right - left, bottom - top);
+        }
+      }
+      entries[index] = Object.freeze({
+        index,
+        parent,
+        children: Object.freeze([...(node.children ?? [])]),
+        kind,
+        display: node.display,
+        node: domNode,
+        text: node.display === "text" ? node.text : null,
+        rect,
+        content,
+      });
+    }
+    this._layoutTreeFor = prepared;
+    this._layoutTree = Object.freeze(entries);
+    return this._layoutTree;
   }
 
   // The immutable presented-frame interaction snapshot for the last
@@ -1493,7 +1605,6 @@ class DOMRenderSurface {
       node._domCore.status("computed_samples_remove_node", this._computedSamples, node._coreHandle);
     }
     this._mutatedNodes.delete(node);
-    this.imageLoadFailures.delete(node);
     this._forcedGenerationNodes.delete(node);
     this._scrollAnchors.delete(node);
     for (const [container, state] of this._scrollAnchors) {
@@ -1581,6 +1692,7 @@ class DOMRenderSurface {
       (documentHasRenderingObservers(document) ? 16 : 0) |
       (this._pendingObserverDelivery ? 32 : 0) |
       (this._forceFullInvalidation ? 64 : 0) |
+      (this._forceFullDamage ? 262144 : 0) |
       (style !== undefined &&
           this._serializedStyleGeneration === style.generation &&
           this._serializedViewportWidth === this.viewport.width &&
@@ -1699,12 +1811,6 @@ class DOMRenderSurface {
 
   _recordMutation(kind, node, detail) {
     if (this._shutdown) throw new Error("render surface is shut down");
-    if (kind === "attribute") {
-      const failure = this.imageLoadFailures.get(node);
-      if (failure && node.getAttribute("src") !== failure.requestedURL) {
-        this.imageLoadFailures.delete(node);
-      }
-    }
     if (node && kind !== "selection") this._mutatedNodes.add(node);
     if (kind === "style" && detail === "transform" && node) {
       this._transformOnlyMutations.add(node);
@@ -1785,6 +1891,37 @@ class DOMRenderSurface {
       ) changed.push(target);
       if (!scrollRead(target, 5)) this._pendingScrollSources.delete(target);
     }
+    // A viewport no request moved this frame can still lose scroll range:
+    // new content, a resize. Its presented box carries the engine's
+    // clamped offset, which is what painted. Accept it, so scrollTop and
+    // the next input step use that offset, and render again: this frame's
+    // text and caret geometry, which pointer selection hit-tests, was built
+    // at the old offset.
+    const viewport = this.viewport;
+    const viewportBox = requestGenerations.has(viewport)
+      ? null
+      : effectiveBoxes[serialized.viewportIndex];
+    if (
+      viewportBox && viewport._scrollState &&
+      (viewportBox.scrollLeft !== scrollRead(viewport, 2) ||
+        viewportBox.scrollTop !== scrollRead(viewport, 3)) &&
+      scrollCore(viewport).status(
+        "scroll_accept",
+        scrollState(viewport),
+        scrollRead(viewport, 7),
+        viewportBox.scrollLeft,
+        viewportBox.scrollTop,
+      )
+    ) {
+      changed.push(viewport);
+      this._dirty = true;
+      this._textGeometryStale = true;
+      // Re-emit every row, so the rebuild frame captures every text
+      // operation; a replayed emission captures none.
+      this._forceFullInvalidation = true;
+      this._forceFullDamage = true;
+      this._schedule();
+    }
     return changed;
   }
 
@@ -1845,6 +1982,31 @@ class DOMRenderSurface {
       record?.onDiscard?.();
     }
     core.status("animation_frame_checkpoint_release", owner, checkpoint);
+  }
+
+  // "Update animations and send events" (HTML, the rendering steps of a
+  // frame, before its animation frame callbacks): the replaced script
+  // animations leave the effect stack, and each fires `remove` (Web
+  // Animations 1, section 5.5), in composite order.
+  _updateAnimationsAndSendEvents(timeMilliseconds) {
+    if (this._shutdown) return;
+    const removed = removeReplacedAnimations(this._animations, timeMilliseconds);
+    if (removed.length === 0) return;
+    const timelineTime = documentTimeline(this._root.ownerDocument)?.currentTime ?? null;
+    const events = removed.map((animation) => {
+      const currentTime = animation._core.status("animation_value", animation._animationId, 0, timeMilliseconds);
+      return new SDAnimationPlaybackEvent("remove", {
+        currentTime: Number.isNaN(currentTime) ? null : currentTime,
+        timelineTime,
+      });
+    });
+    for (let index = 0; index < removed.length; index++) {
+      try {
+        dispatchEvent(removed[index], events[index]);
+      } catch (error) {
+        this._reportBackgroundException(error);
+      }
+    }
   }
 
   _runDocumentAnimationFrameCheckpoint(timeMilliseconds) {
@@ -1946,6 +2108,7 @@ class DOMRenderSurface {
     });
     ownerDocument?._reevaluateMediaQueryLists?.();
     this._forceFullInvalidation = true;
+    this._forceFullDamage = true;
     this._pendingScrollSources.set(this.viewport, "resize");
     this._dirty = true;
     this._schedule();
@@ -1983,8 +2146,150 @@ class DOMRenderSurface {
       height: Number(rectangle.height),
     };
     this._forceFullInvalidation = true;
+    this._forceFullDamage = true;
     this._dirty = true;
     this._schedule();
+  }
+
+  /** Tool overlay: paints `rectangles` above the document and its
+   * scrollbars, as a browser's developer tools paint their highlight. Each
+   * is { x, y, width, height, color: { r, g, b, a } } in viewport CSS
+   * pixels, colour channels 0 to 1. An empty list paints none.
+   */
+  setToolHighlights(rectangles) {
+    if (!Array.isArray(rectangles)) {
+      throw new TypeError(`setToolHighlights takes an array of rectangles, not ${typeof rectangles}`);
+    }
+    this._toolHighlights = Object.freeze(rectangles.map((rectangle, index) => {
+      const { x, y, width, height, color } = rectangle ?? {};
+      if (![x, y, width, height, color?.r, color?.g, color?.b, color?.a].every(Number.isFinite)) {
+        throw new TypeError(
+          `setToolHighlights rectangle ${index} needs finite x, y, width, height and color { r, g, b, a }: ${JSON.stringify(rectangle)}`,
+        );
+      }
+      return Object.freeze({ x, y, width, height, color: Object.freeze({ r: color.r, g: color.g, b: color.b, a: color.a }) });
+    }));
+    this._dirty = true;
+    this._schedule();
+  }
+
+  /** Paged media: lays the document out in pages the size of the
+   * viewport and shows page `index` (0 for the first). null shows the
+   * continuous document. The engine decides every break
+   * (design/fragmentation.md); `page` reports whether a later page follows.
+   */
+  setPage(index) {
+    if (this._shutdown) throw new Error("render surface is shut down");
+    if (index !== null && !(Number.isInteger(index) && index >= 0)) {
+      throw new RangeError(`setPage needs a page index of 0 or more, or null; got ${index}`);
+    }
+    if (index === this._page) return;
+    // Entering or leaving paged media changes how the viewport scrolls and
+    // takes a full frame. Another page of a paged document reuses the
+    // retained scene (frame mode 3): the renderer keeps the rows the engine
+    // holds and seeks the page from the starts it recorded while it counted
+    // the pages. The presented frame shows another page, so it is not
+    // delivered again (_retainedDeliveryPossible).
+    if ((index === null) !== (this._page === null)) {
+      this._forceFullInvalidation = true;
+      this._forceFullDamage = true;
+    }
+    this._page = index;
+    this._dirty = true;
+    this._schedule();
+  }
+
+  /** The page the last frame showed, or null for a continuous frame:
+   * { index, count, name, side, blank, groups, width, height, margin, area }.
+   * count is the document's page count; name the page's name (CSS Paged
+   * Media 3, 7.1; "" for the unnamed page); side "right" or "left" (the
+   * first page is a right page); blank whether the page is left blank for a
+   * side break; groups the page groups the page is in (CSS Generated Content
+   * for Paged Media 3, 3.2), outermost first, each { name, position } with
+   * the page's position in it from 1. width and height are the page box's size from the
+   * document's @page rules (the viewport's when it declares none), margin
+   * its page margins and area the page area inside them, where the page's
+   * content lays out; all in CSS pixels. The frame's target is the page
+   * box. */
+  get page() {
+    if (this._pageFrame === null) return null;
+    return Object.freeze({ ...describePage(this._pageFrame), count: this._pageFrame.count });
+  }
+
+  /** Every page of the last page frame's count, in order, each as `page`
+   * describes the page shown, without count; or null for a continuous
+   * frame. */
+  get pages() {
+    if (this._pageFrame === null) return null;
+    return Object.freeze(this._pageFrame.pages.map((page) => Object.freeze(describePage(page))));
+  }
+
+  // The document's @page rules for a page frame: parsed rules, a key that
+  // changes with them and with the default page size, and that size (the
+  // viewport's).
+  _pageRules(defaultSize) {
+    const rules = this._root.ownerDocument?._styleSystem?.pageRules() ?? [];
+    const key = JSON.stringify([defaultSize.width, defaultSize.height, rules]);
+    if (this._pageRuleCache?.key !== key) {
+      const next = { rules: parsePageRules(rules), key, defaultSize };
+      if (this._pageRuleCache) releasePageRules(this._pageRuleCache.rules);
+      this._pageRuleCache = next;
+    }
+    return this._pageRuleCache;
+  }
+
+  // The raster region of a page frame: the page box, with the page area's
+  // origin at the box's margins. The box is the one the last count gave the
+  // page under the same rules; a page not counted yet takes its box from
+  // its index alone, and a frame whose page box then differs renders again
+  // (_pageTargetStale).
+  _pageTargetRegion(index, pageRules) {
+    const counted = this._pageBoxes !== null && this._pageBoxes.key === pageRules.key
+      ? this._pageBoxes.pages[Math.min(index, this._pageBoxes.pages.length - 1)].box
+      : undefined;
+    const box = counted ?? pageBox(pageRules.rules, {
+      index,
+      name: "",
+      side: index % 2 === 0 ? "right" : "left",
+      blank: false,
+    }, pageRules.defaultSize);
+    return { x: -box.margin.left, y: -box.margin.top, width: box.width, height: box.height };
+  }
+
+  // The page boxes of page `index` (src/dom/page-rules.js pageMarginBoxes:
+  // its page-margin boxes and page background), or null for a continuous
+  // frame or a page that generates none. The page, its box and its
+  // counters come from the last count under the same rules; a page not
+  // counted yet takes its description from its index alone and the count
+  // from the index, and the frame then renders again (_pageTargetStale).
+  _pageMarginBoxesFor(index, defaultSize) {
+    if (index === null) return null;
+    const pageRules = this._pageRules(defaultSize);
+    const pages = this._pageBoxes !== null && this._pageBoxes.key === pageRules.key
+      ? this._pageBoxes.pages
+      : Array.from({ length: index + 1 }, (_, pageIndex) => ({
+        index: pageIndex,
+        name: "",
+        side: pageIndex % 2 === 0 ? "right" : "left",
+        blank: false,
+      }));
+    const page = pages[Math.min(index, pages.length - 1)];
+    const counters = pageCounters(pageRules.rules, pages);
+    const boxes = pageMarginBoxes(pageRules.rules, page, { page: counters.values[page.index], pages: counters.pages },
+      page.box ?? pageBox(pageRules.rules, page, pageRules.defaultSize));
+    return boxes.every((box) => box.content === "none") ? null : boxes;
+  }
+
+  // Gives the DOM core the margin boxes `boxes` of this surface's root
+  // (null for none). A paged surface gives them at every frame, as another
+  // paged surface on the same core replaces them; the core skips a repeat.
+  // Returns whether they differ from the ones this surface gave last.
+  _applyPageMargins(core, boxes) {
+    const key = JSON.stringify(boxes);
+    if (boxes !== null || key !== this._pageMarginsKey) core.setPageMargins(this._root._coreHandle, boxes);
+    if (key === this._pageMarginsKey) return false;
+    this._pageMarginsKey = key;
+    return true;
   }
 
   get _scrollMomentum() {
@@ -2020,37 +2325,22 @@ class DOMRenderSurface {
     return node ? this._root._domCore.wrapperFor(node) : this.viewport;
   }
 
-  _beginScrollInteraction(target) {
-    this._root._domCore.status(
-      "scroll_interaction",
-      this._scrollOwner,
-      target._coreHandle ?? 0n,
-      1,
-    );
-  }
-
-  _endScrollInteraction() {
-    this._root._domCore.status("scroll_interaction", this._scrollOwner, 0n, 0);
-    this._schedule();
-  }
-
-  _startScrollMomentum(target, velocityX, velocityY, timeMilliseconds) {
-    const core = this._root._domCore;
-    core.status(
-      "scroll_presented",
-      this._scrollOwner,
-      this._presentedFrame?.geometryHandle ?? 0n,
-    );
-    const active = !!core.status(
-      "scroll_momentum",
-      this._scrollOwner,
-      target._coreHandle ?? 0n,
-      velocityX,
-      velocityY,
-      timeMilliseconds,
-    );
-    this._dirty ||= active;
-    this._schedule();
+  // An input run executed scroll action `action` on this surface's scroll
+  // owner (src/dom-wasm/input-run.watpart state 9): 7 chain and 11
+  // scrollbar, which owe a frame and a snap check when they moved; 9 the
+  // end of an interaction; 10 momentum, which owes frames while it runs.
+  _inputScrolled(action, changed) {
+    if (action === 7 || action === 11) {
+      if (!changed) return;
+      this._snapCheckPending = true;
+      this._dirty = true;
+      this._schedule();
+    } else if (action === 9) {
+      this._schedule();
+    } else if (action === 10) {
+      this._dirty ||= changed;
+      this._schedule();
+    }
   }
 
   _interruptScrolling() {
@@ -2081,8 +2371,24 @@ class DOMRenderSurface {
           serialized.nodes[index].scrollTop = request.top;
           if (target !== this.viewport) this._mutatedNodes.add(target);
         }
+        this._restateScroll(serialized, capturedScrollRequests);
         return true;
       },
+    );
+  }
+
+  // The core's copy of a restatement: the publication's scroll record takes
+  // the capture's requested offsets on the same rows, and `serialized`
+  // names the row revision its rows now hold. A scene made from it passes
+  // that revision to engine_direct_publish_scene; a scene made before a
+  // later restatement holds other rows and goes through the host encoder.
+  _restateScroll(serialized, capturedScrollRequests) {
+    const publication = serialized.nodes[0]?._corePublication;
+    if (publication === undefined) return;
+    serialized.rowRevision = publication.core.status(
+      "engine_record_scroll_restate",
+      publication.handle,
+      capturedScrollRequests.handle,
     );
   }
 
@@ -2090,7 +2396,7 @@ class DOMRenderSurface {
     const core = this._root._domCore;
     const focused = this._root._activeElement;
     const focusedHandle =
-      focused && (focused.tag === "input" || focused.tag === "textarea")
+      focused && (focused.localName === "input" || focused.localName === "textarea")
         ? focused._coreHandle
         : 0n;
     if (geometryHandle) {
@@ -2215,7 +2521,13 @@ class DOMRenderSurface {
   // blink phase can flip; the frame that flips it changes nothing that
   // feeds serialization, so it reuses the retained scene.
   _caretBlinkActive() {
-    return this._caretBlinkElement !== null;
+    return (this._frameCore.status("frame_caret_state", this._frameOwner, 0) & 1) !== 0;
+  }
+
+  _caretBlinkDue(timeMilliseconds) {
+    return (this._frameCore.status(
+      "frame_caret_state", this._frameOwner, timeMilliseconds,
+    ) & 2) !== 0;
   }
 
   // The CSS cursor the engine resolves at a document point, written to the
@@ -2259,6 +2571,7 @@ class DOMRenderSurface {
     if (
       this._frameTransaction ||
       !this._running || this._shutdown || this._rendering ||
+      this._advancingDocumentClock ||
       (!this._animationFrameCore.status(
         "animation_frame_pending",
         this._animationFrameOwner,
@@ -2268,48 +2581,126 @@ class DOMRenderSurface {
         !this._scrollbarVisibility.active &&
         ((this._pendingScrollEndTargets.size === 0 &&
           !this._snapCheckPending) ||
-          this._scrollInteractionActive)) ||
+          this._scrollInteractionActive) &&
+        !this._documentTimersAwaitFrame()) ||
       this._frameRequest !== null
     ) return;
     this._frameRequest = this._requestFrame((timeMilliseconds) => {
       this._frameRequest = null;
       const frameTimeMilliseconds = timeMilliseconds ?? this._now();
-      // Native snapshots detach before invoking. Exceptions still reach the
-      // realm sink without preventing the remaining callbacks or the render.
-      this._runDocumentAnimationFrameCheckpoint(frameTimeMilliseconds);
-      if (
-        this._caretBlinkActive() &&
-        caretVisibleInPhase(
-            this._caretBlinkAnchorMilliseconds,
-            frameTimeMilliseconds,
-          ) !== this._caretBlinkVisible
-      ) {
-        this._dirty = true;
-      }
-      // An overlay bar that starts or continues to fade, or a pointer that
-      // entered or left a bar, changes the overlay without a DOM change.
-      if (
-        this._scrollbarVisibility.due(this._scrollbars, frameTimeMilliseconds)
-      ) {
-        this._dirty = true;
-      }
-      if (!this._dirty) {
-        if (this._applyScrollSnapping()) return null;
-        this._flushScrollEndEvents();
-        this._schedule();
-        return null;
-      }
-      const forceStateDelivery = this._forceStateDelivery;
-      this._forceStateDelivery = false;
-      // Nothing awaits a loop-scheduled render (the host animation frame
-      // discards this return value), so a rejection here is otherwise an
-      // unobserved promise rejection: a crash in Deno, silence in a
-      // browser worker. Route it to the exception sink.
-      return this._renderOpportunity(
-        frameTimeMilliseconds,
-        forceStateDelivery,
-      ).catch((error) => this._reportBackgroundException(error));
+      // The page timers that are due by the frame's time are tasks, and
+      // tasks run before the frame's rendering steps.
+      const advancing = this._advanceDocumentClock(frameTimeMilliseconds);
+      if (advancing === null) return this._frame(frameTimeMilliseconds);
+      this._advancingDocumentClock = true;
+      return advancing
+        .finally(() => {
+          this._advancingDocumentClock = false;
+        })
+        .then(() => this._shutdown ? null : this._frame(frameTimeMilliseconds))
+        .catch((error) => this._reportBackgroundException(error));
     });
+  }
+
+  // The rendering steps of one loop-scheduled frame.
+  _frame(frameTimeMilliseconds) {
+    // The style update at the start of a frame checks the focus (focus
+    // fixup, input-activation.js), before the animation frame callbacks.
+    scheduleFocusFixup(this._root);
+    // Native snapshots detach before invoking. Exceptions still reach the
+    // realm sink without preventing the remaining callbacks or the render.
+    this._updateAnimationsAndSendEvents(frameTimeMilliseconds);
+    this._runDocumentAnimationFrameCheckpoint(frameTimeMilliseconds);
+    if (this._caretBlinkDue(frameTimeMilliseconds)) {
+      this._dirty = true;
+    }
+    // An overlay bar that starts or continues to fade, or a pointer that
+    // entered or left a bar, changes the overlay without a DOM change.
+    if (
+      this._scrollbarVisibility.due(this._scrollbars, frameTimeMilliseconds)
+    ) {
+      this._dirty = true;
+    }
+    if (!this._dirty) {
+      if (this._applyScrollSnapping()) return null;
+      this._flushScrollEndEvents();
+      this._schedule();
+      return null;
+    }
+    const forceStateDelivery = this._forceStateDelivery;
+    this._forceStateDelivery = false;
+    // Nothing awaits a loop-scheduled render (the host animation frame
+    // discards this return value), so a rejection here is otherwise an
+    // unobserved promise rejection: a crash in Deno, silence in a
+    // browser worker. Route it to the exception sink.
+    // A frame that fails leaves the surface dirty, so the loop would render
+    // and fail again every frame. After three failures in a row the loop
+    // stops and reports why; start() resumes it.
+    return this._renderOpportunity(
+      frameTimeMilliseconds,
+      forceStateDelivery,
+    ).then((result) => {
+      this._failedLoopFrames = 0;
+      return result;
+    }, (error) => {
+      this._failedLoopFrames = (this._failedLoopFrames ?? 0) + 1;
+      if (this._failedLoopFrames >= 3) {
+        this._failedLoopFrames = 0;
+        this.stop();
+        this._reportBackgroundException(new Error(
+          `The render surface stopped its frame loop after 3 failed frames in a row; call start() after fixing the cause. Last failure: ${error?.message ?? error}`,
+          { cause: error },
+        ));
+        return;
+      }
+      this._reportBackgroundException(error);
+    });
+  }
+
+  // The document clock of this surface's own clock, for a document that
+  // fixes its clock while this surface drives it (fixDocumentClock).
+  _clockForDocument() {
+    return new DocumentClock({
+      now: this._now,
+      requestFrame: this._requestFrame,
+      cancelFrame: this._cancelFrame,
+      timeOrigin: this._nowIsHostTime ? hostTimeOrigin : 0,
+      real: this._nowIsHostTime,
+    });
+  }
+
+  // Whether this surface's frames drive the document's page: it is the
+  // document's surface, and it runs on the document's clock.
+  _drivesDocumentClock() {
+    const document = this._root.ownerDocument;
+    return document?._componentRenderSurface === this &&
+      (!document._clock || document._clock.source.now === this._now);
+  }
+
+  // Whether this surface's frames come now: its loop runs, or a capture
+  // samples. While they do not, the document's page timers ask the
+  // document clock's frame source for frames themselves.
+  _framesAdvanceDocumentClock() {
+    return !this._shutdown && (this._running || this._capturingFrames);
+  }
+
+  // A frame or capture sample of this surface at `timeMilliseconds`: when it
+  // drives the document, the document's time reaches the frame's time, and
+  // the page timers due by then run first. Null when none is due, else a
+  // promise that settles after they ran.
+  _advanceDocumentClock(timeMilliseconds) {
+    if (!this._drivesDocumentClock()) return null;
+    const document = this._root.ownerDocument;
+    document._clock?.frame(timeMilliseconds);
+    return document._documentTimers?.advance() ?? null;
+  }
+
+  // An injected clock advances only through frames, so while this surface
+  // drives the document, a pending page timer keeps a frame requested.
+  _documentTimersAwaitFrame() {
+    const document = this._root.ownerDocument;
+    return document?._clock?.real === false && this._drivesDocumentClock() &&
+      (document._documentTimers?.hasPending ?? false);
   }
 
   // Background exceptions (animation-frame callbacks, loop-scheduled
@@ -2345,8 +2736,8 @@ class DOMRenderSurface {
   // does not already cover changed: no host-state/selection/canvas
   // consequence, no mutated or forced-generation node, no animation or
   // transition sampling this frame, the same resources, the same capture
-  // requirements, and a retained raster result to re-deliver. A pixel
-  // capture and a staged transaction always render.
+  // requirements, the same page, and a retained raster result to
+  // re-deliver. A pixel capture and a staged transaction always render.
   _retainedDeliveryPossible(
     cleanSceneReuse,
     pixelReadback,
@@ -2359,6 +2750,9 @@ class DOMRenderSurface {
     const rendered = this._lastRendered;
     const presented = this._presentedFrame;
     return cleanSceneReuse && !pixelReadback &&
+      this._renderedPage === this._page &&
+      !this._pageTargetStale &&
+      this._toolHighlightsRendered === this._toolHighlights &&
       this._frameTransaction === null &&
       rendered !== null && presented !== null &&
       this._lastDeliveredFrame !== null &&
@@ -2409,12 +2803,20 @@ class DOMRenderSurface {
   // of a transition that has not progressed has no duration left, and it
   // starts and ends in the tick of the frame that declares it. Its
   // CSSTransition takes over the track the renderer declared; the
-  // transitions one frame declares share a transition generation.
+  // transitions one frame declares share a transition generation. A
+  // pending CSSTransition that a read created for the same change is that
+  // object; when a script cancelled it, the change starts no transition.
   _registerStartedTransition(transition) {
     const element = this._eventElementAtIndex[transition.nodeIndex];
     if (!element) return;
     this._transitionTimings.get(element)?.get(transition.propertyName)?.animation
       ?._settleReplaced();
+    const held = this._frameHeldTransitions?.get(element)?.get(transition.propertyName);
+    this._frameHeldTransitions?.get(element)?.delete(transition.propertyName);
+    if (held?.playState === "idle") {
+      transition.engineHandle.cancelSilently();
+      return;
+    }
     const timing = {
       duration: transition.duration,
       delay: transition.delay,
@@ -2426,14 +2828,391 @@ class DOMRenderSurface {
       animationId: transition.animationId,
       engineHandle: transition.engineHandle,
     };
-    timing.animation = new CSSTransition(
-      this,
-      element,
-      transition.propertyName,
-      timing,
-      this._frameSequence,
-    );
+    if (held === undefined) {
+      timing.animation = new CSSTransition(
+        this,
+        element,
+        transition.propertyName,
+        timing,
+        this._frameSequence,
+      );
+    } else {
+      timing.animation = held;
+      held._adoptDeclaredTrack(timing, this._frameSequence);
+    }
     this._registerTransitionAnimation(timing.animation);
+    // css-transitions-1 section 6.1: a created transition reports
+    // transitionrun, with the time its delay skipped.
+    dispatchEvent(element, createEvent("transitionrun", {
+      bubbles: true,
+      propertyName: transition.propertyName,
+      elapsedTime: Math.min(Math.max(-transition.delay, 0), transition.duration) / 1000,
+      pseudoElement: "",
+    }));
+  }
+
+  // The identity and timing that the frame declares the track of a pending
+  // CSSTransition with: the transition's start time resolves at this
+  // frame (Web Animations 1, section 4.4.4), and the track runs at the
+  // start time, playback rate and generation that the object then holds.
+  // Null when no running pending transition holds the change.
+  _heldTransitionDeclaration(nodeIndex, propertyName) {
+    const element = this._eventElementAtIndex[nodeIndex];
+    const animation = element ? this._frameHeldTransitions?.get(element)?.get(propertyName) : undefined;
+    if (animation === undefined || animation.playState === "idle") return null;
+    animation._resolveTimeline();
+    return {
+      animationId: animation._animationId,
+      trackGeneration: animation._value(5),
+      timing: {
+        startTime: animation._value(6),
+        duration: animation._value(7),
+        delay: animation._value(8),
+        direction: animation._value(9) ? "reverse" : "normal",
+      },
+    };
+  }
+
+  // A read between frames that reports animations (getAnimations())
+  // updates the style first, as Chrome does: the CSS animations and the
+  // transitions that the style change since the last frame starts exist
+  // from then on, and stay pending until the next frame starts them.
+  _startStyleChangeAnimations() {
+    if (this._shutdown || this._rendering) return;
+    const styleSystem = this._root.ownerDocument?._styleSystem;
+    if (!styleSystem) return;
+    this._prepareStyleSystem(styleSystem);
+    this._synchronizeCSSAnimations(this._frameCore, styleSystem, null);
+    this._planPendingTransitions(styleSystem);
+  }
+
+  // Multi-environment coexistence: serialization and style-driven
+  // animation sync read styles under THIS surface's viewport environment.
+  // setEnvironment bumps the style generation only on an actual change,
+  // so the single-surface path stays free.
+  _prepareStyleSystem(styleSystem) {
+    styleSystem.setEnvironment({
+      viewportWidth: this.viewport.width,
+      viewportHeight: this.viewport.height,
+      scrollbarStyle: this.scrollbarStyle,
+    });
+    // Answered before any element of the update resolves, and before the
+    // style generation is sampled (answers can advance it).
+    styleSystem.answerDeclaredFontFamilies(this._root);
+  }
+
+  // The animation-definition reconciliation resolves definitions for the
+  // elements whose cascade names an animation. Its inputs are exactly the
+  // style system's cascade output plus tree membership, and every change
+  // to either bumps the style generation - the same key the per-element
+  // resolution cache trusts. An unchanged generation owes no scan.
+  // Recorded BEFORE the scan: a scan whose side effects mutate the DOM
+  // re-scans next frame. The core lists the candidates
+  // (animation_candidates: a native walk over its resolved records); an
+  // element that stopped being one has its animations cancelled here,
+  // exactly as an empty definition list would. Without a @keyframes rule
+  // in the root's scope no element has a definition, so the walk, which
+  // resolves every element, is skipped and every element counts as a
+  // non-candidate. A frame passes its time; a read between frames passes
+  // null: its CSS animations are pending (_createAnimation), and its
+  // ::before and ::after content animations start at the next frame.
+  _synchronizeCSSAnimations(core, styleSystem, timeMilliseconds) {
+    if (this._animationSyncStyleGeneration === styleSystem.generation) return;
+    this._animationSyncStyleGeneration = styleSystem.generation;
+    core.mediaEnvironmentSet(styleSystem.environment);
+    const declaresKeyframes = styleSystem.declaresKeyframes(this._root);
+    const activeElements = new Set(
+      declaresKeyframes
+        ? core.animationCandidates(this._root._coreHandle, 0)
+        : [],
+    );
+    // Resolving natively can raise font-family requests; answering them
+    // bumps the style generation, which must land before serialization
+    // samples its checkpoint or the next frame re-serializes for nothing.
+    styleSystem.answerFontFamilyRequests();
+    for (const [element, records] of this._cssAnimations) {
+      if (activeElements.has(element)) continue;
+      for (const record of records) record.animation.cancel();
+      this._cssAnimations.delete(element);
+    }
+    for (const element of activeElements) {
+      const previousRecords = this._cssAnimations.get(element) ?? [];
+      const desiredDefinitions = reconcileAnimationDefinitions(
+        styleSystem.animationDefinitions(element),
+        previousRecords,
+      );
+      const previousAnimationIndices = new Map(
+        previousRecords.map((record) => [
+          record.identity,
+          this._animations.indexOf(record.animation),
+        ]),
+      );
+      const reusableByIdentity = new Map();
+      for (const desired of desiredDefinitions) {
+        if (desired.reusable) {
+          reusableByIdentity.set(desired.identity, desired.reusable);
+        }
+      }
+      for (const previous of previousRecords) {
+        if (reusableByIdentity.get(previous.identity) !== previous) {
+          previous.animation.cancel();
+        }
+      }
+
+      const nextRecords = [];
+      for (
+        let definitionIndex = 0;
+        definitionIndex < desiredDefinitions.length;
+        definitionIndex++
+      ) {
+        const desired = desiredDefinitions[definitionIndex];
+        const reusable = reusableByIdentity.get(desired.identity);
+        if (reusable) {
+          nextRecords.push(reusable);
+          continue;
+        }
+        const followingReusableRecords = desiredDefinitions.slice(
+          definitionIndex + 1,
+        ).map((following) => reusableByIdentity.get(following.identity))
+          .filter(Boolean);
+        const followingAnimationIndex = followingReusableRecords.length > 0
+          ? this._animations.indexOf(
+            followingReusableRecords[0].animation,
+          )
+          : -1;
+        const precedingAnimationIndex = nextRecords.length > 0
+          ? this._animations.indexOf(nextRecords.at(-1).animation)
+          : -1;
+        const previousAnimationIndex = previousAnimationIndices.get(
+          desired.identity,
+        );
+        const firstPreviousAnimationIndex = previousAnimationIndices.size >
+            0
+          ? Math.min(...previousAnimationIndices.values())
+          : this._animations.length;
+        const insertionIndex = animationCSSInsertion(
+          followingAnimationIndex,
+          precedingAnimationIndex,
+          previousAnimationIndex,
+          firstPreviousAnimationIndex,
+          this._animations.length,
+        );
+        const animation = this._createAnimation(
+          element,
+          desired.definition.keyframes,
+          {
+            ...desired.definition.timing,
+            composite: desired.definition.composition,
+          },
+          {
+            insertionIndex,
+            beforeEngineHandles: followingReusableRecords.map((record) =>
+              record.animation._engineHandle
+            ),
+            diagnosticAnimationName: desired.definition.name,
+            implicitKeyframe: desired.definition.implicitKeyframe,
+          },
+        );
+        animation._cascadingStyleSheetsAnimationIdentity = desired.identity;
+        if (desired.definition.paused) animation.pause();
+        nextRecords.push({
+          ...desired,
+          animation,
+        });
+      }
+      for (
+        let recordIndex = 0;
+        recordIndex < nextRecords.length;
+        recordIndex++
+      ) {
+        nextRecords[recordIndex].animation._engineDeclarationOptions
+          .beforeEngineHandles = nextRecords.slice(recordIndex + 1).map(
+            (record) => record.animation._engineHandle,
+          );
+      }
+      if (nextRecords.length === 0) {
+        this._cssAnimations.delete(element);
+        continue;
+      }
+      const cascadingStyleSheetsAnimationSlots = [];
+      for (
+        let animationIndex = 0;
+        animationIndex < this._animations.length;
+        animationIndex++
+      ) {
+        const animation = this._animations[animationIndex];
+        if (
+          animation._element === element &&
+          animation._cascadingStyleSheetsAnimationIdentity !== undefined
+        ) {
+          cascadingStyleSheetsAnimationSlots.push(animationIndex);
+        }
+      }
+      for (
+        let recordIndex = 0;
+        recordIndex < nextRecords.length;
+        recordIndex++
+      ) {
+        this._animations[cascadingStyleSheetsAnimationSlots[recordIndex]] =
+          nextRecords[recordIndex].animation;
+      }
+      this._cssAnimations.set(element, nextRecords);
+    }
+
+    const nextPseudoContentAnimations = new Map();
+    for (const pseudoElement of ["::before", "::after"]) {
+      if (!declaresKeyframes) break;
+      for (
+        const element of core.animationCandidates(
+          this._root._coreHandle,
+          pseudoElement === "::before" ? 1 : 2,
+        )
+      ) {
+        const contentDefinitions = styleSystem.animationDefinitions(
+          element,
+          pseudoElement,
+        ).filter((definition) => {
+          const propertyNames = new Set(
+            definition.keyframes.flatMap((keyframe) =>
+              Object.keys(keyframe).filter((name) =>
+                name !== "offset" && name !== "easing" &&
+                name !== "composite"
+              )
+            ),
+          );
+          return propertyNames.size === 1 && propertyNames.has("content");
+        });
+        if (contentDefinitions.length === 0) continue;
+        const unsupportedContentDefinition = contentDefinitions.find((
+          definition,
+        ) => definition.composition !== "replace");
+        if (unsupportedContentDefinition) {
+          const cause = new TypeError(
+            "content only supports replace composition",
+          );
+          throw new TypeError(
+            `CSS animation "${unsupportedContentDefinition.name}" declaration failed: ${cause.message}`,
+            { cause },
+          );
+        }
+        const previousContentRecords =
+          this._pseudoContentAnimations.get(element)
+            ?.get(pseudoElement) ?? [];
+        const desiredRecords = reconcileAnimationDefinitions(
+          contentDefinitions,
+          previousContentRecords,
+        );
+        const nextRecords = desiredRecords.map((desired) => {
+          if (desired.reusable) return desired.reusable;
+          return {
+            ...desired,
+            element,
+            pseudoElement,
+            startTimeMilliseconds: timeMilliseconds,
+            initialContent: desired.definition.keyframes[0]?.content,
+          };
+        });
+        let pseudoElements = nextPseudoContentAnimations.get(element);
+        if (!pseudoElements) {
+          pseudoElements = new Map();
+          nextPseudoContentAnimations.set(element, pseudoElements);
+        }
+        pseudoElements.set(pseudoElement, nextRecords);
+      }
+    }
+    this._pseudoContentAnimations = nextPseudoContentAnimations;
+  }
+
+  // The transitions that the style change since the last frame starts,
+  // planned by the renderer from the last rendered scene and a scene of
+  // the current style, as pending CSSTransitions. A transition planned
+  // again for the same change stays the same object; one that a later
+  // change no longer starts is cancelled. The read serializes the tree
+  // only: it lays nothing out, so the geometry that later reads answer
+  // from stays the frame's.
+  _planPendingTransitions(styleSystem) {
+    const renderer = this._persistentRenderer;
+    if (!renderer || this._presentedFrame === null) return;
+    const core = this._frameCore;
+    const generation = styleSystem.generation;
+    if (generation === this._serializedStyleGeneration) return;
+    const key = this._pendingTransitionsKey;
+    if (key?.frameSequence === this._frameSequence && key.styleGeneration === generation) return;
+    this._pendingTransitionsKey = { frameSequence: this._frameSequence, styleGeneration: generation };
+    const viewport = this.viewport;
+    const serialized = serializeToScene(this._root, {
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      viewport: {
+        width: viewport.width,
+        height: viewport.height,
+        deviceScale: viewport.deviceScale ?? 1,
+        _requestedLeft: viewport._requestedLeft,
+        _requestedTop: viewport._requestedTop,
+      },
+    });
+    const planned = new Map();
+    try {
+      const elementAtRow = nodesAtRow(serialized);
+      const nodes = serialized.nodes;
+      for (let index = 0; index < nodes.length; index++) {
+        if (!nodes[index].transitionDefinitions?.length) continue;
+        const element = elementAtRow[index];
+        const previousIndex = this._indexOfElement.get(element);
+        if (previousIndex === undefined) continue;
+        const transitions = renderer.planStyleChangeTransitions(previousIndex, nodes[index]);
+        if (transitions.length > 0) {
+          planned.set(element, new Map(transitions.map((transition) => [transition.propertyName, transition])));
+        }
+      }
+    } finally {
+      serialized.release();
+      core.releaseSceneResources(serialized.nodes);
+    }
+    for (const [element, transitions] of this._pendingTransitions) {
+      for (const [propertyName, animation] of transitions) {
+        const transition = planned.get(element)?.get(propertyName);
+        if (transition !== undefined && animation._styleChangePlan === transitionPlanKey(transition)) {
+          planned.get(element).delete(propertyName);
+          continue;
+        }
+        transitions.delete(propertyName);
+        animation.cancel();
+      }
+      if (transitions.size === 0) this._pendingTransitions.delete(element);
+    }
+    for (const [element, transitions] of planned) {
+      for (const [propertyName, transition] of transitions) {
+        const record = {
+          duration: transition.definition.duration,
+          delay: transition.definition.delay,
+          easing: transition.definition.easing,
+          startTimeMilliseconds: NaN,
+          startValue: transition.startValue,
+          endValue: transition.endValue,
+          trackStartValue: transition.startValue,
+        };
+        record.animation = new CSSTransition(this, element, propertyName, record, this._frameSequence);
+        record.animation._styleChangePlan = transitionPlanKey(transition);
+        let held = this._pendingTransitions.get(element);
+        if (held === undefined) {
+          held = new Map();
+          this._pendingTransitions.set(element, held);
+        }
+        held.set(propertyName, record.animation);
+        this._scheduleAnimationFrame(element);
+      }
+    }
+  }
+
+  // The pending transitions a frame did not declare: a later style change
+  // that no read saw no longer starts them, and it cancels them.
+  _cancelUndeclaredTransitions() {
+    const held = this._frameHeldTransitions;
+    this._frameHeldTransitions = null;
+    for (const transitions of held?.values() ?? []) {
+      for (const animation of transitions.values()) animation.cancel();
+    }
   }
 
   // The registry holds each running or paused transition of an element
@@ -2469,14 +3248,56 @@ class DOMRenderSurface {
     if (this._activeTransitionCount > 0) this._activeTransitionCount--;
   }
 
-  // The animations getAnimations() chooses from: this surface's animations
-  // and its registered transitions.
+  // The animations getAnimations() chooses from: this surface's animations,
+  // its registered transitions and its pending transitions. A pending
+  // transition takes the place of the registered transition of its
+  // property: the style change that started it cancels that one.
   _animationCandidates() {
     const candidates = [...this._animations];
-    for (const records of this._transitionRecords.values()) {
-      for (const record of records.values()) candidates.push(record.animation);
+    for (const [element, records] of this._transitionRecords) {
+      const pending = this._pendingTransitions.get(element);
+      for (const [propertyName, record] of records) {
+        if (!pending?.has(propertyName)) candidates.push(record.animation);
+      }
+    }
+    for (const transitions of this._pendingTransitions.values()) {
+      candidates.push(...transitions.values());
     }
     return candidates;
+  }
+
+  // Creates the persistent renderer at the viewport's size. A document whose
+  // canvases have no device yet takes the renderer's: a Canvas 2D toBlob()
+  // while the renderer starts waits for it (_preferredCanvasDevicePending)
+  // instead of requesting a second device.
+  _startPersistentRenderer({ width, height, deviceScale }) {
+    const promise = this._createPersistentRenderer({
+      width,
+      height,
+      deviceScale,
+      ...this._persistentRendererOptions,
+    }).then((renderer) => {
+      this._persistentRenderer = renderer;
+      this._animationEventUnsubscribe = renderer.onAnimationEvent(
+        (record) => this._dispatchEngineAnimationEvent(record),
+      );
+      return renderer;
+    });
+    this._persistentRendererPromise = promise;
+    const document = this._document;
+    if (document._preferredCanvasDevice || document._preferredCanvasDevicePending) return;
+    const pending = promise.then(
+      (renderer) => {
+        const device = renderer.graphicsDevice ?? null;
+        if (device !== null) document._preferredCanvasDevice ??= device;
+      },
+      () => {},
+    ).finally(() => {
+      if (document._preferredCanvasDevicePending === pending) {
+        document._preferredCanvasDevicePending = null;
+      }
+    });
+    document._preferredCanvasDevicePending = pending;
   }
 
   // An engine track's start, iteration end or cancel, dispatched at the
@@ -2505,10 +3326,14 @@ class DOMRenderSurface {
       record.type === "transitioncancel";
     const feedback = matchingAnimation?._beginEngineLifecycle(record);
     // An owned event is dispatched once: never when already reported, or
-    // when it comes from a track its animation has replaced.
+    // when it comes from a track its animation has replaced. A script
+    // animation's track reports its lifecycle to the animation only: CSS
+    // animation and transition events belong to CSS-declared animations.
+    const scriptAnimation = matchingAnimation !== undefined &&
+      !(matchingAnimation instanceof CSSAnimation) && !(matchingAnimation instanceof CSSTransition);
     if (!matchingAnimation || feedback) {
       try {
-        dispatchEvent(
+        if (!scriptAnimation) dispatchEvent(
           element,
           createEvent(record.type, {
             bubbles: true,
@@ -2606,6 +3431,7 @@ class DOMRenderSurface {
       return Promise.resolve(this._lastDeliveredFrame);
     }
     this._currentTime = timeMilliseconds;
+    scheduleFocusFixup(this._root);
     this._advanceSmoothScrolls(timeMilliseconds);
     if (this._hasActiveAnimationWork()) {
       this._dirty = true;
@@ -2617,6 +3443,7 @@ class DOMRenderSurface {
       }
       if (this._pseudoContentAnimations.size > 0) {
         this._forceFullInvalidation = true;
+        this._forceFullDamage = true;
       }
     }
     return this._render(
@@ -2636,17 +3463,27 @@ class DOMRenderSurface {
     {
       insertionIndex = this._animations.length,
       beforeEngineHandles = [],
-      preserveReplacedTracks = false,
       diagnosticAnimationName = null,
+      implicitKeyframe = {},
     } = {},
   ) {
     if (this._shutdown) throw new Error("render surface is shut down");
+    // An animation created between frames is pending: the next frame's
+    // time is its start time (Web Animations 1, section 4.4.4), and that
+    // frame declares its engine track. One that a frame creates starts at
+    // that frame.
     const animation = createDOMAnimation(this, element, keyframes, options, {
       beforeEngineHandles,
-      preserveReplacedTracks,
       diagnosticAnimationName,
+      implicitKeyframe,
+      timelinePending: !this._rendering,
     });
     this._animations.splice(insertionIndex, 0, animation);
+    if (animation._timelinePending) {
+      this._animationsAwaitingTimeline.add(animation);
+    } else {
+      animation._resolveReady(animation);
+    }
     this._scheduleAnimationFrame(element);
     return animation;
   }
@@ -2657,7 +3494,6 @@ class DOMRenderSurface {
     timing,
     {
       beforeEngineHandles = [],
-      preserveReplacedTracks = false,
       diagnosticAnimationName = null,
       animationId,
       trackGeneration,
@@ -2667,7 +3503,9 @@ class DOMRenderSurface {
       beforeTrackIndices: beforeEngineHandles.flatMap((handle) =>
         handle.trackIndices
       ),
-      preserveReplacedTracks,
+      // An animation composites over the tracks before it; it never
+      // cancels another animation's or a transition's track.
+      preserveReplacedTracks: true,
       animationId,
       trackGeneration,
     };
@@ -2722,6 +3560,7 @@ class DOMRenderSurface {
   }
 
   _animationsForElement(element, subtree) {
+    this._startStyleChangeAnimations();
     return animationsForElement(this._animationCandidates(), element, subtree);
   }
 
@@ -2811,7 +3650,7 @@ class DOMRenderSurface {
     ) {
       // The frame takes the layout alone; getters' geometry stays behind.
       this._releaseRetainedGeometry(layout);
-      layout.transitionStartTimeMilliseconds = timeMilliseconds;
+      layout.transitionChangeTimeMilliseconds = timeMilliseconds;
       return layout;
     }
     this._releaseSyncLayoutState(layout);
@@ -2870,9 +3709,18 @@ class DOMRenderSurface {
   ) {
     if (this._shutdown) return null;
     if (this._stagedFrame) return this._stagedFrame.frame;
+    // A scheduled render in flight absorbs a later scheduled render: the
+    // surface stays dirty and the loop renders again. A forced render
+    // (renderNow, prepareNow, captureFrames) waits for the render in
+    // flight, then renders its own frame, so its caller always gets one.
     if (this._rendering) {
-      this._dirty = true;
-      return null;
+      if (!forceDelivery) {
+        this._dirty = true;
+        return null;
+      }
+      while (this._rendering) await this.whenIdle();
+      if (this._shutdown) return null;
+      if (this._stagedFrame) return this._stagedFrame.frame;
     }
     if (!this._dirty && !forceDelivery) return null;
     this._requireEndedTransitionsUnregistered();
@@ -2887,9 +3735,16 @@ class DOMRenderSurface {
       this._animationsAwaitingTimeline.clear();
       for (const animation of awaiting) animation._resolveTimeline();
     }
+    // A ::before or ::after content animation that a read between frames
+    // started begins at this frame.
+    for (const pseudoElements of this._pseudoContentAnimations.values()) {
+      for (const records of pseudoElements.values()) {
+        for (const record of records) record.startTimeMilliseconds ??= timeMilliseconds;
+      }
+    }
     this._stageCounters.currentStage = "prepare";
     let resizeObserverLoopError = false;
-    const renderStartedAt = renderSurfaceNow();
+    const renderStartedAt = hostNow();
     // Image decoding may happen in the preparation layout pass, before the
     // persistent renderer receives its options. Share one collector across
     // both paths so the delivered frame owns every first-use SVG stage.
@@ -2901,6 +3756,14 @@ class DOMRenderSurface {
     let rasterFinishedAt = null;
     let pendingPresentation = null;
     const ownsContinuation = continuation === null;
+    // The transitions that reads since the last frame created are pending
+    // until this frame declares them (_registerStartedTransition); the
+    // frame cancels the rest (_cancelUndeclaredTransitions).
+    if (ownsContinuation) {
+      this._frameHeldTransitions = this._pendingTransitions;
+      this._pendingTransitions = new Map();
+      this._pendingTransitionsKey = null;
+    }
     const core = this._frameCore;
     const frameOwner = this._frameOwner;
     const frameBindings = this._frameBindings;
@@ -2928,7 +3791,7 @@ class DOMRenderSurface {
     let frameForcedGenerationNodes = null;
     let capturedScrollRequests = null;
     let releaseUnpublishedSuccessor = null;
-    let transitionStartTimeMilliseconds = timeMilliseconds;
+    let transitionChangeTimeMilliseconds = timeMilliseconds;
     // Set once this frame restyled the retained publication in place.
     let publicationRestyled = false;
     const previousPublication = {
@@ -2992,240 +3855,17 @@ class DOMRenderSurface {
       let scrollOnly = core.status("frame_mode", continuation) === 1;
       let transformOnly = core.status("frame_mode", continuation) === 2;
       if (styleSystem && !scrollOnly) {
-        // Multi-environment coexistence: serialization and style-driven
-        // animation sync below read styles under THIS surface's viewport
-        // environment. setEnvironment bumps the style generation only on an
-        // actual change, so the single-surface path stays free.
-        styleSystem.setEnvironment({
-          viewportWidth: this.viewport.width,
-          viewportHeight: this.viewport.height,
-          scrollbarStyle: this.scrollbarStyle,
-        });
-        // Answered before any element of this frame resolves, and before
-        // the style generation below is sampled (answers can advance it).
-        styleSystem.answerDeclaredFontFamilies(this._root);
+        this._prepareStyleSystem(styleSystem);
+        this._synchronizeCSSAnimations(core, styleSystem, timeMilliseconds);
       }
-      // The animation-definition reconciliation resolves definitions for
-      // the elements whose cascade names an animation. Its inputs are
-      // exactly the style system's cascade output plus tree membership, and
-      // every change to either bumps the style generation - the same key
-      // the per-element resolution cache trusts. An unchanged generation
-      // owes no scan. Recorded BEFORE the scan: a scan whose side effects
-      // mutate the DOM re-scans next frame. The core lists the candidates
-      // (animation_candidates: a native walk over its resolved records);
-      // an element that stopped being one has its animations cancelled
-      // here, exactly as an empty definition list would. Without a
-      // @keyframes rule in the root's scope no element has a definition,
-      // so the walk, which resolves every element, is skipped and every
-      // element counts as a non-candidate.
-      if (
-        styleSystem && !scrollOnly &&
-        this._animationSyncStyleGeneration !== styleSystem.generation
-      ) {
-        this._animationSyncStyleGeneration = styleSystem.generation;
-        core.mediaEnvironmentSet(styleSystem.environment);
-        core.lengthViewport(this.viewport.width, this.viewport.height);
-        const declaresKeyframes = styleSystem.declaresKeyframes(this._root);
-        const activeElements = new Set(
-          declaresKeyframes
-            ? core.animationCandidates(this._root._coreHandle, 0)
-            : [],
-        );
-        // Resolving natively can raise font-family requests; answering them
-        // bumps the style generation, which must land before serialization
-        // samples its checkpoint or the next frame re-serializes for nothing.
-        styleSystem.answerFontFamilyRequests();
-        for (const [element, records] of this._cssAnimations) {
-          if (activeElements.has(element)) continue;
-          for (const record of records) record.animation.cancel();
-          this._cssAnimations.delete(element);
-        }
-        for (const element of activeElements) {
-          const previousRecords = this._cssAnimations.get(element) ?? [];
-          const desiredDefinitions = reconcileAnimationDefinitions(
-            styleSystem.animationDefinitions(element),
-            previousRecords,
-          );
-          const previousAnimationIndices = new Map(
-            previousRecords.map((record) => [
-              record.identity,
-              this._animations.indexOf(record.animation),
-            ]),
-          );
-          const reusableByIdentity = new Map();
-          for (const desired of desiredDefinitions) {
-            if (desired.reusable) {
-              reusableByIdentity.set(desired.identity, desired.reusable);
-            }
-          }
-          for (const previous of previousRecords) {
-            if (reusableByIdentity.get(previous.identity) !== previous) {
-              previous.animation.cancel();
-            }
-          }
-
-          const nextRecords = [];
-          for (
-            let definitionIndex = 0;
-            definitionIndex < desiredDefinitions.length;
-            definitionIndex++
-          ) {
-            const desired = desiredDefinitions[definitionIndex];
-            const reusable = reusableByIdentity.get(desired.identity);
-            if (reusable) {
-              nextRecords.push(reusable);
-              continue;
-            }
-            const followingReusableRecords = desiredDefinitions.slice(
-              definitionIndex + 1,
-            ).map((following) => reusableByIdentity.get(following.identity))
-              .filter(Boolean);
-            const followingAnimationIndex = followingReusableRecords.length > 0
-              ? this._animations.indexOf(
-                followingReusableRecords[0].animation,
-              )
-              : -1;
-            const precedingAnimationIndex = nextRecords.length > 0
-              ? this._animations.indexOf(nextRecords.at(-1).animation)
-              : -1;
-            const previousAnimationIndex = previousAnimationIndices.get(
-              desired.identity,
-            );
-            const firstPreviousAnimationIndex = previousAnimationIndices.size >
-                0
-              ? Math.min(...previousAnimationIndices.values())
-              : this._animations.length;
-            const insertionIndex = animationCSSInsertion(
-              followingAnimationIndex,
-              precedingAnimationIndex,
-              previousAnimationIndex,
-              firstPreviousAnimationIndex,
-              this._animations.length,
-            );
-            const animation = this._createAnimation(
-              element,
-              desired.definition.keyframes,
-              {
-                ...desired.definition.timing,
-                composite: desired.definition.composition,
-              },
-              {
-                insertionIndex,
-                beforeEngineHandles: followingReusableRecords.map((record) =>
-                  record.animation._engineHandle
-                ),
-                preserveReplacedTracks: true,
-                diagnosticAnimationName: desired.definition.name,
-              },
-            );
-            animation._cascadingStyleSheetsAnimationIdentity = desired.identity;
-            if (desired.definition.paused) animation.pause();
-            nextRecords.push({
-              ...desired,
-              animation,
-            });
-          }
-          for (
-            let recordIndex = 0;
-            recordIndex < nextRecords.length;
-            recordIndex++
-          ) {
-            nextRecords[recordIndex].animation._engineDeclarationOptions
-              .beforeEngineHandles = nextRecords.slice(recordIndex + 1).map(
-                (record) => record.animation._engineHandle,
-              );
-          }
-          if (nextRecords.length === 0) {
-            this._cssAnimations.delete(element);
-            continue;
-          }
-          const cascadingStyleSheetsAnimationSlots = [];
-          for (
-            let animationIndex = 0;
-            animationIndex < this._animations.length;
-            animationIndex++
-          ) {
-            const animation = this._animations[animationIndex];
-            if (
-              animation._element === element &&
-              animation._cascadingStyleSheetsAnimationIdentity !== undefined
-            ) {
-              cascadingStyleSheetsAnimationSlots.push(animationIndex);
-            }
-          }
-          for (
-            let recordIndex = 0;
-            recordIndex < nextRecords.length;
-            recordIndex++
-          ) {
-            this._animations[cascadingStyleSheetsAnimationSlots[recordIndex]] =
-              nextRecords[recordIndex].animation;
-          }
-          this._cssAnimations.set(element, nextRecords);
-        }
-
-        const nextPseudoContentAnimations = new Map();
-        for (const pseudoElement of ["::before", "::after"]) {
-          if (!declaresKeyframes) break;
-          for (
-            const element of core.animationCandidates(
-              this._root._coreHandle,
-              pseudoElement === "::before" ? 1 : 2,
-            )
-          ) {
-            const contentDefinitions = styleSystem.animationDefinitions(
-              element,
-              pseudoElement,
-            ).filter((definition) => {
-              const propertyNames = new Set(
-                definition.keyframes.flatMap((keyframe) =>
-                  Object.keys(keyframe).filter((name) =>
-                    name !== "offset" && name !== "easing" &&
-                    name !== "composite"
-                  )
-                ),
-              );
-              return propertyNames.size === 1 && propertyNames.has("content");
-            });
-            if (contentDefinitions.length === 0) continue;
-            const unsupportedContentDefinition = contentDefinitions.find((
-              definition,
-            ) => definition.composition !== "replace");
-            if (unsupportedContentDefinition) {
-              const cause = new TypeError(
-                "content only supports replace composition",
-              );
-              throw new TypeError(
-                `CSS animation "${unsupportedContentDefinition.name}" declaration failed: ${cause.message}`,
-                { cause },
-              );
-            }
-            const previousContentRecords =
-              this._pseudoContentAnimations.get(element)
-                ?.get(pseudoElement) ?? [];
-            const desiredRecords = reconcileAnimationDefinitions(
-              contentDefinitions,
-              previousContentRecords,
-            );
-            const nextRecords = desiredRecords.map((desired) => {
-              if (desired.reusable) return desired.reusable;
-              return {
-                ...desired,
-                element,
-                pseudoElement,
-                startTimeMilliseconds: timeMilliseconds,
-                initialContent: desired.definition.keyframes[0]?.content,
-              };
-            });
-            let pseudoElements = nextPseudoContentAnimations.get(element);
-            if (!pseudoElements) {
-              pseudoElements = new Map();
-              nextPseudoContentAnimations.set(element, pseudoElements);
-            }
-            pseudoElements.set(pseudoElement, nextRecords);
-          }
-        }
-        this._pseudoContentAnimations = nextPseudoContentAnimations;
+      if (this._applyPageMargins(core, this._pageMarginBoxesFor(this._page, {
+        width: this.viewport.width,
+        height: this.viewport.height,
+      }))) {
+        // The scene's margin boxes changed: the frame builds the scene.
+        this._releaseSyncLayout();
+        this._forceFullInvalidation = true;
+        this._forceFullDamage = true;
       }
       core.status(
         "frame_configure",
@@ -3249,7 +3889,13 @@ class DOMRenderSurface {
         _requestedTop: capturedViewportScroll?.top ??
           this.viewport._requestedTop,
       };
+      // A viewport offset the engine clamped without a request (see
+      // _acceptScrollFeedback) leaves the presented text geometry
+      // translated by the old offset; this frame rebuilds it.
+      const textGeometryStale = this._textGeometryStale;
+      this._textGeometryStale = false;
       const reuseTextGeometry = this._textSelectionEnabled &&
+        !textGeometryStale &&
         (
           scrollOnly ||
           (
@@ -3302,6 +3948,7 @@ class DOMRenderSurface {
           node.scrollTop = request.top;
           declaredChangedNodeIndices.add(index);
         }
+        this._restateScroll(serialized, capturedScrollRequests);
         this._stageCounters.scrollOnlyFrames++;
       } else if (transformOnly) {
         serialized = {
@@ -3309,17 +3956,21 @@ class DOMRenderSurface {
           nodes: this._preparedState.serialized.nodes.slice(),
         };
         declaredChangedNodeIndices = new Set();
+        const publication = serialized.nodes[0]?._corePublication;
         for (const element of this._transformOnlyMutations) {
           const index = serialized.indexOf.get(element);
           if (!Number.isInteger(index)) continue;
+          // The core writes the row's transform from the element's style
+          // (engine_record_transform_restate); the node keeps the resolved
+          // fields for the host's own readers.
+          serialized.rowRevision = publication.core.status(
+            "engine_record_transform_restate", publication.handle, index,
+          );
           const fields = resolvedElementFields(element);
-          const transform = fields.transform;
           serialized.nodes[index] = {
             ...serialized.nodes[index],
-            transform,
+            transform: fields.transform,
             transformOrigin: fields.transformOrigin,
-            _coreTransformOverride: transform,
-            _coreTransformOverrideBox: this._lastBoxes[index],
           };
           declaredChangedNodeIndices.add(index);
         }
@@ -3361,8 +4012,8 @@ class DOMRenderSurface {
           )
           : null;
         if (syncLayout !== null) {
-          transitionStartTimeMilliseconds =
-            syncLayout.transitionStartTimeMilliseconds;
+          transitionChangeTimeMilliseconds =
+            syncLayout.transitionChangeTimeMilliseconds;
         }
         if (syncLayout !== null) {
           serialized = syncLayout.serialized;
@@ -3387,6 +4038,7 @@ class DOMRenderSurface {
               node.scrollLeft = request.left;
               node.scrollTop = request.top;
             }
+            this._restateScroll(serialized, capturedScrollRequests);
             core.releaseSceneResources(syncLayout.serialized.nodes);
           }
         } else {
@@ -3435,7 +4087,14 @@ class DOMRenderSurface {
       // raster target covers the visible rectangle at the raster scale.
       // Damage rectangles are produced in full-scene device
       // coordinates; toTargetRectangle shifts them into target space.
-      const visibleRegion = this._visibleRectangle;
+      // A page frame's target is its page box (_pageTargetRegion); the
+      // host's visible rectangle applies to continuous frames.
+      const framePageRules = this._page === null
+        ? null
+        : this._pageRules({ width: frameViewport.width, height: frameViewport.height });
+      const visibleRegion = this._page === null
+        ? this._visibleRectangle
+        : this._pageTargetRegion(this._page, framePageRules);
       const originDeviceX = (visibleRegion?.x ?? 0) *
         frameViewport.deviceScale;
       const originDeviceY = (visibleRegion?.y ?? 0) *
@@ -3494,6 +4153,7 @@ class DOMRenderSurface {
       this._hasNonTransformMutation = false;
       this._hasNonStateMutation = false;
       this._forceFullInvalidation = false;
+      this._forceFullDamage = false;
       this._selectionChanged = false;
       this._eventElementAtIndex = nodesAtRow(serialized);
       for (;;) {
@@ -3513,7 +4173,8 @@ class DOMRenderSurface {
                 height: frameViewport.height,
                 nodes: serialized.nodes,
                 imageSources: serialized.imageSources,
-              }, svgImageTimings);
+                rowRevision: serialized.rowRevision ?? 0,
+              });
             }
             break;
           case 5:
@@ -3601,13 +4262,16 @@ class DOMRenderSurface {
       // HAS changed, so the retained result is not this frame: the caret
       // has to appear or disappear. Without this the fast path re-presents
       // the previous texture forever and the caret never blinks.
-      const caretBlinkFlipDue = this._caretBlinkActive() &&
-        caretVisibleInPhase(
-            this._caretBlinkAnchorMilliseconds,
-            timeMilliseconds,
-          ) !== this._caretBlinkVisible;
+      const caretBlinkFlipDue = this._caretBlinkDue(timeMilliseconds);
       if (
+        // Retained delivery re-presents the last raster frame. A prepare-only
+        // frame (prepareNow) has no raster stage and returns the prepared
+        // scene, so it takes the prepare path below.
+        rasterize &&
         !caretBlinkFlipDue &&
+        // Text geometry built at a viewport offset since clamped has to be
+        // rebuilt, so the presented frame is not this one.
+        !textGeometryStale &&
         // A scrollbar whose visibility changes is an overlay input too.
         !this._scrollbarVisibility.due(this._scrollbars, timeMilliseconds) &&
         this._retainedDeliveryPossible(
@@ -3678,6 +4342,20 @@ class DOMRenderSurface {
           translated.height,
         );
       }
+      // A frame of another page than the last rendered one replaces the
+      // whole target.
+      const framePage = this._page;
+      if (damageMode !== 0 && framePage !== this._renderedPage) {
+        core.status(
+          "frame_damage_rect",
+          continuation,
+          0,
+          0,
+          0,
+          physicalWidth,
+          physicalHeight,
+        );
+      }
 
       // A frame that only prepares (prepareNow) and has no engine baseline
       // yet takes one layout pass for its boxes.
@@ -3687,65 +4365,40 @@ class DOMRenderSurface {
           height: frameViewport.height,
           nodes: serialized.nodes,
           imageSources: serialized.imageSources,
-        }, svgImageTimings);
+          rowRevision: serialized.rowRevision ?? 0,
+        });
       }
       // The presented snapshot (the engine's boxes, the same family the
       // delivered pixels paint) describes the PREVIOUS frame; THIS frame's
-      // pending scroll deltas are known exactly, so the core predicts
-      // current geometry natively from it: each pending target takes its
-      // clamped requested offset and each scroller box shifts by its
-      // frozen ancestors' pending deltas.
+      // pending scroll deltas are known exactly, so the core predicts the
+      // scrollbars of this frame natively from it (snapshotScrollbars).
       const snapshot = this._presentedFrame;
-      const predictScroll = (target, slot) =>
-        this._root._domCore.status(
-          "scroll_prediction",
-          capturedScrollRequests.handle,
-          snapshot.geometryHandle,
-          target === this.viewport ? 0n : target?._coreHandle ?? 0n,
-          slot,
-        );
-      // The same slots for every node of a list in one crossing: a page of
-      // text has a text owner per line, and four crossings each, every one
-      // walking the ancestor chain, were a measured share of the frame.
-      // Returns Float64Array rows of [pending x, pending y, committed x,
-      // committed y] in list order.
-      const contentShifts = (nodes) => {
-        if (!snapshot || nodes.length === 0) return null;
-        const core = this._root._domCore;
-        const pointer = core.exports.abi_allocate(nodes.length * 8);
-        if (!pointer) core.throwIfError();
-        const input = new DataView(core.refreshBytes().buffer);
-        for (let index = 0; index < nodes.length; index++) {
-          const node = nodes[index];
-          input.setBigUint64(
-            pointer + index * 8,
-            node === this.viewport ? 0n : node?._coreHandle ?? 0n,
-            true,
-          );
-        }
-        core.status(
-          "scroll_prediction_shifts",
-          capturedScrollRequests.handle,
-          snapshot.geometryHandle,
-          pointer,
-          nodes.length,
-        );
-        const base = core.exports.abi_output_pointer();
-        return new Float64Array(
-          core.refreshBytes().buffer.slice(base, base + nodes.length * 32),
-        );
-      };
       // Scrollbar descriptors describe the layout this frame paints. The
       // renderer asks for their parts after it laid the frame out and
       // before it rasterizes (scene-renderer's scrollbarParts), with the
       // engine's layout work so far. When no node was laid out since the
-      // presented frame's layout (a scroll, a paint change), the frame
-      // keeps that layout, and its descriptors come from the presented
-      // snapshot with the prediction above. Otherwise (a script changed
-      // an overflow, the content grew, a layout getter ran, the first
-      // frame) they are built from the frame's own boxes: the presented
-      // snapshot still holds the previous ranges, classic bar space and
-      // overflow.
+      // presented frame's layout (a scroll, a paint change) and no row the
+      // frame lowered anew is or was a scroll container, the frame keeps
+      // that layout and those scrollers, and its descriptors come from the
+      // presented snapshot with that prediction. Otherwise (a script
+      // changed an overflow, the content grew, a layout getter ran, the
+      // first frame) they are built from the frame's own boxes: the
+      // presented snapshot still holds the previous ranges, classic bar
+      // space and overflow. An overflow change in overlay mode moves no
+      // box, so only its row shows it.
+      const scrollbarInputsChanged = () => {
+        if (scrollOnly || !serialized.changedRows?.length) return false;
+        const elementAtRow = nodesAtRow(serialized);
+        const presented = new Set(this._scrollbars.map((scrollbar) => scrollbar.element));
+        for (const index of serialized.changedRows) {
+          const element = elementAtRow[index];
+          if (element?.nodeType !== 1) continue;
+          if (presented.has(element)) return true;
+          const { x, y } = resolvedOverflowAxes(resolvedElementFields(element));
+          if ((x !== "visible" && x !== "clip") || (y !== "visible" && y !== "clip")) return true;
+        }
+        return false;
+      };
       let scrollbars = null;
       let frameLayoutWork = null;
       const describeScrollbars = (frameBoxes, laidOut) => {
@@ -3786,7 +4439,8 @@ class DOMRenderSurface {
           frameLayoutWork = layoutWork;
           describeScrollbars(
             frameBoxes,
-            snapshot === null || presentedLayoutWork.get(snapshot) !== layoutWork,
+            snapshot === null || presentedLayoutWork.get(snapshot) !== layoutWork ||
+              scrollbarInputsChanged(),
           );
         }
         const parts = [];
@@ -3807,105 +4461,14 @@ class DOMRenderSurface {
             });
           }
         }
+        // The tool overlay paints at the viewport's marker after its bars,
+        // so above everything.
+        for (const highlight of this._toolHighlights) {
+          parts.push({ ownerIndex: -1, ...highlight, radius: 0 });
+        }
+        this._toolHighlightsRendered = this._toolHighlights;
         return parts;
       };
-      // Selected text paints in the text's own paint order (the renderer's
-      // text highlights), never as an overlay over the finished frame.
-      const textHighlights = [];
-      // The focused text control's caret paints in the engine, in its value
-      // text's paint order and clip (scene-renderer's textCaret). The value
-      // is the one generated text box the control's scene node holds: its
-      // value, or its placeholder or a line break while the value is empty.
-      let textCaret = null;
-      const focusedElement = this._root.ownerDocument?._focusedElement ?? null;
-      const controlIndex = focusedElement?.localName === "input" ||
-          focusedElement?.localName === "textarea"
-        ? serialized.indexOf.get(focusedElement)
-        : undefined;
-      const caretTextIndex = controlIndex === undefined
-        ? undefined
-        : serialized.nodes[controlIndex]?.children?.find((child) =>
-          serialized.nodes[child]?.generatedOwnerIndex === controlIndex
-        );
-      if (caretTextIndex !== undefined) {
-        const selectionStart = focusedElement.selectionStart ??
-          focusedElement.value.length;
-        const selectionEnd = focusedElement.selectionEnd ?? selectionStart;
-        if (selectionStart === selectionEnd) {
-          // The blink anchor belongs to one caret position: a different
-          // element or a different offset is a caret that just moved, so
-          // the cycle restarts shown. Identity is the element itself, never
-          // its serialization index — a retained frame carries no index
-          // map, so an index key flapped every frame and reset the anchor,
-          // which pinned the caret to its visible phase forever.
-          if (
-            focusedElement !== this._caretBlinkElement ||
-            selectionStart !== this._caretBlinkOffset
-          ) {
-            this._caretBlinkElement = focusedElement;
-            this._caretBlinkOffset = selectionStart;
-            this._caretBlinkAnchorMilliseconds = timeMilliseconds;
-          }
-          this._caretBlinkVisible = caretVisibleInPhase(
-            this._caretBlinkAnchorMilliseconds,
-            timeMilliseconds,
-          );
-          // An explicit pixel capture shows the caret whatever the phase
-          // says. A capture is an observation of the document, and one that
-          // answered "no caret" every other time it was asked would make
-          // every caret assertion and every screenshot a coin toss; the
-          // phase itself is untouched, so the loop keeps its cadence.
-          if (this._caretBlinkVisible || pixelReadback) {
-            const elementCore = focusedElement._domCore;
-            textCaret = {
-              ownerIndex: caretTextIndex,
-              offset: selectionStart,
-              upstream: elementCore.status(
-                "input_caret_upstream",
-                focusedElement._coreHandle,
-                selectionStart,
-              ) === 1,
-              color: elementCore.styleUsedCaretColor(focusedElement._coreHandle),
-            };
-          }
-        } else {
-          // A range, not a caret: nothing blinks, and the next collapsed
-          // selection starts a fresh cycle.
-          this._caretBlinkElement = null;
-          this._caretBlinkOffset = -1;
-          this._caretBlinkAnchorMilliseconds = null;
-          this._caretBlinkVisible = true;
-          textHighlights.push({
-            ownerIndex: controlIndex,
-            start: Math.min(selectionStart, selectionEnd),
-            end: Math.max(selectionStart, selectionEnd),
-            ...selectionPaint(focusedElement),
-          });
-        }
-      } else {
-        this._caretBlinkElement = null;
-        this._caretBlinkOffset = -1;
-        this._caretBlinkAnchorMilliseconds = null;
-        this._caretBlinkVisible = true;
-      }
-      const selectionDocument = this._root.ownerDocument;
-      const documentSelection = selectionDocument?.getSelection();
-      if (documentSelection?.rangeCount === 1 && !documentSelection.isCollapsed) {
-        for (const [node, start, end] of documentSelection._selectedSpans()) {
-          if (
-            node.nodeType !== 3 || !(end > start) ||
-            !isShadowIncludingInclusiveDescendant(node, this._root)
-          ) continue;
-          const ownerIndex = serialized.indexOf.get(node);
-          if (ownerIndex === undefined) continue;
-          textHighlights.push({
-            ownerIndex,
-            start,
-            end,
-            ...selectionPaint(flatTreeParent(node)),
-          });
-        }
-      }
       // The caret, the selection bands and the scrollbars are the
       // renderer's damage.
       if (dirtyTiles !== null) {
@@ -3934,6 +4497,9 @@ class DOMRenderSurface {
         nodes: serialized.nodes,
         generatedBoxRows: serialized.generatedBoxRows,
         imageSources: serialized.imageSources,
+        // The row revision the rows hold; the core publishes the rows as
+        // that revision restated them (engine_direct_publish_scene).
+        rowRevision: serialized.rowRevision ?? 0,
         styleGeneration: serialized.styleGeneration,
         changedRows: serialized.changedRows,
         publicationRevision: serialized.publicationRevision,
@@ -3964,17 +4530,6 @@ class DOMRenderSurface {
           ) {
             forceGenerationNodeIndices.add(index);
           }
-          if (node.nodeType !== 3) continue;
-          for (
-            let ancestor = node.parentNode;
-            ancestor;
-            ancestor = ancestor.parentNode
-          ) {
-            const ancestorIndex = serialized.indexOf.get(ancestor);
-            if (!Number.isInteger(ancestorIndex)) continue;
-            forceGenerationNodeIndices.add(ancestorIndex);
-            break;
-          }
         }
       }
       // Native changedRows describes lowered style, not host scroll requests.
@@ -4004,8 +4559,8 @@ class DOMRenderSurface {
           ? { scrollOnlyNodeIndices: declaredChangedNodeIndices }
           : {}),
         scrollbarParts,
-        ...(textHighlights.length > 0 ? { textHighlights } : {}),
-        ...(textCaret !== null ? { textCaret } : {}),
+        selectionFrameOwner: this._frameOwner,
+        selectionPixelReadback: pixelReadback,
         ...(declaredChangedNodeIndices !== null
           ? { declaredChangedNodeIndices }
           : {}),
@@ -4014,9 +4569,15 @@ class DOMRenderSurface {
           ? { forceGenerationNodeIndices }
           : {}),
         timeMilliseconds,
-        transitionStartTimeMilliseconds,
+        transitionChangeTimeMilliseconds,
+        heldTransition: (nodeIndex, propertyName) =>
+          this._heldTransitionDeclaration(nodeIndex, propertyName),
         onTransitionStarted: (transition) =>
           this._registerStartedTransition(transition),
+        onTransitionPropertyUnanimated: ({ nodeIndex, propertyName }) => {
+          const element = this._eventElementAtIndex[nodeIndex];
+          if (element) recordUnanimatedProperty(element, propertyName, "transition-property");
+        },
         computedSamples: {
           core: this._root._domCore,
           owner: this._computedSamples,
@@ -4052,6 +4613,14 @@ class DOMRenderSurface {
           }
           : {}),
       };
+      if (framePage !== null) {
+        renderOptions.page = {
+          height: scene.height,
+          index: framePage,
+          rulesKey: framePageRules.key,
+          box: (page) => pageBox(framePageRules.rules, page, framePageRules.defaultSize),
+        };
+      }
       if (this._background !== undefined) {
         renderOptions.background = this._background;
       }
@@ -4068,9 +4637,13 @@ class DOMRenderSurface {
             width: scene.width,
             height: scene.height,
             nodes: Object.freeze(scene.nodes),
+            imageSources: scene.imageSources,
           }),
           serialized,
           boxes: freezeBoxes(boxes),
+          // The page the scene was laid out for (scene-renderer's page
+          // option), or null for a continuous document.
+          page: renderOptions.page ?? null,
         });
         if (
           supersededSerialized !== null &&
@@ -4087,34 +4660,21 @@ class DOMRenderSurface {
         return this._preparedState;
       }
       const renderToken = this._frameClaim(continuation, 9, frameBindings);
-      if (!this._persistentRendererPromise) {
-        this._persistentRendererPromise = this._createPersistentRenderer({
-          width: frameViewport.width,
-          height: frameViewport.height,
-          deviceScale: frameViewport.deviceScale,
-          ...this._persistentRendererOptions,
-        }).then((renderer) => {
-          this._persistentRenderer = renderer;
-          this._animationEventUnsubscribe = renderer.onAnimationEvent(
-            (record) => this._dispatchEngineAnimationEvent(record),
-          );
-          return renderer;
-        });
-      }
+      if (!this._persistentRendererPromise) this._startPersistentRenderer(frameViewport);
       this._stageCounters.currentStage = "raster";
-      rasterStartedAt = renderSurfaceNow();
+      rasterStartedAt = hostNow();
       const renderer = await this._persistentRendererPromise;
-      rendererReadyAt = renderSurfaceNow();
+      rendererReadyAt = hostNow();
       await renderer.resize(
         frameViewport.width,
         frameViewport.height,
         frameViewport.deviceScale,
       );
-      rendererResizedAt = renderSurfaceNow();
+      rendererResizedAt = hostNow();
       if (renderer.setVisibleRectangle) {
-        await renderer.setVisibleRectangle(this._visibleRectangle);
+        await renderer.setVisibleRectangle(visibleRegion);
       }
-      visibleRectangleSetAt = renderSurfaceNow();
+      visibleRectangleSetAt = hostNow();
       // Texture delivery is the default: the renderer returns the live GPU
       // texture image plus device, exactly what createCanvasPresenter.present
       // consumes, and no CPU readback happens. Only the webgpu backend can
@@ -4128,11 +4688,37 @@ class DOMRenderSurface {
       const rendered = textureDelivery
         ? await renderer.renderTexture(scene, renderOptions)
         : await renderer.render(scene, renderOptions);
-      rasterFinishedAt = renderSurfaceNow();
+      rasterFinishedAt = hostNow();
       if (this._shutdown) {
         return null;
       }
       this._countRenderWork(rendered.performance);
+      this._pageFrame = rendered.page ?? null;
+      this._pageTargetStale = false;
+      if (this._pageFrame !== null) {
+        this._pageBoxes = { key: this._pageFrame.rulesKey, pages: this._pageFrame.pages };
+        const { box } = this._pageFrame;
+        // A page box this frame did not target (a page not counted before,
+        // or rules that changed its box) is rendered again at its own box:
+        // renderNow renders once more, and a loop frame is scheduled.
+        if (box.width !== visibleRegion.width || box.height !== visibleRegion.height ||
+          -box.margin.left !== visibleRegion.x || -box.margin.top !== visibleRegion.y) {
+          this._pageTargetStale = true;
+          this._forceFullInvalidation = true;
+          this._forceFullDamage = true;
+          this._dirty = true;
+        }
+        // Margin boxes whose content this frame did not show (counters of
+        // pages not counted before) render again with the counted pages.
+        const counted = this._pageMarginBoxesFor(framePage, framePageRules.defaultSize);
+        if (JSON.stringify(counted) !== this._pageMarginsKey) {
+          this._pageTargetStale = true;
+          this._forceFullInvalidation = true;
+          this._forceFullDamage = true;
+          this._dirty = true;
+        }
+      }
+      this._renderedPage = framePage;
       this._frameResume(continuation, renderToken, 0, -1, frameBindings);
       const publicationToken = this._frameClaim(
         continuation,
@@ -4147,6 +4733,8 @@ class DOMRenderSurface {
         }
       }
       for (const animation of this._animations) {
+        // animationiteration is a CSS animation event.
+        if (!(animation instanceof CSSAnimation)) continue;
         for (const elapsedTime of animation._iterationEventsAtCurrentTime()) {
           dispatchEvent(
             animation._element,
@@ -4172,7 +4760,8 @@ class DOMRenderSurface {
           height: frameViewport.height,
           nodes: serialized.nodes,
           imageSources: serialized.imageSources,
-        }, svgImageTimings);
+          rowRevision: serialized.rowRevision ?? 0,
+        });
       }
       const effectiveBoxes = rendered.boxes?.length ? rendered.boxes : boxes;
       // A caller-supplied renderer that paints no scrollbars never asks for
@@ -4253,7 +4842,8 @@ class DOMRenderSurface {
           height: frameViewport.height,
           nodes: serialized.nodes,
           imageSources: serialized.imageSources,
-        }, svgImageTimings);
+          rowRevision: serialized.rowRevision ?? 0,
+        });
       }
       const laidOutHere = presentedBoxes !== boxes;
       if (laidOutHere) {
@@ -4285,10 +4875,11 @@ class DOMRenderSurface {
       const textGeometryByElement = new Map();
       let textGeometryByNode = new Map();
       // A retained scene with unchanged text keeps the presented frame's
-      // glyph and caret geometry; only the scroll translation is refreshed.
-      // Those entries are frozen and already complete, so the paint
-      // artifact's text operations (present whenever the surface captures
-      // paint artifacts) must not be accumulated onto them again.
+      // glyph and caret geometry. A translation holds no scroll (the
+      // geometry records carry it), so a scroll changes none of it. Those
+      // entries are frozen and already complete, so the paint artifact's
+      // text operations (present whenever the surface captures paint
+      // artifacts) must not be accumulated onto them again.
       const reusedTextGeometry = (reuseTextGeometry ||
           (this._textSelectionEnabled &&
             rendered.performance?.preparation?.retained))
@@ -4305,72 +4896,21 @@ class DOMRenderSurface {
       // control's selection added); a kept entry is final.
       const unfinishedTextGeometry = [];
       if (reusedTextGeometry !== null) {
-        // The text controls among the reused entries: a frame keys each
-        // control's entry under textGeometryByElement as well, and every
-        // other entry is a text node's.
+        // A view over the reused entries, whatever scrolled: only a text
+        // control's entry is made, for its live selection. The text
+        // controls among the reused entries: a frame keys each control's
+        // entry under textGeometryByElement as well, and every other entry
+        // is a text node's.
         const reusedControls = this._presentedFrame.textGeometryByElement;
-        const pendingTargets = snapshot === null
-          ? 0
-          : capturedScrollRequests.size;
-        if (
-          pendingTargets === 0 ||
-          (pendingTargets === 1 && capturedScrollRequests.has(this.viewport))
-        ) {
-          // A frame that scrolls the viewport alone shifts every text node by
-          // the viewport's pending delta (no node's chain holds a pending
-          // offset of its own), and one that scrolls nothing by none: one
-          // shift over the reused geometry, which the snapshot applies to
-          // the predecessor's carets and glyphs, instead of an entry per
-          // text node. Only a text control's entry is made, for its live
-          // selection.
-          const shiftX = pendingTargets === 0
-            ? 0
-            : predictScroll(this.viewport, 2);
-          const shiftY = pendingTargets === 0
-            ? 0
-            : predictScroll(this.viewport, 3);
-          textGeometryByNode =
-            reusedTextGeometry instanceof ShiftedTextGeometry
-              ? new ShiftedTextGeometry(
-                reusedTextGeometry.base,
-                reusedTextGeometry.shiftX + shiftX,
-                reusedTextGeometry.shiftY + shiftY,
-                textGeometryByElement,
-              )
-              : new ShiftedTextGeometry(
-                reusedTextGeometry,
-                shiftX,
-                shiftY,
-                textGeometryByElement,
-              );
-          unfinishedTextGeometry.push(...reusedControls.keys());
-          this._stageCounters.translatedTextGeometryEntries +=
-            reusedControls.size;
-        } else {
-          // Any other scroll asks the core for each node's shift.
-          const shifts = contentShifts([...reusedTextGeometry.keys()]);
-          let index = 0;
-          for (const [node, geometry] of reusedTextGeometry) {
-            const shiftX = shifts[index * 4];
-            const shiftY = shifts[index * 4 + 1];
-            index++;
-            const reused = {
-              caretStops: geometry.caretStops,
-              glyphs: geometry.glyphs,
-              anchors: geometry.anchors,
-              translationX: (geometry.translationX ?? 0) - shiftX,
-              translationY: (geometry.translationY ?? 0) - shiftY,
-            };
-            if (reusedControls.has(node)) {
-              textGeometryByNode.set(node, reused);
-              unfinishedTextGeometry.push(node);
-            } else {
-              textGeometryByNode.set(node, Object.freeze(reused));
-            }
-          }
-          this._stageCounters.translatedTextGeometryEntries +=
-            reusedTextGeometry.size;
-        }
+        textGeometryByNode = new TextGeometryView(
+          reusedTextGeometry instanceof TextGeometryView
+            ? reusedTextGeometry.base
+            : reusedTextGeometry,
+          textGeometryByElement,
+        );
+        unfinishedTextGeometry.push(...reusedControls.keys());
+        this._stageCounters.translatedTextGeometryEntries +=
+          reusedControls.size;
       }
       const textOperations = reusedTextGeometry === null
         ? rendered.textGeometryArtifact?.operations ??
@@ -4416,6 +4956,7 @@ class DOMRenderSurface {
         };
       }
       const { kinds: ownerKinds, isDocumentText } = this._textOwnerKinds;
+      this._stageCounters.textGeometryOperationsGrouped += textOperations.length;
       for (const operation of textOperations) {
         if (operation.kind !== "text" || operation.glyphCount === 0) continue;
         const sourceNode = serialized.nodes[operation.nodeIndex];
@@ -4443,7 +4984,7 @@ class DOMRenderSurface {
           operationsByOwner.set(owner, {
             operations: [operation],
             keepable: ownerKind === 2 && loweredRows !== null &&
-              !loweredRows.has(operation.nodeIndex),
+              !textGeometryStale && !loweredRows.has(operation.nodeIndex),
           });
           continue;
         }
@@ -4451,20 +4992,13 @@ class DOMRenderSurface {
         entry.keepable = entry.keepable &&
           !loweredRows.has(operation.nodeIndex);
       }
-      // Captured line coordinates are unscrolled. Their successor snapshot
-      // publishes THIS frame, so include committed offsets and the captured
-      // pending deltas once; reused geometry already carries the former.
+      // Captured line coordinates are unscrolled, and so is a translation:
+      // the geometry records carry each scroll.
       const owners = [...operationsByOwner.keys()];
-      const ownerShifts = contentShifts(owners);
+      this._stageCounters.textGeometryOwnersGrouped += owners.length;
       for (let ownerIndex = 0; ownerIndex < owners.length; ownerIndex++) {
         const owner = owners[ownerIndex];
         const { operations, keepable } = operationsByOwner.get(owner);
-        const shiftX = ownerShifts === null
-          ? 0
-          : ownerShifts[ownerIndex * 4] + ownerShifts[ownerIndex * 4 + 2];
-        const shiftY = ownerShifts === null
-          ? 0
-          : ownerShifts[ownerIndex * 4 + 1] + ownerShifts[ownerIndex * 4 + 3];
         const previous = previousTextGeometry?.get(owner);
         const kept = keepable && previous !== undefined
           ? keptTextGeometryFor(previous, operations)
@@ -4472,32 +5006,22 @@ class DOMRenderSurface {
         if (kept !== null) {
           // The presented entry itself when the translation did not move
           // either, so the snapshot can keep the presented text block.
-          const translationX = (kept.translationX ?? 0) - shiftX;
-          const translationY = (kept.translationY ?? 0) - shiftY;
           textGeometryByNode.set(
             owner,
-            Object.is(translationX, previous.translationX ?? 0) &&
-              Object.is(translationY, previous.translationY ?? 0)
+            Object.is(kept.translationX ?? 0, previous.translationX ?? 0) &&
+              Object.is(kept.translationY ?? 0, previous.translationY ?? 0)
               ? previous
-              : shiftX === 0 && shiftY === 0
-              ? kept
-              : Object.freeze({ ...kept, translationX, translationY }),
+              : kept,
           );
           continue;
         }
         const anchors = new Float64Array(operations.length * 4);
-        // Subtracted from 0, not negated: a zero shift gives +0, as the
-        // kept and scrolled entries' subtractions do. A -0 translation
-        // differs from their +0 (sameTextGeometryValues compares as the
-        // snapshot bytes do), so after a scroll back to the origin an
-        // unchanged rebuilt entry was not the presented one, and the
-        // restyled frame built its whole geometry snapshot.
         const geometry = {
           caretStops: [],
           glyphs: [],
           anchors,
-          translationX: 0 - shiftX,
-          translationY: 0 - shiftY,
+          translationX: 0,
+          translationY: 0,
         };
         textGeometryByNode.set(owner, geometry);
         unfinishedTextGeometry.push(owner);
@@ -4568,24 +5092,15 @@ class DOMRenderSurface {
         }
         const selectionStart = node.selectionStart ?? node.value.length;
         const selectionEnd = node.selectionEnd ?? selectionStart;
-        // A control's selection rectangles are a function of its glyphs
-        // and its selection.
+        // A control's entry carries its selection; its selection
+        // rectangles depend on its scroll too, so the frame's geometry
+        // answers them (controlSelectionRectangles).
         const controlGeometry = sameValues &&
             previous.selectionStart === selectionStart &&
             previous.selectionEnd === selectionEnd
           ? previous
-          : Object.freeze({
-            ...baseGeometry,
-            selectionStart,
-            selectionEnd,
-            selectionRectangles: selectionRectanglesForText(
-              node,
-              baseGeometry,
-              selectionStart,
-              selectionEnd,
-            ),
-          });
-        // A shifted view reads a control's entry from textGeometryByElement.
+          : Object.freeze({ ...baseGeometry, selectionStart, selectionEnd });
+        // A view reads a control's entry from textGeometryByElement.
         if (textGeometryByNode instanceof Map) {
           textGeometryByNode.set(node, controlGeometry);
         }
@@ -4596,9 +5111,11 @@ class DOMRenderSurface {
           width: scene.width,
           height: scene.height,
           nodes: Object.freeze(scene.nodes),
+          imageSources: scene.imageSources,
         }),
         serialized,
         boxes: freezeBoxes(boxes),
+        page: renderOptions.page ?? null,
       });
       const acceptState = (geometryHandle) => {
         const completedScrollTargets = this._acceptScrollFeedback(
@@ -4614,7 +5131,9 @@ class DOMRenderSurface {
         this._preparedState = preparedState;
         return completedScrollTargets;
       };
-      if (!forceDelivery && !pixelsChanged) {
+      // A frame that rebuilt stale text geometry publishes it: its pixels
+      // match the presented frame, its selection geometry does not.
+      if (!forceDelivery && !pixelsChanged && !textGeometryStale) {
         this._frameResume(continuation, publicationToken, 0, -1, frameBindings);
         core.status("frame_finish", continuation);
         accepted = true;
@@ -4717,7 +5236,7 @@ class DOMRenderSurface {
       };
       core.status("frame_publish", continuation, successor.geometryHandle);
       this._frameResume(continuation, publicationToken, 0, -1, frameBindings);
-      const framePreparedAt = renderSurfaceNow();
+      const framePreparedAt = hostNow();
       // A texture frame carries the renderer's live texture image and
       // device and no pixels; a pixel capture carries the retained snapshot.
       // Encoding is the consumer's explicit request (encodeImage).
@@ -4884,6 +5403,7 @@ class DOMRenderSurface {
         this._stageCounters.sceneRestyleRowsRead +=
           (core.status("computed_restyle_counts", 2) - restyleCountsBefore[2]) >>> 0;
       }
+      if (ownsContinuation) this._cancelUndeclaredTransitions();
       this._eventElementAtIndex = null;
       this._stageCounters.currentStage = "idle";
       this._rendering = false;
@@ -4996,12 +5516,18 @@ class DOMRenderSurface {
       );
     }
 
+    // The capture drives the document's clock: a page timer runs when the
+    // capture's time passes its due time, and the document's time is held
+    // at the latest sample's time until its clock passes it.
     this._capturingFrames = true;
+    if (this._drivesDocumentClock()) this._root.ownerDocument._documentTimers?.driverChanged();
     try {
       const sampleCount = model.exports.schedule_count();
       for (let sequence = 0; sequence + 1 < sampleCount; sequence++) {
         const timeMilliseconds = model.exports.schedule_time(sequence);
         const nextTimeMilliseconds = model.exports.schedule_time(sequence + 1);
+        await this._advanceDocumentClock(timeMilliseconds);
+        this._updateAnimationsAndSendEvents(timeMilliseconds);
         const frame = await this._renderOpportunity(
           timeMilliseconds,
           true,
@@ -5026,9 +5552,12 @@ class DOMRenderSurface {
           readbackByteLength: frame?.readbackByteLength ?? 0,
         });
       }
+      await this._advanceDocumentClock(endTime);
+      this._updateAnimationsAndSendEvents(endTime);
       await this._renderOpportunity(endTime, true, false, true);
     } finally {
       this._capturingFrames = false;
+      if (this._drivesDocumentClock()) this._root.ownerDocument._documentTimers?.driverChanged();
     }
   }
 
@@ -5037,16 +5566,27 @@ class DOMRenderSurface {
     return new Promise((resolve) => this._idleWaiters.push(resolve));
   }
 
+  // The display list of the last prepared frame; of a paged document, the
+  // list of the page that frame shows, and `page` names it as
+  // `surface.page` does (null for a continuous document). A frame that
+  // publishes releases the serialization of the scene it supersedes. The
+  // artifact reads the prepared scene when no frame is in flight and queues
+  // its engine operation in the same turn, so a later frame publishes, and
+  // releases this scene, only after the artifact.
   async createDisplayListArtifact() {
     if (this._shutdown) throw new Error("render surface is shut down");
-    const scene = this._preparedState?.scene;
-    if (scene === undefined) {
+    if (this._preparedState === null) {
       throw new Error(
         "createDisplayListArtifact requires one completed render frame",
       );
     }
     const renderer = await this._persistentRendererPromise;
-    return await renderer.createDisplayListArtifact(scene);
+    while (this._rendering) await this.whenIdle();
+    if (this._shutdown) throw new Error("render surface is shut down");
+    const { scene, page: pageOption } = this._preparedState;
+    const page = pageOption === null ? null : this.page;
+    const artifact = await renderer.createDisplayListArtifact(scene, { page: pageOption });
+    return { ...artifact, page };
   }
 
   // The one render entry. Delivers the renderer's GPU texture frame on
@@ -5055,24 +5595,48 @@ class DOMRenderSurface {
   // delivers pixels.
   renderNow({ pixels = false, _transaction = null } = {}) {
     if (this._shutdown) throw new Error("render surface is shut down");
-    return this._renderOpportunity(
-      this._now(),
-      true,
-      true,
-      pixels,
-      _transaction,
-    );
+    const timeMilliseconds = this._now();
+    const render = () => this._renderOpportunity(timeMilliseconds, true, true, pixels, _transaction);
+    // A page frame that targeted another box than its page's (the page's
+    // box was not known before its count) renders again at its own box.
+    // The count is recorded by then, so the second frame knows the box.
+    return this._afterDocumentClock(timeMilliseconds, async () => {
+      this._updateAnimationsAndSendEvents(timeMilliseconds);
+      const frame = await render();
+      if (!this._pageTargetStale) return frame;
+      const again = await render();
+      if (this._pageTargetStale) {
+        throw new Error(
+          `page ${this._pageFrame.index + 1} rendered twice without its page box ${this._pageFrame.box.width} x ${this._pageFrame.box.height} px as the target`,
+        );
+      }
+      return again;
+    });
   }
 
   tick(timeMilliseconds) {
     if (this._shutdown) throw new Error("render surface is shut down");
-    return this._renderOpportunity(timeMilliseconds, false);
+    return this._afterDocumentClock(timeMilliseconds, () => {
+      this._updateAnimationsAndSendEvents(timeMilliseconds);
+      return this._renderOpportunity(timeMilliseconds, false);
+    });
+  }
+
+  // Renders at `timeMilliseconds` after the page timers due by then ran.
+  _afterDocumentClock(timeMilliseconds, render) {
+    const advancing = this._advanceDocumentClock(timeMilliseconds);
+    if (advancing === null) return render();
+    return advancing.then(() => {
+      if (this._shutdown) throw new Error("render surface is shut down");
+      return render();
+    });
   }
 
   start() {
     if (this._shutdown) throw new Error("render surface is shut down");
     this._running = true;
     this._schedule();
+    if (this._drivesDocumentClock()) this._root.ownerDocument._documentTimers?.driverChanged();
   }
 
   stop() {
@@ -5082,6 +5646,7 @@ class DOMRenderSurface {
       this._cancelFrame(this._frameRequest);
       this._frameRequest = null;
     }
+    if (this._drivesDocumentClock()) this._root.ownerDocument._documentTimers?.driverChanged();
   }
 
   replaceRoot(nextRoot) {
@@ -5129,10 +5694,14 @@ class DOMRenderSurface {
     );
     this._scrollGeometry = null;
     this._root = nextRoot;
+    // Text ownership memoizes ancestry against the surface root.
+    this._textOwnerKinds = null;
     nextRegistry.set(this._environmentKey, this);
     this._document._liveRenderSurfaces.delete(this);
     this._document = surfaceDocument(nextRoot);
     (this._document._liveRenderSurfaces ??= new Set()).add(this);
+    // The new root demands its images through its own document's host.
+    this._resolveResource = this._document._resolveResource ?? null;
     this._connectSubtree(nextRoot);
     this.viewport.root = nextRoot;
     this._indexOfElement = new Map();
@@ -5151,6 +5720,7 @@ class DOMRenderSurface {
     this._snapCheckOwed = true;
     this._smoothScrolls.clear();
     this._forceFullInvalidation = true;
+    this._forceFullDamage = true;
     this._dirty = true;
     this._schedule();
   }
@@ -5160,11 +5730,30 @@ class DOMRenderSurface {
     this.stop();
     this._shutdown = true;
     if (!this._presentingFrame) await this.whenIdle();
+    if (this._pageRuleCache) {
+      releasePageRules(this._pageRuleCache.rules);
+      this._pageRuleCache = null;
+    }
     this._scrollAnchors.clear();
     this._anchoringSuppressionProperties.clear();
     this._positionSuppressionNodes.clear();
     this._animationEventUnsubscribe?.();
-    for (const animation of this._animations) animation._engineHandle.cancel();
+    // The root's later scene builds, from any surface, have no margin boxes.
+    this._applyPageMargins(this._root._domCore, null);
+    // Chrome cancels the CSS animations and transitions of an element that
+    // leaves the rendering: they become idle and reject `finished`. A
+    // script animation keeps its current time without a timeline.
+    for (const animation of [...this._animations]) {
+      if (animation instanceof CSSAnimation) animation.cancel();
+      else animation._moveToPendingTimeline();
+    }
+    for (const records of [...this._transitionRecords.values()]) {
+      for (const record of [...records.values()]) record.animation.cancel();
+    }
+    for (const transitions of [...this._pendingTransitions.values()]) {
+      for (const animation of [...transitions.values()]) animation.cancel();
+    }
+    this._pendingTransitions.clear();
     this._animations.length = 0;
     this._animationsAwaitingTimeline.clear();
     const surfaceRegistry = this._root._renderSurfaces;
@@ -5181,6 +5770,7 @@ class DOMRenderSurface {
     if (ownerDocument?._componentRenderSurface === this) {
       ownerDocument._componentRenderSurface =
         surfaceRegistry?.values().next().value ?? null;
+      ownerDocument._documentTimers?.driverChanged();
     }
     const animationFrameCheckpoint = this._animationFrameCore.status(
       "animation_frame_surface_dispose",

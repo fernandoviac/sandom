@@ -1,5 +1,6 @@
 import { sharedDomCore } from "../dom-wasm/core.js";
 import { createEventBindings } from "./dom-bindings.generated.js";
+import { enterComponentCode } from "./component-code.js";
 
 // Language identities and invocation transport only. Native records own
 // registration, snapshots, propagation, removal, and invocation lifetime.
@@ -9,6 +10,14 @@ const dispatchStateByEvent = new WeakMap();
 const bindingsByCore = new WeakMap();
 const targetsByCore = new WeakMap();
 const hostListenerDetailsByCallback = new WeakMap();
+// A node wrapper is weak (DomCore.wrapperFor), but its listeners' callbacks
+// and its event-handler records live in JavaScript state keyed by that
+// wrapper. A collected wrapper would lose them while the native target keeps
+// the listeners, and a new wrapper of the node would dispatch identities it
+// does not know. A node wrapper with a registered listener therefore stays
+// alive until its last registration is released: by removal, or by the
+// disposal of its document.
+const listenedNodesByCore = new WeakMap();
 let nextCallbackIdentity = 1;
 let nextEventIdentity = 1n;
 const targetFinalizer = new FinalizationRegistry(({ core, handle }) => {
@@ -29,6 +38,7 @@ function targetBinding(target, core = targetCore(target)) {
   binding = {
     core,
     handle,
+    target,
     identities: new Map(),
     callbacks: new Map(),
     registrations: new Map(),
@@ -46,6 +56,7 @@ function releaseRegistration(binding, handle) {
   const entry = binding.registrations.get(handle);
   if (!entry) return;
   binding.registrations.delete(handle);
+  if (binding.registrations.size === 0) listenedNodesByCore.get(binding.core)?.delete(binding.target);
   const identity = binding.callbacks.get(entry.identity);
   identity.references--;
   if (identity.references === 0) {
@@ -78,7 +89,7 @@ function prepareEventDisposal(core, documentHandle) {
   };
 }
 
-function normalizeOptions(options) {
+export function normalizeListenerOptions(options) {
   if (typeof options === "boolean") {
     return { capture: options, once: false, passive: false, signal: null };
   }
@@ -132,8 +143,13 @@ function addListener(target, eventType, callback, normalized) {
   retained.references++;
   binding.callbacks.set(identity, retained);
   binding.identities.set(callback, identity);
-  const entry = { identity, signal: normalized.signal, abortHandler: null };
+  const entry = { identity, type: eventType, capture: normalized.capture, signal: normalized.signal, abortHandler: null };
   binding.registrations.set(handle, entry);
+  if (target._coreHandle) {
+    let listenedNodes = listenedNodesByCore.get(binding.core);
+    if (!listenedNodes) listenedNodesByCore.set(binding.core, listenedNodes = new Set());
+    listenedNodes.add(target);
+  }
   if (entry.signal) {
     entry.abortHandler = () =>
       removeEventListener(target, eventType, callback, {
@@ -163,6 +179,31 @@ function removeListener(binding, eventType, callback, capture) {
     capture ? 1 : 0,
   );
   if (handle !== 0n) releaseRegistration(binding, handle);
+}
+
+// Removes every listener of `target`: the HTML Standard's "erase all event
+// listeners and handlers" for document.open(), and the release of a
+// document whose window is a global object that outlives it.
+export function removeAllEventListeners(target, core = targetCore(target)) {
+  const binding = bindingsByCore.get(core)?.get(target);
+  if (!binding) return;
+  for (const entry of [...binding.registrations.values()]) {
+    const retained = binding.callbacks.get(entry.identity);
+    if (retained) removeListener(binding, entry.type, retained.callback, entry.capture);
+  }
+}
+
+// Event.timeStamp on the page's clock (DOM, §2.2 "Interface Event": event
+// creation sets it to the relative high resolution time of the event's
+// relevant global). A window's event constructors stamp an event when the
+// page creates it (src/dom/page-clock.js); an event that Sandom or the host
+// created takes the time when it is first dispatched to a node or window of
+// a document whose page has a clock.
+const eventTimeClocks = new WeakMap();
+
+export function stampEventTime(event, clock) {
+  Object.defineProperty(event, "timeStamp", { configurable: true, value: clock.now() });
+  eventTimeClocks.set(event, clock);
 }
 
 function instrumentEvent(event) {
@@ -300,11 +341,31 @@ function dispatchCoordinator(core, handle, path) {
   return coordinator;
 }
 
-function dispatch(target, event, reportException) {
+// A listener: a function, called with the current target as `this`, or an
+// object with handleEvent.
+function invokeListener(callback, event) {
+  return typeof callback === "function"
+    ? callback.call(this, event)
+    : callback.handleEvent(event);
+}
+
+// `targetOverride` is the HTML Standard's "legacy target override flag": the
+// window's load event reports the document as its target.
+function dispatch(target, event, reportException, targetOverride = null) {
   const state = instrumentEvent(event);
   const binding = targetBinding(target);
   const core = binding.core;
   const document = target.nodeType === 9 ? target : target.ownerDocument;
+  const windowDocument = document ?? (target.document?.defaultView === target ? target.document : null);
+  const pageClock = windowDocument?._clock ?? null;
+  if (pageClock !== null && eventTimeClocks.get(event) !== pageClock) stampEventTime(event, pageClock);
+  // The document whose node, window or media query list the event targets.
+  // Its listeners run as its component code (src/dom/component-code.js).
+  const listenerDocument = windowDocument ?? target._document ?? null;
+  // A listener exception goes to the reporter of that document (its scripts
+  // report it as an error event at the window), else to the realm's
+  // reportError.
+  reportException ??= listenerDocument?._reportException ?? globalThis.reportError;
   if (document?.defaultView) {
     core.status(
       "event_target_window_set",
@@ -330,8 +391,8 @@ function dispatch(target, event, reportException) {
   );
   state.handle = handle;
   state.core = core;
-  state.originalTarget = target;
-  state.target = target;
+  state.originalTarget = targetOverride ?? target;
+  state.target = state.originalTarget;
   let completed = false;
   const finish = () => {
     if (!completed) core.status("event_dispatch_abort", handle);
@@ -348,7 +409,7 @@ function dispatch(target, event, reportException) {
     state.path = path.map((entry) => entry.node);
     state.visiblePath = state.path;
     const coordinator = dispatchCoordinator(core, handle, path);
-    function advance() {
+    const advance = () => {
       for (;;) {
         const token = core.handle("event_dispatch_next", handle);
         if (token === 0n) {
@@ -371,7 +432,7 @@ function dispatch(target, event, reportException) {
         const currentBinding = current.binding;
         const callback = currentBinding.callbacks.get(identity).callback;
         state.currentTarget = current.node;
-        state.target = current.target;
+        state.target = targetOverride ?? current.target;
         state.currentRelatedTarget = isNode(state.relatedTarget)
           ? current.related
           : state.relatedTarget;
@@ -395,9 +456,7 @@ function dispatch(target, event, reportException) {
         let result;
         let outcome = 0;
         try {
-          result = typeof callback === "function"
-            ? callback.call(current.node, event)
-            : callback.handleEvent(event);
+          result = enterComponentCode(listenerDocument, invokeListener, current.node, [callback, event]);
         } catch (error) {
           outcome = 1;
           reportException(error);
@@ -419,7 +478,7 @@ function dispatch(target, event, reportException) {
         state.passive = false;
         core.status("event_dispatch_resume", handle, token, outcome);
       }
-    }
+    };
     const result = coordinator === null ? advance() : coordinator(advance);
     if (result && typeof result.then === "function") {
       return Promise.resolve(result).then(
@@ -434,6 +493,11 @@ function dispatch(target, event, reportException) {
       );
     }
     finish();
+    // A click that no listener canceled reaches the activation behavior of
+    // the hyperlink around its target (src/dom/scripts.js).
+    if (event.type === "click" && !event.defaultPrevented && document?._scriptProcessing) {
+      document._scriptProcessing.followHyperlink(target);
+    }
     return result;
   } catch (error) {
     finish();
@@ -443,10 +507,9 @@ function dispatch(target, event, reportException) {
 
 export const { addEventListener, removeEventListener, dispatchEvent } =
   createEventBindings({
-    listenerOptions: normalizeOptions,
+    listenerOptions: normalizeListenerOptions,
     lookupTarget: (target) => bindingsByCore.get(targetCore(target))?.get(target),
-    exceptionReporter: ({ reportException = globalThis.reportError }) =>
-      reportException,
+    exceptionReporter: ({ reportException }) => reportException,
     eventIdentity: (event) => {
       if (!(event instanceof Event)) {
         throw new TypeError("dispatchEvent expects an Event");
@@ -457,6 +520,63 @@ export const { addEventListener, removeEventListener, dispatchEvent } =
     removeListener,
     dispatch,
   });
+
+const eventTargetBrands = new WeakSet();
+
+// Wrapper materialization does not invoke JavaScript constructors.
+export function registerEventTargetWrapper(target) {
+  eventTargetBrands.add(target);
+}
+
+function requireEventTarget(target) {
+  if (!eventTargetBrands.has(target)) throw new TypeError("Illegal EventTarget receiver");
+}
+
+// WebIDL receiver and argument conversion; the existing native event transport
+// owns registrations, propagation, cancellation and callback lifetime.
+export const SDEventTarget = class EventTarget {
+  constructor() {
+    registerEventTargetWrapper(this);
+  }
+  addEventListener(type, callback, options = undefined) {
+    requireEventTarget(this);
+    if (arguments.length < 2) throw new TypeError("addEventListener requires two arguments");
+    if (typeof type === "symbol") throw new TypeError("An event type cannot be a Symbol");
+    const eventType = String(type);
+    if (callback != null && typeof callback !== "object" && typeof callback !== "function") {
+      throw new TypeError("An event listener must be an object or null");
+    }
+    addEventListener(this, eventType, callback, options);
+  }
+  removeEventListener(type, callback, options = undefined) {
+    requireEventTarget(this);
+    if (arguments.length < 2) throw new TypeError("removeEventListener requires two arguments");
+    if (typeof type === "symbol") throw new TypeError("An event type cannot be a Symbol");
+    const eventType = String(type);
+    if (callback != null && typeof callback !== "object" && typeof callback !== "function") {
+      throw new TypeError("An event listener must be an object or null");
+    }
+    removeEventListener(this, eventType, callback, options);
+  }
+  dispatchEvent(event) {
+    requireEventTarget(this);
+    if (arguments.length < 1) throw new TypeError("dispatchEvent requires an event");
+    return dispatchEvent(this, event);
+  }
+};
+Object.defineProperty(SDEventTarget.prototype, Symbol.toStringTag, {
+  value: "EventTarget", configurable: true,
+});
+for (const name of ["addEventListener", "removeEventListener", "dispatchEvent"]) {
+  Object.defineProperty(SDEventTarget.prototype, name, { enumerable: true });
+}
+
+// Fires `event` at a document's window with the legacy target override:
+// listeners see the document as the event's target.
+export function dispatchWindowEventWithDocumentTarget(window, event, document, reportException) {
+  if (!(event instanceof Event)) throw new TypeError("dispatchEvent expects an Event");
+  return dispatch(window, event, reportException, document);
+}
 
 function defineEventFields(event, init) {
   for (const [name, value] of Object.entries(init)) {
@@ -560,6 +680,46 @@ export class SDToggleEvent extends Event {
   }
 }
 
+// CSS Animations' AnimationEvent: exactly animationName, elapsedTime and
+// pseudoElement.
+export class SDAnimationEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    defineEventFields(this, {
+      animationName: String(init.animationName ?? ""),
+      elapsedTime: Number(init.elapsedTime ?? 0),
+      pseudoElement: String(init.pseudoElement ?? ""),
+    });
+  }
+}
+
+// CSS Transitions' TransitionEvent: exactly propertyName, elapsedTime and
+// pseudoElement.
+export class SDTransitionEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    defineEventFields(this, {
+      propertyName: String(init.propertyName ?? ""),
+      elapsedTime: Number(init.elapsedTime ?? 0),
+      pseudoElement: String(init.pseudoElement ?? ""),
+    });
+  }
+}
+// Web Animations' AnimationPlaybackEvent: exactly currentTime and
+// timelineTime, null when unresolved. Animations dispatch it (remove). Its
+// constructor has the interface's name, as in a browser.
+export const SDAnimationPlaybackEvent = class AnimationPlaybackEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    defineEventFields(this, {
+      currentTime: init.currentTime == null ? null : Number(init.currentTime),
+      timelineTime: init.timelineTime == null ? null : Number(init.timelineTime),
+    });
+  }
+};
+const ANIMATION_EVENT_TYPES = new Set(["animationstart", "animationiteration", "animationend", "animationcancel"]);
+const TRANSITION_EVENT_TYPES = new Set(["transitionrun", "transitionstart", "transitionend", "transitioncancel"]);
+
 export class SDPointerEvent extends SDMouseEvent {}
 
 export function createEvent(type, init = {}, fields = {}) {
@@ -590,6 +750,12 @@ export function createEvent(type, init = {}, fields = {}) {
   }
   if (type === "toggle" || type === "beforetoggle") {
     return new SDToggleEvent(type, nativeInit);
+  }
+  if (ANIMATION_EVENT_TYPES.has(type)) {
+    return new SDAnimationEvent(type, nativeInit);
+  }
+  if (TRANSITION_EVENT_TYPES.has(type)) {
+    return new SDTransitionEvent(type, nativeInit);
   }
   if (
     String(type).startsWith("mouse") || type === "click" ||

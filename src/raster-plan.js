@@ -1,20 +1,14 @@
+import { nativeAtlasView, flushNativeAtlasEffects } from "./atlas.js";
 import {
   clipUniformFloats as packClipUniformFloats,
   MAX_SHADER_CLIP_ENTRIES,
 } from "./gpu-composition-clip.js";
 import {
-  CMD_BOX_SHADOW,
   CMD_DAMAGE,
   CMD_IMAGE,
   CMD_IMAGE_FLAG_PIXELATED,
   CMD_PUSH_BLEND_LAYER,
   CMD_PUSH_OPACITY,
-  CMD_RECT,
-  CMD_SET_NODE,
-  CMD_SET_SCROLL,
-  CMD_SVG_PATH,
-  CMD_TEXT,
-  COLOR_GLYPH_CACHE_PAGE_INDEX_BASE,
   RASTER_PLAN_ABI_VERSION,
   RASTER_PLAN_BOX_SHADOW_INSTANCE_FLOATS,
   RASTER_PLAN_CLIP_ENTRY_SIZE,
@@ -33,7 +27,6 @@ import {
   RASTER_PLAN_PASS_BOX_BLUR_V,
   RASTER_PLAN_PASS_DROP_SHADOW,
   RASTER_PLAN_RECORD_FLAG_NEEDS_BACKDROP_COPY,
-  RASTER_PLAN_RECORD_OFFSET_BOUNDS,
   RASTER_PLAN_RECORD_OFFSET_CLIP,
   RASTER_PLAN_RECORD_OFFSET_FLAGS,
   RASTER_PLAN_RECORD_OFFSET_GRADIENT,
@@ -66,38 +59,12 @@ export function clipUniformFloats(clipState) {
 }
 export { MAX_SHADER_CLIP_ENTRIES };
 
-// The instanced kinds: one pipeline, one bind group, N instances. An image
-// and an SVG path each bind their own resource per draw, so a record of
-// those kinds is always its own draw.
+// Record table words and halves, for the totals passes below.
 const RECORD_WORDS = RASTER_PLAN_RECORD_SIZE / 4;
-const RECORD_WORD_CLIP = RASTER_PLAN_RECORD_OFFSET_CLIP / 4;
-const RECORD_WORD_PAYLOAD = RASTER_PLAN_RECORD_OFFSET_PAYLOAD / 4;
-const RECORD_WORD_PAYLOAD_BYTES = RASTER_PLAN_RECORD_OFFSET_PAYLOAD_BYTES / 4;
 const RECORD_WORD_INSTANCE_COUNT = RASTER_PLAN_RECORD_OFFSET_INSTANCE_COUNT /
   4;
 const RECORD_WORD_RESOURCE = RASTER_PLAN_RECORD_OFFSET_RESOURCE / 4;
-const RECORD_WORD_GRADIENT_BYTES = RASTER_PLAN_RECORD_OFFSET_GRADIENT_BYTES /
-  4;
-const RECORD_WORD_BOUNDS = RASTER_PLAN_RECORD_OFFSET_BOUNDS / 4;
 const RECORD_HALF_KIND = RASTER_PLAN_RECORD_OFFSET_KIND / 2;
-const RECORD_HALF_FLAGS = RASTER_PLAN_RECORD_OFFSET_FLAGS / 2;
-
-function spannableKind(kind) {
-  return kind === CMD_RECT || kind === CMD_BOX_SHADOW || kind === CMD_TEXT;
-}
-
-// A cached color glyph (CMD_IMAGE from an atlas page of the color glyph
-// cache, plans/PLAN-color-glyphs.md slice 3) is one instance of its page's
-// image draw, so consecutive glyphs of one page merge like text runs.
-function spannableRecord(kind, resource) {
-  return spannableKind(kind) ||
-    (kind === CMD_IMAGE && resource >= COLOR_GLYPH_CACHE_PAGE_INDEX_BASE);
-}
-
-// The kinds whose payload is instance data a backend draws from.
-function instancedKind(kind) {
-  return spannableKind(kind) || kind === CMD_IMAGE || kind === CMD_SVG_PATH;
-}
 
 export function openRasterPlan(memory, plan) {
   if (!(memory instanceof WebAssembly.Memory)) {
@@ -116,19 +83,6 @@ export function openRasterPlan(memory, plan) {
   let clipCount;
   let payloadRegionOffset;
   let payloadRegionBytes;
-  // drawSequence's result, reused by every call on this reader.
-  const sequence = {
-    count: 0,
-    first: new Uint32Array(0),
-    last: new Uint32Array(0),
-    instanceCount: new Uint32Array(0),
-    payloadStart: new Uint32Array(0),
-    payloadEnd: new Uint32Array(0),
-    bounds: new Float32Array(0),
-    uploadBytes: 0,
-    pathMaskInUse: false,
-  };
-  let clipsInUse = new Uint8Array(0);
 
   function refresh() {
     if (plan + RASTER_PLAN_HEADER_SIZE > memory.buffer.byteLength) {
@@ -197,6 +151,10 @@ export function openRasterPlan(memory, plan) {
   }
 
   const reader = {
+    // The plan's address in its memory.
+    get address() {
+      return plan;
+    },
     get count() {
       ensureCurrentMemory();
       return recordCount;
@@ -283,10 +241,20 @@ export function openRasterPlan(memory, plan) {
       let state = clipStates.get(clipIndex);
       if (state === undefined) {
         const entryCount = reader.clipEntryCount(index);
+        let packedFloats = reader.clip(index);
+        let pathMaskFloats = reader.pathMask(index);
         state = Object.freeze({
           entries: Object.freeze(Array.from({ length: entryCount }, () => null)),
-          packedFloats: reader.clip(index),
-          pathMaskFloats: reader.pathMask(index),
+          // Atlas effects can grow the fused core while a backend holds this
+          // clip. Keep native offsets authoritative across memory replacement.
+          get packedFloats() {
+            if (packedFloats.buffer !== memory.buffer) packedFloats = reader.clip(index);
+            return packedFloats;
+          },
+          get pathMaskFloats() {
+            if (pathMaskFloats.buffer !== memory.buffer) pathMaskFloats = reader.pathMask(index);
+            return pathMaskFloats;
+          },
           entryCount,
           bounds: reader.clipBounds(index),
           clipIndex,
@@ -309,185 +277,6 @@ export function openRasterPlan(memory, plan) {
         plan + payloadRegionOffset + payloadOffset,
         payloadBytes >>> 2,
       );
-    },
-    // The records a backend visits, in plan order, from one pass over the
-    // record table. A draw may cover several consecutive records.
-    // `raster_plan_prepare` writes one record per source command -- the
-    // record directory doubles as the source-coverage map that
-    // `raster_plan_validate` checks -- so records are never merged in WAT.
-    // The JavaScript materializer that preceded it batched consecutive
-    // rects, shadows and text runs under one clip and atlas into a single
-    // instanced draw, and that is restored here in the reader instead,
-    // where it costs no plan structure.
-    //
-    // Mergeable means: identical kind, clip, resource and flags, no
-    // gradient on either side, and payloads that abut in plan order. Only
-    // the instanced kinds qualify; images and SVG paths carry one logical
-    // draw per record. Records that paint nothing are left out and do not
-    // end a span: SET_NODE and SET_SCROLL, which both backends handle by
-    // doing nothing (the command stream names the owning node before each
-    // run, so an inline paragraph arrives as text, set-node, text, ...),
-    // and instanced records with no payload, which is every record the
-    // raster culled against its target. DAMAGE and the group and clip
-    // records stay: damage changes the scissor, and a group boundary
-    // redirects the target. A culled document is mostly empty records (the
-    // Wikipedia scroll: 6,597 records, 231 draws), so the pass reads the
-    // record table as words rather than one accessor call per field.
-    //
-    // Returns views valid until the next call on this reader: `count`
-    // entries of `first` and `last` record, `instanceCount` over the
-    // entry, `payloadStart`..`payloadEnd`, the entry's bytes in the
-    // payload region, and four `bounds` floats, the union of the extents
-    // its drawing records can write (RASTER_PLAN_RECORD_OFFSET_BOUNDS);
-    // `uploadBytes`, the end of the last instanced payload (the prefix of
-    // the payload region every draw reads from); and `pathMaskInUse`,
-    // whether any record's clip carries an SVG path mask.
-    drawSequence() {
-      ensureCurrentMemory();
-      if (((plan + recordTableOffset) & 3) !== 0) {
-        throw new RangeError(
-          `raster plan record table at ${plan + recordTableOffset} is not word aligned`,
-        );
-      }
-      const words = new Uint32Array(
-        memory.buffer,
-        plan + recordTableOffset,
-        recordCount * RECORD_WORDS,
-      );
-      const halves = new Uint16Array(
-        memory.buffer,
-        plan + recordTableOffset,
-        recordCount * RECORD_WORDS * 2,
-      );
-      const floats = new Float32Array(
-        memory.buffer,
-        plan + recordTableOffset,
-        recordCount * RECORD_WORDS,
-      );
-      if (sequence.first.length < recordCount) {
-        const capacity = Math.max(recordCount, sequence.first.length * 2);
-        sequence.first = new Uint32Array(capacity);
-        sequence.last = new Uint32Array(capacity);
-        sequence.instanceCount = new Uint32Array(capacity);
-        sequence.payloadStart = new Uint32Array(capacity);
-        sequence.payloadEnd = new Uint32Array(capacity);
-        sequence.bounds = new Float32Array(capacity * 4);
-      }
-      if (clipsInUse.length < clipCount) {
-        clipsInUse = new Uint8Array(Math.max(clipCount, clipsInUse.length * 2));
-      } else {
-        clipsInUse.fill(0, 0, clipCount);
-      }
-      const { first, last, instanceCount, payloadStart, payloadEnd, bounds } =
-        sequence;
-      let count = 0;
-      let uploadBytes = 0;
-      let index = 0;
-      while (index < recordCount) {
-        const word = index * RECORD_WORDS;
-        const kind = halves[index * RECORD_WORDS * 2 + RECORD_HALF_KIND];
-        const clip = words[word + RECORD_WORD_CLIP];
-        if (clip !== RASTER_PLAN_NO_CLIP) {
-          if (clip >= clipCount) {
-            throw new RangeError(
-              `raster plan clip index ${clip} exceeds count ${clipCount}`,
-            );
-          }
-          clipsInUse[clip] = 1;
-        }
-        if (kind === CMD_SET_NODE || kind === CMD_SET_SCROLL) {
-          index++;
-          continue;
-        }
-        const start = words[word + RECORD_WORD_PAYLOAD];
-        let end = start + words[word + RECORD_WORD_PAYLOAD_BYTES];
-        let instances = words[word + RECORD_WORD_INSTANCE_COUNT];
-        let spanLast = index;
-        let minimumX = floats[word + RECORD_WORD_BOUNDS];
-        let minimumY = floats[word + RECORD_WORD_BOUNDS + 1];
-        let maximumX = floats[word + RECORD_WORD_BOUNDS + 2];
-        let maximumY = floats[word + RECORD_WORD_BOUNDS + 3];
-        if (spannableRecord(kind, words[word + RECORD_WORD_RESOURCE])) {
-          if (instances === 0 && end === start) {
-            index++;
-            continue;
-          }
-          if (words[word + RECORD_WORD_GRADIENT_BYTES] === 0) {
-            const resource = words[word + RECORD_WORD_RESOURCE];
-            const flags = halves[index * RECORD_WORDS * 2 + RECORD_HALF_FLAGS];
-            for (let next = index + 1; next < recordCount; next++) {
-              const nextWord = next * RECORD_WORDS;
-              const nextKind = halves[next * RECORD_WORDS * 2 + RECORD_HALF_KIND];
-              const nextBytes = words[nextWord + RECORD_WORD_PAYLOAD_BYTES];
-              const nextInstances = words[nextWord + RECORD_WORD_INSTANCE_COUNT];
-              if (
-                nextKind === CMD_SET_NODE || nextKind === CMD_SET_SCROLL ||
-                (nextInstances === 0 && nextBytes === 0)
-              ) {
-                continue;
-              }
-              if (
-                nextKind !== kind ||
-                words[nextWord + RECORD_WORD_CLIP] !== clip ||
-                words[nextWord + RECORD_WORD_RESOURCE] !== resource ||
-                halves[next * RECORD_WORDS * 2 + RECORD_HALF_FLAGS] !== flags ||
-                words[nextWord + RECORD_WORD_GRADIENT_BYTES] !== 0 ||
-                words[nextWord + RECORD_WORD_PAYLOAD] !== end
-              ) {
-                break;
-              }
-              end += nextBytes;
-              instances += nextInstances;
-              spanLast = next;
-              const nextBounds = nextWord + RECORD_WORD_BOUNDS;
-              minimumX = Math.min(minimumX, floats[nextBounds]);
-              minimumY = Math.min(minimumY, floats[nextBounds + 1]);
-              maximumX = Math.max(maximumX, floats[nextBounds + 2]);
-              maximumY = Math.max(maximumY, floats[nextBounds + 3]);
-            }
-          }
-        } else if (kind === CMD_IMAGE || kind === CMD_SVG_PATH) {
-          instances = 1;
-        }
-        if (instancedKind(kind)) {
-          if (end === start) {
-            index = spanLast + 1;
-            continue;
-          }
-          if (end > payloadRegionBytes || (start & 3) !== 0 || (end & 3) !== 0) {
-            throw new RangeError(
-              `raster plan payload ${start}..${end} of record ${index} exceeds ${payloadRegionBytes}-byte region`,
-            );
-          }
-          if (end > uploadBytes) uploadBytes = end;
-        }
-        first[count] = index;
-        last[count] = spanLast;
-        instanceCount[count] = instances;
-        payloadStart[count] = start;
-        payloadEnd[count] = end;
-        bounds[count * 4] = minimumX;
-        bounds[count * 4 + 1] = minimumY;
-        bounds[count * 4 + 2] = maximumX;
-        bounds[count * 4 + 3] = maximumY;
-        count++;
-        index = spanLast + 1;
-      }
-      let pathMaskInUse = false;
-      for (let clip = 0; clip < clipCount && !pathMaskInUse; clip++) {
-        if (clipsInUse[clip] === 0) continue;
-        const mask = new Float32Array(
-          memory.buffer,
-          plan + clipTableOffset + clip * RASTER_PLAN_CLIP_ENTRY_SIZE + 4 +
-            RASTER_PLAN_CLIP_FLOATS * 4,
-          RASTER_PLAN_CLIP_PATH_MASK_FLOATS,
-        );
-        pathMaskInUse = mask.some((value) => value !== 0);
-      }
-      sequence.count = count;
-      sequence.uploadBytes = uploadBytes;
-      sequence.pathMaskInUse = pathMaskInUse;
-      return sequence;
     },
     // Totals every backend-independent consumer reads from the record
     // table: the instances the records draw (a DAMAGE record's count is
@@ -518,6 +307,29 @@ export function openRasterPlan(memory, plan) {
         }
       }
       return { instances, liveImage };
+    },
+    // The image resources that the plan's CMD_IMAGE records draw. A frame
+    // captures only these canvases: the host image map holds every image
+    // of the runtime, other documents' canvases included.
+    imageResources() {
+      ensureCurrentMemory();
+      const words = new Uint32Array(
+        memory.buffer,
+        plan + recordTableOffset,
+        recordCount * RECORD_WORDS,
+      );
+      const halves = new Uint16Array(
+        memory.buffer,
+        plan + recordTableOffset,
+        recordCount * RECORD_WORDS * 2,
+      );
+      const resources = new Set();
+      for (let index = 0; index < recordCount; index++) {
+        if (halves[index * RECORD_WORDS * 2 + RECORD_HALF_KIND] === CMD_IMAGE) {
+          resources.add(words[index * RECORD_WORDS + RECORD_WORD_RESOURCE]);
+        }
+      }
+      return resources;
     },
     // The first `byteLength` bytes of the payload region.
     payloadRegion(byteLength) {
@@ -659,14 +471,16 @@ export function openRasterPlan(memory, plan) {
             `native filter pass ${passIndex} uniform ${uniformOffset}..${uniformOffset + uniformBytes} exceeds ${passView.byteLength}-byte list`,
           );
         }
+        const uniformAddress = payload.byteOffset + listOffset + uniformOffset;
+        let uniform = new Float32Array(memory.buffer, uniformAddress, uniformBytes >>> 2);
         passes.push({
-
           kind,
-          uniform: new Float32Array(
-            payload.buffer,
-            payload.byteOffset + listOffset + uniformOffset,
-            uniformBytes >>> 2,
-          ),
+          get uniform() {
+            if (uniform.buffer !== memory.buffer) {
+              uniform = new Float32Array(memory.buffer, uniformAddress, uniformBytes >>> 2);
+            }
+            return uniform;
+          },
         });
       }
       return passes;
@@ -726,14 +540,51 @@ export function filterRegionPadding(reach, extent, maxExtent) {
   return Math.min(padding, Math.floor((maxExtent - extent) / 2));
 }
 
+// Copies the native draw sequence of `reader`'s plan: per entry the first
+// record, instance count, payload span and four device-pixel bounds; the
+// instance upload prefix; and whether a visited clip carries a path mask.
+function rasterPlanSequence(reader, exports) {
+  const state = exports.raster_plan_sequence_create();
+  try {
+    const count = exports.raster_plan_sequence(state, reader.address);
+    if (count < 0) {
+      throw new RangeError(
+        `raster plan payload of record ${exports.raster_plan_sequence_failure_record(state)} ends at ` +
+          `${exports.raster_plan_sequence_failure_value(state)}, outside its region or word alignment`,
+      );
+    }
+    const words = new Uint32Array(count * 12);
+    words.set(new Uint32Array(exports.memory.buffer, exports.raster_plan_sequence_entries(state), count * 12));
+    const floats = new Float32Array(words.buffer);
+    const field = (offset) => Uint32Array.from({ length: count }, (_, index) => words[index * 12 + offset]);
+    const bounds = new Float32Array(count * 4);
+    for (let index = 0; index < count; index++) bounds.set(floats.subarray(index * 12 + 5, index * 12 + 9), index * 4);
+    return {
+      count,
+      first: field(0),
+      instanceCount: field(2),
+      payloadStart: field(3),
+      payloadEnd: field(4),
+      bounds,
+      uploadBytes: exports.raster_plan_sequence_upload_bytes(state),
+      pathMaskInUse: exports.raster_plan_sequence_path_mask(state) !== 0,
+    };
+  } finally {
+    exports.raster_plan_sequence_destroy(state);
+  }
+}
+
+// Renderer-core forms the draw sequence (`raster_plan_sequence`,
+// src/wasm/gpu-frame.watpart), as it does for the GPU command stream;
+// `exports` belong to the core whose memory holds the plan.
 // One mutable cursor serves the complete frame. It walks the reader's draw
 // sequence: selecting an entry changes only numeric indices, and payloads
 // remain zero-copy views into the native plan. An entry may cover a SPAN of
 // consecutive mergeable records, in which case `instances`, `count` and
 // `gradients` describe the whole span and the backend issues one instanced
 // draw for it.
-export function createRasterPlanCursor(reader, resources = {}) {
-  const sequence = reader.drawSequence();
+export function createRasterPlanCursor(reader, exports, resources = {}) {
+  const sequence = rasterPlanSequence(reader, exports);
   let entry = 0;
   let recordIndex = 0;
   let selectionGradients = null;
@@ -749,6 +600,10 @@ export function createRasterPlanCursor(reader, resources = {}) {
     },
     get pathMaskInUse() {
       return sequence.pathMaskInUse;
+    },
+    // Four device-pixel bounds per draw-sequence entry, without a copied view.
+    get bounds() {
+      return sequence.bounds;
     },
     // Selects entry `index` and returns its first record.
     selectEntry(index) {
@@ -795,23 +650,11 @@ export function createRasterPlanCursor(reader, resources = {}) {
       return cursor.atlas?.revision ?? 0;
     },
     get atlas() {
-      if (reader.kind(recordIndex) === CMD_TEXT) {
-        const fontIndex = reader.resource(recordIndex);
-        const atlas = resources.atlases?.get(fontIndex)?.atlas;
-        if (!atlas) {
-          throw new Error(
-            `native CMD_TEXT resource ${fontIndex} is absent from the host atlas map`,
-          );
-        }
-        return atlas;
+      const identity = reader.resource(recordIndex);
+      if (!resources.atlasForIdentity) {
+        throw new Error(`Native atlas ${identity} requires the raster plan's graphics resource reader`);
       }
-      const pathIndex = reader.resource(recordIndex);
-      if (!resources.svgPathAtlas?.getPathByIndex(pathIndex)) {
-        throw new Error(
-          `native CMD_SVG_PATH resource ${pathIndex} is absent from the host path atlas`,
-        );
-      }
-      return resources.svgPathAtlas;
+      return resources.atlasForIdentity(identity);
     },
     get image() {
       const imageIndex = reader.resource(recordIndex);
@@ -902,184 +745,38 @@ export function createRasterPlanCursor(reader, resources = {}) {
   return cursor;
 }
 
-// The device-pixel rectangles {x, y, w, h} that cover exactly the dirty
-// tiles of a `width` × `height` target: each row's runs of adjacent dirty
-// tiles, a run extending the rectangle that ends on the row above with the
-// same columns. The rectangles are disjoint, the rule raster_plan_select
-// writes its DAMAGE rectangles by (raster-plan.watpart).
-export function dirtyTileRectangles(dirtyTiles, width, height, tileSize) {
-  const columns = Math.ceil(width / tileSize);
-  const rows = Math.ceil(height / tileSize);
-  const rectangles = [];
-  // Per column, the rectangle whose run starts there and ends on the
-  // previous row.
-  let previous = new Array(columns).fill(null);
-  let current = new Array(columns).fill(null);
-  for (let row = 0; row < rows; row++) {
-    const y = row * tileSize;
-    const h = Math.min(tileSize, height - y);
-    current.fill(null);
-    for (let column = 0; column < columns; column++) {
-      if (!dirtyTiles[row * columns + column]) continue;
-      let end = column + 1;
-      while (end < columns && dirtyTiles[row * columns + end]) end++;
-      const x = column * tileSize;
-      const w = Math.min(end * tileSize, width) - x;
-      let rectangle = previous[column];
-      if (rectangle !== null && rectangle.w === w) {
-        rectangle.h += h;
-      } else {
-        rectangle = { x, y, w, h };
-        rectangles.push(rectangle);
-      }
-      current[column] = rectangle;
-      column = end - 1;
-    }
-    [previous, current] = [current, previous];
+
+// The native plan owns every revision. This cache holds only graphics views.
+const rasterPlanAtlasViews = new WeakMap();
+
+export function rasterPlanAtlasResources(descriptor) {
+  let plans = rasterPlanAtlasViews.get(descriptor.exports);
+  if (!plans) {
+    plans = new Map();
+    rasterPlanAtlasViews.set(descriptor.exports, plans);
   }
-  return rectangles;
+  let state = plans.get(descriptor.plan);
+  if (!state) {
+    const views = new Map();
+    const atlasForIdentity = (identity) => {
+      let atlas = views.get(identity);
+      if (!atlas) {
+        const revision = descriptor.exports.raster_plan_atlas_revision(descriptor.plan, identity);
+        atlas = nativeAtlasView(descriptor.memory, identity, revision);
+        views.set(identity, atlas);
+      }
+      return atlas;
+    };
+    state = { atlasForIdentity };
+    plans.set(descriptor.plan, state);
+  }
+  const pathIdentity = new DataView(descriptor.memory.buffer, descriptor.plan, RASTER_PLAN_HEADER_SIZE).getUint32(88, true);
+  return { atlasForIdentity: state.atlasForIdentity,
+    svgPathAtlas: pathIdentity ? state.atlasForIdentity(pathIdentity) : null };
 }
 
-export function prepareRetainedRasterPlan(
-  previous,
-  options,
-  width,
-  height,
-) {
-  const publication = options.commandRetention;
-  const rectangle = options.visibleRectangle;
-  const background = options.background;
-  const thickening = options.textThickening;
-  const descriptor = options.rasterPlanDescriptor;
-  const rasterPlan = options.rasterPlan;
-  const key = [
-    options.deviceScale ?? 1,
-    options.renderMode ?? "standard",
-    rectangle?.x,
-    rectangle?.y,
-    rectangle?.width,
-    rectangle?.height,
-    background?.r ?? 0,
-    background?.g ?? 0,
-    background?.b ?? 0,
-    background?.a ?? 0,
-    thickening?.lightInk ?? 0,
-    thickening?.darkInk ?? 0,
-    width,
-    height,
-    options.tileSize ?? 64,
-  ];
-  const reusable = publication?.owner != null &&
-    publication.resourceRevision !== undefined &&
-    previous?.publication?.owner === publication.owner &&
-    previous.publication.resourceRevision === publication.resourceRevision &&
-    previous.commandBytes === rasterPlan.bytes.byteLength &&
-    previous.key.length === key.length &&
-    previous.key.every((value, index) => value === key[index]) &&
-    previous.plan === descriptor.plan &&
-    !previous.liveCanvas;
-  const rebuilt = !reusable;
-  const changed = reusable &&
-    previous.publication.revision !== publication.revision;
-  const planReader = rebuilt || changed
-    ? rasterPlan
-    : previous.planReader.refresh();
-  const tileSize = options.tileSize ?? 64;
-  const needsIndex = publication?.owner != null || options.dirtyTiles != null;
-  const indexed = needsIndex &&
-    descriptor.exports.raster_plan_index(descriptor.plan, tileSize) === 1;
-  const totals = planReader.recordTotals((imageIndex) =>
-    options.images?.get(imageIndex)?.kind === "canvas"
-  );
-  const liveCanvas = totals.liveImage;
-  const sameTarget = previous && previous.key.length === key.length &&
-    previous.key.every((value, index) => value === key[index]);
-  const samePublisher = publication?.owner != null
-    ? previous?.publication?.owner === publication.owner
-    : !previous?.publication;
-  const validTarget = sameTarget && samePublisher &&
-    !previous.liveCanvas && !liveCanvas && previous.indexed && indexed;
-  let dirtyTiles = validTarget || (reusable && indexed)
-    ? options.dirtyTiles
-    : null;
-  const requiresFullReplay =
-    descriptor.exports.raster_plan_requires_full_replay(descriptor.plan) === 1;
-  if (
-    dirtyTiles != null && dirtyTiles.length > 0 &&
-    dirtyTiles.every((value) => value !== 0)
-  ) {
-    dirtyTiles = null;
-  }
-  // A backend that scissors every draw to the dirty tiles itself (WebGPU,
-  // rasterize.js renderFrame) replays the plan as it is; one that starts
-  // unscissored (WebGL 2) replays the damage selection, whose DAMAGE record
-  // scissors the draws after it. raster_plan_select copies the whole plan
-  // to prefix that record.
-  let selected = planReader;
-  let replayPlan = 0;
-  if (
-    options.damageSelection === true &&
-    !requiresFullReplay &&
-    dirtyTiles != null &&
-    dirtyTiles.some((value) => value !== 0)
-  ) {
-    const dirtyPointer = descriptor.exports.abi_malloc(dirtyTiles.byteLength);
-    if (dirtyPointer === 0) {
-      throw new Error(
-        `raster_plan_select could not allocate ${dirtyTiles.byteLength} dirty-tile bytes`,
-      );
-    }
-    try {
-      new Uint8Array(
-        descriptor.memory.buffer,
-        dirtyPointer,
-        dirtyTiles.byteLength,
-      ).set(dirtyTiles);
-      replayPlan = descriptor.exports.raster_plan_select(
-        descriptor.plan,
-        dirtyPointer,
-        dirtyTiles.length,
-      );
-    } finally {
-      descriptor.exports.abi_free(dirtyPointer);
-    }
-    if (replayPlan !== 0) {
-      selected = openRasterPlan(descriptor.memory, replayPlan);
-    }
-  }
-  const replayedInstances = selected === planReader
-    ? totals.instances
-    : selected.recordTotals(() => false).instances;
-  return {
-    state: {
-      publication: publication ? { ...publication } : null,
-      planReader,
-      indexed,
-      key,
-      commandBytes: rasterPlan.bytes.byteLength,
-      liveCanvas,
-      plan: descriptor.plan,
-    },
-    dirtyTiles,
-    requiresFullReplay,
-    planReader: selected,
-    release() {
-      if (replayPlan !== 0) {
-        descriptor.exports.raster_plan_release(replayPlan);
-        replayPlan = 0;
-      }
-    },
-    statistics: {
-      rebuilt,
-      decodedRecords: rebuilt
-        ? rasterPlan.count
-        : changed
-        ? publication.ranges.length
-        : 0,
-      replayedInstances,
-      replayedBatches: selected.count,
-      // The replay is the plan's damage selection (raster_plan_select).
-      damageSelected: selected !== planReader,
-    },
-  };
+export function releaseRasterPlan(descriptor) {
+  descriptor.exports.raster_plan_release(descriptor.plan);
+  rasterPlanAtlasViews.get(descriptor.exports)?.delete(descriptor.plan);
+  flushNativeAtlasEffects(descriptor.memory ?? descriptor.exports.memory);
 }

@@ -1,9 +1,8 @@
 import colorBytes from "@sandom/color/color.wasm" with { type: "bytes" };
-import fontMetricsBytes from "@sandom/font-metrics/font-metrics.wasm" with { type: "bytes" };
 import gainMapBytes from "@sandom/gain-map/gain-map.wasm" with { type: "bytes" };
+import pngBytes from "@sandom/png/png-codec.wasm" with { type: "bytes" };
 import harfbuzzBytes from "../../vendor/hb.wasm" with { type: "bytes" };
 import msdfgenBytes from "../../vendor/msdfgen.wasm" with { type: "bytes" };
-import pngBytes from "../../vendor/png-codec.wasm" with { type: "bytes" };
 // Byte imports belong to the reviewed module graph, not ambient worker I/O.
 // Seed the eager default renderer before importing the worker implementation;
 // the component's runtime then owns these explicit assets, including its PNG
@@ -12,7 +11,6 @@ import pngBytes from "../../vendor/png-codec.wasm" with { type: "bytes" };
 
 globalThis[Symbol.for("sandom.hbBytes")] = harfbuzzBytes;
 globalThis[Symbol.for("sandom.colorBytes")] = colorBytes;
-globalThis[Symbol.for("sandom.fontMetricsBytes")] = fontMetricsBytes;
 globalThis[Symbol.for("sandom.gainMapBytes")] = gainMapBytes;
 globalThis[Symbol.for("sandom.msdfgenBytes")] = msdfgenBytes;
 globalThis.window = globalThis;

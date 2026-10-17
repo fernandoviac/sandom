@@ -1,4 +1,5 @@
-// Sandom owns PPM framing; @sandom/color supplies generic RGB quantization.
+// output_ppm_frame frames the samples; @sandom/color supplies generic RGB quantization.
+import { sharedDomCore as core } from "../dom-wasm/core.js";
 import { transformImageForOutput } from "./color-transform.js";
 import { packSignal } from "./packing.js";
 
@@ -7,10 +8,8 @@ export function encodePPM(descriptor, request) {
     throw new Error('encodePPM requires a validated OutputRequest with format "ppm"');
   }
   const { pixels } = transformImageForOutput(descriptor, request);
-  const header = new TextEncoder().encode(`P6\n${descriptor.width} ${descriptor.height}\n255\n`);
-  const rgb = packSignal(pixels, 8, 3);
-  const output = new Uint8Array(header.byteLength + rgb.byteLength);
-  output.set(header);
-  output.set(rgb, header.byteLength);
-  return output;
+  const [rgb] = core.byteInput(packSignal(pixels, 8, 3));
+  core.status("output_ppm_frame", rgb, descriptor.width, descriptor.height);
+  const pointer = core.exports.abi_output_pointer();
+  return core.refreshBytes().slice(pointer, pointer + core.exports.abi_output_length());
 }

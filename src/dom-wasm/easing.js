@@ -1,8 +1,6 @@
 import { markAuthorValueRejection, sharedDomCore } from "./core.js";
 import { createEasingBindings } from "../dom/dom-bindings.generated.js";
 
-const STEP_POSITIONS = ["jump-end", "jump-start", "jump-none", "jump-both"];
-
 // Easing diagnostics already contain the complete language-level message.
 // Kinds 2 and 14 are the grammar's verdict on the value it was handed - the
 // author-value rejection CSS Cascade drops a declaration for - and are
@@ -53,13 +51,11 @@ function parseEasingTransport(raw) {
           y2: view.getFloat64(40, true),
           cssText,
         };
-      case 2:
-        return {
-          kind: "steps",
-          count: view.getFloat64(8, true),
-          position: STEP_POSITIONS[view.getUint32(4, true)],
-          cssText,
-        };
+      case 2: {
+        const count = view.getFloat64(8, true);
+        core.status("css_easing_step_position", handle);
+        return { kind: "steps", count, position: core.outputString(), cssText };
+      }
       case 3: {
         const points = new Array(view.getUint32(48, true));
         for (let index = 0; index < points.length; index++) {
@@ -152,3 +148,11 @@ export const { parseCSSEasing, serializeCSSEasing } = createEasingBindings({
   parseEasingTransport,
   serializeEasingTransport,
 });
+
+// The serialization of a timing function that the Web Animations interface
+// reports (animation_easing_report). $easing is CSS text or a parsed record.
+export function serializeAnimationEasing(easing) {
+  const record = typeof easing === "string" ? parseCSSEasing(easing) : easing;
+  if (typeof record !== "string") return serializeCSSEasing(record);
+  return sharedDomCore.string("animation_easing_report", ...sharedDomCore.input(record));
+}

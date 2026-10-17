@@ -1,5 +1,10 @@
-import { readBinaryFile } from './host.js';
+import { readPackageAsset } from './package-assets.js';
 import { PNG_ABI as ABI } from './png-abi.js';
+
+// Sandom's binding for the @sandom/png module. The package ships the module
+// and its ABI record; the library import map resolves it (a sibling checkout
+// locally, the reviewed library set or the installed npm package otherwise).
+const PNG_CODEC_WASM = '@sandom/png/png-codec.wasm';
 
 export class PngCodecError extends Error {
   constructor(status, domain, field, offset) {
@@ -15,7 +20,7 @@ export function createPngCodec({ getPngBytes = null } = {}) {
   let loading, ready;
   async function load() {
     loading ??= (async () => {
-      const bytes = getPngBytes ? await getPngBytes() : await readBinaryFile(new URL('../vendor/png-codec.wasm', import.meta.url));
+      const bytes = getPngBytes ? await getPngBytes() : await readPackageAsset(new URL(import.meta.resolve(PNG_CODEC_WASM)));
       const { instance } = await WebAssembly.instantiate(bytes, {});
       const e = instance.exports;
       if (!(e.memory instanceof WebAssembly.Memory) || e.png_version?.() !== ABI.version || e.png_record_bytes?.() !== ABI.recordBytes) {
@@ -65,7 +70,46 @@ export function createPngCodec({ getPngBytes = null } = {}) {
     }
     return { get, view, copy };
   }
+  function encodingRequest(pixels, width, height, options) {
+    if (!(pixels instanceof Uint8Array || pixels instanceof Uint8ClampedArray || pixels instanceof Uint16Array || pixels instanceof Float32Array)) throw new TypeError('PNG pixels must be uint8, uint16, or float32');
+    if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0 || width > 0x7fffffff || height > 0x7fffffff) throw new TypeError('PNG dimensions must be positive integers');
+    if (pixels.byteLength > ABI.limits.decodedBytes) throw new PngCodecError(ABI.status.resourceLimit, 0, 0, 0);
+    const level = options.compressionLevel ?? 6;
+    if (!Number.isInteger(level) || level < 0 || level > 9) throw new TypeError('PNG compressionLevel must be an integer 0..9 (advisory)');
+    if (options.profile && (!(options.profile instanceof Uint8Array) || options.profile.byteLength > ABI.limits.profileBytes)) throw new TypeError('Invalid PNG profile bytes');
+    const channelLayout = options.channelLayout ?? 'rgba';
+    if (channelLayout !== 'rgba' && channelLayout !== 'rgb') throw new TypeError('PNG channelLayout must be "rgba" or "rgb"');
+    return { pixels, width, height, options, level, channelLayout };
+  }
+  function encodeReady({ pixels, width, height, options, level, channelLayout }) {
+    if (!ready) throw new Error('PNG codec: initialize() must complete before synchronous encoding');
+    const e = ready;
+    const channels = channelLayout === 'rgb' ? 3 : 4;
+    let input, request, profile, output;
+    try {
+      input = allocate(e, new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength));
+      if (options.profile) profile = allocate(e, options.profile);
+      const record = new Uint8Array(ABI.recordBytes); const view = new DataView(record.buffer);
+      const set = (name, value) => view.setUint32(ABI.fields[name], value, true);
+      const setFloat = (name, value) => view.setFloat64(ABI.fields[name], value, true);
+      set('version', ABI.version); set('width', width); set('height', height);
+      set('rowStride', options.rowStride ?? width * channels * pixels.BYTES_PER_ELEMENT);
+      set('sampleType', pixels instanceof Float32Array ? ABI.enums.sampleType.indexOf('float32') : pixels instanceof Uint16Array ? ABI.enums.sampleType.indexOf('uint16') : ABI.enums.sampleType.indexOf('uint8'));
+      set('bitsPerSample', options.bitDepth ?? 8); set('channelLayout', ABI.enums.channelLayout.indexOf(channelLayout)); set('alphaMode', ABI.enums.alphaMode.indexOf(channelLayout === 'rgb' ? 'opaque' : 'straight'));
+      set('pixelHandle', id(input)); set('pixelLength', pixels.byteLength);
+      set('profileHandle', profile ? id(profile) : 0); set('profileLength', options.profile?.byteLength ?? 0);
+      set('mode', options.colorEncoding ? 1 : 0); set('compressionLevel', level);
+      if (options.colorEncoding) { set('primaries', ABI.enums.primaries.indexOf(options.colorEncoding.primaries)); set('transfer', ABI.enums.transfer.indexOf(options.colorEncoding.transferFunction)); }
+      let flags = 0;
+      if (options.masteringDisplay != null) { flags |= ABI.flags.masteringDisplay; setFloat('masteringMaxLow', options.masteringDisplay.maxLuminance); setFloat('masteringMinLow', options.masteringDisplay.minLuminance); }
+      if (options.contentLightLevel != null) { flags |= ABI.flags.contentLightLevel; setFloat('contentMaxLow', options.contentLightLevel.maxContentLightLevel); setFloat('frameAverageLow', options.contentLightLevel.maxFrameAverageLightLevel); }
+      set('flags', flags); request = allocate(e, record);
+      output = handle(e, e.png_encode(id(request)));
+      return result(e, output).copy('pixelOffset', 'pixelLength');
+    } finally { release(e, output); release(e, request); release(e, profile); release(e, input); }
+  }
   return Object.freeze({
+    async initialize() { await load(); },
     async decode(bytes) {
       if (!(bytes instanceof Uint8Array)) throw new TypeError('decodePNG requires Uint8Array bytes');
       if (bytes.byteLength > ABI.limits.inputBytes) throw new PngCodecError(ABI.status.resourceLimit, 0, 0, 0);
@@ -100,43 +144,22 @@ export function createPngCodec({ getPngBytes = null } = {}) {
       } finally { release(e, output); release(e, input); }
     },
     async encode(pixels, width, height, options = {}) {
-      if (!(pixels instanceof Uint8Array || pixels instanceof Uint8ClampedArray || pixels instanceof Uint16Array || pixels instanceof Float32Array)) throw new TypeError('PNG pixels must be uint8, uint16, or float32');
-      if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0 || width > 0x7fffffff || height > 0x7fffffff) throw new TypeError('PNG dimensions must be positive integers');
-      if (pixels.byteLength > ABI.limits.decodedBytes) throw new PngCodecError(ABI.status.resourceLimit, 0, 0, 0);
-      const level = options.compressionLevel ?? 6;
-      if (!Number.isInteger(level) || level < 0 || level > 9) throw new TypeError('PNG compressionLevel must be an integer 0..9 (advisory)');
-      if (options.profile && (!(options.profile instanceof Uint8Array) || options.profile.byteLength > ABI.limits.profileBytes)) throw new TypeError('Invalid PNG profile bytes');
+      const request = encodingRequest(pixels, width, height, options);
       if (!ready) {
-        pixels = pixels.slice();
-        options = { ...options, profile: options.profile?.slice(),
+        request.pixels = pixels.slice();
+        request.options = { ...options, profile: options.profile?.slice(),
           colorEncoding: options.colorEncoding && { ...options.colorEncoding },
           masteringDisplay: options.masteringDisplay && { ...options.masteringDisplay },
           contentLightLevel: options.contentLightLevel && { ...options.contentLightLevel } };
+        await load();
       }
-      const e = ready ?? await load(); let input, request, profile, output;
-      try {
-        input = allocate(e, new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength));
-        if (options.profile) {
-          profile = allocate(e, options.profile);
-        }
-        const record = new Uint8Array(ABI.recordBytes); const view = new DataView(record.buffer);
-        const set = (name, value) => view.setUint32(ABI.fields[name], value, true);
-        const setFloat = (name, value) => view.setFloat64(ABI.fields[name], value, true);
-        set('version', ABI.version); set('width', width); set('height', height);
-        set('rowStride', options.rowStride ?? width * 4 * pixels.BYTES_PER_ELEMENT);
-        set('sampleType', pixels instanceof Float32Array ? ABI.enums.sampleType.indexOf('float32') : pixels instanceof Uint16Array ? ABI.enums.sampleType.indexOf('uint16') : ABI.enums.sampleType.indexOf('uint8'));
-        set('bitsPerSample', options.bitDepth ?? 8); set('channelLayout', ABI.enums.channelLayout.indexOf('rgba')); set('alphaMode', ABI.enums.alphaMode.indexOf('straight'));
-        set('pixelHandle', id(input)); set('pixelLength', pixels.byteLength);
-        set('profileHandle', profile ? id(profile) : 0); set('profileLength', options.profile?.byteLength ?? 0);
-        set('mode', options.colorEncoding ? 1 : 0); set('compressionLevel', level);
-        if (options.colorEncoding) { set('primaries', ABI.enums.primaries.indexOf(options.colorEncoding.primaries)); set('transfer', ABI.enums.transfer.indexOf(options.colorEncoding.transferFunction)); }
-        let flags = 0;
-        if (options.masteringDisplay != null) { flags |= ABI.flags.masteringDisplay; setFloat('masteringMaxLow', options.masteringDisplay.maxLuminance); setFloat('masteringMinLow', options.masteringDisplay.minLuminance); }
-        if (options.contentLightLevel != null) { flags |= ABI.flags.contentLightLevel; setFloat('contentMaxLow', options.contentLightLevel.maxContentLightLevel); setFloat('frameAverageLow', options.contentLightLevel.maxFrameAverageLightLevel); }
-        set('flags', flags); request = allocate(e, record);
-        output = handle(e, e.png_encode(id(request)));
-        return result(e, output).copy('pixelOffset', 'pixelLength');
-      } finally { release(e, output); release(e, request); release(e, profile); release(e, input); }
+      return encodeReady(request);
+    },
+    encodeWithCompletion(pixels, width, height, options, operation) {
+      let bytes;
+      try { bytes = encodeReady(encodingRequest(pixels, width, height, options)); }
+      catch (error) { operation.throw(error); return; }
+      operation.reply(bytes);
     },
   });
 }
