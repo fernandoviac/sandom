@@ -1,3 +1,8 @@
+// Render planning. The core resolves each field of the plan and records
+// its decision (output-plan.watpart); this binding performs the viewport
+// recommendation, the inspection and the motion recommendation between the
+// core's steps, and builds the plan, warning and refusal records.
+
 import {
   inspectPreparedInput,
   prepareRenderInput,
@@ -6,35 +11,30 @@ import { assertScrollbarStyle } from "./scrollbar-visibility.js";
 import { DocumentSession } from "./document-session.js";
 import { recommendMotionCapture } from "./motion-capture-recommendation.js";
 import { recommendViewport } from "./viewport-recommendation.js";
+import { sharedDomCore as core } from "../dom-wasm/core.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+
+// The codes, texts and result record of output-plan.watpart, by WAT name
+// without the OUTPUT_PLAN_ prefix.
+const PLAN = Object.freeze(Object.fromEntries([
+  "TEXT_FIELD_DURATION", "TEXT_FIELD_SAMPLING", "TEXT_FIELD_PROGRESS_SCHEDULE", "TEXT_SOURCE_BOUNDED_FALLBACK",
+  "TEXT_VIEWPORT_FALLBACK_CODE", "TEXT_VIEWPORT_FALLBACK_MESSAGE", "TEXT_DURATION_FALLBACK_CODE",
+  "TEXT_DURATION_FALLBACK_MESSAGE", "TEXT_REFUSAL_EXTERNAL", "TEXT_REFUSAL_INDETERMINATE", "TEXT_REFUSAL_NO_SCHEDULE",
+  "TEXT_FORMATS", "TEXT_SAMPLING_STRATEGY", "FORMAT_JPEG_GAIN_MAP", "REPETITION_INFINITE", "REPETITION_CALLER",
+  "REFUSAL_EXTERNAL_MOTION", "REFUSAL_NO_SCHEDULE", "WARNING_VIEWPORT", "WARNING_DURATION",
+  "VIEWPORT_AUTO", "VIEWPORT_NOT_OBJECT", "VIEWPORT_OBJECT", "RECOMMENDATION_NONE_VALID",
+  "RECOMMENDATION_SELECTED", "RECOMMENDATION_INVALID", "REFUSED",
+  "RESULT_FORMAT", "RESULT_REPETITION", "RESULT_SAMPLING_FALLBACK", "RESULT_CONFIDENCE", "RESULT_REFUSAL",
+  "RESULT_WARNINGS", "RESULT_DECISION_COUNT", "RESULT_VIEWPORT_WIDTH", "RESULT_VIEWPORT_HEIGHT",
+  "RESULT_DEVICE_SCALE", "RESULT_DURATION", "RESULT_FALLBACK_SAMPLING", "RESULT_DECISIONS",
+  "DECISION_SIZE", "DECISION_FIELD", "DECISION_SOURCE", "DECISION_CODE", "DECISION_MESSAGE", "DYNAMIC_TEXT",
+].map((name) => [name, layoutConstant(`OUTPUT_PLAN_${name}`)])));
 
 export const STANDARD_RENDER_VIEWPORT = Object.freeze({
   width: 1280,
   height: 720,
 });
 export const INDETERMINATE_MOTION_FALLBACK_DURATION_MILLISECONDS = 3000;
-
-const OUTPUTS = Object.freeze({
-  png: Object.freeze({
-    format: "png",
-    mediaType: "image/png",
-    extension: ".png",
-  }),
-  gif: Object.freeze({
-    format: "gif",
-    mediaType: "image/gif",
-    extension: ".gif",
-  }),
-  "jpeg-xl": Object.freeze({
-    format: "jpeg-xl",
-    mediaType: "image/jxl",
-    extension: ".jxl",
-  }),
-  "jpeg-gain-map": Object.freeze({
-    format: "jpeg-gain-map",
-    mediaType: "image/jpeg",
-    extension: ".gain-map.jpg",
-  }),
-});
 
 function deepFreeze(value) {
   if (Array.isArray(value)) {
@@ -48,10 +48,6 @@ function deepFreeze(value) {
   return value;
 }
 
-function decision(field, source, code, message) {
-  return { field, source, reason: { code, message } };
-}
-
 export class RenderPlanningError extends Error {
   constructor(message, details) {
     super(message);
@@ -60,442 +56,282 @@ export class RenderPlanningError extends Error {
   }
 }
 
-function planningRefusal(field, motion, reason, acceptedCallerConstraints) {
-  throw new RenderPlanningError(reason.message, {
-    kind: "render-planning-refusal",
-    version: 1,
-    unresolvedField: field,
-    inspectionClassification: motion.classification,
-    reason,
-    acceptedCallerConstraints,
-    effects: motion.effects.map((effect) => ({
-      effectOrder: effect.effectOrder,
-      animationName: effect.animationName || null,
-      kind: effect.kind,
-    })),
-  });
+function planText(id) {
+  core.status("output_plan_text", id);
+  return core.outputString();
 }
 
-function explicitViewport(value, deviceScale) {
-  if (value === "auto" || value === undefined) return null;
-  if (value === null || typeof value !== "object") {
-    throw new TypeError("viewport must be auto or an object");
+const isAuto = (value) => value === undefined || value === "auto";
+const textOf = (value) => typeof value === "string" ? value : "";
+const jsonText = (value) => String(JSON.stringify(value));
+
+// The core's plan: its fields and decisions.
+function readPlan(session) {
+  core.status("output_plan_result", session);
+  const output = core.exports.abi_output_pointer();
+  const view = new DataView(core.refreshBytes().buffer);
+  const word = (offset) => view.getUint32(output + offset, true);
+  const number = (offset) => view.getFloat64(output + offset, true);
+  const plan = {
+    format: word(PLAN.RESULT_FORMAT),
+    repetition: word(PLAN.RESULT_REPETITION),
+    samplingFallback: word(PLAN.RESULT_SAMPLING_FALLBACK) !== 0,
+    confidence: word(PLAN.RESULT_CONFIDENCE),
+    refusal: word(PLAN.RESULT_REFUSAL),
+    warnings: word(PLAN.RESULT_WARNINGS),
+    viewport: {
+      width: number(PLAN.RESULT_VIEWPORT_WIDTH),
+      height: number(PLAN.RESULT_VIEWPORT_HEIGHT),
+      deviceScale: number(PLAN.RESULT_DEVICE_SCALE),
+    },
+    durationMilliseconds: number(PLAN.RESULT_DURATION),
+    fallbackSampling: [0, 1, 2, 3].map((index) =>
+      number(PLAN.RESULT_FALLBACK_SAMPLING + index * Float64Array.BYTES_PER_ELEMENT)),
+    decisions: [],
+  };
+  const entries = Array.from({ length: word(PLAN.RESULT_DECISION_COUNT) }, (_, index) =>
+    [PLAN.DECISION_FIELD, PLAN.DECISION_SOURCE, PLAN.DECISION_CODE, PLAN.DECISION_MESSAGE]
+      .map((offset) => word(PLAN.RESULT_DECISIONS + index * PLAN.DECISION_SIZE + offset)));
+  const dynamic = PLAN.DYNAMIC_TEXT >>> 0;
+  const text = (id) => {
+    if (id < dynamic) return planText(id);
+    core.status("output_plan_dynamic_text", session, id - dynamic);
+    return core.outputString();
+  };
+  plan.decisions = entries.map(([field, source, code, message]) => ({
+    field: text(field),
+    source: text(source),
+    reason: { code: text(code), message: text(message) },
+  }));
+  return plan;
+}
+
+// Records the viewport recommendation in the session.
+function submitRecommendation(session, recommendation) {
+  const outcome = recommendation.classification === "none-valid"
+    ? PLAN.RECOMMENDATION_NONE_VALID
+    : recommendation.classification === "selected" && recommendation.viewport !== null
+    ? PLAN.RECOMMENDATION_SELECTED
+    : PLAN.RECOMMENDATION_INVALID;
+  const reasons = outcome === PLAN.RECOMMENDATION_SELECTED ? recommendation.reasons : [];
+  const encoder = new TextEncoder();
+  const encoded = reasons.map((reason) => encoder.encode(String(reason)));
+  const packed = new Uint8Array(Math.max(4, encoded.reduce((sum, bytes) => sum + 4 + bytes.byteLength, 0)));
+  const packedView = new DataView(packed.buffer);
+  let cursor = 0;
+  for (const bytes of encoded) {
+    packedView.setUint32(cursor, bytes.byteLength, true);
+    packed.set(bytes, cursor + 4);
+    cursor += 4 + bytes.byteLength;
   }
-  const width = Number(value.width);
-  const height = Number(value.height);
-  const scaleValue = value.deviceScale ?? deviceScale ?? "auto";
-  const scale = scaleValue === "auto" ? 1 : Number(scaleValue);
-  if (!(width > 0) || !(height > 0) || !(scale > 0)) {
-    throw new RangeError(
-      "viewport width, height, and deviceScale must be positive",
-    );
-  }
-  return { width, height, deviceScale: scale };
+  const [confidencePointer, confidenceLength] = core.input(textOf(recommendation.confidence));
+  const [reasonsPointer] = core.byteInput(packed);
+  core.statusRaw("output_plan_automatic_viewport", session, outcome,
+    Number(recommendation.viewport?.width), Number(recommendation.viewport?.height),
+    confidencePointer, confidenceLength, reasonsPointer, encoded.length);
+}
+
+function viewportWarning(recommendation) {
+  return {
+    field: "viewport",
+    source: "standard-viewport",
+    reason: { code: planText(PLAN.TEXT_VIEWPORT_FALLBACK_CODE), message: planText(PLAN.TEXT_VIEWPORT_FALLBACK_MESSAGE) },
+    evidence: {
+      classification: recommendation.classification,
+      recommendationReason: recommendation.reason,
+      rejections: recommendation.rejections,
+    },
+  };
 }
 
 export function planAutomaticViewport(recommendation, deviceScale = 1) {
-  const scale = Number(deviceScale);
-  if (!(scale > 0)) {
-    throw new RangeError("deviceScale must be positive");
-  }
-  if (recommendation.classification === "none-valid") {
-    const reason = {
-      code: "no-valid-viewport-standard-fallback",
-      message:
-        "No recommended viewport satisfies every analytical constraint; policy selected the standard 1280 by 720 viewport",
-    };
+  const [backendPointer, backendLength] = core.input("auto");
+  const session = core.statusRaw("output_plan_begin", backendPointer, backendLength, 0, 0, 1);
+  try {
+    const scale = Number(deviceScale);
+    if (!(scale > 0)) throw new RangeError("deviceScale must be positive");
+    core.statusRaw("output_plan_viewport", session, 0, scale, 0, NaN, NaN);
+    submitRecommendation(session, recommendation);
+    const plan = readPlan(session);
+    const fallback = recommendation.classification === "none-valid";
     return deepFreeze({
-      viewport: { ...STANDARD_RENDER_VIEWPORT, deviceScale: scale },
-      confidence: "fallback",
-      decision: decision(
-        "viewport",
-        "standard-viewport",
-        reason.code,
-        reason.message,
-      ),
-      warning: {
-        field: "viewport",
-        source: "standard-viewport",
-        reason,
-        evidence: {
-          classification: recommendation.classification,
-          recommendationReason: recommendation.reason,
-          rejections: recommendation.rejections,
-        },
-      },
+      viewport: plan.viewport,
+      confidence: fallback ? "fallback" : recommendation.confidence,
+      decision: plan.decisions.at(-1),
+      warning: fallback ? viewportWarning(recommendation) : null,
     });
+  } finally {
+    core.status("output_plan_release", session);
   }
-  if (
-    recommendation.classification === "selected" &&
-    recommendation.viewport !== null
-  ) {
-    return deepFreeze({
-      viewport: { ...recommendation.viewport, deviceScale: scale },
-      confidence: recommendation.confidence,
-      decision: decision(
-        "viewport",
-        "recommendation",
-        "recommended-viewport",
-        recommendation.reasons.join("; "),
-      ),
-      warning: null,
-    });
-  }
-  throw new TypeError("Viewport recommendation has an invalid outcome");
+}
+
+function effectSummaries(motion) {
+  return motion.effects.map((effect) => ({
+    effectOrder: effect.effectOrder,
+    animationName: effect.animationName || null,
+    kind: effect.kind,
+  }));
 }
 
 export async function planRenderInput(preparedInput, request = {}) {
-  const decisions = [];
-  const warnings = [];
   const graphicsBackend = request.graphicsBackend ?? "auto";
-  if (!["auto", "webgpu", "webgl2"].includes(graphicsBackend)) {
-    throw new RangeError(
-      `Unsupported graphics backend ${JSON.stringify(graphicsBackend)}`,
+  const [backendPointer, backendLength] = core.input(textOf(graphicsBackend));
+  const [backendJsonPointer, backendJsonLength] = core.input(jsonText(graphicsBackend));
+  const session = core.statusRaw("output_plan_begin", backendPointer, backendLength,
+    backendJsonPointer, backendJsonLength, request.scrollbarStyle === undefined ? 1 : 0);
+  try {
+    const scrollbarStyle = assertScrollbarStyle(
+      request.scrollbarStyle ?? "overlay",
+      "render planning request",
     );
-  }
-  decisions.push(decision(
-    "graphicsBackend",
-    graphicsBackend === "auto" ? "default" : "caller",
-    graphicsBackend === "auto"
-      ? "automatic-graphics-backend"
-      : "caller-graphics-backend",
-    graphicsBackend === "auto"
-      ? "The runtime selects the first available graphics backend"
-      : "The caller supplied the graphics backend",
-  ));
-  const scrollbarStyle = assertScrollbarStyle(
-    request.scrollbarStyle ?? "overlay",
-    "render planning request",
-  );
-  decisions.push(decision(
-    "scrollbarStyle",
-    request.scrollbarStyle === undefined ? "default" : "caller",
-    request.scrollbarStyle === undefined
-      ? "default-scrollbar-style"
-      : "caller-scrollbar-style",
-    request.scrollbarStyle === undefined
-      ? "Scrollbars use the overlay style"
-      : "The caller supplied the scrollbar style",
-  ));
-  const viewportDeviceScale = request.viewport !== null &&
-      typeof request.viewport === "object"
-    ? request.viewport.deviceScale
-    : undefined;
-  const requestedDeviceScale = viewportDeviceScale ?? request.deviceScale ?? 1;
-  const provisionalDeviceScale = requestedDeviceScale === "auto"
-    ? 1
-    : Number(requestedDeviceScale);
-  if (!(provisionalDeviceScale > 0)) {
-    throw new RangeError("deviceScale must be auto or a positive number");
-  }
-  const requestedViewport = explicitViewport(
-    request.viewport,
-    provisionalDeviceScale,
-  );
-  let viewport;
-  let viewportConfidence;
-  if (requestedViewport) {
-    viewport = requestedViewport;
-    viewportConfidence = "caller";
-    decisions.push(decision(
-      "viewport",
-      "caller",
-      "caller-viewport",
-      "The caller supplied the viewport",
-    ));
-  } else {
-    const viewportPlan = planAutomaticViewport(
-      await recommendViewport(
+    const viewportDeviceScale = request.viewport !== null &&
+        typeof request.viewport === "object"
+      ? request.viewport.deviceScale
+      : undefined;
+    const requestedDeviceScale = viewportDeviceScale ?? request.deviceScale ?? 1;
+    const viewportKind = request.viewport === "auto" || request.viewport === undefined
+      ? PLAN.VIEWPORT_AUTO
+      : request.viewport === null || typeof request.viewport !== "object"
+      ? PLAN.VIEWPORT_NOT_OBJECT
+      : PLAN.VIEWPORT_OBJECT;
+    const explicit = core.statusRaw("output_plan_viewport", session,
+      requestedDeviceScale === "auto" ? 1 : 0,
+      requestedDeviceScale === "auto" ? 1 : Number(requestedDeviceScale), viewportKind,
+      viewportKind === PLAN.VIEWPORT_OBJECT ? Number(request.viewport.width) : NaN,
+      viewportKind === PLAN.VIEWPORT_OBJECT ? Number(request.viewport.height) : NaN);
+    let recommendation = null;
+    if (!explicit) {
+      recommendation = await recommendViewport(
         preparedInput,
         { ...request.viewportRecommendation, scrollbarStyle },
-      ),
-      provisionalDeviceScale,
-    );
-    viewport = viewportPlan.viewport;
-    viewportConfidence = viewportPlan.confidence;
-    decisions.push(viewportPlan.decision);
-    if (viewportPlan.warning) warnings.push(viewportPlan.warning);
-  }
-
-  const inspection = await inspectPreparedInput(preparedInput, {
-    mode: "observed",
-    viewport,
-    scrollbarStyle,
-  });
-  const requestedCapture = request.capture ?? {};
-  const durationOverride = requestedCapture.durationMilliseconds;
-  const repetitionOverride = requestedCapture.repetition;
-  const preferredFrameRateOverride = requestedCapture.preferredFrameRate;
-  const motionRecommendation = recommendMotionCapture(inspection.motion, {
-    preferredFrameRate: preferredFrameRateOverride === "auto" ||
-        preferredFrameRateOverride === undefined
-      ? 30
-      : preferredFrameRateOverride,
-    maximumFrameRate: requestedCapture.maximumFrameRate ?? 60,
-    maximumFrameCount: requestedCapture.maximumFrameCount ?? 300,
-    maximumPeriodMilliseconds: requestedCapture.maximumPeriodMilliseconds ??
-      60000,
-  });
-
-  const requestedOutput = request.output ?? "auto";
-  const outputOptions = request.outputOptions ?? {};
-  if (outputOptions === null || typeof outputOptions !== "object" || Array.isArray(outputOptions)) {
-    throw new TypeError("outputOptions must be an object");
-  }
-  let format;
-  if (requestedOutput !== "auto") {
-    if (!Object.hasOwn(OUTPUTS, requestedOutput)) {
-      throw new RangeError(
-        `Unsupported output format ${JSON.stringify(requestedOutput)}`,
       );
+      submitRecommendation(session, recommendation);
     }
-    format = requestedOutput;
-    decisions.push(decision(
-      "output.format",
-      "caller",
-      "caller-output-format",
-      "The caller supplied the output format",
-    ));
-  } else if (motionRecommendation.kind === "still") {
-    format = "png";
-    decisions.push(decision(
-      "output.format",
-      "inspection",
-      "still-motion-uses-png",
-      "No progressing rendered effect exists",
-    ));
-  } else if (
-    ["finite", "periodic", "bounded-but-not-returning"].includes(
-      motionRecommendation.kind,
-    )
-  ) {
-    format = "gif";
-    decisions.push(decision(
-      "output.format",
-      "recommendation",
-      "bounded-motion-uses-gif",
-      "The selected scene has a bounded automatic capture",
-    ));
-  } else if (motionRecommendation.kind === "indeterminate") {
-    format = "gif";
-    decisions.push(decision(
-      "output.format",
-      durationOverride !== undefined && durationOverride !== "auto"
-        ? "caller"
-        : "bounded-fallback",
-      durationOverride !== undefined && durationOverride !== "auto"
-        ? "caller-bounded-motion-uses-gif"
-        : "indeterminate-motion-bounded-fallback-uses-gif",
-      durationOverride !== undefined && durationOverride !== "auto"
-        ? "The caller supplied a bound for indeterminate motion"
-        : "Policy bounded indeterminate motion with a short capture duration",
-    ));
-  } else {
-    planningRefusal(
-      motionRecommendation.kind === "externally-driven"
-        ? "capture.progressSchedule"
-        : "capture.durationMilliseconds",
-      inspection.motion,
-      {
-        code: motionRecommendation.reason.code,
-        message: motionRecommendation.kind === "externally-driven"
-          ? "External motion requires a caller progress schedule"
-          : "Indeterminate motion requires a caller duration",
-      },
-      motionRecommendation.kind === "externally-driven"
-        ? ["capture.progressSchedule"]
-        : ["capture.durationMilliseconds"],
-    );
-  }
-  const resolvedDeviceScale = requestedDeviceScale === "auto"
-    ? format === "gif" ? 1 : 2
-    : provisionalDeviceScale;
-  viewport = { ...viewport, deviceScale: resolvedDeviceScale };
-  decisions.push(decision(
-    "viewport.deviceScale",
-    requestedDeviceScale === "auto" ? "output-policy" : "caller",
-    requestedDeviceScale === "auto"
-      ? format === "gif"
-        ? "animated-output-device-scale"
-        : "still-output-device-scale"
-      : "caller-device-scale",
-    requestedDeviceScale === "auto"
-      ? format === "gif"
-        ? "Animated output uses device scale 1"
-        : "Still output uses device scale 2"
-      : "The caller supplied the device scale",
-  ));
-  if (format !== "jpeg-gain-map" && Object.keys(outputOptions).length > 0) {
-    throw new RangeError("outputOptions are available only for jpeg-gain-map");
-  }
+    const provisional = readPlan(session).viewport;
 
-  let durationMilliseconds = motionRecommendation.durationMilliseconds;
-  if (durationOverride !== undefined && durationOverride !== "auto") {
-    durationMilliseconds = Number(durationOverride);
-    if (!(durationMilliseconds > 0) || !Number.isFinite(durationMilliseconds)) {
-      throw new RangeError(
-        "capture durationMilliseconds must be positive and finite",
-      );
-    }
-    decisions.push(decision(
-      "capture.durationMilliseconds",
-      "caller",
-      "caller-capture-duration",
-      "The caller supplied the capture duration",
-    ));
-  } else if (motionRecommendation.kind === "indeterminate") {
-    durationMilliseconds = INDETERMINATE_MOTION_FALLBACK_DURATION_MILLISECONDS;
-    const reason = {
-      code: "indeterminate-motion-bounded-duration-fallback",
-      message:
-        `Motion duration is indeterminate; policy bounded capture at ${INDETERMINATE_MOTION_FALLBACK_DURATION_MILLISECONDS} milliseconds`,
-    };
-    decisions.push(decision(
-      "capture.durationMilliseconds",
-      "bounded-fallback",
-      reason.code,
-      reason.message,
-    ));
-    warnings.push({
-      field: "capture.durationMilliseconds",
-      source: "bounded-fallback",
-      reason,
-      evidence: {
+    const inspection = await inspectPreparedInput(preparedInput, {
+      mode: "observed",
+      viewport: provisional,
+      scrollbarStyle,
+    });
+    const requestedCapture = request.capture ?? {};
+    const durationOverride = requestedCapture.durationMilliseconds;
+    const repetitionOverride = requestedCapture.repetition;
+    const preferredFrameRateOverride = requestedCapture.preferredFrameRate;
+    const motionRecommendation = recommendMotionCapture(inspection.motion, {
+      preferredFrameRate: isAuto(preferredFrameRateOverride) ? undefined : preferredFrameRateOverride,
+      maximumFrameRate: requestedCapture.maximumFrameRate,
+      maximumFrameCount: requestedCapture.maximumFrameCount,
+      maximumPeriodMilliseconds: requestedCapture.maximumPeriodMilliseconds,
+    });
+
+    const requestedOutput = request.output ?? "auto";
+    const outputOptions = request.outputOptions ?? {};
+    const optionsObject = outputOptions !== null && typeof outputOptions === "object" &&
+      !Array.isArray(outputOptions);
+    const inputs = [
+      textOf(motionRecommendation.kind), textOf(motionRecommendation.confidence),
+      textOf(motionRecommendation.reason?.code), textOf(requestedOutput), jsonText(requestedOutput),
+      textOf(repetitionOverride?.kind),
+    ].map((value) => core.input(value));
+    const outcome = core.statusRaw("output_plan_capture", session,
+      ...inputs[0], ...inputs[1], ...inputs[2],
+      motionRecommendation.durationMilliseconds ?? NaN, motionRecommendation.sampling === null ? 0 : 1,
+      requestedOutput === "auto" ? 0 : 1, ...inputs[3], ...inputs[4],
+      optionsObject ? 1 : 0, optionsObject ? Object.keys(outputOptions).length : 0,
+      isAuto(durationOverride) ? 0 : 1, isAuto(durationOverride) ? NaN : Number(durationOverride),
+      isAuto(repetitionOverride) ? 0 : 1, ...inputs[5],
+      typeof repetitionOverride?.count === "number" ? repetitionOverride.count : NaN,
+      isAuto(preferredFrameRateOverride) ? 0 : 1,
+      isAuto(preferredFrameRateOverride) ? NaN : Number(preferredFrameRateOverride),
+      requestedCapture.maximumFrameCount == null ? 0 : 1, Number(requestedCapture.maximumFrameCount),
+      requestedCapture.maximumFrameRate == null ? 0 : 1, Number(requestedCapture.maximumFrameRate));
+    const plan = readPlan(session);
+    if (outcome === PLAN.REFUSED) {
+      if (plan.refusal === PLAN.REFUSAL_NO_SCHEDULE) {
+        throw new RenderPlanningError(planText(PLAN.TEXT_REFUSAL_NO_SCHEDULE), {
+          kind: "render-planning-refusal",
+          version: 1,
+          unresolvedField: planText(PLAN.TEXT_FIELD_SAMPLING),
+          inspectionClassification: inspection.motion.classification,
+          reason: motionRecommendation.reason,
+          acceptedCallerConstraints: [planText(PLAN.TEXT_FIELD_DURATION)],
+          effects: [],
+        });
+      }
+      const external = plan.refusal === PLAN.REFUSAL_EXTERNAL_MOTION;
+      const field = planText(external ? PLAN.TEXT_FIELD_PROGRESS_SCHEDULE : PLAN.TEXT_FIELD_DURATION);
+      const message = planText(external ? PLAN.TEXT_REFUSAL_EXTERNAL : PLAN.TEXT_REFUSAL_INDETERMINATE);
+      throw new RenderPlanningError(message, {
+        kind: "render-planning-refusal",
+        version: 1,
+        unresolvedField: field,
         inspectionClassification: inspection.motion.classification,
-        recommendationReason: motionRecommendation.reason,
-        effects: inspection.motion.effects.map((effect) => ({
-          effectOrder: effect.effectOrder,
-          animationName: effect.animationName || null,
-          kind: effect.kind,
-        })),
-      },
-    });
-  } else {
-    decisions.push(decision(
-      "capture.durationMilliseconds",
-      "recommendation",
-      motionRecommendation.reason.code,
-      "Motion inspection determined the capture duration",
-    ));
-  }
-
-  let repetition = motionRecommendation.kind === "periodic"
-    ? { kind: "infinite" }
-    : { kind: "count", count: 1 };
-  if (repetitionOverride !== undefined && repetitionOverride !== "auto") {
-    repetition = repetitionOverride;
-    decisions.push(decision(
-      "capture.repetition",
-      "caller",
-      "caller-repetition",
-      "The caller supplied repetition",
-    ));
-  } else {
-    decisions.push(decision(
-      "capture.repetition",
-      "recommendation",
-      motionRecommendation.kind === "periodic"
-        ? "proven-periodic-repetition"
-        : "bounded-one-play",
-      motionRecommendation.kind === "periodic"
-        ? "The scene has a proven shared period"
-        : "The bounded scene plays once",
-    ));
-  }
-
-  if (
-    repetition?.kind !== "infinite" &&
-    !(repetition?.kind === "count" && Number.isInteger(repetition.count) &&
-      repetition.count > 0)
-  ) {
-    throw new RangeError(
-      "capture repetition must be infinite or a positive count",
-    );
-  }
-  if (format !== "gif" && motionRecommendation.kind !== "still") {
-    throw new RangeError(`${format} does not support animated capture`);
-  }
-
-  let sampling = motionRecommendation.sampling;
-  if (sampling === null && motionRecommendation.kind === "indeterminate") {
-    const preferredFrameRate = preferredFrameRateOverride === undefined ||
-        preferredFrameRateOverride === "auto"
-      ? 30
-      : Number(preferredFrameRateOverride);
-    const maximumFrameCount = Number(requestedCapture.maximumFrameCount ?? 300);
-    if (!(preferredFrameRate > 0) || !Number.isFinite(preferredFrameRate)) {
-      throw new RangeError("capture preferredFrameRate must be positive");
+        reason: { code: motionRecommendation.reason.code, message },
+        acceptedCallerConstraints: [field],
+        effects: effectSummaries(inspection.motion),
+      });
     }
-    if (!(Number.isInteger(maximumFrameCount) && maximumFrameCount > 0)) {
-      throw new RangeError(
-        "capture maximumFrameCount must be a positive integer",
-      );
+    const warnings = [];
+    if (plan.warnings & PLAN.WARNING_VIEWPORT) warnings.push(viewportWarning(recommendation));
+    if (plan.warnings & PLAN.WARNING_DURATION) {
+      warnings.push({
+        field: planText(PLAN.TEXT_FIELD_DURATION),
+        source: planText(PLAN.TEXT_SOURCE_BOUNDED_FALLBACK),
+        reason: { code: planText(PLAN.TEXT_DURATION_FALLBACK_CODE), message: planText(PLAN.TEXT_DURATION_FALLBACK_MESSAGE) },
+        evidence: {
+          inspectionClassification: inspection.motion.classification,
+          recommendationReason: motionRecommendation.reason,
+          effects: effectSummaries(inspection.motion),
+        },
+      });
     }
-    sampling = {
-      strategy: "adaptive",
-      preferredFrameRate,
-      maximumFrameRate: Number(requestedCapture.maximumFrameRate ?? 60),
-      maximumFrameCount,
-      requiredSampleCount: null,
-      recommendedFrameBudget: Math.min(
+    const [preferredFrameRate, maximumFrameRate, maximumFrameCount, recommendedFrameBudget] = plan.fallbackSampling;
+    const sampling = plan.samplingFallback
+      ? {
+        strategy: planText(PLAN.TEXT_SAMPLING_STRATEGY),
+        preferredFrameRate,
+        maximumFrameRate,
         maximumFrameCount,
-        Math.ceil(durationMilliseconds * preferredFrameRate / 1000) + 1,
-      ),
-      mandatorySampleTimesMilliseconds: null,
-      recommendedSampleTimesMilliseconds: null,
-    };
-  }
-  if (format === "gif" && sampling === null) {
-    throw new RenderPlanningError("Animated output has no capture schedule", {
-      kind: "render-planning-refusal",
+        requiredSampleCount: null,
+        recommendedFrameBudget,
+        mandatorySampleTimesMilliseconds: null,
+        recommendedSampleTimesMilliseconds: null,
+      }
+      : motionRecommendation.sampling;
+    const format = PLAN.TEXT_FORMATS + plan.format * 3;
+    return deepFreeze({
+      kind: "render-plan",
       version: 1,
-      unresolvedField: "capture.sampling",
-      inspectionClassification: inspection.motion.classification,
-      reason: motionRecommendation.reason,
-      acceptedCallerConstraints: ["capture.durationMilliseconds"],
-      effects: [],
+      output: {
+        format: planText(format),
+        mediaType: planText(format + 1),
+        extension: planText(format + 2),
+        ...(plan.format === PLAN.FORMAT_JPEG_GAIN_MAP ? { codecOptions: { ...outputOptions } } : {}),
+      },
+      graphicsBackend,
+      scrollbarStyle,
+      viewport: plan.viewport,
+      capture: {
+        kind: motionRecommendation.kind,
+        durationMilliseconds: plan.durationMilliseconds,
+        repetition: plan.repetition === PLAN.REPETITION_CALLER
+          ? repetitionOverride
+          : plan.repetition === PLAN.REPETITION_INFINITE
+          ? { kind: "infinite" }
+          : { kind: "count", count: 1 },
+        sampling,
+        periodMilliseconds: motionRecommendation.periodMilliseconds,
+        periodRational: motionRecommendation.periodRational,
+        returnsToInitialState: motionRecommendation.returnsToInitialState,
+      },
+      confidence: planText(plan.confidence),
+      decisions: plan.decisions,
+      warnings,
     });
+  } finally {
+    core.status("output_plan_release", session);
   }
-  decisions.push(decision(
-    "capture.sampling",
-    preferredFrameRateOverride === undefined ||
-      preferredFrameRateOverride === "auto"
-      ? "recommendation"
-      : "caller",
-    "adaptive-motion-boundaries",
-    "Adaptive sampling preserves mandatory motion boundaries",
-  ));
-  return deepFreeze({
-    kind: "render-plan",
-    version: 1,
-    output: {
-      ...OUTPUTS[format],
-      ...(format === "jpeg-gain-map"
-        ? { codecOptions: { ...outputOptions } }
-        : {}),
-    },
-    graphicsBackend,
-    scrollbarStyle,
-    viewport,
-    capture: {
-      kind: motionRecommendation.kind,
-      durationMilliseconds,
-      repetition,
-      sampling,
-      periodMilliseconds: motionRecommendation.periodMilliseconds,
-      periodRational: motionRecommendation.periodRational,
-      returnsToInitialState: motionRecommendation.returnsToInitialState,
-    },
-    confidence: viewportConfidence === "fallback" || warnings.length > 0
-      ? "fallback"
-      : motionRecommendation.confidence === "proven"
-      ? viewportConfidence === "high" || viewportConfidence === "caller"
-        ? "high"
-        : "medium"
-      : "indeterminate",
-    decisions,
-    warnings,
-  });
 }
 
 export async function renderInput(input, options = {}) {

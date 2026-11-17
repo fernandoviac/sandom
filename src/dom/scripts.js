@@ -13,7 +13,15 @@ import { enterComponentCode } from "./component-code.js";
 import { beginHTMLDocumentParse } from "./html.js";
 import { DocumentTimers } from "./document-timers.js";
 import { fixDocumentClock } from "./document-clock.js";
-import { createEvent, dispatchEvent, dispatchWindowEventWithDocumentTarget } from "./events.js";
+import { microtaskCheckpoint } from "./microtask-checkpoint.js";
+import {
+  createEvent,
+  createEventUsing,
+  dispatchEvent,
+  dispatchWindowEventWithDocumentTarget,
+  SDErrorEvent,
+  SDPromiseRejectionEvent,
+} from "./events.js";
 import {
   activateHandlerElements,
   activateParsedEventHandlers,
@@ -21,116 +29,84 @@ import {
   eventHandlerAttributeChanged,
   hasEventHandlerAttributes,
 } from "./event-handlers.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 
-const FORM_ASSOCIATED = new Set(["button", "fieldset", "input", "object", "output", "select", "textarea"]);
-
-const HTML_NS = "http://www.w3.org/1999/xhtml";
-const SVG_NS = "http://www.w3.org/2000/svg";
-
-// MIME Sniffing, "JavaScript MIME type".
-const JAVASCRIPT_MIME_TYPES = new Set([
-  "application/ecmascript",
-  "application/javascript",
-  "application/x-ecmascript",
-  "application/x-javascript",
-  "text/ecmascript",
-  "text/javascript",
-  "text/javascript1.0",
-  "text/javascript1.1",
-  "text/javascript1.2",
-  "text/javascript1.3",
-  "text/javascript1.4",
-  "text/javascript1.5",
-  "text/jscript",
-  "text/livescript",
-  "text/x-ecmascript",
-  "text/x-javascript",
+// The parameter names of an event handler by SCRIPT_HANDLER_* code.
+const HANDLER_PARAMETERS = Object.freeze([
+  ["event"],
+  ["event", "source", "lineno", "colno", "error"],
+  ["evt"],
 ]);
 
-// Fetch, "should response to request be blocked due to its MIME type?".
-function blockedScriptMediaType(mediaType) {
-  return mediaType !== null && (
-    mediaType.startsWith("audio/") || mediaType.startsWith("image/") ||
-    mediaType.startsWith("video/") || mediaType === "text/csv"
-  );
+// The decisions of script-elements.watpart.
+const SCRIPT_RESULT_MASK = layoutConstant("SCRIPT_RESULT_MASK");
+const SCRIPT_RESULT_NONE = layoutConstant("SCRIPT_RESULT_NONE");
+const SCRIPT_RESULT_ERROR_EVENT = layoutConstant("SCRIPT_RESULT_ERROR_EVENT");
+const SCRIPT_RESULT_IMPORTMAP = layoutConstant("SCRIPT_RESULT_IMPORTMAP");
+const SCRIPT_RESULT_FETCH_CLASSIC = layoutConstant("SCRIPT_RESULT_FETCH_CLASSIC");
+const SCRIPT_RESULT_MODULE_EXTERNAL = layoutConstant("SCRIPT_RESULT_MODULE_EXTERNAL");
+const SCRIPT_RESULT_CLASSIC_INLINE = layoutConstant("SCRIPT_RESULT_CLASSIC_INLINE");
+const SCRIPT_EXECUTE_NOW = layoutConstant("SCRIPT_EXECUTE_NOW");
+const SCRIPT_READY_NOTIFY = layoutConstant("SCRIPT_READY_NOTIFY");
+const SCRIPT_READY_IN_ORDER = layoutConstant("SCRIPT_READY_IN_ORDER");
+const SCRIPT_READY_ASAP = layoutConstant("SCRIPT_READY_ASAP");
+const SCRIPT_EXECUTE_SKIP = layoutConstant("SCRIPT_EXECUTE_SKIP");
+const SCRIPT_EXECUTE_ERROR_EVENT = layoutConstant("SCRIPT_EXECUTE_ERROR_EVENT");
+const SCRIPT_EXECUTE_MODULE = layoutConstant("SCRIPT_EXECUTE_MODULE");
+const SCRIPT_EXECUTE_EXTERNAL = layoutConstant("SCRIPT_EXECUTE_EXTERNAL");
+const SCRIPT_EXECUTE_CURRENT = layoutConstant("SCRIPT_EXECUTE_CURRENT");
+const SCRIPT_LIST_AFTER_PARSING = layoutConstant("SCRIPT_LIST_AFTER_PARSING");
+const SCRIPT_LIST_BLOCKING = layoutConstant("SCRIPT_LIST_BLOCKING");
+const SCRIPT_MUTATION_CHILDREN = layoutConstant("SCRIPT_MUTATION_CHILDREN");
+const SCRIPT_MUTATION_INSERTED = layoutConstant("SCRIPT_MUTATION_INSERTED");
+const CALLBACK_EFFECT_SCRIPT_CHILDREN = layoutConstant("CALLBACK_EFFECT_SCRIPT_CHILDREN");
+const CALLBACK_EFFECT_SCRIPT_INSERTED = layoutConstant("CALLBACK_EFFECT_SCRIPT_INSERTED");
+const CALLBACK_EFFECT_SCRIPT_SRC = layoutConstant("CALLBACK_EFFECT_SCRIPT_SRC");
+const CALLBACK_EFFECT_EVENT_HANDLER = layoutConstant("CALLBACK_EFFECT_EVENT_HANDLER");
+const SCRIPT_MUTATION_SRC = layoutConstant("SCRIPT_MUTATION_SRC");
+const SCRIPT_MARKUP_OPEN = layoutConstant("SCRIPT_MARKUP_OPEN");
+const SCRIPT_MARKUP_CLOSE = layoutConstant("SCRIPT_MARKUP_CLOSE");
+const SCRIPT_MARKUP_WRITE = layoutConstant("SCRIPT_MARKUP_WRITE");
+
+// Fetch, "should response to request be blocked due to its MIME type?"
+// (script_blocked_media_type).
+function blockedScriptMediaType(core, mediaType) {
+  return mediaType !== null && core.status("script_blocked_media_type", ...core.input(mediaType)) !== 0;
 }
 
-const ASCII_WHITESPACE = /^[\t\n\f\r ]+|[\t\n\f\r ]+$/g;
-
-function isScriptElement(node) {
-  return node?.nodeType === 1 && node.localName === "script" &&
-    (node.namespaceURI === HTML_NS || node.namespaceURI === SVG_NS);
-}
-
-// "The script block's type string" and the script's type (4.12.1.1,
-// "prepare the script element", steps 8 to 10): "classic", "module",
-// "importmap", or null for a data block.
-function scriptType(element) {
-  const type = element.getAttribute("type");
-  const language = element.getAttribute("language");
-  let typeString;
-  if (type === "" || (type === null && (language === null || language === ""))) {
-    typeString = "text/javascript";
-  } else if (type !== null) {
-    typeString = type.replace(ASCII_WHITESPACE, "");
-  } else {
-    typeString = `text/${language}`;
-  }
-  const lower = typeString.toLowerCase();
-  if (JAVASCRIPT_MIME_TYPES.has(lower)) return "classic";
-  if (lower === "module") return "module";
-  if (lower === "importmap") return "importmap";
-  return null;
-}
-
-// The child text content of the element: its Text children, in order.
+// The child text content of the element (node_child_text).
 function childTextContent(element) {
-  let text = "";
-  for (let child = element.firstChild; child !== null; child = child.nextSibling) {
-    if (child.nodeType === 3) text += child.data;
-  }
-  return text;
+  return element._domCore.string("node_child_text", element._coreHandle);
 }
 
-// The per-element flags of the HTML Standard: "already started", "parser
-// document", "force async", "preparation-time document", "from an external
-// file", and the script's result once it is ready (null on failure).
-const elementStates = new WeakMap();
-
-function stateOf(element) {
-  let state = elementStates.get(element);
-  if (state === undefined) {
-    state = {
-      alreadyStarted: false,
-      parserDocument: null,
-      forceAsync: true,
-      preparationTimeDocument: null,
-      type: null,
-      external: false,
-      ready: false,
-      result: undefined,
-      onReady: null,
-    };
-    elementStates.set(element, state);
+// The host values of each script element: its result once it is ready
+// (null on failure) and the input position of its text. The core keeps its
+// flags and lists (script-elements.watpart). The records are keyed by the
+// element's core handle, never by its wrapper: the core holds a wrapper
+// weakly, so a collection between a script's fetch and its execution
+// gives the element a new wrapper.
+function scriptRecord(records, element) {
+  let record = records.get(element._coreHandle);
+  if (record === undefined) {
+    record = { result: undefined, position: null };
+    records.set(element._coreHandle, record);
   }
-  return state;
+  return record;
 }
 
 // Fragment parsing (innerHTML, insertAdjacentHTML, DOMParser fragments)
 // marks its scripts "already started", so inserting them runs nothing.
 export function markScriptsAlreadyStarted(root) {
-  for (const element of root.querySelectorAll("script")) {
-    stateOf(element).alreadyStarted = true;
-  }
+  root._domCore.status("script_mark_started", root._coreHandle);
 }
 
 // The "async" IDL attribute of a script element.
 export function scriptElementAsync(element) {
-  return stateOf(element).forceAsync || element.hasAttribute("async");
+  return element._domCore.status("script_async", element._coreHandle) === 1;
 }
 
 export function setScriptElementAsync(element, value) {
-  stateOf(element).forceAsync = false;
+  element._domCore.status("script_async_set", element._coreHandle);
   if (value) element.setAttribute("async", "");
   else element.removeAttribute("async");
 }
@@ -179,22 +155,11 @@ function exceptionMessage(error) {
   return `Uncaught ${String(error)}`;
 }
 
-// URL Standard, "percent-decode" of a string.
-function percentDecode(text) {
-  const bytes = new TextEncoder().encode(text);
-  const decoded = new Uint8Array(bytes.length);
-  const hex = (byte) => (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x46) || (byte >= 0x61 && byte <= 0x66);
-  let length = 0;
-  for (let index = 0; index < bytes.length; index += 1) {
-    const byte = bytes[index];
-    if (byte === 0x25 && index + 2 < bytes.length && hex(bytes[index + 1]) && hex(bytes[index + 2])) {
-      decoded[length++] = Number.parseInt(String.fromCharCode(bytes[index + 1], bytes[index + 2]), 16);
-      index += 2;
-    } else {
-      decoded[length++] = byte;
-    }
-  }
-  return decoded.subarray(0, length);
+// URL Standard, "percent-decode" of a string (url_percent_decode).
+function percentDecode(core, text) {
+  core.status("url_percent_decode", ...core.input(text));
+  const pointer = core.exports.abi_output_pointer();
+  return core.refreshBytes().slice(pointer, pointer + core.exports.abi_output_length());
 }
 
 // "Erase all event listeners and handlers" for each shadow-including
@@ -214,25 +179,6 @@ function invalidState(message) {
   return new DOMException(message, "InvalidStateError");
 }
 
-// The realm's MessageChannel, taken before a component session can replace
-// the global one: the document's task queue is not component code, and its
-// ports do not close with the component's (component-globals.js).
-const RealmMessageChannel = globalThis.MessageChannel;
-
-// One macrotask hop: every microtask queued so far, and every microtask
-// they queue, runs before it ("perform a microtask checkpoint" after a
-// script runs with an empty execution context stack).
-function microtaskCheckpoint() {
-  return new Promise((resolve) => {
-    const channel = new RealmMessageChannel();
-    channel.port1.onmessage = () => {
-      channel.port1.close();
-      resolve();
-    };
-    channel.port2.postMessage(null);
-  });
-}
-
 class DocumentScripts {
   constructor(document) {
     this.document = document;
@@ -241,15 +187,15 @@ class DocumentScripts {
     this.parserLoopRunning = false;
     this.scriptNestingLevel = 0;
     this.parserPause = false;
-    this.pendingParsingBlockingScript = null;
-    this.afterParsing = [];
-    this.inOrderAsap = [];
-    this.asapSet = new Set();
     this.readyState = "complete";
+    // HTML "completely loaded": the end of a load fired the window's load
+    // event. A document that loads no input is completely loaded.
+    this.completelyLoaded = true;
     this.currentScript = null;
     this.ignoreDestructiveWrites = 0;
-    this.throwOnDynamicMarkupInsertion = 0;
     this.importMaps = [];
+    // Core handle → script record (scriptRecord).
+    this.scriptRecords = new Map();
     this.moduleScriptCount = 0;
     this.executeModule = null;
     this.inputURL = document.URL;
@@ -258,6 +204,7 @@ class DocumentScripts {
     this.taskDepth = 0;
     this.tasks = [];
     this.runningTasks = false;
+    this.idleWaiters = [];
     this.timers = null;
     this.pendingJavaScriptURLs = [];
     this.reporting = false;
@@ -336,7 +283,29 @@ class DocumentScripts {
       }
     } finally {
       this.runningTasks = false;
+      this.settleIdleWaiters();
     }
+  }
+
+  // Settles once the task queue is empty and the microtasks of its last
+  // task ran: a host that drives the document's frames (a test harness on a
+  // virtual clock) runs the next frame only after the page's work of the
+  // previous one, whatever order the host delivers its macrotasks in.
+  whenTasksIdle() {
+    return new Promise((resolve) => {
+      this.idleWaiters.push(resolve);
+      this.settleIdleWaiters();
+    });
+  }
+
+  // A drain that runs later tasks settles the waiters when it ends.
+  settleIdleWaiters() {
+    const busy = () => !this.released && (this.runningTasks || this.tasks.length > 0);
+    if (this.idleWaiters.length === 0 || busy()) return;
+    microtaskCheckpoint().then(() => {
+      if (busy()) return;
+      for (const resolve of this.idleWaiters.splice(0)) resolve();
+    });
   }
 
   runTask(task) {
@@ -485,7 +454,7 @@ class DocumentScripts {
     if (window !== null && !this.reporting) {
       this.reporting = true;
       try {
-        const event = new ErrorEvent("error", {
+        const event = createEventUsing(SDErrorEvent, "error", {
           message,
           filename: location.filename,
           lineno: location.lineno,
@@ -518,7 +487,7 @@ class DocumentScripts {
     const window = this.window();
     let canceled = false;
     if (window !== null) {
-      const event = createEvent("unhandledrejection", { cancelable: true }, { promise, reason });
+      const event = createEventUsing(SDPromiseRejectionEvent, "unhandledrejection", { cancelable: true, promise, reason });
       dispatchEvent(window, event, { reportException: (error) => this.reportException(error, this.document.URL) });
       canceled = event.defaultPrevented;
     }
@@ -548,66 +517,43 @@ class DocumentScripts {
     return completion;
   }
 
-  // "Prepare the script element".
+  // "Prepare the script element" (script_prepare): the core decides; the
+  // host obtains the result and executes the script at once or as the
+  // core's lists say. The linked style sheets that block a parser-inserted
+  // script are reconciled first.
   prepare(element) {
-    const state = stateOf(element);
-    if (state.alreadyStarted) return;
-    const parserDocument = state.parserDocument;
-    state.parserDocument = null;
-    if (parserDocument !== null && !element.hasAttribute("async")) state.forceAsync = true;
-    const sourceText = childTextContent(element);
-    const hasSource = element.hasAttribute("src");
-    if (!hasSource && sourceText === "") return;
-    if (!element.isConnected) return;
-    const type = scriptType(element);
-    if (type === null) return;
-    if (parserDocument !== null) {
-      state.parserDocument = parserDocument;
-      state.forceAsync = false;
-    }
-    state.alreadyStarted = true;
+    const core = this.document._domCore;
     const document = element.ownerDocument;
-    state.preparationTimeDocument = document;
-    if (parserDocument !== null && parserDocument !== document) return;
-    if (!this.scripting) return;
-    if (type === "classic" && element.hasAttribute("nomodule")) return;
-    if (type === "classic" && element.hasAttribute("event") && element.hasAttribute("for")) {
-      const forValue = element.getAttribute("for").replace(ASCII_WHITESPACE, "").toLowerCase();
-      const eventValue = element.getAttribute("event").replace(ASCII_WHITESPACE, "").toLowerCase();
-      if (forValue !== "window" || (eventValue !== "onload" && eventValue !== "onload()")) return;
-    }
-    state.type = type;
-    if (type === "importmap") {
-      if (hasSource) {
-        this.queueTask(() => this.fire(element, "error"));
-        return;
-      }
-      this.importMaps.push(Object.freeze({ text: sourceText, baseURL: document.baseURI }));
+    this.document._styleSystem.reconcileLinkedSheets();
+    const action = core.status(
+      "script_prepare",
+      element._coreHandle,
+      this.document._coreHandle,
+      Number(this.scripting),
+      this.scriptNestingLevel,
+    );
+    const result = action & SCRIPT_RESULT_MASK;
+    if (result === SCRIPT_RESULT_NONE) return;
+    if (result === SCRIPT_RESULT_ERROR_EVENT) {
+      this.queueTask(() => this.fire(element, "error"));
       return;
     }
-    if (hasSource) {
-      const reference = element.getAttribute("src");
-      if (reference === "") {
-        this.queueTask(() => this.fire(element, "error"));
-        return;
-      }
-      state.external = true;
-      if (!URL.canParse(reference, document.baseURI)) {
-        this.queueTask(() => this.fire(element, "error"));
-        return;
-      }
-      if (type === "classic") {
-        this.fetchClassicScript(element, state, reference);
-      } else {
-        this.moduleScriptCount += 1;
-        this.markReady(state, { module: { reference, baseURL: document.baseURI, source: null } });
-      }
-    } else if (type === "classic") {
-      this.markReady(state, {
-        source: sourceText,
+    if (result === SCRIPT_RESULT_IMPORTMAP) {
+      this.importMaps.push(Object.freeze({ text: childTextContent(element), baseURL: document.baseURI }));
+      return;
+    }
+    const position = scriptRecord(this.scriptRecords, element).position;
+    if (result === SCRIPT_RESULT_FETCH_CLASSIC) {
+      this.fetchClassicScript(element, element.getAttribute("src"));
+    } else if (result === SCRIPT_RESULT_MODULE_EXTERNAL) {
+      this.moduleScriptCount += 1;
+      this.markReady(element, { module: { reference: element.getAttribute("src"), baseURL: document.baseURI, source: null } });
+    } else if (result === SCRIPT_RESULT_CLASSIC_INLINE) {
+      this.markReady(element, {
+        source: childTextContent(element),
         url: document.URL,
-        line: state.position?.line ?? 1,
-        column: state.position?.column ?? 0,
+        line: position?.line ?? 1,
+        column: position?.column ?? 0,
       });
     } else {
       this.moduleScriptCount += 1;
@@ -616,63 +562,43 @@ class DocumentScripts {
       const moduleURL = new URL(this.inputURL);
       moduleURL.pathname += `.inline-${this.moduleScriptCount}.js`;
       moduleURL.hash = `inline-module-${this.moduleScriptCount}`;
-      this.markReady(state, {
+      this.markReady(element, {
         module: {
           reference: moduleURL.href,
           baseURL: document.baseURI,
-          source: new TextEncoder().encode(sourceText),
+          source: new TextEncoder().encode(childTextContent(element)),
         },
       });
     }
+    if ((action & SCRIPT_EXECUTE_NOW) !== 0) this.executeScriptElement(element);
+  }
 
-    const parserInserted = state.parserDocument !== null;
-    const isAsync = element.hasAttribute("async");
-    const fetched = (type === "classic" && hasSource) || type === "module";
-    if (
-      (type === "classic" && hasSource && element.hasAttribute("defer") && parserInserted && !isAsync) ||
-      (type === "module" && parserInserted && !isAsync)
-    ) {
-      this.afterParsing.push(element);
-      state.onReady = () => this.notify();
-    } else if (type === "classic" && hasSource && parserInserted && !isAsync) {
-      this.pendingParsingBlockingScript = element;
-      state.onReady = () => this.notify();
-    } else if (fetched && !isAsync && !state.forceAsync) {
-      this.inOrderAsap.push(element);
-      state.onReady = () => this.queueTask(() => this.runInOrderAsap());
-      if (state.ready) state.onReady();
-    } else if (fetched) {
-      this.asapSet.add(element);
-      state.onReady = () =>
-        this.queueTask(() => {
-          const finished = () => {
-            this.asapSet.delete(element);
-            this.notify();
-          };
-          const execution = this.executeScriptElement(element);
-          if (execution) execution.then(finished, (error) => this.failLoading(error));
-          else finished();
-        });
-      if (state.ready) state.onReady();
-    } else if (
-      parserInserted && type === "classic" && this.scriptNestingLevel <= 1 &&
-      this.document._styleSystem.hasLoadingLinkedSheets()
-    ) {
-      this.pendingParsingBlockingScript = element;
-      state.onReady = () => this.notify();
-    } else {
-      this.executeScriptElement(element);
+  // The script's result is ready (script_ready): wake the parser or the
+  // end of parsing, run the in-order list, or execute an
+  // as-soon-as-possible script.
+  markReady(element, result) {
+    const core = this.document._domCore;
+    scriptRecord(this.scriptRecords, element).result = result;
+    const followUp = core.status("script_ready", element._coreHandle, Number(result === null));
+    if (followUp === SCRIPT_READY_NOTIFY) {
+      this.notify();
+    } else if (followUp === SCRIPT_READY_IN_ORDER) {
+      this.queueTask(() => this.runInOrderAsap());
+    } else if (followUp === SCRIPT_READY_ASAP) {
+      this.queueTask(() => {
+        const finished = () => {
+          core.status("script_list_remove", element._coreHandle);
+          this.notify();
+        };
+        const execution = this.executeScriptElement(element);
+        if (execution) execution.then(finished, (error) => this.failLoading(error));
+        else finished();
+      });
     }
   }
 
-  markReady(state, result) {
-    state.result = result;
-    state.ready = true;
-    state.onReady?.();
-  }
-
   // "Fetch a classic script": a demand to the host resource session.
-  fetchClassicScript(element, state, reference) {
+  fetchClassicScript(element, reference) {
     const crossOrigin = element.getAttribute("crossorigin");
     const corsMode = crossOrigin === null ? null : crossOrigin.toLowerCase() === "use-credentials" ? "include" : "same-origin";
     const charset = element.getAttribute("charset");
@@ -684,7 +610,7 @@ class DocumentScripts {
       mode: corsMode === null ? "no-cors" : "cors",
       credentials: corsMode ?? "include",
     }).then((resource) => {
-      if (blockedScriptMediaType(resource.mediaType)) {
+      if (blockedScriptMediaType(this.document._domCore, resource.mediaType)) {
         throw new TypeError(
           `The script ${resource.finalURL} has media type ${resource.mediaType}, which a script must not have`,
         );
@@ -695,7 +621,7 @@ class DocumentScripts {
       } catch {
         decoder = new TextDecoder("utf-8");
       }
-      this.markReady(state, { source: decoder.decode(resource.bytes), url: resource.finalURL, line: 1 });
+      this.markReady(element, { source: decoder.decode(resource.bytes), url: resource.finalURL, line: 1 });
     }).catch((error) => {
       if (this.released) return;
       this.diagnose({
@@ -704,31 +630,36 @@ class DocumentScripts {
         resource: Object.freeze({ kind: "classic-script", reference }),
         cause: Object.freeze({ name: error?.name ?? "Error", code: error?.code ?? null, message: error?.message ?? String(error) }),
       });
-      this.markReady(state, null);
+      this.markReady(element, null);
     });
   }
 
-  // "Execute the script element". A module script returns the promise of
-  // its host module evaluation.
+  // "Execute the script element" (script_execute). A module script
+  // returns the promise of its host module evaluation.
   executeScriptElement(element) {
-    const state = stateOf(element);
-    const document = element.ownerDocument;
-    if (state.preparationTimeDocument !== document || document !== this.document) return undefined;
-    if (state.result === null) {
+    const core = this.document._domCore;
+    const action = core.status("script_execute", element._coreHandle, this.document._coreHandle);
+    // A script executes at most once; its record ends here.
+    const record = scriptRecord(this.scriptRecords, element);
+    this.scriptRecords.delete(element._coreHandle);
+    const kind = action & 3;
+    if (kind === SCRIPT_EXECUTE_SKIP) return undefined;
+    if (kind === SCRIPT_EXECUTE_ERROR_EVENT) {
       this.fire(element, "error");
       return undefined;
     }
-    if (state.type === "module") return this.executeModuleScript(element, state);
-    if (state.external) this.ignoreDestructiveWrites += 1;
+    const external = (action & SCRIPT_EXECUTE_EXTERNAL) !== 0;
+    if (kind === SCRIPT_EXECUTE_MODULE) return this.executeModuleScript(element, record, external);
+    if (external) this.ignoreDestructiveWrites += 1;
     const previousScript = this.currentScript;
-    this.currentScript = element.getRootNode() === document ? element : null;
+    this.currentScript = (action & SCRIPT_EXECUTE_CURRENT) !== 0 ? element : null;
     try {
-      this.runClassicSource(state.result.source, state.result.url, state.result.line, state.result.column ?? 0);
+      this.runClassicSource(record.result.source, record.result.url, record.result.line, record.result.column ?? 0);
     } finally {
       this.currentScript = previousScript;
-      if (state.external) this.ignoreDestructiveWrites -= 1;
+      if (external) this.ignoreDestructiveWrites -= 1;
     }
-    if (state.external) this.fire(element, "load");
+    if (external) this.fire(element, "load");
     return undefined;
   }
 
@@ -736,7 +667,7 @@ class DocumentScripts {
   // error event at the window, and the render continues; a module graph
   // that the host cannot obtain fires error at the element, as a failed
   // fetch does in Chrome.
-  async executeModuleScript(element, state) {
+  async executeModuleScript(element, record, external) {
     if (this.executeModule === null) {
       this.diagnose({
         code: "module-script-not-run",
@@ -747,30 +678,37 @@ class DocumentScripts {
     // A module script evaluates in the realm of the document's classic
     // scripts. When that realm is Sandom's own, the host module session
     // evaluates the graph there already; a realm of the document's own goes
-    // with the request, and the host evaluates the graph in it.
+    // with the request, and the host evaluates the graph in it. Sandom's
+    // own realm becomes the document's window first when its global can
+    // take the document's bindings, as a dedicated worker's can, so the
+    // module's globalThis is its window; a browser window's global keeps
+    // its own document, and its modules see the document's globals while
+    // they evaluate (input-preprocessors.js, withComponentGlobals).
     const session = this.document._resources.classicScriptSession;
-    const realm = session !== null && session.globalObject !== globalThis ? this.realm() : null;
+    const ownRealm = session !== null && session.globalObject === globalThis;
+    if (ownRealm && Object.getOwnPropertyDescriptor(globalThis, "document")?.configurable !== false) this.realm();
+    const realm = session !== null && !ownRealm ? this.realm() : null;
     this.ignoreDestructiveWrites += 1;
     const previousScript = this.currentScript;
     this.currentScript = null;
     try {
       // The module runs as the document's code, as a classic script does.
       await enterComponentCode(this.document, this.executeModule, this, [{
-        ...state.result.module,
+        ...record.result.module,
         preprocessor: "javascript",
         importMaps: this.importMaps,
         realm,
       }]);
     } catch (error) {
-      const { reference, baseURL } = state.result.module;
-      const url = state.external ? new URL(reference, baseURL).href : this.document.URL;
+      const { reference, baseURL } = record.result.module;
+      const url = external ? new URL(reference, baseURL).href : this.document.URL;
       if (error?.code === "module-evaluation-failure") {
         // An inline module is evaluated under a synthetic locator; its
         // exception names the document, at the document's line, as in Chrome.
-        this.reportException(error.cause, url, 0, state.external ? null : {
+        this.reportException(error.cause, url, 0, external ? null : {
           from: reference,
-          lineOffset: (state.position?.line ?? 1) - 1,
-          columnOffset: state.position?.column ?? 0,
+          lineOffset: (record.position?.line ?? 1) - 1,
+          columnOffset: record.position?.column ?? 0,
         });
       } else {
         this.diagnose({
@@ -785,30 +723,44 @@ class DocumentScripts {
       this.currentScript = previousScript;
       this.ignoreDestructiveWrites -= 1;
     }
-    if (state.external) this.fire(element, "load");
+    if (external) this.fire(element, "load");
   }
 
-  // "The list of scripts that will execute in order as soon as possible".
+  // "The list of scripts that will execute in order as soon as possible"
+  // (script_in_order_next: its first script, when ready).
   runInOrderAsap() {
-    while (this.inOrderAsap.length > 0 && stateOf(this.inOrderAsap[0]).ready) {
-      const element = this.inOrderAsap[0];
-      const execution = this.executeScriptElement(element);
+    const core = this.document._domCore;
+    for (;;) {
+      const handle = core.handle("script_in_order_next", this.document._coreHandle);
+      if (handle === 0n) return;
+      const execution = this.executeScriptElement(core.wrapperFor(handle));
       if (execution) {
         execution.then(() => {
-          this.inOrderAsap.shift();
+          core.status("script_list_remove", handle);
           this.notify();
           this.queueTask(() => this.runInOrderAsap());
         }, (error) => this.failLoading(error));
         return;
       }
-      this.inOrderAsap.shift();
+      core.status("script_list_remove", handle);
       this.notify();
     }
   }
 
   failLoading(error) {
     this.loadFailure ??= error;
+    this.document._domCore.status("script_load_failed", this.document._coreHandle);
     this.notify();
+  }
+
+  // The first script of a list of the document (script_list_first), 0n
+  // for none.
+  firstScript(list) {
+    return this.document._domCore.handle("script_list_first", this.document._coreHandle, list);
+  }
+
+  scriptReady(handle) {
+    return this.document._domCore.status("script_is_ready", handle) === 1;
   }
 
   setReadyState(state) {
@@ -836,10 +788,8 @@ class DocumentScripts {
   // `position` is where the script's text starts in the input.
   scriptEndTag(element, position = null) {
     const parser = this.parser;
-    const state = stateOf(element);
-    state.parserDocument = this.document;
-    state.forceAsync = false;
-    state.position = position;
+    this.document._domCore.status("script_parser_inserted", element._coreHandle, this.document._coreHandle);
+    scriptRecord(this.scriptRecords, element).position = position;
     const oldInsertionPoint = parser.insertionPoint;
     parser.markInsertionPoint();
     this.scriptNestingLevel += 1;
@@ -850,7 +800,7 @@ class DocumentScripts {
     }
     if (this.scriptNestingLevel === 0) this.parserPause = false;
     if (parser.active) parser.insertionPoint = oldInsertionPoint;
-    if (this.pendingParsingBlockingScript !== null && this.scriptNestingLevel > 0) {
+    if (this.firstScript(SCRIPT_LIST_BLOCKING) !== 0n && this.scriptNestingLevel > 0) {
       this.parserPause = true;
     }
   }
@@ -866,19 +816,18 @@ class DocumentScripts {
     try {
       for (;;) {
         if (parser !== this.parser || !parser.active || this.released) return;
-        if (this.pendingParsingBlockingScript !== null) {
-          const element = this.pendingParsingBlockingScript;
-          const state = stateOf(element);
+        const blocking = this.firstScript(SCRIPT_LIST_BLOCKING);
+        if (blocking !== 0n) {
           await this.outsideTask(async () => {
-            await this.until(() => state.ready || this.released || parser !== this.parser);
+            await this.until(() => this.scriptReady(blocking) || this.released || parser !== this.parser);
             await this.document._styleSystem.linkedSheetsSettled();
           });
           if (parser !== this.parser || !parser.active || this.released) return;
-          this.pendingParsingBlockingScript = null;
+          this.document._domCore.status("script_list_remove", blocking);
           parser.markInsertionPoint();
           this.scriptNestingLevel += 1;
           try {
-            this.executeScriptElement(element);
+            this.executeScriptElement(this.document._domCore.wrapperFor(blocking));
           } finally {
             this.scriptNestingLevel -= 1;
           }
@@ -928,22 +877,23 @@ class DocumentScripts {
     this.parser = null;
     this.setReadyState("interactive");
     await microtaskCheckpoint();
-    while (this.afterParsing.length > 0) {
-      const element = this.afterParsing[0];
-      const state = stateOf(element);
-      if (!state.ready) await this.outsideTask(() => this.until(() => state.ready));
-      await this.outsideTask(() => this.document._styleSystem.linkedSheetsSettled());
+    for (;;) {
+      const handle = this.firstScript(SCRIPT_LIST_AFTER_PARSING);
+      if (handle === 0n) break;
+      if (!this.scriptReady(handle)) await this.outsideTask(() => this.until(() => this.scriptReady(handle)));
+      // Sandom's own step: the document's declared fonts load before a
+      // deferred or module script runs (stylesheet.js, sheetsAndFontsSettled).
+      await this.outsideTask(() => this.document._styleSystem.sheetsAndFontsSettled());
       if (this.released || this.parser !== null) return;
-      const execution = this.executeScriptElement(element);
+      const execution = this.executeScriptElement(this.document._domCore.wrapperFor(handle));
       if (execution) await execution;
-      this.afterParsing.shift();
+      this.document._domCore.status("script_list_remove", handle);
       await microtaskCheckpoint();
     }
     if (this.parser !== null || this.released) return;
     this.fire(this.document, "DOMContentLoaded", { bubbles: true });
     await microtaskCheckpoint();
-    const scriptsDone = () =>
-      this.loadFailure !== undefined || (this.asapSet.size === 0 && this.inOrderAsap.length === 0);
+    const scriptsDone = () => this.document._domCore.status("script_scripts_done", this.document._coreHandle) === 1;
     if (!scriptsDone()) await this.outsideTask(() => this.until(scriptsDone));
     if (this.loadFailure !== undefined) throw this.loadFailure;
     // Linked style sheets, fonts and images delay the load event; a failed
@@ -967,6 +917,7 @@ class DocumentScripts {
         createEvent("pageshow", { bubbles: true, cancelable: true }, { persisted: false }),
       );
     }
+    this.completelyLoaded = true;
     await microtaskCheckpoint();
   }
 
@@ -980,6 +931,7 @@ class DocumentScripts {
     }
     this.parser = beginHTMLDocumentParse(this.document, { scripting: this.scripting });
     this.readyState = "loading";
+    this.completelyLoaded = false;
     this.parser.append(text);
     this.parser.end();
     this.loading = this.runParser();
@@ -989,18 +941,14 @@ class DocumentScripts {
   // document.open() (8.4.1, "document open steps").
   open() {
     const document = this.document;
-    if (document._xmlDocument) throw invalidState("document.open() is not supported in an XML document");
-    if (this.throwOnDynamicMarkupInsertion > 0) {
-      throw invalidState("document.open() cannot run while the parser constructs a custom element");
-    }
+    document._domCore.statusRaw("script_dynamic_markup_allowed", document._coreHandle, SCRIPT_MARKUP_OPEN);
     if (this.parser !== null && this.parser.active && this.scriptNestingLevel > 0) return document;
     if (this.parser !== null && this.parser.active) {
       // A document that is still loading stops loading first.
       this.parser.abort();
     }
     this.parser = null;
-    this.pendingParsingBlockingScript = null;
-    this.afterParsing = [];
+    document._domCore.status("script_lists_reset", document._coreHandle);
     // Every node and the window lose their listeners and handlers.
     eraseShadowIncludingListeners(document);
     const window = document.defaultView;
@@ -1018,13 +966,10 @@ class DocumentScripts {
   // document.close().
   close() {
     const document = this.document;
-    if (document._xmlDocument) throw invalidState("document.close() is not supported in an XML document");
-    if (this.throwOnDynamicMarkupInsertion > 0) {
-      throw invalidState("document.close() cannot run while the parser constructs a custom element");
-    }
+    document._domCore.statusRaw("script_dynamic_markup_allowed", document._coreHandle, SCRIPT_MARKUP_CLOSE);
     if (this.parser === null || !this.parser.active || !this.parser.scriptCreated) return;
     this.parser.end();
-    if (this.pendingParsingBlockingScript !== null) return;
+    if (this.firstScript(SCRIPT_LIST_BLOCKING) !== 0n) return;
     this.loading = this.runParser();
     this.loading.catch((error) => this.reportException(error, document.URL));
   }
@@ -1032,17 +977,14 @@ class DocumentScripts {
   // document.write() and document.writeln() (8.4.3).
   write(text) {
     const document = this.document;
-    if (document._xmlDocument) throw invalidState("document.write() is not supported in an XML document");
-    if (this.throwOnDynamicMarkupInsertion > 0) {
-      throw invalidState("document.write() cannot run while the parser constructs a custom element");
-    }
+    document._domCore.statusRaw("script_dynamic_markup_allowed", document._coreHandle, SCRIPT_MARKUP_WRITE);
     if (this.parser === null || !this.parser.active || this.parser.insertionPoint === null) {
       if (this.ignoreDestructiveWrites > 0) return;
       this.open();
     }
     const parser = this.parser;
     parser.insert(text);
-    if (this.pendingParsingBlockingScript !== null) return;
+    if (this.firstScript(SCRIPT_LIST_BLOCKING) !== 0n) return;
     this.enterTask();
     try {
       for (;;) {
@@ -1050,50 +992,40 @@ class DocumentScripts {
         const result = this.runParserStretch(parser, true);
         if (result.status !== "script") break;
         this.scriptEndTag(result.script, result);
-        if (this.parserPause || this.pendingParsingBlockingScript !== null) break;
+        if (this.parserPause || this.firstScript(SCRIPT_LIST_BLOCKING) !== 0n) break;
       }
     } finally {
       this.leaveTask();
     }
     // A script-created parser at script nesting level zero continues on its
     // own once a parser-blocking script it met is delivered.
-    if (this.pendingParsingBlockingScript !== null && this.scriptNestingLevel === 0) {
+    if (this.firstScript(SCRIPT_LIST_BLOCKING) !== 0n && this.scriptNestingLevel === 0) {
       this.loading = this.runParser();
       this.loading.catch((error) => this.reportException(error, document.URL));
     }
   }
 
   // A tree mutation outside the parser: the insertion, children-changed
-  // and src-attribute steps of script elements.
-  mutation(node, kind, detail, record) {
+  // and src-attribute steps of script elements (script_mutation_prepares)
+  // and event handler content attributes, as the callback record's
+  // effects request.
+  mutation(node, effects, record) {
     if (!this.scripting || this.released) return;
-    if (kind === "structure") {
-      if (isScriptElement(node) && node.isConnected && stateOf(node).parserDocument === null) {
-        this.prepare(node);
+    const core = this.document._domCore;
+    const prepareListed = (handle, mutation, oldPresent = 0) => {
+      for (const script of core.outputNodes(core.status("script_mutation_prepares", handle, mutation, oldPresent))) {
+        this.prepare(script);
       }
-      for (const added of record?.addedNodes ?? []) {
-        if (added.nodeType !== 1 || !added.isConnected) continue;
-        if (isScriptElement(added)) {
-          if (stateOf(added).parserDocument === null) this.prepare(added);
-          continue;
-        }
-        for (const script of added.querySelectorAll("script")) {
-          if (script.isConnected && stateOf(script).parserDocument === null) this.prepare(script);
-        }
-      }
-      return;
+    };
+    if (effects & CALLBACK_EFFECT_SCRIPT_CHILDREN) prepareListed(node._coreHandle, SCRIPT_MUTATION_CHILDREN);
+    if (effects & CALLBACK_EFFECT_SCRIPT_INSERTED) {
+      for (const added of record.addedNodes) prepareListed(added._coreHandle, SCRIPT_MUTATION_INSERTED);
     }
-    if (kind !== "attribute") return;
-    const name = record?.attributeName ?? detail;
-    if (typeof name !== "string") return;
-    if (
-      name === "src" && isScriptElement(node) && node.isConnected &&
-      record?.oldValue === null && stateOf(node).parserDocument === null && node.hasAttribute("src")
-    ) {
-      this.prepare(node);
-      return;
+    if (effects & CALLBACK_EFFECT_SCRIPT_SRC) {
+      prepareListed(node._coreHandle, SCRIPT_MUTATION_SRC, Number(record.oldValue !== null));
     }
-    if (name.startsWith("on")) {
+    if (effects & CALLBACK_EFFECT_EVENT_HANDLER) {
+      const name = record.attributeName;
       this.realm();
       eventHandlerAttributeChanged(node, name, node.getAttribute(name), this.handlerPosition());
     }
@@ -1120,13 +1052,12 @@ class DocumentScripts {
     if (!this.scripting || this.released) return null;
     const realm = this.realm();
     const window = this.window();
+    const core = this.document._domCore;
     const element = target === window ? null : raw.element;
-    const formOwner = element !== null && FORM_ASSOCIATED.has(element.localName) && element.namespaceURI === HTML_NS
-      ? element.form ?? null
-      : null;
-    let parameters = ["event"];
-    if (type === "error" && target === window) parameters = ["event", "source", "lineno", "colno", "error"];
-    else if (element?.namespaceURI === SVG_NS) parameters = ["evt"];
+    const formOwner = element === null ? null : core.wrapperFor(core.handle("script_handler_form", element._coreHandle));
+    const parameters = HANDLER_PARAMETERS[
+      core.status("script_handler_parameters", element?._coreHandle ?? 0n, Number(type === "error"))
+    ];
     const completion = validateCompletion(
       realm.session.compileEventHandler({
         name: `on${type}`,
@@ -1152,16 +1083,12 @@ class DocumentScripts {
   // runs; Sandom performs no other navigation.
   followHyperlink(target) {
     if (!this.scripting || this.released) return;
-    const element = target.nodeType === 1 ? target : target.parentElement;
-    const link = element?.closest?.("a[href], area[href]") ?? null;
+    const core = this.document._domCore;
+    const link = core.wrapperFor(core.handle("script_hyperlink", target._coreHandle));
     if (link === null) return;
-    let url;
-    try {
-      url = new URL(link.getAttribute("href"), this.document.baseURI);
-    } catch {
-      return;
-    }
-    if (url.protocol === "javascript:") this.queueJavaScriptURL(url.href);
+    const url = URL.parse(link.getAttribute("href"), this.document.baseURI);
+    if (url === null) return;
+    if (core.status("script_url_is_javascript", ...core.input(url.href)) === 1) this.queueJavaScriptURL(url.href);
   }
 
   // "Evaluate a javascript: URL" as a task of the document: the decoded
@@ -1189,7 +1116,7 @@ class DocumentScripts {
     const encoded = href.slice("javascript:".length);
     let source;
     try {
-      source = new TextDecoder().decode(percentDecode(encoded));
+      source = new TextDecoder().decode(percentDecode(this.document._domCore, encoded));
     } catch {
       return;
     }
@@ -1231,10 +1158,7 @@ export async function loadHTMLDocument(document, text, options) {
 // A document whose host evaluates no classic script keeps its classic
 // scripts inert, as a browser with scripting disabled does, and says so.
 export function reportScriptingDisabled(document) {
-  let count = 0;
-  for (const element of document.querySelectorAll("script")) {
-    if (scriptType(element) === "classic") count += 1;
-  }
+  const count = document._domCore.status("script_classic_count", document._coreHandle);
   if (count === 0) return;
   documentScripts(document).diagnose({
     code: "scripting-disabled",
@@ -1259,6 +1183,10 @@ export function documentClose(document) {
 
 export function documentReadyState(document) {
   return document._scriptProcessing?.readyState ?? "complete";
+}
+
+export function documentCompletelyLoaded(document) {
+  return document._scriptProcessing?.completelyLoaded ?? true;
 }
 
 export function documentCurrentScript(document) {

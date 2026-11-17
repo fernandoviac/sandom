@@ -1,26 +1,30 @@
-import { markAuthorValueRejection, sharedDomCore } from "./core.js";
+import { sharedDomCore } from "./core.js";
 import { createEasingBindings } from "../dom/dom-bindings.generated.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 
-// Easing diagnostics already contain the complete language-level message.
-// Kinds 2 and 14 are the grammar's verdict on the value it was handed - the
-// author-value rejection CSS Cascade drops a declaration for - and are
-// marked as such. Every other kind is a fault inside the core and stays
-// unmarked, so an apply path cannot mistake one for the other.
+const TEXT_ROW_SIZE = layoutConstant("TEXT_ROW_SIZE");
+const TEXT_ROW_POINTER = layoutConstant("TEXT_ROW_POINTER");
+const TEXT_ROW_LENGTH = layoutConstant("TEXT_ROW_LENGTH");
+const EASING_LINEAR_TEXT_SIZE = layoutConstant("EASING_LINEAR_TEXT_SIZE");
+const EASING_LINEAR_TEXT_INPUT = layoutConstant("EASING_LINEAR_TEXT_INPUT");
+const EASING_LINEAR_TEXT_ROW = layoutConstant("EASING_LINEAR_TEXT_ROW");
+// The css_easing_payload output of easing.watpart, by WAT name.
+const EASING_PAYLOAD = Object.freeze(Object.fromEntries(["KIND", "COUNT", "X1", "Y1", "X2", "Y2", "POINT_COUNT", "POINTS"]
+  .map((name) => [name, layoutConstant(`EASING_PAYLOAD_${name}`)])));
+const EASING_POINT = Object.freeze(Object.fromEntries(["SIZE", "INPUT", "OUTPUT"]
+  .map((name) => [name, layoutConstant(`EASING_POINT_${name}`)])));
+const EASING_KIND = Object.freeze(Object.fromEntries(["KEYWORD", "CUBIC", "STEPS", "LINEAR"]
+  .map((name) => [name, layoutConstant(`EASING_KIND_${name}`)])));
+const ERROR_KIND_INVALID_HANDLE = layoutConstant("ERROR_KIND_INVALID_HANDLE");
+const ERROR_KIND_RANGE = layoutConstant("ERROR_KIND_RANGE");
+
+// The grammar's verdict on an easing value (ERROR_KIND_INVALID_HANDLE and
+// ERROR_KIND_RANGE) already contains the complete language-level message;
+// every other kind is a fault inside the core and keeps its detail numbers.
 function throwEasingError(core) {
   const kind = core.exports.abi_error_kind();
   if (kind === 0) return;
-  if (kind !== 2 && kind !== 14) {
-    core.throwIfError();
-    return;
-  }
-  const pointer = core.exports.abi_error_pointer();
-  const length = core.exports.abi_error_length();
-  const message = core.decoder.decode(
-    core.refreshBytes().subarray(pointer, pointer + length),
-  );
-  throw markAuthorValueRejection(
-    kind === 14 ? new RangeError(message) : new TypeError(message),
-  );
+  core.throwIfError(kind === ERROR_KIND_INVALID_HANDLE || kind === ERROR_KIND_RANGE);
 }
 
 function parseEasingTransport(raw) {
@@ -39,29 +43,30 @@ function parseEasingTransport(raw) {
       core.exports.abi_output_pointer(),
       core.exports.abi_output_length(),
     );
-    switch (view.getUint32(0, true)) {
-      case 0:
+    switch (view.getUint32(EASING_PAYLOAD.KIND, true)) {
+      case EASING_KIND.KEYWORD:
         return cssText;
-      case 1:
+      case EASING_KIND.CUBIC:
         return {
           kind: "cubicBezier",
-          x1: view.getFloat64(16, true),
-          y1: view.getFloat64(24, true),
-          x2: view.getFloat64(32, true),
-          y2: view.getFloat64(40, true),
+          x1: view.getFloat64(EASING_PAYLOAD.X1, true),
+          y1: view.getFloat64(EASING_PAYLOAD.Y1, true),
+          x2: view.getFloat64(EASING_PAYLOAD.X2, true),
+          y2: view.getFloat64(EASING_PAYLOAD.Y2, true),
           cssText,
         };
-      case 2: {
-        const count = view.getFloat64(8, true);
+      case EASING_KIND.STEPS: {
+        const count = view.getFloat64(EASING_PAYLOAD.COUNT, true);
         core.status("css_easing_step_position", handle);
         return { kind: "steps", count, position: core.outputString(), cssText };
       }
-      case 3: {
-        const points = new Array(view.getUint32(48, true));
+      case EASING_KIND.LINEAR: {
+        const points = new Array(view.getUint32(EASING_PAYLOAD.POINT_COUNT, true));
         for (let index = 0; index < points.length; index++) {
+          const point = EASING_PAYLOAD.POINTS + index * EASING_POINT.SIZE;
           points[index] = {
-            input: view.getFloat64(56 + index * 16, true),
-            output: view.getFloat64(64 + index * 16, true),
+            input: view.getFloat64(point + EASING_POINT.INPUT, true),
+            output: view.getFloat64(point + EASING_POINT.OUTPUT, true),
           };
         }
         return { kind: "linear", points, cssText };
@@ -117,7 +122,7 @@ function serializeEasingTransport({ kind, text, strings, inputs }) {
   // Finish all observable JavaScript coercions before touching ABI scratch.
   const encoded = strings.map((value) => core.input(value));
   const [textPointer, textLength] = core.input(text);
-  const stride = inputs === null ? 8 : 16;
+  const stride = inputs === null ? TEXT_ROW_SIZE : EASING_LINEAR_TEXT_SIZE;
   const pointer = encoded.length
     ? core.exports.abi_allocate(encoded.length * stride)
     : 0;
@@ -126,11 +131,11 @@ function serializeEasingTransport({ kind, text, strings, inputs }) {
   for (let index = 0; index < encoded.length; index++) {
     let offset = pointer + index * stride;
     if (inputs !== null) {
-      view.setFloat64(offset, inputs[index], true);
-      offset += 8;
+      view.setFloat64(offset + EASING_LINEAR_TEXT_INPUT, inputs[index], true);
+      offset += EASING_LINEAR_TEXT_ROW;
     }
-    view.setUint32(offset, encoded[index][0], true);
-    view.setUint32(offset + 4, encoded[index][1], true);
+    view.setUint32(offset + TEXT_ROW_POINTER, encoded[index][0], true);
+    view.setUint32(offset + TEXT_ROW_LENGTH, encoded[index][1], true);
   }
   core.exports.css_easing_serialize(
     kind,

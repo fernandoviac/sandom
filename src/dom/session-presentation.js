@@ -1,9 +1,8 @@
 // Presentation delivery for a component session's presentFrame stream: the
 // policy that turns each renderer delivery (live GPU texture image plus
 // device, or the WebGL 2 float pixel fallback) into pixels on one caller
-// canvas. Extracted from the session host worker so consumers whose mounts
-// the host protocol cannot express yet (Studio Preview's document worker)
-// share one delivery rule instead of duplicating presenter wiring.
+// canvas. Consumers whose mounts the host protocol cannot express share
+// this one delivery rule instead of duplicating presenter wiring.
 //
 // The module is side-effect-free: no top-level canvas or GPU access.
 // Everything flows through the factory arguments; the extended-range probe

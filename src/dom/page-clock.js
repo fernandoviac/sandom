@@ -6,19 +6,32 @@
 //   lists, with an entry buffer per document.
 // - `Date`, for an injected clock: the realm's `Date` whose current time is
 //   the time origin plus the document's time.
-// - The window's event constructors: a construction stamps `timeStamp`
-//   (DOM, §2.2).
+// - The window's event constructors (src/dom/events.js): a construction
+//   stamps `timeStamp` (DOM, §2.2).
 // - The window timers: the document's timers (src/dom/document-timers.js).
 //
 // A window that is the host's own global object (`renderComponent`) on the
 // host's real clock keeps the host's interfaces: they already read that
 // clock, and host code that shares the realm keeps its own timers.
+// The User Timing rules are in core/dom/frame-performance.watpart.
 import { fixDocumentClock } from "./document-clock.js";
-import { stampEventTime } from "./events.js";
+import { SDEvent, stampEventTime } from "./events.js";
 import { documentScripts } from "./scripts.js";
+import { sharedDomCore as core } from "../dom-wasm/core.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 
-// The host's Event, taken before any window can replace the global one.
-const HostEvent = globalThis.Event;
+const PERFORMANCE_FILTER_TYPE = layoutConstant("PERFORMANCE_FILTER_TYPE");
+const PERFORMANCE_FILTER_NAME = layoutConstant("PERFORMANCE_FILTER_NAME");
+const NEGATIVE_MARK = layoutConstant("PERFORMANCE_NEGATIVE_MARK");
+const NEGATIVE_MEASURE = layoutConstant("PERFORMANCE_NEGATIVE_MEASURE");
+const END_RULE_MASK = layoutConstant("PERFORMANCE_END_RULE_MASK");
+const START_RULE_SHIFT = layoutConstant("PERFORMANCE_START_RULE_SHIFT");
+const END_FROM_END_OPTION = layoutConstant("PERFORMANCE_END_FROM_END");
+const END_FROM_START_AND_DURATION = layoutConstant("PERFORMANCE_END_FROM_START_AND_DURATION");
+const START_FROM_START_OPTION = layoutConstant("PERFORMANCE_START_FROM_START");
+const START_FROM_END_AND_DURATION = layoutConstant("PERFORMANCE_START_FROM_END_AND_DURATION");
+const COMBINE_ADD = layoutConstant("PERFORMANCE_COMBINE_ADD");
+const COMBINE_SUBTRACT = layoutConstant("PERFORMANCE_COMBINE_SUBTRACT");
 
 // `windowNames` are the names of the bindings that the window's installer
 // defined on `target`: a `node:vm` context's global object does not list
@@ -45,7 +58,7 @@ export function installPageClock(target, document, windowNames) {
     const Constructor = target[name];
     if (
       typeof Constructor !== "function" ||
-      (Constructor !== HostEvent && !(Constructor.prototype instanceof HostEvent))
+      (Constructor !== SDEvent && !(Constructor.prototype instanceof SDEvent))
     ) continue;
     Object.defineProperty(target, name, {
       configurable: true,
@@ -101,22 +114,25 @@ function createPageDate(RealmDate, clock) {
   return PageDate;
 }
 
-function syntaxError(message) {
-  return new DOMException(message, "SyntaxError");
+// The entries as host values: entry type, name and start time each
+// (core/dom/frame-performance.watpart).
+function entryValues(entries) {
+  return entries.flatMap((entry) => [entry.entryType, entry.name, entry.startTime]);
+}
+
+function outputIndices(count) {
+  const pointer = core.exports.abi_output_pointer();
+  return new Uint32Array(core.refreshBytes().slice(pointer, pointer + count * 4).buffer);
 }
 
 // User Timing, "convert a mark to a timestamp".
 function markTime(entries, mark) {
   if (typeof mark === "string") {
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index];
-      if (entry.entryType === "mark" && entry.name === mark) return entry.startTime;
-    }
-    throw syntaxError(`Failed to execute 'measure' on 'Performance': The mark '${mark}' does not exist.`);
+    return core.statusRaw("frame_performance_mark_lookup", ...core.valueListInput([mark, ...entryValues(entries)]));
   }
   const time = Number(mark);
-  if (time < 0) {
-    throw new TypeError(`Failed to execute 'measure' on 'Performance': '${mark}' cannot be negative.`);
+  if (core.exports.frame_performance_negative(time)) {
+    core.statusRaw("frame_performance_negative_error", NEGATIVE_MEASURE, ...core.input(`${mark}`));
   }
   return time;
 }
@@ -136,13 +152,15 @@ function performanceEntry(name, entryType, startTime, duration, detail) {
 
 function createPagePerformance(clock) {
   const entries = [];
-  const listed = (filter) =>
-    entries.filter(filter).sort((left, right) => left.startTime - right.startTime);
-  const clear = (entryType, name) => {
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index];
-      if (entry.entryType === entryType && (name === undefined || entry.name === name)) entries.splice(index, 1);
-    }
+  // filter: the PERFORMANCE_FILTER_* bits; none lists every entry.
+  const listed = (filter, type = "", name = "") => {
+    const count = core.status("frame_performance_list", ...core.valueListInput([filter, type, name, ...entryValues(entries)]));
+    return Array.from(outputIndices(count), (index) => entries[index]);
+  };
+  const clear = (measure, name) => {
+    const count = core.status("frame_performance_clear", measure, ...core.valueListInput([name, ...entryValues(entries)]));
+    const indices = outputIndices(count);
+    for (let index = indices.length - 1; index >= 0; index--) entries.splice(indices[index], 1);
   };
   return Object.freeze({
     now() {
@@ -157,8 +175,8 @@ function createPagePerformance(clock) {
     mark(markName, markOptions = {}) {
       const name = String(markName);
       const startTime = markOptions?.startTime === undefined ? clock.now() : Number(markOptions.startTime);
-      if (startTime < 0) {
-        throw new TypeError(`Failed to execute 'mark' on 'Performance': '${name}' cannot have a negative start time.`);
+      if (core.exports.frame_performance_negative(startTime)) {
+        core.statusRaw("frame_performance_negative_error", NEGATIVE_MARK, ...core.input(name));
       }
       const entry = performanceEntry(name, "mark", startTime, 0, markOptions?.detail ?? null);
       entries.push(entry);
@@ -172,47 +190,46 @@ function createPagePerformance(clock) {
       if (startOrMeasureOptions !== null && typeof startOrMeasureOptions === "object") {
         const { start: startOption, end: endOption, duration } = startOrMeasureOptions;
         detail = startOrMeasureOptions.detail ?? null;
-        if (
-          (startOption !== undefined || endOption !== undefined || duration !== undefined) && endMark !== undefined
-        ) {
-          throw new TypeError("Failed to execute 'measure' on 'Performance': an end mark cannot come with measure options.");
-        }
-        if (startOption === undefined && endOption === undefined && duration !== undefined) {
-          throw new TypeError("Failed to execute 'measure' on 'Performance': a duration needs a start or an end.");
-        }
-        if (startOption !== undefined && endOption !== undefined && duration !== undefined) {
-          throw new TypeError("Failed to execute 'measure' on 'Performance': start, end and duration cannot all be given.");
-        }
-        if (endOption !== undefined) end = markTime(entries, endOption);
-        else if (startOption !== undefined && duration !== undefined) end = markTime(entries, startOption) + Number(duration);
-        else end = endMark === undefined ? clock.now() : markTime(entries, endMark);
-        if (startOption !== undefined) start = markTime(entries, startOption);
-        else if (duration !== undefined) start = end - Number(duration);
+        const plan = core.statusRaw(
+          "frame_performance_measure_plan",
+          startOption === undefined ? 0 : 1,
+          endOption === undefined ? 0 : 1,
+          duration === undefined ? 0 : 1,
+          endMark === undefined ? 0 : 1,
+        );
+        const endRule = plan & END_RULE_MASK;
+        const startRule = plan >> START_RULE_SHIFT;
+        if (endRule === END_FROM_END_OPTION) end = markTime(entries, endOption);
+        else if (endRule === END_FROM_START_AND_DURATION) {
+          end = core.exports.frame_performance_combine(COMBINE_ADD, markTime(entries, startOption), Number(duration));
+        } else end = endMark === undefined ? clock.now() : markTime(entries, endMark);
+        if (startRule === START_FROM_START_OPTION) start = markTime(entries, startOption);
+        else if (startRule === START_FROM_END_AND_DURATION) start = core.exports.frame_performance_combine(COMBINE_SUBTRACT, end, Number(duration));
         else start = 0;
       } else {
         end = endMark === undefined ? clock.now() : markTime(entries, endMark);
         start = startOrMeasureOptions === undefined ? 0 : markTime(entries, startOrMeasureOptions);
       }
-      const entry = performanceEntry(name, "measure", start, end - start, detail);
+      const entry = performanceEntry(name, "measure", start, core.exports.frame_performance_combine(COMBINE_SUBTRACT, end, start), detail);
       entries.push(entry);
       return entry;
     },
     getEntries() {
-      return listed(() => true);
+      return listed(0);
     },
     getEntriesByType(type) {
-      const entryType = String(type);
-      return listed((entry) => entry.entryType === entryType);
+      return listed(PERFORMANCE_FILTER_TYPE, String(type));
     },
     getEntriesByName(entryName, type = undefined) {
       const name = String(entryName);
-      return listed((entry) => entry.name === name && (type === undefined || entry.entryType === String(type)));
+      return type === undefined ? listed(PERFORMANCE_FILTER_NAME, "", name)
+        : listed(PERFORMANCE_FILTER_TYPE | PERFORMANCE_FILTER_NAME, String(type), name);
     },
     clearMarks(markName = undefined) {
-      clear("mark", markName === undefined ? undefined : String(markName));
+      clear(false, markName === undefined ? undefined : String(markName));
     },
     clearMeasures(measureName = undefined) {
-      clear("measure", measureName === undefined ? undefined : String(measureName));
+      clear(true, measureName === undefined ? undefined : String(measureName));
     },
   });
 }

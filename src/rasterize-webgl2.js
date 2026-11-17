@@ -62,26 +62,30 @@ import {
   RASTER_PLAN_PASS_BOX_BLUR_V,
   RASTER_PLAN_PASS_DROP_SHADOW,
   RASTER_PLAN_PASS_MATRIX,
+  RASTER_PLAN_RECT_BATCH_INSTANCES,
 } from "./wasm/layout.js";
 import {
   BOX_SHADOW_INSTANCE_FLOATS,
   clipUniformFloats,
   createRasterPlanCursor,
   EMPTY_CLIP_STATE,
-  filterPassReaches,
-  filterRegionPadding,
   MAX_SHADER_CLIP_ENTRIES,
   RECT_INSTANCE_FLOATS,
 } from "./raster-plan.js";
 import { STANDARD_WORKING_COLOR_ENCODING } from "./color.js";
 import { createRasterRetention } from "./gpu-raster-binding.js";
+import { SHADER_CONSTANTS } from "./shaders/constants.js";
 
-// Fixed width (texels) of the two gradient data textures. 4096 records ×
-// 3 texels = 12288 texels = 12 rows at this width; ES 3.0 guarantees a
-// maximum texture size of at least 2048, so 1024 is portable.
+// A WGSL matrix constant as GLSL: both take columns in order.
+function glslMat3(wgslMatrix) {
+  return wgslMatrix.replace("mat3x3f(", "mat3(");
+}
+
+// Fixed width (texels) of the two gradient data textures. A rect draw of
+// RASTER_PLAN_RECT_BATCH_INSTANCES (4096) records × 3 texels = 12288
+// texels = 12 rows at this width; ES 3.0 guarantees a maximum texture size
+// of at least 2048, so 1024 is portable.
 const DATA_TEXTURE_WIDTH = 1024;
-
-const MAX_INSTANCES = 4096;
 
 // --------------------------------------------------------------------------
 // Shared GLSL fragments (ports of CLIP_STRUCT_WGSL / CLIP_EVAL_WGSL and the
@@ -123,15 +127,15 @@ const CLIP_EVAL_GLSL = `
       }
     } else if (clipMode < 2.5) {
       // SDF mode: rounded and/or oriented — evaluate in the entry's own
-      // local space, antialias over ~1 screen pixel via fwidth.
+      // local space, antialias with Skia's distance ramp (CLIP_EVAL_WGSL).
       vec2 clipLocalP = vec2(
         clipInvA.x * vPixelPos.x + clipInvA.z * vPixelPos.y + clipInvB.x,
         clipInvA.y * vPixelPos.x + clipInvA.w * vPixelPos.y + clipInvB.y);
       vec2 clipCenter = (clipRect.xy + clipRect.zw) * 0.5;
       vec2 clipHalfSize = (clipRect.zw - clipRect.xy) * 0.5;
       float clipD = roundedRectSDF(clipLocalP - clipCenter, clipHalfSize, clipRadiiX, clipRadiiY);
-      float clipAa = fwidth(clipD) * 0.5;
-      clipCoverage = clipCoverage * (1.0 - smoothstep(-clipAa, clipAa, clipD));
+      float clipGradLength = max(length(vec2(dFdx(clipD), dFdy(clipD))), 1e-6);
+      clipCoverage = clipCoverage * clamp(0.5 - clipD / clipGradLength, 0.0, 1.0);
     } else {
       // Area axis-aligned screen-space clip (an SVG viewport, a color
       // glyph's clip box): the fraction of the fragment's own pixel inside
@@ -241,8 +245,7 @@ vec4 walkGradientStops(float rawT, int stopStart, int stopCount, bool isRepeatin
 
 vec4 sampleLinearGradient(vec2 posO, vec2 originSize, vec4 geomA, int stopStart, int stopCount, bool isRepeating) {
   float rawT = 0.5 + dot(posO - originSize * 0.5, vec2(geomA.x, geomA.y)) / max(geomA.z, 1e-6);
-  float t = isRepeating ? rawT : clamp(rawT, 0.0, 1.0);
-  return walkGradientStops(t, stopStart, stopCount, isRepeating);
+  return walkGradientStops(rawT, stopStart, stopCount, isRepeating);
 }
 
 vec4 sampleRadialGradient(vec2 posO, vec4 geomA, int stopStart, int stopCount, bool isRepeating) {
@@ -250,8 +253,7 @@ vec4 sampleRadialGradient(vec2 posO, vec4 geomA, int stopStart, int stopCount, b
   float dx = centerRelPos.x / max(geomA.z, 1e-6);
   float dy = centerRelPos.y / max(geomA.w, 1e-6);
   float rawT = sqrt(dx * dx + dy * dy);
-  float t = isRepeating ? rawT : clamp(rawT, 0.0, 1.0);
-  return walkGradientStops(t, stopStart, stopCount, isRepeating);
+  return walkGradientStops(rawT, stopStart, stopCount, isRepeating);
 }
 
 vec4 sampleConicGradient(vec2 posO, vec4 geomA, int stopStart, int stopCount, bool isRepeating) {
@@ -260,6 +262,56 @@ vec4 sampleConicGradient(vec2 posO, vec4 geomA, int stopStart, int stopCount, bo
   float rawT = (pointAngle - geomA.z) / 6.283185307179586;
   float t = rawT - floor(rawT);
   return walkGradientStops(t, stopStart, stopCount, isRepeating);
+}
+
+// The OKLCH plane (kind 8), a port of rect.wgsl's sampleOklchPlane (see
+// its comments). The WebGL2 path paints encoded sRGB, so the sampler
+// encodes its linear result.
+const mat3 OKLCH_PLANE_LAB_TO_LMS = ${glslMat3(SHADER_CONSTANTS.GRAD_OKLAB_LAB_TO_LMS)};
+const mat3 OKLCH_PLANE_LMS_TO_XYZ = ${glslMat3(SHADER_CONSTANTS.GRAD_OKLAB_LMS_TO_XYZ)};
+const mat3 OKLCH_PLANE_XYZ_TO_SRGB = ${glslMat3(SHADER_CONSTANTS.GRAD_XYZ_TO_SRGB)};
+const mat3 OKLCH_PLANE_XYZ_TO_DISPLAY_P3 = ${glslMat3(SHADER_CONSTANTS.GRAD_XYZ_TO_DISPLAY_P3)};
+const mat3 OKLCH_PLANE_XYZ_TO_REC2020 = ${glslMat3(SHADER_CONSTANTS.GRAD_XYZ_TO_REC2020)};
+vec3 oklchPlaneXyz(vec2 posO, vec2 originSize, vec4 geomA) {
+  bool hdr = (uint(geomA.y) & 4u) != 0u;
+  float top = hdr ? 1.701510580563294 : 1.0;
+  vec2 fraction = posO / originSize;
+  float chroma = geomA.z * fraction.x;
+  float hue = radians(geomA.x);
+  vec3 nonlinear = OKLCH_PLANE_LAB_TO_LMS * vec3(top * (1.0 - fraction.y), chroma * cos(hue), chroma * sin(hue));
+  return OKLCH_PLANE_LMS_TO_XYZ * (nonlinear * nonlinear * nonlinear);
+}
+float oklchPlaneExcess(vec3 xyz, uint space, float top) {
+  vec3 rgb = OKLCH_PLANE_XYZ_TO_SRGB * xyz;
+  if (space == 2u) { rgb = OKLCH_PLANE_XYZ_TO_DISPLAY_P3 * xyz; }
+  if (space == 3u) { rgb = OKLCH_PLANE_XYZ_TO_REC2020 * xyz; }
+  return max(max(max(rgb.x, rgb.y), rgb.z) - top, -min(min(rgb.x, rgb.y), rgb.z));
+}
+float oklchPlaneEdgeDistance(vec2 posO, vec2 originSize, vec4 geomA, uint space, float top) {
+  float here = oklchPlaneExcess(oklchPlaneXyz(posO, originSize, geomA), space, top);
+  float right = oklchPlaneExcess(oklchPlaneXyz(posO + vec2(1.0, 0.0), originSize, geomA), space, top);
+  float down = oklchPlaneExcess(oklchPlaneXyz(posO + vec2(0.0, 1.0), originSize, geomA), space, top);
+  return here / max(length(vec2(right - here, down - here)), 1e-6);
+}
+vec4 sampleOklchPlane(vec2 posO, vec2 originSize, vec4 geomA) {
+  uint mode = uint(geomA.y);
+  uint space = clamp(mode & 3u, 1u, 3u);
+  bool hdr = (mode & 4u) != 0u;
+  float top = hdr ? 4.926108374384236 : 1.0;
+  vec3 linear = OKLCH_PLANE_XYZ_TO_SRGB * oklchPlaneXyz(posO, originSize, geomA);
+  float edge = oklchPlaneEdgeDistance(posO, originSize, geomA, space, top);
+  float alpha = clamp(0.5 - edge, 0.0, 1.0);
+  float line = clamp(1.0 - abs(edge + 1.0), 0.0, 1.0);
+  for (uint smaller = 1u; smaller < space; smaller++) {
+    line = max(line, clamp(1.0 - abs(oklchPlaneEdgeDistance(posO, originSize, geomA, smaller, top)), 0.0, 1.0));
+  }
+  if (hdr) {
+    line = max(line, clamp(1.0 - abs(oklchPlaneEdgeDistance(posO, originSize, geomA, space, 1.0)), 0.0, 1.0));
+  }
+  float luminance = dot(clamp(linear, 0.0, 1.0), vec3(0.2126, 0.7152, 0.0722));
+  linear = mix(clamp(linear, 0.0, 1.0), vec3(luminance > 0.3 ? 0.0 : 1.0), line * 0.85);
+  vec3 encoded = mix(linear * 12.92, 1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), linear));
+  return vec4(encoded, alpha);
 }
 
 // COLRv1 gradients, a port of svg-path.wgsl's sampleColrGradient (see its
@@ -437,6 +489,29 @@ float insetRectSDF(vec2 localPos, vec2 halfSize, vec4 radiiX, vec4 radiiY, vec4 
   return roundedRectSDF(localPos - centerOffset, half_, rX, rY);
 }
 
+// RECT_SHADER's insetBoxAreaCoverage and insetContourAlpha (see their
+// comments): exact area coverage at a square corner of an axis-aligned box.
+float insetBoxAreaCoverage(vec2 localPos, vec2 halfSize, vec4 insets, vec2 halfPixel, vec2 screenPerLocal) {
+  vec2 centerOffset = vec2((insets.w - insets.y) * 0.5, (insets.x - insets.z) * 0.5);
+  vec2 half_ = max(halfSize - vec2((insets.w + insets.y) * 0.5, (insets.x + insets.z) * 0.5), vec2(0.0));
+  vec2 overlap = max(
+    min(localPos + halfPixel, centerOffset + half_) - max(localPos - halfPixel, centerOffset - half_),
+    vec2(0.0));
+  vec2 axisCoverage = clamp(overlap * screenPerLocal, vec2(0.0), vec2(1.0));
+  return axisCoverage.x * axisCoverage.y;
+}
+
+float insetContourAlpha(float rampAlpha, bool axisAligned, vec2 localPos, vec2 halfSize,
+    vec4 radiiX, vec4 radiiY, vec4 insets, vec2 halfPixel, vec2 screenPerLocal) {
+  if (!axisAligned) { return rampAlpha; }
+  vec2 centerOffset = vec2((insets.w - insets.y) * 0.5, (insets.x - insets.z) * 0.5);
+  vec4 rX = max(radiiX - vec4(insets.w, insets.y, insets.y, insets.w), vec4(0.0));
+  vec4 rY = max(radiiY - vec4(insets.x, insets.x, insets.z, insets.z), vec4(0.0));
+  vec2 p = localPos - centerOffset;
+  if (min(cornerSelect(p, rX), cornerSelect(p, rY)) > 0.0) { return rampAlpha; }
+  return insetBoxAreaCoverage(localPos, halfSize, insets, halfPixel, screenPerLocal);
+}
+
 // Distance from v (both >= 0) to the ellipse of semi-axes e (see WGSL
 // ellipseDistanceQ1: Eberly's bisection, fixed trip count).
 float ellipseDistanceQ1(vec2 v, vec2 e) {
@@ -486,6 +561,11 @@ vec2 svgStrokeRingSDF(vec2 localP, vec2 halfSize, vec4 radiiX, vec4 radiiY, floa
 // Exact pixel-area coverage of the half-plane d < 0 (see WGSL
 // halfPlaneCoverage): the box filter's trapezoid along the screen normal.
 const uint AREA_COVERAGE_BIT = 0x10000u;
+float distanceRampCoverage(float d, vec2 grad) {
+  float gradLength = length(grad);
+  if (gradLength < 1e-6) { return d < 0.0 ? 1.0 : 0.0; }
+  return clamp(0.5 - d / gradLength, 0.0, 1.0);
+}
 float halfPlaneCoverage(float d, vec2 grad) {
   float gradLength = length(grad);
   if (gradLength < 1e-6) { return d < 0.0 ? 1.0 : 0.0; }
@@ -550,16 +630,82 @@ vec4 styledSideColor(vec4 base, uint style, uint side, float outerHalfness) {
   }
   return base;
 }
+float squareSideOuterHalfness(uint side, vec2 localPos, vec2 halfSize, vec4 widths,
+    bool axisAligned, vec2 screenPerLocal, vec2 aa) {
+  float past = localPos.y + halfSize.y - ceil(widths.x * 0.5);
+  int axis = 1;
+  if (side == 1u) { past = halfSize.x - floor(widths.y * 0.5) - localPos.x; axis = 0; }
+  else if (side == 2u) { past = halfSize.y - floor(widths.z * 0.5) - localPos.y; }
+  else if (side == 3u) { past = localPos.x + halfSize.x - ceil(widths.w * 0.5); axis = 0; }
+  if (axisAligned) { return clamp(0.5 - past * screenPerLocal[axis], 0.0, 1.0); }
+  return clamp(0.5 - past / (2.0 * aa[axis]), 0.0, 1.0);
+}
+
+// Chrome's round dot: a regular polygon inscribed in the circle of radius
+// r, sampled at the four standard positions (see the WGSL original).
+float roundDotSampleCoverage(float dAlong, float dAcross, float r, float devicePerLocal,
+                             vec4 sampleAlong, vec4 sampleAcross) {
+  const float PI = 3.14159265358979;
+  float halfTurnSegments = ceil(PI * 0.5 / acos(max(1.0 - 0.25 / (r * devicePerLocal), -1.0)));
+  float step = PI / halfTurnSegments;
+  float apothem = r * cos(step * 0.5);
+  float inside = 0.0;
+  for (int i = 0; i < 4; i++) {
+    vec2 p = vec2(dAlong + sampleAlong[i], dAcross + sampleAcross[i]);
+    float angle = atan(p.y, p.x) - PI * 0.5;
+    float inStep = angle - step * floor(angle / step);
+    if (length(p) * cos(inStep - step * 0.5) < apothem) { inside += 1.0; }
+  }
+  return inside * 0.25;
+}
+
+// The four-sample coverage of a rounded rect whose corners Skia
+// tessellates (see the WGSL original).
+float tessellatedRRectSampleCoverage(vec2 localPos, vec2 halfSize, vec4 radiiX, vec4 radiiY,
+                                     vec4 sampleX, vec4 sampleY, vec2 devicePerLocal) {
+  const float w = 0.70710678;
+  float inside = 0.0;
+  for (int i = 0; i < 4; i++) {
+    vec2 p = localPos + vec2(sampleX[i], sampleY[i]);
+    vec2 a = abs(p);
+    if (a.x >= halfSize.x || a.y >= halfSize.y) { continue; }
+    vec2 r = vec2(cornerSelect(p, radiiX), cornerSelect(p, radiiY));
+    vec2 q = a - (halfSize - r);
+    if (q.x <= 0.0 || q.y <= 0.0 || r.x <= 0.0 || r.y <= 0.0) { inside += 1.0; continue; }
+    vec2 rDevice = r * devicePerLocal;
+    float maxLength = length(rDevice) * 0.5;
+    float numer = w * length(rDevice) * 4.0 + max(0.0, maxLength * 4.0 - 1.0) * (2.0 - 2.0 * w);
+    float wang = ceil(sqrt(numer / (4.0 * w)));
+    float segments = exp2(ceil(log2(max(wang, 1.0))));
+    vec2 previous = vec2(r.x, 0.0);
+    bool inPolygon = true;
+    for (float k = 1.0; k <= segments; k += 1.0) {
+      float t = k / segments;
+      float u = 1.0 - t;
+      vec2 vertex = (vec2(r.x, 0.0) * u * u + r * (2.0 * w * t * u) + vec2(0.0, r.y) * t * t)
+        / (u * u + 2.0 * w * t * u + t * t);
+      vec2 edge = vertex - previous;
+      if (edge.x * (q.y - previous.y) - edge.y * (q.x - previous.x) < 0.0) { inPolygon = false; }
+      previous = vertex;
+    }
+    if (inPolygon) { inside += 1.0; }
+  }
+  return inside * 0.25;
+}
+
+// A left or right groove or ridge side of odd device width.
+bool sampledOuterSide(uint side, uint style, vec4 widths, vec2 devicePerLocal) {
+  float deviceWidth = floor(widths[side] * devicePerLocal.x + 0.5);
+  return (side == 1u || side == 3u) && (style == 6u || style == 7u) && deviceWidth - 2.0 * floor(deviceWidth * 0.5) > 0.5;
+}
 
 // border-style dashed/dotted — Blink's dash sizing (see the WGSL original
 // for the full derivation and measurement notes; ported line for line).
-float dashDotInkCoverage(uint style, float w, float sideLength, float s, float across, float aa) {
+float dashDotInkCoverage(uint style, float w, float sideLength, float s, float across, float aa,
+                         vec4 sampleAlong, vec4 sampleAcross, float devicePerLocal) {
   if (style == 3u && w > 3.0) {
-    float alongRadius = w * 0.5 - 0.25;
-    float acrossRadius = w * 0.5 - 0.25;
     if (sideLength < 2.0 * w) {
-      float d = length(vec2((s - w * 0.5) * (acrossRadius / alongRadius), across)) - acrossRadius;
-      return clamp(0.5 - d / (2.0 * aa), 0.0, 1.0);
+      return roundDotSampleCoverage(s - w * 0.5, across, w * 0.5, devicePerLocal, sampleAlong, sampleAcross);
     }
     float minDots = floor((sideLength + w) / (2.0 * w));
     float maxDots = minDots + 1.0;
@@ -571,8 +717,7 @@ float dashDotInkCoverage(uint style, float w, float sideLength, float s, float a
     float period = gap + w;
     float dotIndex = clamp(round((s - w * 0.5) / period), 0.0, dotCount - 1.0);
     float center = w * 0.5 + dotIndex * period;
-    float d = length(vec2((s - center) * (acrossRadius / alongRadius), across)) - acrossRadius;
-    return clamp(0.5 - d / (2.0 * aa), 0.0, 1.0);
+    return roundDotSampleCoverage(s - center, across, w * 0.5, devicePerLocal, sampleAlong, sampleAcross);
   }
   float dashLength = w;
   float gapLength = w;
@@ -771,18 +916,27 @@ float closedDashDotCoverage(uint style, float w, float pathLengthExact, float s,
 
 float sidePatternCoverage(uint side, uint style, float tSide,
                           vec2 localPos, vec2 halfSize, vec4 widths,
-                          float aaX, float aaY) {
+                          float aaX, float aaY, vec2 localPerScreen) {
+  vec4 sampleX = vec4(-0.125, 0.375, -0.375, 0.125) * localPerScreen.x;
+  vec4 sampleY = vec4(-0.375, -0.125, 0.125, 0.375) * localPerScreen.y;
   float sideLength = 2.0 * halfSize.x;
   float s = localPos.x + halfSize.x;
   float aa = aaX;
+  vec4 sampleAlong = sampleX;
+  vec4 sampleAcross = sampleY;
+  float devicePerLocal = 1.0 / max(localPerScreen.x, 1e-6);
   if (side == 1u || side == 3u) {
     sideLength = 2.0 * halfSize.y;
     s = localPos.y + halfSize.y;
     aa = aaY;
+    sampleAlong = sampleY;
+    sampleAcross = sampleX;
+    devicePerLocal = 1.0 / max(localPerScreen.y, 1e-6);
   }
+  if (side == 1u || side == 2u) { sampleAcross = -sampleAcross; }
   float w = widths[side];
   float across = tSide * w - w * 0.5;
-  return dashDotInkCoverage(style, w, sideLength, s, across, aa);
+  return dashDotInkCoverage(style, w, sideLength, s, across, aa, sampleAlong, sampleAcross, devicePerLocal);
 }
 
 void main() {
@@ -795,24 +949,29 @@ void main() {
     svgRing = svgStrokeRingSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, vBorderWidths.x);
   }
   float d = isSvgStroke ? svgRing.x : roundedRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY);
-  float aa = fwidth(d) * 0.5;
   vec2 localPerScreen = abs(vec2(dFdx(vLocalPos.x), dFdy(vLocalPos.y)));
   vec2 screenPerLocal = 1.0 / max(localPerScreen, vec2(1e-6));
+  vec2 halfPixel = localPerScreen * 0.5;
+  bool squareCorners = vIsAxisAligned > 0.5 && !isSvgStroke;
 
   vec4 widths = vBorderWidths;  // x=top, y=right, z=bottom, w=left
   float dInner = isSvgStroke ? svgRing.y : insetRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, widths);
-  float aaInner = fwidth(dInner) * 0.5;
   vec2 dGrad = vec2(dFdx(d), dFdy(d));
   vec2 dInnerGrad = vec2(dFdx(dInner), dFdy(dInner));
 
   vec4 doubleThirds = floor((widths + vec4(1.0)) / 3.0);
   float dStripeOuter = insetRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, doubleThirds);
-  float aaStripeOuter = fwidth(dStripeOuter) * 0.5;
+  vec2 dStripeOuterGrad = vec2(dFdx(dStripeOuter), dFdy(dStripeOuter));
   float dStripeInner = insetRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, widths - doubleThirds);
-  float aaStripeInner = fwidth(dStripeInner) * 0.5;
+  vec2 dStripeInnerGrad = vec2(dFdx(dStripeInner), dFdy(dStripeInner));
 
   float dHalfBand = insetRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, widths * 0.5);
-  float outerHalfness = smoothstep(-fwidth(dHalfBand) * 0.5, fwidth(dHalfBand) * 0.5, dHalfBand);
+  bool isRoundedBox = any(greaterThan(vRadiiX, vec4(0.0))) || any(greaterThan(vRadiiY, vec4(0.0)));
+  vec4 roundedSplitInsets = floor(widths * 0.5);
+  float dGrooveSplit = insetRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY, roundedSplitInsets);
+  float roundedOuterHalfness = 1.0 - insetContourAlpha(
+    distanceRampCoverage(dGrooveSplit, vec2(dFdx(dGrooveSplit), dFdy(dGrooveSplit))),
+    squareCorners, vLocalPos, vHalfSize, vRadiiX, vRadiiY, roundedSplitInsets, halfPixel, screenPerLocal);
 
   float dashAaX = fwidth(vLocalPos.x) * 0.5;
   float dashAaY = fwidth(vLocalPos.y) * 0.5;
@@ -833,14 +992,43 @@ void main() {
   else if (tBottom < tSecond) { tSecond = tBottom; colorSecond = vBorderColorBottom; sideSecond = 2u; }
   if (tLeft < tFirst) { tSecond = tFirst; colorSecond = colorFirst; sideSecond = sideFirst; tFirst = tLeft; colorFirst = vBorderColorLeft; sideFirst = 3u; }
   else if (tLeft < tSecond) { tSecond = tLeft; colorSecond = vBorderColorLeft; sideSecond = 3u; }
-  colorFirst = styledSideColor(colorFirst,
-    (vBorderStyles >> (4u * sideFirst)) & 0xFu, sideFirst, outerHalfness);
-  colorSecond = styledSideColor(colorSecond,
-    (vBorderStyles >> (4u * sideSecond)) & 0xFu, sideSecond, outerHalfness);
+  vec2 dashAa = vec2(dashAaX, dashAaY);
+  float outerHalfnessFirst = isRoundedBox ? roundedOuterHalfness
+    : squareSideOuterHalfness(sideFirst, vLocalPos, vHalfSize, widths, squareCorners, screenPerLocal, dashAa);
+  float outerHalfnessSecond = isRoundedBox ? roundedOuterHalfness
+    : squareSideOuterHalfness(sideSecond, vLocalPos, vHalfSize, widths, squareCorners, screenPerLocal, dashAa);
+  // A groove or ridge side is two draws: the whole band in the outer-half
+  // color, then the inner half in the inner-half color over it (see the
+  // WGSL original).
+  uint styleFirst = (vBorderStyles >> (4u * sideFirst)) & 0xFu;
+  uint styleSecond = (vBorderStyles >> (4u * sideSecond)) & 0xFu;
+  float innerShareFirst = (styleFirst == 6u || styleFirst == 7u) ? 1.0 - outerHalfnessFirst : 0.0;
+  float innerShareSecond = (styleSecond == 6u || styleSecond == 7u) ? 1.0 - outerHalfnessSecond : 0.0;
+  vec4 innerColorFirst = styledSideColor(colorFirst, styleFirst, sideFirst, 0.0);
+  vec4 innerColorSecond = styledSideColor(colorSecond, styleSecond, sideSecond, 0.0);
+  colorFirst = styledSideColor(colorFirst, styleFirst, sideFirst, 1.0);
+  colorSecond = styledSideColor(colorSecond, styleSecond, sideSecond, 1.0);
   float seamDistance = tSecond - tFirst;
   float seamAa = max(fwidth(seamDistance) * 0.5, 1e-6);
   float seamBlend = clamp(seamDistance / (2.0 * seamAa) + 0.5, 0.5, 1.0);
   vec4 borderColor = mix(colorSecond, colorFirst, seamBlend);
+  float innerShare = mix(innerShareSecond, innerShareFirst, seamBlend);
+  vec4 innerLayerWeighted = mix(innerColorSecond * innerShareSecond, innerColorFirst * innerShareFirst, seamBlend);
+  vec4 innerLayerColor = innerLayerWeighted / max(innerShare, 1e-6);
+  // Chrome samples the rounded outer contour of a left or right groove or
+  // ridge side of odd device width (see the WGSL original).
+  float sampledOuterFirst = 1.0;
+  float sampledOuterSecond = 1.0;
+  bool sampleFirst = sampledOuterSide(sideFirst, styleFirst, widths, screenPerLocal);
+  bool sampleSecond = sampledOuterSide(sideSecond, styleSecond, widths, screenPerLocal);
+  if (isRoundedBox && (sampleFirst || sampleSecond)) {
+    float sampled = tessellatedRRectSampleCoverage(vLocalPos, vHalfSize, vRadiiX, vRadiiY,
+      vec4(-0.125, 0.375, -0.375, 0.125) * localPerScreen.x,
+      vec4(-0.375, -0.125, 0.125, 0.375) * localPerScreen.y, screenPerLocal);
+    if (sampleFirst) { sampledOuterFirst = sampled; }
+    if (sampleSecond) { sampledOuterSecond = sampled; }
+  }
+  float sampledOuter = mix(sampledOuterSecond, sampledOuterFirst, seamBlend);
 
 ${CLIP_EVAL_GLSL}
 
@@ -871,31 +1059,33 @@ ${CLIP_EVAL_GLSL}
       resolvedFillColor = sampleRadialGradient(gradPosO, geomA, gradStopStart, gradStopCount, gradIsRepeating);
     } else if (gradKind == 3u) {
       resolvedFillColor = sampleConicGradient(gradPosO, geomA, gradStopStart, gradStopCount, gradIsRepeating);
+    } else if (gradKind == 8u) {
+      resolvedFillColor = sampleOklchPlane(gradPosO, gradOriginSize, geomA);
     }
   }
 
   if (!isBorderOnly && vIsAxisAligned > 0.5 && vRadiiX == vec4(0.0) && vRadiiY == vec4(0.0) && widths == vec4(0.0)) {
-    vec2 halfPixel = localPerScreen * 0.5;
-    vec2 overlap = max(
-      min(vLocalPos + halfPixel, vHalfSize) - max(vLocalPos - halfPixel, -vHalfSize),
-      vec2(0.0));
-    vec2 axisCoverage = clamp(overlap * screenPerLocal, vec2(0.0), vec2(1.0));
-    float coverage = axisCoverage.x * axisCoverage.y;
+    float coverage = insetBoxAreaCoverage(vLocalPos, vHalfSize, vec4(0.0), halfPixel, screenPerLocal);
     if (resolvedFillColor.a * clipCoverage * coverage < 0.001) { discard; }
     fragColor = vec4(resolvedFillColor.rgb, resolvedFillColor.a * clipCoverage * coverage);
     return;
   }
 
   // SVG geometry (bit 16 of the styles word) takes exact area coverage;
-  // CSS boxes keep the smoothstep ramp (see the WGSL original).
+  // CSS boxes take Skia's distance ramp (see the WGSL original).
   bool areaCoverage = (vBorderStyles & AREA_COVERAGE_BIT) != 0u;
-  float outerAlpha = areaCoverage ? halfPlaneCoverage(d, dGrad) : 1.0 - smoothstep(-aa, aa, d);
-  float innerAlpha = isFillOnly ? outerAlpha
-    : areaCoverage ? halfPlaneCoverage(dInner, dInnerGrad) : 1.0 - smoothstep(-aaInner, aaInner, dInner);
-  float ringCoverage = max(outerAlpha - innerAlpha, 0.0);
+  float outerAlpha = insetContourAlpha(
+    areaCoverage ? halfPlaneCoverage(d, dGrad) : distanceRampCoverage(d, dGrad),
+    squareCorners, vLocalPos, vHalfSize, vRadiiX, vRadiiY, vec4(0.0), halfPixel, screenPerLocal);
+  float innerAlpha = isFillOnly ? outerAlpha : insetContourAlpha(
+    areaCoverage ? halfPlaneCoverage(dInner, dInnerGrad) : distanceRampCoverage(dInner, dInnerGrad),
+    squareCorners, vLocalPos, vHalfSize, vRadiiX, vRadiiY, widths, halfPixel, screenPerLocal);
+  float ringCoverage = max(outerAlpha * sampledOuter - innerAlpha, 0.0);
 
-  float stripeOuterAlpha = 1.0 - smoothstep(-aaStripeOuter, aaStripeOuter, dStripeOuter);
-  float stripeInnerAlpha = 1.0 - smoothstep(-aaStripeInner, aaStripeInner, dStripeInner);
+  float stripeOuterAlpha = insetContourAlpha(distanceRampCoverage(dStripeOuter, dStripeOuterGrad),
+    squareCorners, vLocalPos, vHalfSize, vRadiiX, vRadiiY, doubleThirds, halfPixel, screenPerLocal);
+  float stripeInnerAlpha = insetContourAlpha(distanceRampCoverage(dStripeInner, dStripeInnerGrad),
+    squareCorners, vLocalPos, vHalfSize, vRadiiX, vRadiiY, widths - doubleThirds, halfPixel, screenPerLocal);
   float doubleInk = max(outerAlpha - stripeOuterAlpha, 0.0) + max(stripeInnerAlpha - innerAlpha, 0.0);
 
   uint sideStyle = (vBorderStyles >> (4u * sideFirst)) & 0xFu;
@@ -916,7 +1106,7 @@ ${CLIP_EVAL_GLSL}
     } else {
       inkFirst = ringCoverage * sidePatternCoverage(
         sideFirst, sideStyle, tFirst,
-        vLocalPos, vHalfSize, widths, dashAaX, dashAaY);
+        vLocalPos, vHalfSize, widths, dashAaX, dashAaY, localPerScreen);
     }
   }
   float inkSecond = ringCoverage;
@@ -928,7 +1118,7 @@ ${CLIP_EVAL_GLSL}
     } else {
       inkSecond = ringCoverage * sidePatternCoverage(
         sideSecond, styleOfSecond, tSecond,
-        vLocalPos, vHalfSize, widths, dashAaX, dashAaY);
+        vLocalPos, vHalfSize, widths, dashAaX, dashAaY, localPerScreen);
     }
   }
   float borderInkCoverage = mix(inkSecond, inkFirst, seamBlend);
@@ -936,18 +1126,21 @@ ${CLIP_EVAL_GLSL}
       && tSecond <= 1.0 && colorSecond == colorFirst && !boxIsRounded) {
     borderInkCoverage = max(inkFirst, inkSecond);
   }
-  float gapCoverage = max(ringCoverage - borderInkCoverage, 0.0);
+  float gapCoverage = max(outerAlpha - innerAlpha - borderInkCoverage, 0.0);
 
   float backgroundA = isBorderOnly ? 0.0 : resolvedFillColor.a;
   float borderA = borderColor.a;
   float ringA = borderA + backgroundA * (1.0 - borderA);
   vec3 ringRGBWeighted = borderColor.rgb * borderA + resolvedFillColor.rgb * backgroundA * (1.0 - borderA);
 
-  float unclippedAlpha = (innerAlpha + gapCoverage) * backgroundA + borderInkCoverage * ringA;
+  float innerLayerAlpha = borderInkCoverage * innerShare * innerLayerColor.a;
+  float unclippedAlpha = ((innerAlpha + gapCoverage) * backgroundA + borderInkCoverage * ringA) * (1.0 - innerLayerAlpha)
+    + innerLayerAlpha;
   float totalAlpha = unclippedAlpha * clipCoverage;
   if (totalAlpha < 0.001) { discard; }
 
-  vec3 colorWeighted = resolvedFillColor.rgb * (innerAlpha + gapCoverage) * backgroundA + ringRGBWeighted * borderInkCoverage;
+  vec3 colorWeighted = (resolvedFillColor.rgb * (innerAlpha + gapCoverage) * backgroundA + ringRGBWeighted * borderInkCoverage)
+    * (1.0 - innerLayerAlpha) + innerLayerColor.rgb * innerLayerAlpha;
   vec3 color = colorWeighted / unclippedAlpha;
 
   fragColor = vec4(color, totalAlpha);
@@ -1218,19 +1411,20 @@ ${CLIP_EVAL_GLSL}
     vec2 bitmapSize = pathMaskUv.zw;
     ivec2 bitmapTexels = ivec2(bitmapSize);
     float padding = pathMaskInfo.w;
-    vec2 insetSize = bitmapSize - 2.0 * padding;
-    vec2 texelPos = padding + clamp(normalized, vec2(0.0), vec2(1.0)) * insetSize;
+    float texelsPerUnit = pathMaskTranslation.z;
+    vec2 bboxTexels = bboxSize * texelsPerUnit;
+    vec2 texelPos = padding + clamp(pathPos - pathMaskBbox.xy, vec2(0.0), bboxSize) * texelsPerUnit;
     float sampledCoverage = 0.0;
     if (pathMaskInfo.z == 0.0) {
       sampledCoverage = pathMaskTexel(bitmapOrigin, bitmapTexels, texelPos).r;
     } else {
-      vec2 texelPerLocal = insetSize / (bboxSize * pathMaskInfo.y);
+      float texelPerLocal = texelsPerUnit / pathMaskInfo.y;
       vec2 texeldx = pathMaskInvA.xy * texelPerLocal;
       vec2 texeldy = pathMaskInvA.zw * texelPerLocal;
       float coverage = 0.0;
       for (int i = 0; i < BOX_GRID * BOX_GRID; i++) {
         vec2 o = boxCentre(i);
-        vec2 boxPos = clamp(texelPos + texeldx * o.x + texeldy * o.y, vec2(padding), bitmapSize - padding);
+        vec2 boxPos = clamp(texelPos + texeldx * o.x + texeldy * o.y, vec2(padding), padding + bboxTexels);
         vec4 m = pathMaskTexel(bitmapOrigin, bitmapTexels, boxPos);
         float distance = (median(m.r, m.g, m.b) - 0.5) * pathMaskInfo.z;
         coverage += clamp(distance * float(BOX_GRID) + 0.5, 0.0, 1.0);
@@ -1277,6 +1471,12 @@ ${CLIP_EVAL_GLSL}
     float alpha = color.a * opacity;
     vec2 factors = porterDuffFactors(porterDuff, alpha, destination.a);
     vec4 composed = min(vec4(color.rgb * alpha, alpha) * factors.x + destination * factors.y, vec4(1.0));
+    if (porterDuff > 12.5) {
+      // plus-darker (composite.wgsl).
+      float composedAlpha = min(1.0, alpha + destination.a);
+      composed = vec4(max(vec3(0.0),
+        vec3(composedAlpha) - (vec3(alpha) - color.rgb * alpha) - (vec3(destination.a) - destination.rgb)), composedAlpha);
+    }
     fragColor = mix(destination, composed, clipCoverage);
     return;
   }
@@ -1683,11 +1883,17 @@ ${CLIP_EVAL_GLSL}
   for (int i = 0; i < BOX_GRID * BOX_GRID; i++) {
     cov += clamp(boxDistances[i] * screenPerTexel * float(BOX_GRID) + 0.5, 0.0, 1.0);
   }
-  float alpha = vPxRange == 0.0 ? msdf.r : cov / float(BOX_GRID * BOX_GRID);
+  // SVG_PATH_SHADER's pxRange -1: a device coverage raster read at the
+  // fragment's own texel.
+  float alpha = vPxRange < 0.0
+    ? bitmapTexel(bitmapOrigin, bitmapTexels, fromTranslation).r
+    : (vPxRange == 0.0 ? msdf.r : cov / float(BOX_GRID * BOX_GRID));
 
   if (alpha < 0.001) { discard; }
 
-  vec4 gradHeader = fetchGradientTexel(gradientRecordsTex, vInstanceIndex * 3);
+  // One gradient record for all of a path draw's instances (the tiles of
+  // one device coverage raster).
+  vec4 gradHeader = fetchGradientTexel(gradientRecordsTex, 0);
   uint gradFlags = uint(gradHeader.x);
   uint gradKindBits = uint(gradHeader.y);
   int gradStopStart = int(gradHeader.z);
@@ -1696,8 +1902,8 @@ ${CLIP_EVAL_GLSL}
   bool gradIsRepeating = (gradKindBits & 0x80u) != 0u;
   vec4 resolvedColor = vColor;
   if (gradFlags != 0u) {
-    vec4 geomA = fetchGradientTexel(gradientRecordsTex, vInstanceIndex * 3 + 1);
-    vec4 geomB = fetchGradientTexel(gradientRecordsTex, vInstanceIndex * 3 + 2);
+    vec4 geomA = fetchGradientTexel(gradientRecordsTex, 1);
+    vec4 geomB = fetchGradientTexel(gradientRecordsTex, 2);
     vec2 gradOriginSize = max(vec2(geomB.z, geomB.w), vec2(1e-6));
     vec2 gradPosO = gradLocalPos + vGradHalfSize - vec2(geomB.x, geomB.y);
     if ((gradFlags & 2u) != 0u) {
@@ -1827,10 +2033,14 @@ ${CLIP_EVAL_GLSL}
     ? boxCoverage(vPixelPos, vCoverageRect)
     : 1.0 - smoothstep(-aa, aa, d);
 
+  // IMAGE_SHADER's sourceUV: an axis whose source rect spans more than the
+  // whole texture repeats and wraps; every other axis clamps to the rect.
   vec2 halfTexel = 0.5 / vec2(textureSize(imageTex, 0));
   vec2 lo = vUvRect.xy + halfTexel;
   vec2 hi = vUvRect.zw - halfTexel;
-  vec2 uv = clamp(vUv, min(lo, hi), max(lo, hi));
+  bvec2 repeats = greaterThan(vUvRect.zw - vUvRect.xy, vec2(1.0));
+  vec2 clamped = clamp(vUv, min(lo, hi), max(lo, hi));
+  vec2 uv = vec2(repeats.x ? vUv.x : clamped.x, repeats.y ? vUv.y : clamped.y);
 
   // Same EMPIRICAL -0.25 bias as the WGSL original (see its comment).
   vec4 premultipliedColor = textureLod(imageTex, uv, imageLod - 0.25);
@@ -2005,20 +2215,20 @@ ${CLIP_EVAL_GLSL}
   if (isCoincidentOutset) { discard; }
 
   float bd = roundedRectSDF(vLocalPos - vBorderBoxLocalCenter, vBorderBoxHalfSize, vBorderBoxRadiiX, vBorderBoxRadiiY);
-  float bAa = fwidth(bd) * 0.5;
+  float bGradLength = max(length(vec2(dFdx(bd), dFdy(bd))), 1e-6);
   float borderBoxCoverage = 1.0;
   if (isInset) {
-    if (bd > bAa) { discard; }
-    borderBoxCoverage = 1.0 - smoothstep(-bAa, bAa, bd);
+    if (bd > 0.5 * bGradLength) { discard; }
+    borderBoxCoverage = clamp(0.5 - bd / bGradLength, 0.0, 1.0);
   } else if (excludesBorderBox) {
     if (bd < -1.0) { discard; }
   }
 
   float d = roundedRectSDF(vLocalPos, vHalfSize, vRadiiX, vRadiiY);
-  float aa = fwidth(d) * 0.5;
+  float gradLength = max(length(vec2(dFdx(d), dFdy(d))), 1e-6);
   float coverage;
   if (vBlurSigma <= 0.0) {
-    coverage = 1.0 - smoothstep(-aa, aa, d);
+    coverage = clamp(0.5 - d / gradLength, 0.0, 1.0);
   } else {
     coverage = clamp(roundedBoxShadow(vHalfSize, vLocalPos, vBlurSigma, vRadiiX, vRadiiY), 0.0, 1.0);
   }
@@ -2524,7 +2734,7 @@ async function createSharedWebgl2State() {
   gl.bindVertexArray(null);
 
   // --- Gradient data textures (the storage-buffer replacement) ---
-  const gradientRecordRows = Math.ceil(MAX_INSTANCES * 3 / DATA_TEXTURE_WIDTH);
+  const gradientRecordRows = Math.ceil(RASTER_PLAN_RECT_BATCH_INSTANCES * 3 / DATA_TEXTURE_WIDTH);
   const gradientRecordsTexture = createDataTexture(gl, gradientRecordRows);
   // 4096 stops × 2 texels = 8 rows. The stop count is bounded per batch by
   // the walker's own data; a scene exceeding this throws loudly in
@@ -2635,13 +2845,20 @@ export async function createRenderContextWebgl2(options) {
   const stateOwner = options.sharedStateOwner ?? defaultSharedStateOwner;
   const shared = await (stateOwner.webgl2 ??= createSharedWebgl2State());
   shared.gl.activate?.();
-  if (shared.capabilities.maxTextureSize < Math.max(width, height)) {
-    throw new Error(
-      `WebGL 2 capability probe failed: maximum texture size ` +
-        `${shared.capabilities.maxTextureSize} is smaller than the surface ${width}x${height}`,
-    );
-  }
-  const mainTarget = createCanvasTexture(shared.gl, width, height);
+  // The raster target, created by the first frame that draws into it: a
+  // renderer that replaces this context for another size before a frame
+  // (a visible region set after its viewport) allocates nothing for it.
+  let mainTarget = null;
+  const mainTargetNow = () => {
+    if (mainTarget !== null) return mainTarget;
+    if (shared.capabilities.maxTextureSize < Math.max(width, height)) {
+      throw new Error(
+        `WebGL 2 capability probe failed: maximum texture size ` +
+          `${shared.capabilities.maxTextureSize} is smaller than the surface ${width}x${height}`,
+      );
+    }
+    return mainTarget = createCanvasTexture(shared.gl, width, height);
+  };
   let frameCount = 0;
   let rasterRetention = null;
   return {
@@ -2653,7 +2870,7 @@ export async function createRenderContextWebgl2(options) {
     shared,
     width,
     height,
-    mainTarget,
+    get mainTarget() { return mainTargetNow(); },
     capabilities: shared.capabilities,
     get contextLost() {
       return shared.contextLost;
@@ -2669,8 +2886,10 @@ export async function createRenderContextWebgl2(options) {
     },
     destroy() {
       rasterRetention?.destroy();
-      shared.gl.deleteFramebuffer(mainTarget.framebuffer);
-      shared.gl.deleteTexture(mainTarget.texture);
+      if (mainTarget !== null) {
+        shared.gl.deleteFramebuffer(mainTarget.framebuffer);
+        shared.gl.deleteTexture(mainTarget.texture);
+      }
     },
   };
 }
@@ -3362,12 +3581,13 @@ export function renderWebgl2(context, options = {}) {
     return outputTarget;
   }
 
-  // The filter region: see the WebGPU backend's applyFilterPasses.
-  function applyFilterPasses(sourceTarget, passes) {
-    const reaches = filterPassReaches(passes);
+  // The filter region of the pass list at `list` (raster_plan_filter_reach,
+  // raster_plan_filter_padding; the WebGPU path is gpu-groups.watpart).
+  function applyFilterPasses(sourceTarget, passes, list) {
+    const core = options.rasterPlan.exports;
     const maxExtent = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    const padX = filterRegionPadding(reaches[0], width, maxExtent);
-    const padY = filterRegionPadding(reaches[1], height, maxExtent);
+    const padX = core.raster_plan_filter_padding(core.raster_plan_filter_reach(list, 0, 0), width, maxExtent);
+    const padY = core.raster_plan_filter_padding(core.raster_plan_filter_reach(list, 0, 1), height, maxExtent);
     const padded = padX > 0 || padY > 0;
     let target = padded
       ? applyWindowPass(
@@ -3382,8 +3602,8 @@ export function renderWebgl2(context, options = {}) {
     let blurPassIndex = 0;
     for (let index = 0; index < passes.length; index++) {
       const pass = passes[index];
-      const reachX = reaches[2 * index + 2];
-      const reachY = reaches[2 * index + 3];
+      const reachX = core.raster_plan_filter_reach(list, index + 1, 0);
+      const reachY = core.raster_plan_filter_reach(list, index + 1, 1);
       if (pass.kind === RASTER_PLAN_PASS_MATRIX) {
         target = applyMatrixPass(target, pass.uniform, reachX, reachY);
         blurPassIndex = 0;
@@ -3645,6 +3865,7 @@ export function renderWebgl2(context, options = {}) {
         opacity: batch.opacity,
         blendMode: batch.blendMode,
         filterPasses: batch.filterPasses,
+        filterList: batch.filterList,
         clipState: batch.clipState,
         hasMask: batch.hasMask,
         previousTarget: currentTarget,
@@ -3659,6 +3880,7 @@ export function renderWebgl2(context, options = {}) {
       const filteredTarget = applyFilterPasses(
         entry.target,
         entry.filterPasses,
+        entry.filterList,
       );
 
       const nativeComposite = batch.nativeComposite;
@@ -3796,6 +4018,7 @@ export function renderWebgl2(context, options = {}) {
       const filteredTarget = applyFilterPasses(
         snapshot,
         batch.filterPasses,
+        batch.filterList,
       );
       bindTarget(currentTarget);
       setStandardBlend();

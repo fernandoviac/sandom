@@ -1,5 +1,7 @@
 // Handwritten WebGPU interface. Native effects execute on the GPU thread.
 // Interface coverage follows https://gpuweb.github.io/gpuweb/#idl-index.
+import { createEventUsing, dispatchEvent, SDEvent, SDEventTarget } from './events.js';
+
 const construction = Symbol('GPU-thread construction');
 const resources = new WeakMap();
 const values = new WeakMap();
@@ -66,7 +68,6 @@ class GpuObject {
   constructor(token, transport, description) { initialize(this, token, transport, description); }
   get label() { return label(this); }
   set label(value) { setLabel(this, value); }
-  get [Symbol.toStringTag]() { return state(this).name; }
 }
 class ReadonlyGpuSet {
   #entries;
@@ -82,8 +83,8 @@ class ReadonlyGpuSet {
   forEach(callback, thisArgument) { this.#entries.forEach((value) => callback.call(thisArgument, value, value, this)); }
   [Symbol.iterator]() { return this.#entries.values(); }
 }
-export class GPUSupportedFeatures extends ReadonlyGpuSet { get [Symbol.toStringTag]() { return 'GPUSupportedFeatures'; } }
-export class WGSLLanguageFeatures extends ReadonlyGpuSet { get [Symbol.toStringTag]() { return 'WGSLLanguageFeatures'; } }
+export class GPUSupportedFeatures extends ReadonlyGpuSet {}
+export class WGSLLanguageFeatures extends ReadonlyGpuSet {}
 export class GPUSupportedLimits {
   constructor(token, record) { if (token !== construction) throw new TypeError('Illegal constructor'); values.set(this, record); }
   get maxTextureDimension1D() { return data(this, 'maxTextureDimension1D', 'GPUSupportedLimits'); }
@@ -122,7 +123,6 @@ export class GPUSupportedLimits {
   get maxComputeWorkgroupSizeY() { return data(this, 'maxComputeWorkgroupSizeY', 'GPUSupportedLimits'); }
   get maxComputeWorkgroupSizeZ() { return data(this, 'maxComputeWorkgroupSizeZ', 'GPUSupportedLimits'); }
   get maxComputeWorkgroupsPerDimension() { return data(this, 'maxComputeWorkgroupsPerDimension', 'GPUSupportedLimits'); }
-  get [Symbol.toStringTag]() { return 'GPUSupportedLimits'; }
 }
 export class GPUAdapterInfo {
   constructor(token, record) { if (token !== construction) throw new TypeError('Illegal constructor'); values.set(this, record); }
@@ -133,7 +133,6 @@ export class GPUAdapterInfo {
   get subgroupMinSize() { return data(this, 'subgroupMinSize', 'GPUAdapterInfo'); }
   get subgroupMaxSize() { return data(this, 'subgroupMaxSize', 'GPUAdapterInfo'); }
   get isFallbackAdapter() { return data(this, 'isFallbackAdapter', 'GPUAdapterInfo'); }
-  get [Symbol.toStringTag]() { return 'GPUAdapterInfo'; }
 }
 export class GPU {
   #language = null;
@@ -145,7 +144,6 @@ export class GPU {
   get wgslLanguageFeatures() {
     return this.#language ??= new WGSLLanguageFeatures(construction, get(this, 'wgslLanguageFeatures'));
   }
-  get [Symbol.toStringTag]() { return 'GPU'; }
 }
 export class GPUAdapter {
   #features; #limits; #info;
@@ -159,9 +157,8 @@ export class GPUAdapter {
   get limits() { return this.#limits; }
   get info() { return this.#info ?? unsupported('GPUAdapter', 'info'); }
   requestDevice(_descriptor = undefined) { return callAsync(this, 'requestDevice', arguments, 'GPUDevice'); }
-  get [Symbol.toStringTag]() { return 'GPUAdapter'; }
 }
-export class GPUDevice extends EventTarget {
+export class GPUDevice extends SDEventTarget {
   #features; #limits; #info; #queue; #lost; #lostReply; #onuncapturederror = null;
   constructor(token, transport, description) {
     super();
@@ -176,8 +173,8 @@ export class GPUDevice extends EventTarget {
       if (event.event === 'lost') this.#lostReply(new GPUDeviceLostInfo(construction, event.information));
       else if (event.event === 'uncapturederror') {
         const error = createGpuFacade(transport, event.error);
-        const notification = new GPUUncapturedErrorEvent('uncapturederror', { error, cancelable: true });
-        if (this.dispatchEvent(notification)) console.error(error.message);
+        const notification = createEventUsing(GPUUncapturedErrorEvent, 'uncapturederror', { error, cancelable: true });
+        if (dispatchEvent(this, notification)) console.error(error.message);
       } else throw new Error(`Unknown GPU device event ${event.event}`);
     });
   }
@@ -212,7 +209,6 @@ export class GPUDevice extends EventTarget {
   createQuerySet(_descriptor) { return call(this, 'createQuerySet', arguments, 'GPUQuerySet'); }
   pushErrorScope(_filter) { return call(this, 'pushErrorScope', arguments); }
   popErrorScope() { return callAsync(this, 'popErrorScope', arguments, 'GPUError'); }
-  get [Symbol.toStringTag]() { return 'GPUDevice'; }
 }
 export class GPUBuffer extends GpuObject {
   constructor(token, transport, description) {
@@ -329,7 +325,6 @@ export class GPUDeviceLostInfo {
   constructor(token, record) { if (token !== construction) throw new TypeError('Illegal constructor'); values.set(this, record); }
   get reason() { return data(this, 'reason', 'GPUDeviceLostInfo'); }
   get message() { return data(this, 'message', 'GPUDeviceLostInfo'); }
-  get [Symbol.toStringTag]() { return 'GPUDeviceLostInfo'; }
 }
 export class GPUCompilationMessage {
   constructor(token, record) { if (token !== construction) throw new TypeError('Illegal constructor'); values.set(this, record); }
@@ -339,7 +334,6 @@ export class GPUCompilationMessage {
   get linePos() { return data(this, 'linePos', 'GPUCompilationMessage'); }
   get offset() { return data(this, 'offset', 'GPUCompilationMessage'); }
   get length() { return data(this, 'length', 'GPUCompilationMessage'); }
-  get [Symbol.toStringTag]() { return 'GPUCompilationMessage'; }
 }
 export class GPUCompilationInfo {
   #messages;
@@ -348,13 +342,11 @@ export class GPUCompilationInfo {
     this.#messages = Object.freeze(record.messages.map((message) => new GPUCompilationMessage(construction, message)));
   }
   get messages() { return this.#messages; }
-  get [Symbol.toStringTag]() { return 'GPUCompilationInfo'; }
 }
 export class GPUError {
   #message;
   constructor(token, message) { if (token !== construction) throw new TypeError('Illegal constructor'); this.#message = String(message); }
   get message() { return this.#message; }
-  get [Symbol.toStringTag]() { return this.constructor.name; }
 }
 export class GPUValidationError extends GPUError {
   constructor(message) { if (!arguments.length) throw new TypeError('GPUValidationError requires a message'); super(construction, message); }
@@ -374,7 +366,7 @@ export class GPUPipelineError extends DOMException {
   }
   get reason() { return this.#reason; }
 }
-export class GPUUncapturedErrorEvent extends Event {
+export class GPUUncapturedErrorEvent extends SDEvent {
   #error;
   constructor(type, initialization) {
     super(type, initialization);
@@ -384,13 +376,22 @@ export class GPUUncapturedErrorEvent extends Event {
   get error() { return this.#error; }
 }
 
-export const GPUBufferUsage = Object.freeze({ MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8,
+// A namespace object (Web IDL §3.13.1): its constants are enumerable,
+// read-only and non-configurable, and its class string is its name.
+function gpuNamespace(name, constants) {
+  const namespace = {};
+  for (const [constant, value] of Object.entries(constants)) {
+    Object.defineProperty(namespace, constant, { value, enumerable: true });
+  }
+  return Object.defineProperty(namespace, Symbol.toStringTag, { value: name, configurable: true });
+}
+export const GPUBufferUsage = gpuNamespace('GPUBufferUsage', { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8,
   INDEX: 16, VERTEX: 32, UNIFORM: 64, STORAGE: 128, INDIRECT: 256, QUERY_RESOLVE: 512 });
-export const GPUTextureUsage = Object.freeze({ COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4,
+export const GPUTextureUsage = gpuNamespace('GPUTextureUsage', { COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4,
   STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16, TRANSIENT_ATTACHMENT: 32 });
-export const GPUMapMode = Object.freeze({ READ: 1, WRITE: 2 });
-export const GPUShaderStage = Object.freeze({ VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 });
-export const GPUColorWrite = Object.freeze({ RED: 1, GREEN: 2, BLUE: 4, ALPHA: 8, ALL: 15 });
+export const GPUMapMode = gpuNamespace('GPUMapMode', { READ: 1, WRITE: 2 });
+export const GPUShaderStage = gpuNamespace('GPUShaderStage', { VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 });
+export const GPUColorWrite = gpuNamespace('GPUColorWrite', { RED: 1, GREEN: 2, BLUE: 4, ALPHA: 8, ALL: 15 });
 
 export const gpuFacadeInterfaces = Object.freeze({ GPU, GPUAdapter, GPUDevice, GPUSupportedFeatures,
   GPUSupportedLimits, GPUAdapterInfo, WGSLLanguageFeatures, GPUBuffer, GPUTexture, GPUTextureView,
@@ -400,10 +401,45 @@ export const gpuFacadeInterfaces = Object.freeze({ GPU, GPUAdapter, GPUDevice, G
   GPUCompilationMessage, GPUCompilationInfo, GPUError, GPUValidationError, GPUOutOfMemoryError,
   GPUInternalError, GPUPipelineError, GPUUncapturedErrorEvent, GPUBufferUsage, GPUTextureUsage,
   GPUMapMode, GPUShaderStage, GPUColorWrite });
+// Each interface prototype's class string is the interface's name (Web IDL
+// §3.7.3): a data property, also on an interface whose parent has one.
+for (const [name, Interface] of Object.entries(gpuFacadeInterfaces)) {
+  if (typeof Interface === 'function') {
+    Object.defineProperty(Interface.prototype, Symbol.toStringTag, { value: name, configurable: true });
+  }
+}
+
+// The context of a host canvas that the GPU thread adopted for a presenter
+// (src/canvas-presentation.js). It is not a component global: a component's
+// canvases have Sandom's own GPUCanvasContext (src/dom/canvas.js).
+class GPUThreadCanvasContext {
+  constructor(token, transport, description) { initialize(this, token, transport, description); }
+  configure(_configuration) { return call(this, 'configure', arguments); }
+  unconfigure() { return call(this, 'unconfigure', arguments); }
+  getCurrentTexture() { return call(this, 'getCurrentTexture', arguments, 'GPUTexture'); }
+}
+/**
+ * Transfers a host OffscreenCanvas to the GPU thread of `device` and returns
+ * its WebGPU context there. The host does not use the canvas afterwards.
+ */
+export function adoptGpuThreadCanvas(device, canvas) {
+  const owner = state(device);
+  return owner.transport.adoptCanvas(owner, canvas);
+}
+/** Sizes the adopted canvas of `context` on the GPU thread. */
+export function sizeGpuThreadCanvas(context, width, height) {
+  const owner = state(context);
+  owner.transport.sizeCanvas(owner, width, height);
+}
+/** Sends the queued calls of the GPU thread of `object`, a GPU-thread facade, now. */
+export function flushGpuThread(object) {
+  state(object).transport.flush();
+}
 
 export function createGpuFacade(transport, record) {
   if (record === null) return null;
   if (record.type === 'mapped-range') return record;
+  if (record.type === 'GPUCanvasContext') return new GPUThreadCanvasContext(construction, transport, record);
   if (record.type === 'GPUCompilationInfo') return new GPUCompilationInfo(construction, record);
   if (record.type === 'GPUValidationError') return new GPUValidationError(record.message);
   if (record.type === 'GPUOutOfMemoryError') return new GPUOutOfMemoryError(record.message);

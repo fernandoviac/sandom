@@ -2,7 +2,7 @@
 // slice 2; docs/specifications/canvas-2d.md).
 //
 // This object is a facade. It converts and validates arguments as Chrome's
-// bindings do and forwards them to src/wasm/canvas-2d.wat, which holds the
+// bindings do and forwards them to core/build/canvas-2d.wat, which holds the
 // drawing state, the save stack and the command list. Drawing records
 // commands and does no GPU work. A flush rasterizes the pending commands
 // into the bitmap texture (renderer-core, src/dom/canvas-gpu-binding.js) when paint samples
@@ -19,9 +19,7 @@
 // Copies take their place in native queue order before this call returns.
 // GPU completion for a synchronous read is delivered from the GPU thread.
 import {
-  canvasFontText,
   canvasGlyphRun,
-  canvasSpacingPx,
   canvasTextEnvironment,
   DIRECTIONS,
   FONT_KERNINGS,
@@ -29,16 +27,13 @@ import {
   FONT_VARIANT_CAPS,
   layoutCanvasText,
   measureCanvasText,
-  parseCanvasFont,
-  parseCanvasSpacing,
   readTextState,
   TEXT_ALIGNS,
   TEXT_BASELINES,
   TEXT_RENDERINGS,
-  textDrawBounds,
   textPlacement,
 } from "./canvas-2d-text.js";
-import { getWasmBytes } from "../wasm/canvas-2d-binary.js";
+import * as canvas2dBinary from "../wasm/canvas-2d-binary.js";
 import {
   BITMAP_FORMAT,
   BITMAP_FORMATS,
@@ -52,22 +47,54 @@ import {
   registerSandomImageSources,
 } from "./canvas-gpu-binding.js";
 import { isCanvasPaint, PAINT_DEFINITION } from "./canvas-2d-paint.js";
-import { createGradient, GRADIENT_CONICAL, GRADIENT_LINEAR, GRADIENT_SWEEP } from "./canvas-2d-gradient.js";
-import {
-  FILTER_DROP_SHADOW_ONLY,
-  filterWords,
-  parseCanvasFilter,
-  resolveCanvasFilter,
-  UnsupportedFilter,
-} from "./canvas-2d-filter.js";
-import { CanvasPattern, createCanvasPattern, patternRepetition } from "./canvas-2d-pattern.js";
+import { createGradient } from "./canvas-2d-gradient.js";
+import { CanvasPattern, createCanvasPattern } from "./canvas-2d-pattern.js";
 import { matrixFromInit } from "./canvas-2d-matrix-init.js";
 import { encodeJpegRgbaWithCompletion, initializeJpegEncoder } from "../output/jpeg-encoder.js";
 import { defaultPngCodec } from "../png-codec.js";
 import { imageCanvasSource } from "./images.js";
-import { convertCanvasColor, SOURCE_CONVERSION_NONE, sourceConversion } from "./canvas-2d-color-space.js";
 import { buildDisplayP3Profile } from "../output/icc-profile.js";
 import { createDefaultGpuDeviceSync, getDefaultGpu } from "../gpu-thread.js";
+import { layoutConstant, moduleLayoutConstants } from "../wasm/layout-table.js";
+import * as outputFormatsBinary from "../wasm/output-formats-binary.js";
+import { callOutputFormats, encodeText } from "../output/format-policy.js";
+
+const canvasCoreConstant = moduleLayoutConstants(canvas2dBinary, "canvas 2d");
+const SPACING_LETTER = canvasCoreConstant("SPACING_LETTER");
+const PATH_SLOT_CURRENT = canvasCoreConstant("PATH_SLOT_CURRENT");
+const PATH_SLOT_PATH2D = canvasCoreConstant("PATH_SLOT_PATH2D");
+const SPACING_WORD = canvasCoreConstant("SPACING_WORD");
+const SOURCE_CONVERSION_NONE = canvasCoreConstant("SOURCE_CONVERSION_NONE");
+
+// The source color space conversion (source_conversion of canvas core
+// `core`) of `source` (a resolved image source, or { colorSpace } of an
+// ImageData) drawn into a canvas of `colorSpace`.
+function sourceConversion(core, source, colorSpace) {
+  return core.source_conversion(source.kind === "image" ? 1 : 0, source.colorSpace === "display-p3" ? 1 : 0,
+    colorSpace === "display-p3" ? 1 : 0);
+}
+// The records this facade exchanges with the canvas core and the DOM core,
+// by WAT name.
+const CANVAS_CORE = Object.freeze(Object.fromEntries([
+  "GRADIENT_STOP_SIZE", "GRADIENT_STOP_OFFSET", "GRADIENT_STOP_LEGACY", "GRADIENT_STOP_COLOR", "GRADIENT_STOP_OKLAB",
+  "GRADIENT_STOP_OKLAB_PADDING", "PATH_DATA_SIZE", "CURRENT_TRANSFORM_COUNT", "GEOMETRY_VERTEX_SIZE",
+  "PAINT_VECTOR_SIZE", "TEXT_RUN_HEADER_SIZE", "TEXT_RUN_FONT", "TEXT_RUN_COUNT", "TEXT_RUN_FONT_SIZE", "TEXT_RUN_OBLIQUE",
+  "TEXT_GLYPH_SIZE", "TEXT_GLYPH_X", "TEXT_GLYPH_Y", "TEXT_GLYPH_ID", "OUTLINE_HEADER_SIZE", "OUTLINE_X", "OUTLINE_Y",
+  "OUTLINE_OBLIQUE", "OUTLINE_LENGTH", "OUTLINE_FONT_SIZE", "OUTLINE_UPEM",
+].map((name) => [name, canvasCoreConstant(name)])));
+const F32 = Float32Array.BYTES_PER_ELEMENT;
+const DOM_CORE = Object.freeze(Object.fromEntries([
+  "COLOR_RGBA_R", "COLOR_RGBA_G", "COLOR_RGBA_B", "COLOR_RGBA_A", "COLOR_RGBA_SIZE",
+  "CANVAS_COLOR_SIZE", "CANVAS_COLOR_PARSED", "CANVAS_COLOR_DRAWN",
+  "CANVAS_FONT_SIZE", "CANVAS_FONT_WEIGHT", "CANVAS_FONT_SLOPE", "CANVAS_FONT_STYLE", "CANVAS_FONT_CAPS",
+  "CANVAS_FONT_STRETCH", "CANVAS_FONT_FAMILY_OFFSET", "CANVAS_FONT_SERIALIZATION",
+  "CANVAS_SPACING_NUMBER", "CANVAS_SPACING_UNIT", "CANVAS_SPACING_SERIALIZATION",
+].map((name) => [name, layoutConstant(name)])));
+// The r, g, b and a of the COLOR_RGBA record at `offset` of `view`.
+function colorComponents(view, offset) {
+  return [DOM_CORE.COLOR_RGBA_R, DOM_CORE.COLOR_RGBA_G, DOM_CORE.COLOR_RGBA_B, DOM_CORE.COLOR_RGBA_A]
+    .map((field) => view.getFloat64(offset + field, true));
+}
 
 // Synchronous toBlob/toDataURL encoding needs initialized codecs. A realm
 // that cannot read a codec (a restricted worker, a bundle without the
@@ -90,18 +117,86 @@ export function registerOffscreenCanvasState(state) {
 }
 
 const INTERFACE = "CanvasRenderingContext2D";
-const CLIP_ENTRY_SIZE = 32;
-const MASK_SIZE = 32;
-// Chrome 151 draws the canvas focus ring (drawFocusIfNeeded) 5 user units
-// wide with round joins in #005fcc (measured 2026-10-10).
-const FOCUS_RING_WIDTH = 5;
-const FOCUS_RING_COLOR = Object.freeze({ r: 0, g: 95 / 255, b: 204 / 255, a: 1 });
+// The renderer core's codes that this file passes, by the names of their
+// WAT globals.
+const RESOURCE_READY = layoutConstant("RESOURCE_READY");
+const CANVAS_BITMAP_WIDTH = layoutConstant("CANVAS_BITMAP_WIDTH");
+const CANVAS_BITMAP_HEIGHT = layoutConstant("CANVAS_BITMAP_HEIGHT");
+const CLIP_ENTRY_SIZE = canvasCoreConstant("CLIP_ENTRY_SIZE");
+const MASK_SIZE = canvasCoreConstant("MASK_SIZE");
+const DASH_CAPACITY = canvasCoreConstant("DASH_CAPACITY");
+const PATH_NEGATIVE_RADIUS_X = canvasCoreConstant("PATH_NEGATIVE_RADIUS_X");
+const PATH_NEGATIVE_RADIUS_Y = canvasCoreConstant("PATH_NEGATIVE_RADIUS_Y");
+const PATH_RADII_COUNT = canvasCoreConstant("PATH_RADII_COUNT");
+// The results of the canvas core's exports.
+const RESULT_DONE = canvasCoreConstant("RESULT_DONE");
+const RESULT_FULL = canvasCoreConstant("RESULT_FULL");
+const RESULT_UNSUPPORTED = canvasCoreConstant("RESULT_UNSUPPORTED");
+const GRADIENT_LINEAR = canvasCoreConstant("GRADIENT_LINEAR");
+const GRADIENT_CONICAL = canvasCoreConstant("GRADIENT_CONICAL");
+const GRADIENT_SWEEP = canvasCoreConstant("GRADIENT_SWEEP");
+const GRADIENT_NEGATIVE_R0 = canvasCoreConstant("GRADIENT_NEGATIVE_R0");
+export const EXPORT_TAINTED = canvasCoreConstant("EXPORT_TAINTED");
+export const EXPORT_EMPTY = canvasCoreConstant("EXPORT_EMPTY");
+const IMAGE_DATA_TAINTED = canvasCoreConstant("IMAGE_DATA_TAINTED");
+// The canvas core's ImageBitmap geometry (canvas-2d-layer.watpart).
+export const BITMAP = Object.freeze(Object.fromEntries([
+  "CROP_WIDTH_ZERO", "CROP_HEIGHT_ZERO", "RESIZE_ZERO", "SOURCE_WIDTH_ZERO", "SOURCE_HEIGHT_ZERO", "NO_NATURAL_SIZE",
+  "WHOLE", "DERIVED",
+].map((name) => [name, canvasCoreConstant(`BITMAP_${name}`)])));
+const BITMAP_DERIVED = BITMAP.DERIVED;
+const BITMAP_CROP_X = canvasCoreConstant("BITMAP_CROP_X");
+const BITMAP_CROP_Y = canvasCoreConstant("BITMAP_CROP_Y");
+const BITMAP_CROP_WIDTH = canvasCoreConstant("BITMAP_CROP_WIDTH");
+const BITMAP_CROP_HEIGHT = canvasCoreConstant("BITMAP_CROP_HEIGHT");
+const BITMAP_WIDTH = canvasCoreConstant("BITMAP_WIDTH");
+const BITMAP_HEIGHT = canvasCoreConstant("BITMAP_HEIGHT");
+const FILTER_STAGE_FILTER = canvasCoreConstant("FILTER_STAGE_FILTER");
+const FILTER_STAGE_SHADOW = canvasCoreConstant("FILTER_STAGE_SHADOW");
+const FILTER_BLOCK_DRAW = canvasCoreConstant("FILTER_BLOCK_DRAW");
+const FILTER_BLOCK_SHADOW = canvasCoreConstant("FILTER_BLOCK_SHADOW");
+const FILTER_SHADOW = Object.freeze(Object.fromEntries(["OFFSET_X", "OFFSET_Y", "DEVIATION", "COLOR", "SIZE"]
+  .map((name) => [name, canvasCoreConstant(`FILTER_SHADOW_${name}`)])));
+// The canvas core's ImageData shapes and regions (canvas-2d-core.watpart).
+const IMAGE_DATA_NO_ELEMENTS = canvasCoreConstant("IMAGE_DATA_NO_ELEMENTS");
+const IMAGE_DATA_LENGTH_NOT_MULTIPLE_OF_FOUR = canvasCoreConstant("IMAGE_DATA_LENGTH_NOT_MULTIPLE_OF_FOUR");
+const IMAGE_DATA_WIDTH_ZERO = canvasCoreConstant("IMAGE_DATA_WIDTH_ZERO");
+const IMAGE_DATA_HEIGHT_ZERO = canvasCoreConstant("IMAGE_DATA_HEIGHT_ZERO");
+const IMAGE_DATA_LENGTH_NOT_MULTIPLE_OF_ROW = canvasCoreConstant("IMAGE_DATA_LENGTH_NOT_MULTIPLE_OF_ROW");
+const IMAGE_DATA_HEIGHT_MISMATCH = canvasCoreConstant("IMAGE_DATA_HEIGHT_MISMATCH");
+const IMAGE_DATA_TOO_LARGE = canvasCoreConstant("IMAGE_DATA_TOO_LARGE");
+const IMAGE_DATA_FORMAT_MISMATCH = canvasCoreConstant("IMAGE_DATA_FORMAT_MISMATCH");
+const IMAGE_DATA_FORM_DATA = canvasCoreConstant("IMAGE_DATA_FORM_DATA");
+const IMAGE_DATA_FORM_SIZE = canvasCoreConstant("IMAGE_DATA_FORM_SIZE");
+const IMAGE_DATA_FORM_CREATE = canvasCoreConstant("IMAGE_DATA_FORM_CREATE");
+const IMAGE_DATA_RGBA_UNORM8 = canvasCoreConstant("IMAGE_DATA_RGBA_UNORM8");
+const IMAGE_DATA_RGBA_FLOAT16 = canvasCoreConstant("IMAGE_DATA_RGBA_FLOAT16");
+const IMAGE_DATA_SHAPE_WIDTH = canvasCoreConstant("IMAGE_DATA_SHAPE_WIDTH");
+const IMAGE_DATA_SHAPE_HEIGHT = canvasCoreConstant("IMAGE_DATA_SHAPE_HEIGHT");
+const IMAGE_DATA_SHAPE_LENGTH = canvasCoreConstant("IMAGE_DATA_SHAPE_LENGTH");
+const IMAGE_DATA_REGION_WIDTH = canvasCoreConstant("IMAGE_DATA_REGION_WIDTH");
+const IMAGE_DATA_REGION_HEIGHT = canvasCoreConstant("IMAGE_DATA_REGION_HEIGHT");
+const IMAGE_DATA_REGION_SIZE = canvasCoreConstant("IMAGE_DATA_REGION_SIZE");
+const PUT_IMAGE_DATA = Object.freeze(Object.fromEntries(["SOURCE_X", "SOURCE_Y", "WIDTH", "HEIGHT"]
+  .map((name) => [name, canvasCoreConstant(`PUT_IMAGE_DATA_${name}`)])));
+const DRAW_IMAGE_FORMS = Object.freeze({
+  3: canvasCoreConstant("DRAW_IMAGE_AT"),
+  5: canvasCoreConstant("DRAW_IMAGE_SCALED"),
+  9: canvasCoreConstant("DRAW_IMAGE_CROPPED"),
+});
+// The DOM core's canvas color and filter statuses.
+const CANVAS_COLOR_LEGACY = layoutConstant("CANVAS_COLOR_LEGACY");
+const CANVAS_COLOR_CURRENT = layoutConstant("CANVAS_COLOR_CURRENT");
+const CANVAS_COLOR_NEEDS_CURRENT = layoutConstant("CANVAS_COLOR_NEEDS_CURRENT");
+const CANVAS_FILTER_NONE = layoutConstant("CANVAS_FILTER_NONE");
+const CANVAS_FILTER_UNSUPPORTED = layoutConstant("CANVAS_FILTER_UNSUPPORTED");
+const CANVAS_FILTER_NEEDS_ROOT_FONT_SIZE = layoutConstant("CANVAS_FILTER_NEEDS_ROOT_FONT_SIZE");
 const CONSTRUCTION = Symbol("CanvasRenderingContext2D construction");
 const IMAGE_DATA_CONSTRUCTION = Symbol("ImageData construction");
-const STYLE_FILL = 0;
-const STYLE_STROKE = 1;
-const STYLE_SHADOW = 2;
-const DEFAULT_JPEG_QUALITY = 0.92;
+const STYLE_FILL = canvasCoreConstant("STYLE_FILL");
+const STYLE_STROKE = canvasCoreConstant("STYLE_STROKE");
+const STYLE_SHADOW = canvasCoreConstant("STYLE_SHADOW");
+const CANVAS_ENCODING_PNG = moduleLayoutConstants(outputFormatsBinary, "output formats")("CANVAS_ENCODING_PNG");
 // The [[TypedArrayName]] of a typed array of any realm: a page script's
 // array belongs to the document's realm, not to Sandom's.
 const typedArrayName = Object.getOwnPropertyDescriptor(
@@ -109,17 +204,16 @@ const typedArrayName = Object.getOwnPropertyDescriptor(
   Symbol.toStringTag,
 ).get;
 
-let compiledModule = null;
-
 // WebAssembly has no trigonometry; the core imports these (arcs, SVG arcs,
 // round joins).
 const CORE_IMPORTS = Object.freeze({
-  math: Object.freeze({ sin: Math.sin, cos: Math.cos, tan: Math.tan, atan2: Math.atan2, acos: Math.acos }),
+  math: Object.freeze({
+    sin: Math.sin, cos: Math.cos, tan: Math.tan, atan2: Math.atan2, acos: Math.acos, cbrt: Math.cbrt,
+  }),
 });
 
 function instantiateCore() {
-  compiledModule ??= new WebAssembly.Module(getWasmBytes());
-  return new WebAssembly.Instance(compiledModule, CORE_IMPORTS).exports;
+  return new WebAssembly.Instance(canvas2dBinary.getModule(), CORE_IMPORTS).exports;
 }
 
 function notSupported(member, detail = "this member") {
@@ -142,34 +236,6 @@ function finiteArguments(member, values) {
     if (!Number.isFinite(number)) throw new TypeError(`${INTERFACE}.${member}: The provided double value is non-finite.`);
     return number;
   });
-}
-
-// A color component to 8 bits as the core stores a canvas color
-// ($component8 and $alpha8 of canvas-2d-core.watpart): components round
-// half up, alpha rounds in single precision.
-function component8(value) {
-  return Math.min(Math.max(Math.floor(value * 255 + 0.500000001), 0), 255);
-}
-
-function alpha8(value) {
-  const f32 = Math.fround;
-  return Math.min(Math.max(Math.floor(f32(f32(f32(value) * 255) + 0.5)), 0), 255);
-}
-
-// A parsed color (`parsed`: encoded sRGB r, g, b, a) at the precision that
-// Chrome keeps for its authored `text`: a legacy sRGB color (hex, named,
-// rgb(), hsl(), hwb()) has an 8-bit alpha; rgb(), hex and named colors
-// have 8-bit components, hsl() and hwb() keep their precision; any other
-// color keeps its precision (measured on the pinned Chrome: hsl(90 30% 55%
-// / 0.6) fills with blue 105, its float component, not 106).
-function colorPrecision(text, { r, g, b, a }) {
-  const syntax = /^\s*(#|[a-z-]+\s*$|rgba?\(|hsla?\(|hwb\()/i.exec(text)?.[1].toLowerCase() ?? "";
-  const legacy = syntax !== "";
-  const alpha = legacy ? alpha8(a) / 255 : a;
-  const color = legacy && !/^(?:hsla?|hwb)\($/.test(syntax)
-    ? [component8(r) / 255, component8(g) / 255, component8(b) / 255, alpha]
-    : [r, g, b, alpha];
-  return { color, legacy };
 }
 
 // WebIDL `long`: ToInt32 of the number.
@@ -234,8 +300,42 @@ export function convertCanvas2DSettings(options, member = "HTMLCanvasElement.get
 
 let isImageData;
 
-// The typed array of each ImageData pixelFormat.
-const PIXEL_FORMAT_ARRAYS = Object.freeze({ "rgba-unorm8": "Uint8ClampedArray", "rgba-float16": "Float16Array" });
+// The ImageData pixelFormat values and the typed array of each, by the
+// canvas core's IMAGE_DATA_RGBA_* code.
+const PIXEL_FORMATS = Object.freeze({
+  [IMAGE_DATA_RGBA_UNORM8]: Object.freeze({ name: "rgba-unorm8", array: "Uint8ClampedArray", create: (length) => new Uint8ClampedArray(length) }),
+  [IMAGE_DATA_RGBA_FLOAT16]: Object.freeze({ name: "rgba-float16", array: "Float16Array", create: (length) => new Float16Array(length) }),
+});
+const pixelFormatCode = (name) => Number(Object.keys(PIXEL_FORMATS).find((code) => PIXEL_FORMATS[code].name === name));
+const arrayFormatCode = (array) => Object.keys(PIXEL_FORMATS).find((code) => PIXEL_FORMATS[code].array === array);
+
+// The shape of an ImageData from the canvas core (image_data_shape), with
+// Blink's error for each failure: { width, height, length }.
+function imageDataShape(member, form, width, hasHeight, height, length = 0, arrayFormat = 0, pixelFormat = 0) {
+  const core = builder();
+  const result = core.image_data_shape(form, width, hasHeight, height, length, arrayFormat, pixelFormat);
+  if (result === RESULT_DONE) {
+    const view = new DataView(builderMemory.buffer, core.output_pointer(), IMAGE_DATA_SHAPE_LENGTH + 8);
+    return {
+      width: view.getFloat64(IMAGE_DATA_SHAPE_WIDTH, true),
+      height: view.getFloat64(IMAGE_DATA_SHAPE_HEIGHT, true),
+      length: view.getFloat64(IMAGE_DATA_SHAPE_LENGTH, true),
+    };
+  }
+  const failures = {
+    [IMAGE_DATA_FORMAT_MISMATCH]: [
+      `${PIXEL_FORMATS[arrayFormat].array} must use ${PIXEL_FORMATS[arrayFormat].name} pixelFormat.`, "InvalidStateError"],
+    [IMAGE_DATA_NO_ELEMENTS]: ["The input data has zero elements.", "IndexSizeError"],
+    [IMAGE_DATA_LENGTH_NOT_MULTIPLE_OF_FOUR]: ["The input data length is not a multiple of 4.", "InvalidStateError"],
+    [IMAGE_DATA_WIDTH_ZERO]: ["The source width is zero or not a number.", "IndexSizeError"],
+    [IMAGE_DATA_HEIGHT_ZERO]: ["The source height is zero or not a number.", "IndexSizeError"],
+    [IMAGE_DATA_LENGTH_NOT_MULTIPLE_OF_ROW]: ["The input data length is not a multiple of (4 * width).", "IndexSizeError"],
+    [IMAGE_DATA_HEIGHT_MISMATCH]: ["The input data length is not equal to (4 * width * height).", "IndexSizeError"],
+  };
+  if (result === IMAGE_DATA_TOO_LARGE) throw new RangeError(`${member}: Out of memory at ImageData creation.`);
+  const [text, name] = failures[result];
+  throw new DOMException(`${member}: ${text}`, name);
+}
 
 export class ImageData {
   #width;
@@ -258,54 +358,31 @@ export class ImageData {
       throw new TypeError(`ImageData: 2 arguments required, but only ${count} present.`);
     }
     if (ArrayBuffer.isView(first)) {
-      const arrayType = Reflect.apply(typedArrayName, first, []);
-      if (!Object.values(PIXEL_FORMAT_ARRAYS).includes(arrayType)) {
+      const arrayFormat = arrayFormatCode(Reflect.apply(typedArrayName, first, []));
+      if (arrayFormat === undefined) {
         throw notSupported("ImageData", "pixel data other than a Uint8ClampedArray or a Float16Array");
       }
+      const width = Number(second) >>> 0;
+      const height = third === undefined ? 0 : Number(third) >>> 0;
       const settings = imageDataSettings(fourth);
       const pixelFormat = settings.pixelFormat ?? "rgba-unorm8";
-      if (PIXEL_FORMAT_ARRAYS[pixelFormat] !== arrayType) {
-        throw new DOMException(`ImageData: ${arrayType} must use ${pixelFormatOf(arrayType)} pixelFormat.`, "InvalidStateError");
-      }
-      const length = first.length;
-      if (length === 0) throw new DOMException("ImageData: The input data has zero elements.", "IndexSizeError");
-      if (length % 4 !== 0) {
-        throw new DOMException("ImageData: The input data length is not a multiple of 4.", "InvalidStateError");
-      }
-      const width = Number(second) >>> 0;
-      if (width === 0) {
-        throw new DOMException("ImageData: The source width is zero or not a number.", "IndexSizeError");
-      }
-      if (length % (4 * width) !== 0) {
-        throw new DOMException("ImageData: The input data length is not a multiple of (4 * width).", "IndexSizeError");
-      }
-      const rows = length / (4 * width);
-      if (third !== undefined && (Number(third) >>> 0) !== rows) {
-        throw new DOMException(
-          "ImageData: The input data length is not equal to (4 * width * height).",
-          "IndexSizeError",
-        );
-      }
-      this.#width = width;
-      this.#height = rows;
+      const shape = imageDataShape("ImageData", IMAGE_DATA_FORM_DATA, width, third !== undefined, height, first.length,
+        Number(arrayFormat), pixelFormatCode(pixelFormat));
+      this.#width = shape.width;
+      this.#height = shape.height;
       this.#data = first;
       this.#colorSpace = settings.colorSpace ?? "srgb";
       this.#pixelFormat = pixelFormat;
       return;
     }
-    const settings = imageDataSettings(third);
     const width = Number(first) >>> 0;
     const height = Number(second) >>> 0;
-    if (width === 0) {
-      throw new DOMException("ImageData: The source width is zero or not a number.", "IndexSizeError");
-    }
-    if (height === 0) {
-      throw new DOMException("ImageData: The source height is zero or not a number.", "IndexSizeError");
-    }
-    this.#width = width;
-    this.#height = height;
+    const settings = imageDataSettings(third);
+    const shape = imageDataShape("ImageData", IMAGE_DATA_FORM_SIZE, width, true, height);
+    this.#width = shape.width;
+    this.#height = shape.height;
     this.#pixelFormat = settings.pixelFormat ?? "rgba-unorm8";
-    this.#data = allocateImageData("ImageData", width, height, this.#pixelFormat);
+    this.#data = allocateImageData(shape, this.#pixelFormat);
     this.#colorSpace = settings.colorSpace ?? "srgb";
   }
 
@@ -329,17 +406,10 @@ export class ImageData {
     return this.#pixelFormat;
   }
 
-  get [Symbol.toStringTag]() {
-    return "ImageData";
-  }
-
   static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "ImageData", configurable: true });
     isImageData = (value) => value !== null && typeof value === "object" && #width in value;
   }
-}
-
-function pixelFormatOf(arrayType) {
-  return Object.keys(PIXEL_FORMAT_ARRAYS).find((format) => PIXEL_FORMAT_ARRAYS[format] === arrayType);
 }
 
 // The color space and pixel format that `settings` (ImageDataSettings)
@@ -356,16 +426,14 @@ function imageDataSettings(settings) {
   const pixelFormatValue = settings.pixelFormat;
   const pixelFormat = pixelFormatValue === undefined
     ? undefined
-    : enumValue("ImageData", "pixelFormat", pixelFormatValue, Object.keys(PIXEL_FORMAT_ARRAYS), "rgba-unorm8");
+    : enumValue("ImageData", "pixelFormat", pixelFormatValue, Object.values(PIXEL_FORMATS).map((format) => format.name),
+      "rgba-unorm8");
   return { colorSpace, pixelFormat };
 }
 
-function allocateImageData(member, width, height, pixelFormat) {
-  const length = width * height * 4;
-  if (!Number.isSafeInteger(length) || length > 0x7fffffff) {
-    throw new RangeError(`${member}: Out of memory at ImageData creation.`);
-  }
-  return pixelFormat === "rgba-float16" ? new Float16Array(length) : new Uint8ClampedArray(length);
+// The typed array of `shape` (imageDataShape) in `pixelFormat`.
+function allocateImageData(shape, pixelFormat) {
+  return PIXEL_FORMATS[pixelFormatCode(pixelFormat)].create(shape.length);
 }
 
 // The putImageData() payload of `data` (`imageData`'s data, or a region of
@@ -480,8 +548,8 @@ class SandomDOMMatrix {
   toString() {
     return `matrix(${this.#values.join(", ")})`;
   }
-  get [Symbol.toStringTag]() {
-    return "DOMMatrix";
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "DOMMatrix", configurable: true });
   }
 }
 
@@ -503,46 +571,45 @@ function fillRuleValue(member, value) {
   return index;
 }
 
-function pathResult(member, result) {
-  if (result === -1) throw new RangeError(`${member}: the path cannot grow`);
+// The core's result of a path call. A negative radius throws Blink's
+// error for the member, with the radius in single precision that the core
+// reports.
+function pathResult(member, result, core = null, memory = null, count = 0) {
+  if (result === RESULT_FULL) throw new RangeError(`${member}: the path cannot grow`);
+  if (result >= 0) return;
+  if (result === PATH_RADII_COUNT) {
+    throw new RangeError(`${member}: ${count} radii provided. Between one and four radii are necessary.`);
+  }
+  const radius = new Float64Array(memory.buffer, core.output_pointer(), 1)[0];
+  if (member.endsWith(".roundRect")) {
+    const label = result === PATH_NEGATIVE_RADIUS_X ? "X-radius value"
+      : result === PATH_NEGATIVE_RADIUS_Y ? "Y-radius value" : "Radius value";
+    throw new RangeError(`${member}: ${label} ${radius} is negative.`);
+  }
+  const label = result === PATH_NEGATIVE_RADIUS_X ? "major-axis radius"
+    : result === PATH_NEGATIVE_RADIUS_Y ? "minor-axis radius" : "radius";
+  throw new DOMException(`${member}: The ${label} provided (${radius}) is negative.`, "IndexSizeError");
 }
 
-function negativeRadius(member, label, value) {
-  return new DOMException(`${member}: The ${label} provided (${value}) is negative.`, "IndexSizeError");
-}
-
-// roundRect radii (HTML "roundRect" steps 2 to 5, Blink's messages): four
-// corners, upper-left, upper-right, lower-right, lower-left, each x and y;
-// or null when a radius is infinite or NaN (the call does nothing).
-function roundRectRadii(member, radii) {
+// Writes the roundRect radii (a (unrestricted double or DOMPointInit) or a
+// sequence of them) into the core's import buffer as the core reads them
+// (round_rect): 1 and the point's x and y, or 0 and the number. Returns
+// their count.
+function writeRoundRectRadii(member, core, memory, radii) {
   let list;
   if (radii === undefined) list = [0];
   else if (radii !== null && typeof radii === "object" && typeof radii[Symbol.iterator] === "function") list = [...radii];
   else list = [radii];
-  if (list.length < 1 || list.length > 4) {
-    throw new RangeError(`${member}: ${list.length} radii provided. Between one and four radii are necessary.`);
-  }
-  const corners = [];
-  for (const radius of list) {
-    if (radius !== null && typeof radius === "object") {
-      const x = Math.fround(Number(radius.x ?? 0));
-      const y = Math.fround(Number(radius.y ?? 0));
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
-      if (x < 0) throw new RangeError(`${member}: X-radius value ${x} is negative.`);
-      if (y < 0) throw new RangeError(`${member}: Y-radius value ${y} is negative.`);
-      corners.push([x, y]);
-    } else {
-      const value = Math.fround(Number(radius));
-      if (!Number.isFinite(value)) return null;
-      if (value < 0) throw new RangeError(`${member}: Radius value ${value} is negative.`);
-      corners.push([value, value]);
-    }
-  }
-  const [first, second, third, fourth] = corners;
-  if (corners.length === 1) return [first, first, first, first];
-  if (corners.length === 2) return [first, second, first, second];
-  if (corners.length === 3) return [first, second, third, second];
-  return [first, second, third, fourth];
+  const entries = list.flatMap((radius) =>
+    radius !== null && typeof radius === "object"
+      ? [1, Number(radius.x ?? 0), Number(radius.y ?? 0)]
+      : [0, Number(radius), 0]
+  );
+  if (entries.length === 0) return 0;
+  const pointer = core.import_buffer(entries.length * Float64Array.BYTES_PER_ELEMENT);
+  if (pointer === 0) throw new RangeError(`${member}: the path cannot grow`);
+  new Float64Array(memory.buffer, pointer, entries.length).set(entries);
+  return list.length;
 }
 
 // One CanvasPath call on `core`: `name` and the converted `values`.
@@ -560,36 +627,18 @@ function buildPath(interfaceName, core, memory, name, values) {
       return pathResult(member, core.quadratic_curve_to(...numbers.slice(0, 4)));
     case "bezierCurveTo":
       return pathResult(member, core.bezier_curve_to(...numbers.slice(0, 6)));
-    case "arcTo": {
-      const [x1, y1, x2, y2, radius] = numbers;
-      if ([x1, y1, x2, y2, radius].every(Number.isFinite) && radius < 0) {
-        throw negativeRadius(member, "radius", Math.fround(radius));
-      }
-      return pathResult(member, core.arc_to(x1, y1, x2, y2, radius));
-    }
+    case "arcTo":
+      return pathResult(member, core.arc_to(...numbers.slice(0, 5)), core, memory);
     case "rect":
       return pathResult(member, core.rect(...numbers.slice(0, 4)));
     case "roundRect": {
-      const radii = roundRectRadii(member, values[4]);
-      if (radii === null || !numbers.slice(0, 4).every(Number.isFinite)) return;
-      new Float64Array(memory.buffer, core.input_pointer(), 8).set(radii.flat());
-      return pathResult(member, core.round_rect(...numbers.slice(0, 4)));
+      const count = writeRoundRectRadii(member, core, memory, values[4]);
+      return pathResult(member, core.round_rect(...numbers.slice(0, 4), count), core, memory, count);
     }
-    case "arc": {
-      const [x, y, radius, start, end] = numbers;
-      if ([x, y, radius, start, end].every(Number.isFinite) && radius < 0) {
-        throw negativeRadius(member, "radius", Math.fround(radius));
-      }
-      return pathResult(member, core.arc(x, y, radius, start, end, values[5] ? 1 : 0));
-    }
-    case "ellipse": {
-      const [x, y, radiusX, radiusY, rotation, start, end] = numbers;
-      if ([x, y, radiusX, radiusY, rotation, start, end].every(Number.isFinite)) {
-        if (radiusX < 0) throw negativeRadius(member, "major-axis radius", Math.fround(radiusX));
-        if (radiusY < 0) throw negativeRadius(member, "minor-axis radius", Math.fround(radiusY));
-      }
-      return pathResult(member, core.ellipse(x, y, radiusX, radiusY, rotation, start, end, values[7] ? 1 : 0));
-    }
+    case "arc":
+      return pathResult(member, core.arc(...numbers.slice(0, 5), values[5] ? 1 : 0), core, memory);
+    case "ellipse":
+      return pathResult(member, core.ellipse(...numbers.slice(0, 7), values[7] ? 1 : 0), core, memory);
   }
   throw new Error(`${member}: unknown path call`);
 }
@@ -629,18 +678,69 @@ function builder() {
   if (builderCore === null) {
     builderCore = instantiateCore();
     builderMemory = builderCore.memory;
-    builderCore.context_reset(0);
+    builderCore.context_reset(false);
   }
   return builderCore;
 }
+
+// The definition words of a gradient in a canvas of `colorSpace`
+// (gradient_definition, core/engine/canvas-2d-gradient.watpart), computed in
+// the shared builder core: the stops are written as records of 64 bytes,
+// the offset (f64), 1 for a legacy sRGB color (i32 at 8), the color, the
+// OKLab stop and the OKLab padding (f32 at 16, 32 and 48).
+function gradientWords(kind, geometry, stops, colorSpace) {
+  const core = builder();
+  const pointer = core.gradient_stops(stops.length);
+  if (pointer === 0) throw new RangeError("CanvasGradient: the gradient cannot grow");
+  const view = new DataView(builderMemory.buffer, pointer, stops.length * CANVAS_CORE.GRADIENT_STOP_SIZE);
+  stops.forEach((stop, index) => {
+    const at = index * CANVAS_CORE.GRADIENT_STOP_SIZE;
+    view.setFloat64(at + CANVAS_CORE.GRADIENT_STOP_OFFSET, stop.offset, true);
+    view.setInt32(at + CANVAS_CORE.GRADIENT_STOP_LEGACY, stop.legacy ? 1 : 0, true);
+    for (let component = 0; component < 4; component++) {
+      view.setFloat32(at + CANVAS_CORE.GRADIENT_STOP_COLOR + component * F32, stop.color[component], true);
+      view.setFloat32(at + CANVAS_CORE.GRADIENT_STOP_OKLAB + component * F32, stop.oklabColor[component], true);
+      view.setFloat32(at + CANVAS_CORE.GRADIENT_STOP_OKLAB_PADDING + component * F32, stop.oklabPadding[component], true);
+    }
+  });
+  const count = core.gradient_definition(kind, ...geometry, ...new Array(6 - geometry.length).fill(0),
+    colorSpace === "display-p3");
+  const words = core.gradient_words();
+  return new Float32Array(builderMemory.buffer.slice(words, words + count * 4));
+}
+
+// The canvas core's gradient (src/dom/canvas-2d-gradient.js).
+const GRADIENT_CORE = Object.freeze({
+  offsetValid: (offset) => builder().gradient_stop_offset_valid(offset) === 1,
+  words: gradientWords,
+});
+
+// The canvas core's pattern (src/dom/canvas-2d-pattern.js). A pattern whose
+// transform the core cannot invert paints nothing and keeps no source in
+// the flush.
+const PATTERN_CORE = Object.freeze({
+  matrixFromInit: (value, member) => matrixFromInit(value, member, builder()),
+  words(context, source, width, height, repetition, matrix) {
+    const core = builder();
+    const invertible = core.pattern_inverse(...matrix) === 1;
+    const inverse = Array.from(new Float64Array(builderMemory.buffer, core.output_pointer(), 6));
+    const index = invertible ? context.addSource(source) : 0;
+    const conversion = invertible ? sourceConversion(core, source, context.colorSpace()) : 0;
+    const count = core.pattern_definition(invertible, repetition, index, conversion, width, height, ...inverse);
+    const pointer = core.output_pointer();
+    return new Float32Array(builderMemory.buffer.slice(pointer, pointer + count * Float32Array.BYTES_PER_ELEMENT));
+  },
+});
 
 // The transport bytes of slot `slot` of `core`.
 function exportPath(core, memory, slot) {
   const headerSize = core.path_header_size();
   const count = core.path_data_count(slot);
-  const bytes = new Uint8Array(headerSize + count * 8);
+  const bytes = new Uint8Array(headerSize + count * CANVAS_CORE.PATH_DATA_SIZE);
   bytes.set(new Uint8Array(memory.buffer, core.path_header_pointer(slot), headerSize));
-  if (count > 0) bytes.set(new Uint8Array(memory.buffer, core.path_data_pointer(slot), count * 8), headerSize);
+  if (count > 0) {
+    bytes.set(new Uint8Array(memory.buffer, core.path_data_pointer(slot), count * CANVAS_CORE.PATH_DATA_SIZE), headerSize);
+  }
   return bytes;
 }
 
@@ -668,7 +768,7 @@ export class Path2D {
     }
     const text = String(path);
     const core = this.#resident();
-    core.path_clear(0);
+    core.path_clear(PATH_SLOT_CURRENT);
     const encoded = new TextEncoder().encode(text);
     const pointer = core.import_buffer(encoded.length);
     if (pointer === 0) throw new RangeError("Path2D: the path cannot grow");
@@ -676,17 +776,17 @@ export class Path2D {
     pathResult("Path2D", core.parse_svg_path(encoded.length));
   }
 
-  get [Symbol.toStringTag]() {
-    return "Path2D";
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "Path2D", configurable: true });
   }
 
   // Makes this path the builder's slot 0.
   #resident() {
     const core = builder();
     if (residentPath === this) return core;
-    if (residentPath !== null) residentPath.#bytes = exportPath(core, builderMemory, 0);
+    if (residentPath !== null) residentPath.#bytes = exportPath(core, builderMemory, PATH_SLOT_CURRENT);
     core.reset_transform();
-    importPath("Path2D", core, builderMemory, 0, this.#bytes);
+    importPath("Path2D", core, builderMemory, PATH_SLOT_CURRENT, this.#bytes);
     residentPath = this;
     return core;
   }
@@ -694,17 +794,17 @@ export class Path2D {
   addPath(path, transform = undefined) {
     requireArgumentsOf("Path2D", "addPath", 1, arguments.length);
     if (!isPath2D(path)) throw new TypeError("Path2D.addPath: parameter 1 is not of type 'Path2D'.");
-    const matrix = matrixFromInit(transform, "Path2D.addPath");
+    const matrix = matrixFromInit(transform, "Path2D.addPath", builder());
     const bytes = path2DBytes(path);
     const core = this.#resident();
     this.#version++;
-    importPath("Path2D.addPath", core, builderMemory, 1, bytes);
+    importPath("Path2D.addPath", core, builderMemory, PATH_SLOT_PATH2D, bytes);
     pathResult("Path2D.addPath", core.path_add_path(...matrix));
   }
 
   static {
     isPath2D = (value) => value !== null && typeof value === "object" && #bytes in value;
-    path2DBytes = (path) => (residentPath === path ? exportPath(builder(), builderMemory, 0) : path.#bytes);
+    path2DBytes = (path) => (residentPath === path ? exportPath(builder(), builderMemory, PATH_SLOT_CURRENT) : path.#bytes);
     path2DVersion = (path) => path.#version;
     for (const [name, required] of Object.entries(CANVAS_PATH_METHODS)) {
       Object.defineProperty(this.prototype, name, {
@@ -733,46 +833,24 @@ function requireArgumentsOf(interfaceName, member, required, actual) {
 
 // ----------------------------------------------------------------- attributes
 
-// The composite operations, indexed as the core stores them
-// (src/wasm/canvas-2d-composite.watpart). Chrome also accepts "clear"
-// (Skia's kClear), and "normal" as source-over; it ignores every other
-// value and compares case-sensitively (measured on the pinned Chrome).
-const COMPOSITE_OPERATIONS = [
-  "source-over", "source-in", "source-out", "source-atop", "destination-over", "destination-in",
-  "destination-out", "destination-atop", "lighter", "copy", "xor", "multiply", "screen", "overlay",
-  "darken", "lighten", "color-dodge", "color-burn", "hard-light", "soft-light", "difference",
-  "exclusion", "hue", "saturation", "color", "luminosity", "clear",
-];
-
 const IMAGE_SMOOTHING_QUALITIES = ["low", "medium", "high"];
 
-// Blink keeps shadow offsets and blur as float (ClampTo<float>).
-function clampToFloat(value) {
-  return Math.fround(Math.min(Math.max(value, -3.4028234663852886e38), 3.4028234663852886e38));
-}
-
-// The enumerated text attributes: their values and their offset in the
-// core's text state (src/wasm/canvas-2d-text.watpart).
+// The enumerated text attributes: their values and their field in the
+// core's text state (core/engine/canvas-2d-text.watpart).
 const TEXT_ENUMS = Object.freeze({
-  textAlign: { values: TEXT_ALIGNS, offset: 40 },
-  textBaseline: { values: TEXT_BASELINES, offset: 44 },
-  fontKerning: { values: FONT_KERNINGS, offset: 52 },
-  fontStretch: { values: FONT_STRETCHES, offset: 56 },
-  fontVariantCaps: { values: FONT_VARIANT_CAPS, offset: 60 },
-  textRendering: { values: TEXT_RENDERINGS, offset: 64 },
+  textAlign: { values: TEXT_ALIGNS, offset: canvasCoreConstant("TEXT_STATE_TEXT_ALIGN") },
+  textBaseline: { values: TEXT_BASELINES, offset: canvasCoreConstant("TEXT_STATE_TEXT_BASELINE") },
+  fontKerning: { values: FONT_KERNINGS, offset: canvasCoreConstant("TEXT_STATE_FONT_KERNING") },
+  fontStretch: { values: FONT_STRETCHES, offset: canvasCoreConstant("TEXT_STATE_FONT_STRETCH") },
+  fontVariantCaps: { values: FONT_VARIANT_CAPS, offset: canvasCoreConstant("TEXT_STATE_FONT_VARIANT_CAPS") },
+  textRendering: { values: TEXT_RENDERINGS, offset: canvasCoreConstant("TEXT_STATE_TEXT_RENDERING") },
 });
-const TEXT_DIRECTION_OFFSET = 48;
+const TEXT_DIRECTION_OFFSET = canvasCoreConstant("TEXT_STATE_DIRECTION");
 // Layouts of measured and drawn text kept for each context.
 const TEXT_LAYOUT_CACHE_SIZE = 256;
 
 const LINE_CAPS = ["butt", "round", "square"];
 const LINE_JOINS = ["miter", "round", "bevel"];
-
-// Chrome slants a font that it synthesizes italic for (Skia's fake
-// italic): x' = x - 0.25 y about each glyph origin, y down.
-function obliqueSkew(font) {
-  return font.syntheticOblique ? -0.25 : 0;
-}
 
 // ------------------------------------------------------------ sources
 //
@@ -879,6 +957,12 @@ const SOURCE_ERRORS = Object.freeze({
   },
 });
 
+// Whether a source of `width` x `height` has no pixels (export_check of
+// the canvas core: a zero side).
+function sourceEmpty(width, height) {
+  return builder().export_check(width, height, true) === EXPORT_EMPTY;
+}
+
 function sizeError(member, use, width, kind) {
   const text = SOURCE_ERRORS[use === "bitmap" ? "bitmap" : "draw"][kind] ??
     `The image source's ${width === 0 ? "width" : "height"} is 0.`;
@@ -901,13 +985,13 @@ export const BROKEN_IMAGE = Symbol("broken image");
 export function resolveImageSource(member, value, use, device = null) {
   if (isSandomCanvas(value)) {
     const { width, height } = value;
-    if (width === 0 || height === 0) throw sizeError(member, use, width, "canvasSize");
+    if (sourceEmpty(width, height)) throw sizeError(member, use, width, "canvasSize");
     return canvasElementSource(value, width, height, device);
   }
   const offscreen = offscreenCanvasState(value);
   if (offscreen !== undefined) {
     const { width, height, context } = offscreen;
-    if (width === 0 || height === 0) throw sizeError(member, use, width, "offscreenSize");
+    if (sourceEmpty(width, height)) throw sizeError(member, use, width, "offscreenSize");
     return context === null ? blankImage(width, height) : contextImage(context, device);
   }
   const bitmap = imageBitmapState(value);
@@ -979,14 +1063,16 @@ async function sessionDevice(document) {
   return document?._preferredCanvasDevice ?? device;
 }
 
+// The file encoding of an export (canvas_encoding of the output formats
+// module): { jpeg, type, quality in percent }. `quality` is `any`: only a
+// number counts.
 function encodingOptions(type, quality) {
-  const jpeg = (type === undefined ? "image/png" : `${type}`).toLowerCase() === "image/jpeg";
-  return {
-    jpeg,
-    type: jpeg ? "image/jpeg" : "image/png",
-    quality: Math.round((typeof quality === "number" && quality >= 0 && quality <= 1
-      ? quality : DEFAULT_JPEG_QUALITY) * 100),
-  };
+  const hasType = type !== undefined;
+  const hasQuality = typeof quality === "number";
+  const { result, output } = callOutputFormats("canvas_encoding", [hasType, hasQuality ? quality : 0, hasQuality],
+    [encodeText(hasType ? `${type}` : "")]);
+  const jpeg = result !== CANVAS_ENCODING_PNG;
+  return { jpeg, type: new TextDecoder().decode(output), quality: jpeg ? result : 0 };
 }
 
 function encodePixels(samples, width, height, colorSpace, encoding, operation) {
@@ -1047,7 +1133,6 @@ export class CanvasRenderingContext2D {
   #clearBitmap = true;
   #dirty = false;
   #snapshot = null;
-  #originClean = true;
   #shutdown = false;
   #encoder = new TextEncoder();
   #decoder = new TextDecoder();
@@ -1055,7 +1140,7 @@ export class CanvasRenderingContext2D {
   #slotPath = null;
   #slotVersion = 0;
   // The paint styles (CanvasGradient, CanvasPattern) that the core's state
-  // names by handle (src/wasm/canvas-2d-paint.watpart), both ways.
+  // names by handle (core/engine/canvas-2d-paint.watpart), both ways.
   #paints = new Map();
   #paintHandles = new WeakMap();
   #nextPaintHandle = 1;
@@ -1069,8 +1154,10 @@ export class CanvasRenderingContext2D {
     return BITMAP_FORMATS[this.#settings.colorType];
   }
 
-  // The resolved filters (src/dom/canvas-2d-filter.js) that the core's
-  // state names by handle (src/wasm/canvas-2d-filter.watpart). A handle
+  // The resolved filters (canvas_filter_resolve, src/dom-wasm/canvas-
+  // filter.watpart) that the core's state names by handle
+  // (core/engine/canvas-2d-filter.watpart): the text, the font sizes it
+  // resolved against and its filter block. A handle
   // below 0 names a value without filter functions (none), kept for the
   // getter's text. #filterBlocks: the filter block of each handle drawn in
   // this flush.
@@ -1088,7 +1175,7 @@ export class CanvasRenderingContext2D {
     this.#resourceHandle = resourceHandle;
     this.#core = instantiateCore();
     this.#memory = this.#core.memory;
-    this.#core.context_reset(settings.alpha ? 0 : 1);
+    this.#core.context_reset(!settings.alpha);
     const core = canvas._domCore;
     const bitmapDevice = () => this.#bitmap?.device ?? null;
     this.paintSource = Object.freeze({
@@ -1096,10 +1183,10 @@ export class CanvasRenderingContext2D {
       sourceIdentifier: core.resourceId(resourceHandle),
       resourceHandle,
       get width() {
-        return core.canvasResourceDimension(resourceHandle, 0);
+        return core.canvasResourceDimension(resourceHandle, CANVAS_BITMAP_WIDTH);
       },
       get height() {
-        return core.canvasResourceDimension(resourceHandle, 1);
+        return core.canvasResourceDimension(resourceHandle, CANVAS_BITMAP_HEIGHT);
       },
       get revision() {
         return core.resourceContentGeneration(resourceHandle);
@@ -1119,8 +1206,8 @@ export class CanvasRenderingContext2D {
     return this.#resourceHandle;
   }
 
-  get [Symbol.toStringTag]() {
-    return INTERFACE;
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: INTERFACE, configurable: true });
   }
 
   get canvas() {
@@ -1156,7 +1243,7 @@ export class CanvasRenderingContext2D {
 
   reset() {
     this.#discardCommands();
-    this.#core.context_reset(this.#settings.alpha ? 0 : 1);
+    this.#core.context_reset(!this.#settings.alpha);
     this.#slotPath = null;
     this.#paints.clear();
     this.#filters.clear();
@@ -1173,8 +1260,7 @@ export class CanvasRenderingContext2D {
 
   rotate(angle) {
     requireArguments("rotate", 1, arguments.length);
-    const radians = Number(angle);
-    this.#core.rotate(Math.cos(radians), Math.sin(radians));
+    this.#core.rotate(Number(angle));
   }
 
   translate(x, y) {
@@ -1190,7 +1276,7 @@ export class CanvasRenderingContext2D {
   setTransform(...values) {
     const core = this.#core;
     if (values.length <= 1) {
-      core.set_transform(...matrixFromInit(values[0], `${INTERFACE}.setTransform`));
+      core.set_transform(...matrixFromInit(values[0], `${INTERFACE}.setTransform`, core));
       return;
     }
     if (values.length < 6) {
@@ -1201,7 +1287,7 @@ export class CanvasRenderingContext2D {
 
   getTransform() {
     const pointer = this.#core.transform_pointer();
-    return new SandomDOMMatrix(Array.from(new Float64Array(this.#memory.buffer, pointer, 6)));
+    return new SandomDOMMatrix(Array.from(new Float64Array(this.#memory.buffer, pointer, CANVAS_CORE.CURRENT_TRANSFORM_COUNT)));
   }
 
   resetTransform() {
@@ -1266,14 +1352,14 @@ export class CanvasRenderingContext2D {
       throw new TypeError(`${INTERFACE}.setLineDash: The provided value cannot be converted to a sequence.`);
     }
     const values = Array.from(segments, Number);
-    if (values.some((value) => !Number.isFinite(value) || value < 0)) return;
-    const length = values.length % 2 === 1 ? values.length * 2 : values.length;
-    if (length > 64) {
-      throw notSupported(`${INTERFACE}.setLineDash`, `a dash list of ${length} values (at most 64)`);
-    }
     const core = this.#core;
-    new Float64Array(this.#memory.buffer, core.input_pointer(), values.length).set(values);
-    core.set_line_dash(values.length);
+    const pointer = values.length === 0 ? -1 : core.import_buffer(values.length * Float64Array.BYTES_PER_ELEMENT);
+    if (pointer === 0) throw new RangeError(`${INTERFACE}.setLineDash: the dash list cannot grow`);
+    if (pointer > 0) new Float64Array(this.#memory.buffer, pointer, values.length).set(values);
+    if (core.set_line_dash(values.length) === RESULT_UNSUPPORTED) {
+      const length = new Int32Array(this.#memory.buffer, core.output_pointer(), 1)[0];
+      throw notSupported(`${INTERFACE}.setLineDash`, `a dash list of ${length} values (at most ${DASH_CAPACITY})`);
+    }
   }
 
   getLineDash() {
@@ -1310,8 +1396,7 @@ export class CanvasRenderingContext2D {
   }
 
   set shadowOffsetX(value) {
-    const number = Number(value);
-    if (Number.isFinite(number)) this.#core.set_shadow_offset_x(clampToFloat(number));
+    this.#core.set_shadow_offset_x(Number(value));
   }
 
   get shadowOffsetY() {
@@ -1319,8 +1404,7 @@ export class CanvasRenderingContext2D {
   }
 
   set shadowOffsetY(value) {
-    const number = Number(value);
-    if (Number.isFinite(number)) this.#core.set_shadow_offset_y(clampToFloat(number));
+    this.#core.set_shadow_offset_y(Number(value));
   }
 
   get shadowBlur() {
@@ -1328,12 +1412,12 @@ export class CanvasRenderingContext2D {
   }
 
   set shadowBlur(value) {
-    const number = Number(value);
-    if (Number.isFinite(number) && number >= 0) this.#core.set_shadow_blur(clampToFloat(number));
+    this.#core.set_shadow_blur(Number(value));
   }
 
   get globalCompositeOperation() {
-    return COMPOSITE_OPERATIONS[this.#core.global_composite_operation()];
+    const length = this.#core.global_composite_operation();
+    return this.#decoder.decode(new Uint8Array(this.#memory.buffer, this.#core.output_pointer(), length));
   }
 
   set globalCompositeOperation(value) {
@@ -1342,9 +1426,7 @@ export class CanvasRenderingContext2D {
         "Failed to set the 'globalCompositeOperation' property on 'CanvasRenderingContext2D': Cannot convert a Symbol value to a string",
       );
     }
-    const text = String(value);
-    const index = text === "normal" ? 0 : COMPOSITE_OPERATIONS.indexOf(text);
-    if (index >= 0) this.#core.set_global_composite_operation(index);
+    this.#core.set_global_composite_operation(this.#input(this.#encoder.encode(String(value))));
   }
 
   get imageSmoothingEnabled() {
@@ -1380,42 +1462,46 @@ export class CanvasRenderingContext2D {
     const fontSize = this.#filterFontSize();
     const current = handle === 0 ? null : this.#filters.get(handle);
     if (current !== null && current.text === text && current.fontSize === fontSize) return;
-    let functions;
-    try {
-      functions = parseCanvasFilter(text, {
-        fontSize,
-        rootFontSize: () => this.#rootFontSize(),
-        parseColor: (color) => this.#filterColor(color),
-      });
-    } catch (error) {
-      if (error instanceof UnsupportedFilter) {
-        throw notSupported(`${INTERFACE}.filter`, `the value ${text} (${error.message})`);
-      }
-      throw error;
-    }
-    if (functions === null) return;
+    const resolved = this.#resolveFilter(text, fontSize, null);
+    if (resolved === null) return;
     if (this.#filters.size >= 32) {
       for (const old of this.#filters.keys()) {
         if (core.filter_handle_in_use(old) === 0) this.#filters.delete(old);
       }
     }
     const serial = this.#nextFilterHandle++;
-    const next = functions.length === 0 ? -serial : serial;
-    this.#filters.set(next, Object.freeze({ ...resolveCanvasFilter(text, functions), fontSize }));
+    const next = (resolved.status & CANVAS_FILTER_NONE) !== 0 ? -serial : serial;
+    this.#filters.set(next, Object.freeze({
+      text,
+      fontSize,
+      rootFontSize: resolved.rootFontSize,
+      words: resolved.words,
+    }));
     core.set_filter_handle(next);
   }
 
-  // A drop-shadow() color: encoded components 0 to 1 in the canvas's color
-  // space, "currentColor", or null. A legacy sRGB color keeps 8-bit
-  // components, its alpha included (measured: drop-shadow(… rgba(0, 0, 0,
-  // 0.7)) draws as alpha 179/255).
-  #filterColor(text) {
-    const core = this.#canvas._domCore;
-    const parsed = core.parseColor(text, { r: 0, g: 0, b: 0, a: 1 });
-    if (parsed === null || parsed === "currentColor") return parsed;
-    const a = core.parsedColorText() !== null ? parsed.a : Math.round(parsed.a * 255) / 255;
-    const [r, g, b] = convertCanvasColor(parsed.r, parsed.g, parsed.b, "srgb", this.#settings.colorSpace);
-    return { r, g, b, a };
+  // The filter value resolved by the DOM core (canvas_filter_resolve):
+  // { status, words, rootFontSize }, or null for an invalid value. The
+  // root font size is null until the core asks for it. `shadow` appends
+  // Blink's shadow-only drop shadow of the shadow parameters.
+  #resolveFilter(text, fontSize, rootFontSize, shadow = null) {
+    const dom = this.#canvas._domCore;
+    for (;;) {
+      const status = dom.status("canvas_filter_resolve", ...dom.input(text), fontSize, rootFontSize ?? NaN,
+        rootFontSize !== null, this.#settings.colorSpace === "display-p3", shadow !== null,
+        shadow?.offsetX ?? 0, shadow?.offsetY ?? 0, shadow?.deviation ?? 0, shadow?.color ?? 0);
+      if (status === CANVAS_FILTER_NEEDS_ROOT_FONT_SIZE) {
+        rootFontSize = this.#rootFontSize();
+        continue;
+      }
+      if (status === CANVAS_FILTER_UNSUPPORTED) {
+        throw notSupported(`${INTERFACE}.filter`, `the value ${text} (${dom.outputString()})`);
+      }
+      if (status === 0) return null;
+      const pointer = dom.outputPointerRegister.value;
+      const words = new Float32Array(dom.refreshBytes().buffer.slice(pointer, pointer + dom.outputLengthRegister.value));
+      return { status, words, rootFontSize };
+    }
   }
 
   // The font size of the canvas font in pixels, for em.
@@ -1423,61 +1509,47 @@ export class CanvasRenderingContext2D {
     return this.#textState().size;
   }
 
-  // The root element's font size in pixels, for rem.
+  // The root element's computed font size in pixels, for rem; NaN when the
+  // canvas is outside a document or the document has no root element.
   #rootFontSize() {
     const document = this.#canvas.ownerDocument;
     const root = document?.documentElement;
-    if (!root || !this.#canvas.isConnected) return 16;
-    const size = Number.parseFloat(document.getComputedStyle(root).fontSize);
-    return Number.isFinite(size) ? size : 16;
+    if (!root || !this.#canvas.isConnected) return NaN;
+    return Number.parseFloat(document.getComputedStyle(root).fontSize);
   }
 
   // Writes the filter block of the current filter into this flush's
   // paints for the next draw, or names the block already written; with a
   // shadow, also the block of the shadow's layer: the filter, then Blink's
-  // shadow-only drop shadow of the shadow parameters (canvas-2d-shadow.
-  // watpart). Blink shadows a fill or stroke with a pattern the same way
-  // without a filter (Canvas2DRecorderContext::
-  // ShouldUseDropShadowPaintFilter: a pattern is a kNonOpaqueImage), so
-  // `style` (STYLE_FILL, STYLE_STROKE, or undefined for an image) with a
-  // pattern stages that block alone. A filter with a drop shadow of
-  // currentcolor taints the canvas, as Chrome's filter resolution at the
-  // draw does.
+  // shadow-only drop shadow of the shadow parameters. The core plans which
+  // blocks a draw stages (filter_stage_plan); `style` (STYLE_FILL,
+  // STYLE_STROKE, or undefined for an image) tells it whether the paint is
+  // a pattern.
   #stageFilter(style = undefined) {
     const core = this.#core;
     const handle = core.filter_handle();
-    let filter = null;
-    if (handle > 0) {
-      filter = this.#filters.get(handle);
-      if (filter.taints) this.#originClean = false;
-      this.#stageFilterBlock(0, `${handle}`, () => filter.words);
-    } else {
-      const paint = style === undefined ? 0 : core.paint_handle(style);
-      if (paint === 0 || !(this.#paints.get(paint) instanceof CanvasPattern)) return;
+    const paint = style === undefined ? 0 : core.paint_handle(style);
+    const plan = core.filter_stage_plan(this.#paints.get(paint) instanceof CanvasPattern);
+    const view = new DataView(this.#memory.buffer, core.output_pointer(), FILTER_SHADOW.SIZE);
+    const shadow = (plan & FILTER_STAGE_SHADOW) === 0 ? null : {
+      offsetX: view.getFloat64(FILTER_SHADOW.OFFSET_X, true),
+      offsetY: view.getFloat64(FILTER_SHADOW.OFFSET_Y, true),
+      deviation: view.getFloat64(FILTER_SHADOW.DEVIATION, true),
+      color: view.getInt32(FILTER_SHADOW.COLOR, true),
+    };
+    const filter = (plan & FILTER_STAGE_FILTER) === 0 ? null : this.#filters.get(handle);
+    if (filter !== null) {
+      this.#stageFilterBlock(FILTER_BLOCK_DRAW, `${handle}`, () => filter.words);
     }
-    if (core.shadow_drawn() === 0) return;
-    const color = core.shadow_color();
-    const offsetX = Math.fround(core.shadow_offset_x());
-    const offsetY = Math.fround(core.shadow_offset_y());
-    const deviation = Math.fround(Math.fround(core.shadow_blur()) * 0.5);
-    const key = `${filter === null ? 0 : handle} ${offsetX} ${offsetY} ${deviation} ${color}`;
-    this.#stageFilterBlock(1, key, () =>
-      filterWords([...(filter?.steps ?? []), {
-        kind: FILTER_DROP_SHADOW_ONLY,
-        offsetX,
-        offsetY,
-        deviation,
-        color: {
-          r: (color & 0xff) / 255,
-          g: ((color >>> 8) & 0xff) / 255,
-          b: ((color >>> 16) & 0xff) / 255,
-          a: (color >>> 24) / 255,
-        },
-      }]));
+    if (shadow === null) return;
+    const key = `${filter === null ? 0 : handle} ${shadow.offsetX} ${shadow.offsetY} ${shadow.deviation} ${shadow.color}`;
+    this.#stageFilterBlock(FILTER_BLOCK_SHADOW, key, () =>
+      this.#resolveFilter(filter?.text ?? "none", filter?.fontSize ?? 0, filter?.rootFontSize ?? null, shadow).words);
   }
 
   // Names the filter block `key` of this flush for the next draw ($which
-  // 0) or its shadow (1), writing its words first when the flush has none.
+  // FILTER_BLOCK_DRAW) or its shadow (FILTER_BLOCK_SHADOW), writing its
+  // words first when the flush has none.
   #stageFilterBlock(which, key, words) {
     const core = this.#core;
     const block = this.#filterBlocks.get(key);
@@ -1504,32 +1576,41 @@ export class CanvasRenderingContext2D {
     return this.#decoder.decode(new Uint8Array(this.#memory.buffer, this.#core.output_pointer(), length));
   }
 
-  // The color `text` names, as encoded sRGB components and the text the
-  // style serializes from, or null when `text` is not a color. A color
-  // outside the legacy sRGB forms carries Chrome's serialization of it; a
-  // legacy one serializes from its 8-bit components.
+  // The canvas color of `text` (canvas_color_resolve): { color (the parsed
+  // encoded sRGB), draw ([r, g, b, a] at Chrome's precision in the
+  // canvas's color space), text (the getter's serialization: Chrome's for
+  // a color outside the legacy sRGB forms; a legacy one serializes from
+  // its 8-bit components), legacy }, or null when `text` is not a color.
+  // The core asks for the canvas element's color when the text names
+  // currentcolor.
   #resolveColor(text) {
     const core = this.#canvas._domCore;
-    // currentcolor, alone or inside a color-mix(), is the canvas element's
-    // computed color. It is resolved before `text` is parsed: the core keeps
-    // the serialization of the last parse only.
-    const current = /currentcolor/i.test(text) ? this.#currentColor() : null;
-    const parsed = core.parseColor(text, current);
-    if (parsed === null) return null;
-    if (parsed === "currentColor") return { color: current, text };
-    return { color: parsed, text: core.parsedColorText() ?? text };
+    const displayP3 = this.#settings.colorSpace === "display-p3";
+    let status = core.status("canvas_color_resolve", ...core.input(text), false, NaN, NaN, NaN, NaN, displayP3);
+    if (status === CANVAS_COLOR_NEEDS_CURRENT) {
+      const current = this.#currentColor();
+      status = core.status("canvas_color_resolve", ...core.input(text), true, current.r, current.g, current.b, current.a,
+        displayP3);
+    }
+    if (status === 0) return null;
+    const view = new DataView(core.refreshBytes().buffer, core.outputPointerRegister.value, DOM_CORE.CANVAS_COLOR_SIZE);
+    const [r, g, b, a] = colorComponents(view, DOM_CORE.CANVAS_COLOR_PARSED);
+    const color = { r, g, b, a };
+    const draw = colorComponents(view, DOM_CORE.CANVAS_COLOR_DRAWN);
+    const serialized = (status & CANVAS_COLOR_CURRENT) !== 0 ? text : core.parsedColorText() ?? text;
+    return { color, draw, text: serialized, legacy: (status & CANVAS_COLOR_LEGACY) !== 0 };
   }
 
-  // The canvas element's computed color, black outside a document.
+  // The canvas element's computed color; NaN components when the canvas
+  // is outside a document or the element has no color the host can parse
+  // (the core takes black).
   #currentColor() {
     const canvas = this.#canvas;
-    const black = { r: 0, g: 0, b: 0, a: 1 };
-    if (!canvas.isConnected) return black;
-    // An element without an authored color reports "": the initial color, black.
+    const unknown = { r: NaN, g: NaN, b: NaN, a: NaN };
+    if (!canvas.isConnected) return unknown;
     const computed = canvas.ownerDocument.getComputedStyle(canvas).color;
-    if (!computed) return black;
-    const resolved = canvas._domCore.parseColor(computed);
-    return resolved === null || resolved === "currentColor" ? black : resolved;
+    const resolved = computed ? canvas._domCore.parseColor(computed) : null;
+    return resolved === null || resolved === "currentColor" ? unknown : resolved;
   }
 
   #setStyle(member, which, value) {
@@ -1540,17 +1621,15 @@ export class CanvasRenderingContext2D {
     const text = String(value);
     const resolved = this.#resolveColor(text);
     if (resolved === null) return;
-    const { color } = resolved;
+    const { color, draw } = resolved;
     const core = this.#core;
     const input = new Uint8Array(this.#memory.buffer, core.input_pointer(), core.input_capacity());
     const { written } = this.#encoder.encodeInto(resolved.text, input);
     // Draws use the color at Chrome's precision (currentcolor as a named
     // color), in the canvas's color space; the getter serializes the
     // parsed color.
-    const [red, green, blue, alpha] = colorPrecision(text, color).color;
-    const [drawRed, drawGreen, drawBlue] = convertCanvasColor(red, green, blue, "srgb", this.#settings.colorSpace);
-    const result = core.set_style(which, color.r, color.g, color.b, color.a, drawRed, drawGreen, drawBlue, alpha, written);
-    if (result === -2) throw notSupported(`${INTERFACE}.${member}`, `the value ${text}`);
+    const result = core.set_style(which, color.r, color.g, color.b, color.a, draw[0], draw[1], draw[2], draw[3], written);
+    if (result === RESULT_UNSUPPORTED) throw notSupported(`${INTERFACE}.${member}`, `the value ${text}`);
   }
 
   // Makes `paint` the fill or stroke style. A paint keeps one handle; the
@@ -1567,7 +1646,7 @@ export class CanvasRenderingContext2D {
       this.#paintHandles.set(paint, handle);
       this.#paints.set(handle, paint);
     }
-    if (taintingPaints.has(paint)) this.#originClean = false;
+    if (taintingPaints.has(paint)) this.#core.taint();
     this.#core.set_paint(which, handle);
   }
 
@@ -1596,50 +1675,50 @@ export class CanvasRenderingContext2D {
     void this.#core;
     requireArguments("createLinearGradient", 4, arguments.length);
     const geometry = finiteArguments("createLinearGradient", [x0, y0, x1, y1]);
-    return createGradient(GRADIENT_LINEAR, geometry, this.#stopColorParser());
+    return createGradient(GRADIENT_LINEAR, geometry, this.#stopColorParser(), GRADIENT_CORE);
   }
 
   createRadialGradient(x0, y0, r0, x1, y1, r1) {
-    void this.#core;
+    const core = this.#core;
     requireArguments("createRadialGradient", 6, arguments.length);
     const geometry = finiteArguments("createRadialGradient", [x0, y0, r0, x1, y1, r1]);
-    for (const [label, radius] of [["r0", geometry[2]], ["r1", geometry[5]]]) {
-      if (radius < 0) {
-        throw new DOMException(
-          `${INTERFACE}.createRadialGradient: The ${label} provided is less than 0.`,
-          "IndexSizeError",
-        );
-      }
+    const negative = core.gradient_negative_radius(geometry[2], geometry[5]);
+    if (negative !== 0) {
+      throw new DOMException(
+        `${INTERFACE}.createRadialGradient: The ${negative === GRADIENT_NEGATIVE_R0 ? "r0" : "r1"} provided is less than 0.`,
+        "IndexSizeError",
+      );
     }
-    return createGradient(GRADIENT_CONICAL, geometry, this.#stopColorParser());
+    return createGradient(GRADIENT_CONICAL, geometry, this.#stopColorParser(), GRADIENT_CORE);
   }
 
   createConicGradient(startAngle, x, y) {
     void this.#core;
     requireArguments("createConicGradient", 3, arguments.length);
     const geometry = finiteArguments("createConicGradient", [startAngle, x, y]);
-    return createGradient(GRADIENT_SWEEP, geometry, this.#stopColorParser());
+    return createGradient(GRADIENT_SWEEP, geometry, this.#stopColorParser(), GRADIENT_CORE);
   }
 
   // A gradient stop color as Blink parses it (ParseCanvasColorString):
-  // currentcolor is black, and the color has Chrome's precision
-  // (colorPrecision). A color other than a legacy sRGB color makes the
-  // gradient interpolate in OKLab, where Blink hands Skia each stop
+  // currentcolor is black, and the color has Chrome's precision in sRGB
+  // (canvas_color_resolve). A color other than a legacy sRGB color makes
+  // the gradient interpolate in OKLab, where Blink hands Skia each stop
   // converted to OKLab and back to sRGB (`oklabColor`), and the first
   // stop's own sRGB at offset 0 (`oklabPadding`; Gradient::FillSkiaStops).
   #stopColorParser() {
     const core = this.#canvas._domCore;
     return (text) => {
-      const parsed = core.parseColor(text, { r: 0, g: 0, b: 0, a: 1 });
-      if (parsed === null) return null;
-      if (parsed === "currentColor") {
+      const status = core.status("canvas_color_resolve", ...core.input(text), true, 0, 0, 0, 1, false);
+      if (status === 0) return null;
+      if ((status & CANVAS_COLOR_CURRENT) !== 0) {
         // Black is exact through OKLab.
         return { color: [0, 0, 0, 1], oklabColor: [0, 0, 0, 1], oklabPadding: [0, 0, 0, 1], legacy: true };
       }
-      const { color, legacy } = colorPrecision(text, parsed);
+      const view = new DataView(core.refreshBytes().buffer, core.outputPointerRegister.value, DOM_CORE.CANVAS_COLOR_SIZE);
+      const color = colorComponents(view, DOM_CORE.CANVAS_COLOR_DRAWN);
       const alpha = color[3];
       const { stop, own } = core.parsedOklabStop(color[0], color[1], color[2]);
-      return { color, oklabColor: [...stop, alpha], oklabPadding: [...own, alpha], legacy };
+      return { color, oklabColor: [...stop, alpha], oklabPadding: [...own, alpha], legacy: (status & CANVAS_COLOR_LEGACY) !== 0 };
     };
   }
 
@@ -1672,58 +1751,48 @@ export class CanvasRenderingContext2D {
       if (!isImageData(first)) {
         throw new TypeError(`${INTERFACE}.createImageData: parameter 1 is not of type 'ImageData'.`);
       }
-      return new ImageData(
-        IMAGE_DATA_CONSTRUCTION,
-        first.width,
-        first.height,
-        allocateImageData(`${INTERFACE}.createImageData`, first.width, first.height, first.pixelFormat),
-        first.colorSpace,
-        first.pixelFormat,
-      );
+      const shape = imageDataShape(`${INTERFACE}.createImageData`, IMAGE_DATA_FORM_SIZE, first.width, true, first.height);
+      return new ImageData(IMAGE_DATA_CONSTRUCTION, shape.width, shape.height,
+        allocateImageData(shape, first.pixelFormat), first.colorSpace, first.pixelFormat);
     }
-    const width = Math.abs(toLong(first));
-    const height = Math.abs(toLong(second));
-    if (width === 0) {
-      throw new DOMException(`${INTERFACE}.createImageData: The source width is zero or not a number.`, "IndexSizeError");
-    }
-    if (height === 0) {
-      throw new DOMException(`${INTERFACE}.createImageData: The source height is zero or not a number.`, "IndexSizeError");
-    }
+    const width = toLong(first);
+    const height = toLong(second);
     // Without a color space in the settings, the data takes the canvas's,
     // as in Chrome; without a pixel format, rgba-unorm8, also on a float16
     // canvas (measured on Chrome 151).
     const settings = imageDataSettings(third);
+    const shape = imageDataShape(`${INTERFACE}.createImageData`, IMAGE_DATA_FORM_CREATE, width, true, height);
     const pixelFormat = settings.pixelFormat ?? "rgba-unorm8";
-    return new ImageData(
-      IMAGE_DATA_CONSTRUCTION,
-      width,
-      height,
-      allocateImageData(`${INTERFACE}.createImageData`, width, height, pixelFormat),
-      settings.colorSpace ?? this.#settings.colorSpace,
-      pixelFormat,
-    );
+    return new ImageData(IMAGE_DATA_CONSTRUCTION, shape.width, shape.height, allocateImageData(shape, pixelFormat),
+      settings.colorSpace ?? this.#settings.colorSpace, pixelFormat);
   }
 
   getImageData(sx, sy, sw, sh) {
     requireArguments("getImageData", 4, arguments.length);
     const values = [sx, sy, sw, sh].map((value) => toEnforcedLong("getImageData", value));
     const settings = imageDataSettings(arguments[4]);
-    if (values[2] === 0 || values[3] === 0) {
-      throw new DOMException(`${INTERFACE}.getImageData: The source ${values[2] === 0 ? "width" : "height"} is 0.`, "IndexSizeError");
+    const intersects = this.#core.get_image_data_region(...values, this.#canvas.width, this.#canvas.height);
+    if (intersects === IMAGE_DATA_WIDTH_ZERO || intersects === IMAGE_DATA_HEIGHT_ZERO) {
+      throw new DOMException(
+        `${INTERFACE}.getImageData: The source ${intersects === IMAGE_DATA_WIDTH_ZERO ? "width" : "height"} is 0.`,
+        "IndexSizeError",
+      );
     }
-    if (!this.#originClean) {
+    if (intersects === IMAGE_DATA_TAINTED) {
       throw new DOMException(
         `${INTERFACE}.getImageData: The canvas has been tainted by cross-origin data.`,
         "SecurityError",
       );
     }
-    const intersects = this.#core.get_image_data_region(...values, this.#canvas.width, this.#canvas.height);
-    const region = new Uint32Array(this.#memory.buffer, this.#core.output_pointer(), 8).slice();
+    const region = new Uint32Array(this.#memory.buffer, this.#core.output_pointer(),
+      IMAGE_DATA_REGION_SIZE / Uint32Array.BYTES_PER_ELEMENT).slice();
+    const regionView = new DataView(region.buffer);
     const pixelFormat = settings.pixelFormat ?? "rgba-unorm8";
-    const imageData = new ImageData(IMAGE_DATA_CONSTRUCTION, region[0], region[1],
-      allocateImageData(`${INTERFACE}.getImageData`, region[0], region[1], pixelFormat),
-      settings.colorSpace ?? this.#settings.colorSpace, pixelFormat);
-    if (!intersects) return imageData;
+    const shape = imageDataShape(`${INTERFACE}.getImageData`, IMAGE_DATA_FORM_SIZE,
+      regionView.getUint32(IMAGE_DATA_REGION_WIDTH, true), true, regionView.getUint32(IMAGE_DATA_REGION_HEIGHT, true));
+    const imageData = new ImageData(IMAGE_DATA_CONSTRUCTION, shape.width, shape.height,
+      allocateImageData(shape, pixelFormat), settings.colorSpace ?? this.#settings.colorSpace, pixelFormat);
+    if (intersects === 0) return imageData;
     const document = this.#canvas.ownerDocument;
     const device = this.#bitmap?.device ?? document?._preferredCanvasDevice ?? createDefaultGpuDeviceSync();
     if (document) document._preferredCanvasDevice ??= device;
@@ -1748,27 +1817,27 @@ export class CanvasRenderingContext2D {
     const member = "putImageData";
     const destinationX = toEnforcedLong(member, dx);
     const destinationY = toEnforcedLong(member, dy);
-    const region = count === 3
-      ? [0, 0, imageData.width, imageData.height]
-      : [dirtyX, dirtyY, dirtyWidth, dirtyHeight].map((value) => toEnforcedLong(member, value));
+    const hasDirty = count !== 3;
+    const region = hasDirty
+      ? [dirtyX, dirtyY, dirtyWidth, dirtyHeight].map((value) => toEnforcedLong(member, value))
+      : [0, 0, 0, 0];
     const data = imageData.data;
     if (data.buffer.detached) {
       throw new DOMException(`${INTERFACE}.putImageData: The source data has been detached.`, "InvalidStateError");
     }
     const core = this.#core;
     if (
-      !core.put_image_data_region(
-        imageData.width,
-        imageData.height,
-        destinationX,
-        destinationY,
-        ...region,
-        this.#canvas.width,
-        this.#canvas.height,
-      )
+      !core.put_image_data_region(imageData.width, imageData.height, destinationX, destinationY, hasDirty, ...region,
+        this.#canvas.width, this.#canvas.height)
     ) return;
-    const [sourceX, sourceY, width, height] = new Int32Array(this.#memory.buffer, core.output_pointer(), 4);
-    const pixels = allocateImageData(`${INTERFACE}.putImageData`, width, height, imageData.pixelFormat);
+    const view = new DataView(this.#memory.buffer, core.output_pointer(), PUT_IMAGE_DATA.HEIGHT + 4);
+    const sourceX = view.getInt32(PUT_IMAGE_DATA.SOURCE_X, true);
+    const sourceY = view.getInt32(PUT_IMAGE_DATA.SOURCE_Y, true);
+    const width = view.getInt32(PUT_IMAGE_DATA.WIDTH, true);
+    const height = view.getInt32(PUT_IMAGE_DATA.HEIGHT, true);
+    // The region's rows, copied out of the data's RGBA pixels.
+    const shape = imageDataShape(`${INTERFACE}.putImageData`, IMAGE_DATA_FORM_SIZE, width, true, height);
+    const pixels = allocateImageData(shape, imageData.pixelFormat);
     for (let row = 0; row < height; row++) {
       const start = ((sourceY + row) * imageData.width + sourceX) * 4;
       pixels.set(data.subarray(start, start + width * 4), row * width * 4);
@@ -1776,10 +1845,10 @@ export class CanvasRenderingContext2D {
     // The bitmap stores the canvas's color space; the rasterizer converts
     // the data into it as it premultiplies, in single precision (sRGB red
     // put into a display-p3 canvas reads 234, 51, 35).
-    const conversion = sourceConversion({ colorSpace: imageData.colorSpace }, this.#settings.colorSpace);
+    const conversion = sourceConversion(core, { colorSpace: imageData.colorSpace }, this.#settings.colorSpace);
     const index = this.#payloads.length;
     const result = core.record_put_image_data(index, conversion);
-    if (result === 1) this.#payloads.push(imageDataPayload(imageData, pixels, width, height));
+    if (result === RESULT_DONE) this.#payloads.push(imageDataPayload(imageData, pixels, width, height));
     this.#record(result);
   }
 
@@ -1800,24 +1869,15 @@ export class CanvasRenderingContext2D {
       throw new DOMException(`${member}: The HTMLImageElement provided is in the 'broken' state.`, "InvalidStateError");
     }
     if (resolved === null) return;
-    const numbers = values.map(Number);
+    if (!resolved.originClean) this.#core.taint();
     const { source, width, height } = resolved;
-    let sx = 0, sy = 0, sw = width, sh = height, dx, dy, dw, dh;
-    if (count === 3) {
-      [dx, dy] = numbers;
-      dw = width;
-      dh = height;
-    } else if (count === 5) {
-      [dx, dy, dw, dh] = numbers;
-    } else {
-      [sx, sy, sw, sh, dx, dy, dw, dh] = numbers;
-    }
-    if (!resolved.originClean) this.#originClean = false;
     const index = this.#sources.length;
     this.#stageFilter();
-    const conversion = sourceConversion(source, this.#settings.colorSpace);
-    const result = this.#core.draw_image(index, resolved.opaque ? 1 : 0, conversion, width, height, sx, sy, sw, sh, dx, dy, dw, dh);
-    if (result === 1) this.#sources.push(retainSource(source));
+    const conversion = sourceConversion(this.#core, source, this.#settings.colorSpace);
+    const numbers = [...values.map(Number), ...new Array(9 - count).fill(0)];
+    const result = this.#core.draw_image(index, resolved.opaque ? 1 : 0, conversion, width, height,
+      DRAW_IMAGE_FORMS[count], ...numbers);
+    if (result === RESULT_DONE) this.#sources.push(retainSource(source));
     else discardSource(source);
     this.#record(result);
   }
@@ -1837,8 +1897,8 @@ export class CanvasRenderingContext2D {
       throw new TypeError(`${member}: The provided value is not of type '${IMAGE_SOURCE_TYPE}'.`);
     }
     const text = repetition === null ? "" : String(repetition);
-    const tiles = patternRepetition(text);
-    if (tiles === null) {
+    const tiles = this.#core.pattern_repetition(this.#input(this.#encoder.encode(text)));
+    if (tiles < 0) {
       if (resolved !== null && resolved !== BROKEN_IMAGE) discardSource(resolved.source);
       throw new DOMException(
         `${member}: The provided type ('${text}') is not one of 'repeat', 'no-repeat', 'repeat-x', or 'repeat-y'.`,
@@ -1850,12 +1910,12 @@ export class CanvasRenderingContext2D {
     }
     if (resolved === null) return null;
     const { source, width, height } = resolved;
-    if (width === 0 || height === 0) {
+    if (sourceEmpty(width, height)) {
       discardSource(source);
       return null;
     }
     retainSource(source);
-    const pattern = createCanvasPattern(source, width, height, tiles);
+    const pattern = createCanvasPattern(source, width, height, tiles, PATTERN_CORE);
     patternSources.register(pattern, source);
     if (!resolved.originClean) taintingPaints.add(pattern);
     return pattern;
@@ -1864,8 +1924,8 @@ export class CanvasRenderingContext2D {
   // ------------------------------------------------------- text state
   //
   // The text attributes live in the core's text state
-  // (src/wasm/canvas-2d-text.watpart); src/dom/canvas-2d-text.js parses
-  // the authored values as Chrome does.
+  // (core/engine/canvas-2d-text.watpart); the DOM core parses the authored
+  // values as Chrome does (canvas_font_parse, canvas_spacing_parse).
 
   #textState() {
     const pointer = this.#core.text_state_pointer();
@@ -1888,7 +1948,10 @@ export class CanvasRenderingContext2D {
   }
 
   get font() {
-    return canvasFontText(this.#textState());
+    const core = this.#core;
+    const length = core.font_text();
+    if (length === RESULT_FULL) throw new RangeError(`${INTERFACE}.font: the text state cannot grow`);
+    return this.#decoder.decode(new Uint8Array(this.#memory.buffer, core.font_text_pointer(), length));
   }
 
   // Chrome ignores an authored string equal to the last one it took, and a
@@ -1899,14 +1962,11 @@ export class CanvasRenderingContext2D {
     const text = `${value}`;
     const authored = this.#encoder.encode(text);
     const core = this.#core;
-    if (authored.length <= 1024 && this.#input(authored) >= 0 && core.font_unchanged(authored.length) === 1) return;
-    const font = parseCanvasFont(text, canvasTextEnvironment(this.#canvas));
+    if (core.font_unchanged(this.#input(authored)) === 1) return;
+    const font = this.#parseFont(text);
     if (font === null) return;
     const state = this.#textState();
-    const serialization = this.#encoder.encode(font.serialization);
-    if (serialization.length > 1024 || authored.length > 1024) {
-      throw notSupported(member, "a font of more than 1024 bytes");
-    }
+    const serialization = font.serialization;
     this.#input(serialization, authored);
     const result = core.set_font(
       serialization.length,
@@ -1918,18 +1978,48 @@ export class CanvasRenderingContext2D {
       font.style,
       font.caps,
       font.stretch,
-      canvasSpacingPx(state.letterSpacing.number, state.letterSpacing.unit, font.size, true),
-      canvasSpacingPx(state.wordSpacing.number, state.wordSpacing.unit, font.size, true),
+      this.#spacingPx(state.letterSpacing.number, state.letterSpacing.unit, font.size, true),
+      this.#spacingPx(state.wordSpacing.number, state.wordSpacing.unit, font.size, true),
     );
-    if (result === -1) throw new RangeError(`${member}: the text state cannot grow`);
+    if (result === RESULT_FULL) throw new RangeError(`${member}: the text state cannot grow`);
+    if (result === RESULT_UNSUPPORTED) throw notSupported(member, "a font of more than 1024 bytes");
+  }
+
+  // The font value as Chrome's canvas setter parses it (canvas_font_parse)
+  // against the canvas element's font, the root font and the viewport:
+  // { size, weight, slope, style, caps, stretch, familyOffset,
+  // serialization (UTF-8, without small-caps) }, or null.
+  #parseFont(text) {
+    const environment = canvasTextEnvironment(this.#canvas);
+    const dom = this.#canvas._domCore;
+    const status = dom.status("canvas_font_parse", ...dom.input(text), environment.connected, environment.parentSize,
+      environment.parentWeight, environment.rootSize, environment.viewport.width, environment.viewport.height);
+    if (status === 0) return null;
+    const pointer = dom.outputPointerRegister.value;
+    const bytes = dom.refreshBytes().slice(pointer, pointer + dom.outputLengthRegister.value);
+    const view = new DataView(bytes.buffer);
+    return {
+      size: view.getFloat64(DOM_CORE.CANVAS_FONT_SIZE, true),
+      weight: view.getFloat64(DOM_CORE.CANVAS_FONT_WEIGHT, true),
+      slope: view.getFloat64(DOM_CORE.CANVAS_FONT_SLOPE, true),
+      style: view.getInt32(DOM_CORE.CANVAS_FONT_STYLE, true),
+      caps: view.getInt32(DOM_CORE.CANVAS_FONT_CAPS, true),
+      stretch: view.getInt32(DOM_CORE.CANVAS_FONT_STRETCH, true),
+      familyOffset: view.getInt32(DOM_CORE.CANVAS_FONT_FAMILY_OFFSET, true),
+      serialization: bytes.subarray(DOM_CORE.CANVAS_FONT_SERIALIZATION),
+    };
+  }
+
+  // The px of a spacing for a font size (canvas_spacing_px).
+  #spacingPx(number, unit, size, atFontChange) {
+    return this.#canvas._domCore.status("canvas_spacing_px", number, unit, size, atFontChange ? 1 : 0);
   }
 
   // Chrome 151 reflects the resolved direction: "inherit" reads as the
   // canvas element's direction.
   get direction() {
-    const direction = this.#textState().direction;
-    if (direction !== 2) return DIRECTIONS[direction];
-    return DIRECTIONS[canvasTextEnvironment(this.#canvas).direction];
+    if (this.#core.text_direction_inherits() === 1) return DIRECTIONS[canvasTextEnvironment(this.#canvas).direction];
+    return DIRECTIONS[this.#textState().direction];
   }
 
   set direction(value) {
@@ -1938,7 +2028,7 @@ export class CanvasRenderingContext2D {
   }
 
   #setTextEnum(offset, index) {
-    if (this.#core.set_text_enum(offset, index) === -1) {
+    if (this.#core.set_text_enum(offset, index) === RESULT_FULL) {
       throw new RangeError(`${INTERFACE}: the text state cannot grow`);
     }
   }
@@ -1948,7 +2038,7 @@ export class CanvasRenderingContext2D {
   }
 
   set letterSpacing(value) {
-    this.#setSpacing("letterSpacing", 0, value);
+    this.#setSpacing("letterSpacing", SPACING_LETTER, value);
   }
 
   get wordSpacing() {
@@ -1956,7 +2046,7 @@ export class CanvasRenderingContext2D {
   }
 
   set wordSpacing(value) {
-    this.#setSpacing("wordSpacing", 1, value);
+    this.#setSpacing("wordSpacing", SPACING_WORD, value);
   }
 
   // A spacing equal to the current serialization, a value that is not one
@@ -1965,14 +2055,19 @@ export class CanvasRenderingContext2D {
     const text = `${value}`;
     const state = this.#textState();
     if (text === (which === 0 ? state.letterSpacingText : state.wordSpacingText)) return;
-    const spacing = parseCanvasSpacing(text);
-    if (spacing === null) return;
-    const serialization = this.#encoder.encode(spacing.serialization);
+    const dom = this.#canvas._domCore;
+    if (dom.status("canvas_spacing_parse", ...dom.input(text)) === 0) return;
+    const pointer = dom.outputPointerRegister.value;
+    const bytes = dom.refreshBytes().slice(pointer, pointer + dom.outputLengthRegister.value);
+    const view = new DataView(bytes.buffer);
+    const number = view.getFloat64(DOM_CORE.CANVAS_SPACING_NUMBER, true);
+    const unit = view.getInt32(DOM_CORE.CANVAS_SPACING_UNIT, true);
+    const serialization = bytes.subarray(DOM_CORE.CANVAS_SPACING_SERIALIZATION);
     if (this.#input(serialization) < 0) throw notSupported(`${INTERFACE}.${member}`, `the value ${text}`);
-    const px = canvasSpacingPx(spacing.number, spacing.unit, state.size, false);
-    const result = this.#core.set_spacing(which, spacing.number, spacing.unit, px, serialization.length);
-    if (result === -1) throw new RangeError(`${INTERFACE}.${member}: the text state cannot grow`);
-    if (result === -2) throw notSupported(`${INTERFACE}.${member}`, `the value ${text}`);
+    const px = this.#spacingPx(number, unit, state.size, false);
+    const result = this.#core.set_spacing(which, number, unit, px, serialization.length);
+    if (result === RESULT_FULL) throw new RangeError(`${INTERFACE}.${member}: the text state cannot grow`);
+    if (result === RESULT_UNSUPPORTED) throw notSupported(`${INTERFACE}.${member}`, `the value ${text}`);
   }
 
   get lang() {
@@ -1983,9 +2078,9 @@ export class CanvasRenderingContext2D {
     const text = `${value}`;
     if (text === this.#textState().lang) return;
     const bytes = this.#encoder.encode(text);
-    const result = bytes.length > 256 ? -2 : this.#core.set_lang(this.#input(bytes));
-    if (result === -1) throw new RangeError(`${INTERFACE}.lang: the text state cannot grow`);
-    if (result === -2) throw notSupported(`${INTERFACE}.lang`, "a lang of more than 256 bytes");
+    const result = this.#core.set_lang(this.#input(bytes));
+    if (result === RESULT_FULL) throw new RangeError(`${INTERFACE}.lang: the text state cannot grow`);
+    if (result === RESULT_UNSUPPORTED) throw notSupported(`${INTERFACE}.lang`, "a lang of more than 256 bytes");
   }
 
   static {
@@ -2026,8 +2121,8 @@ export class CanvasRenderingContext2D {
       textRendering: state.textRendering,
       letterSpacingPx: state.letterSpacing.px,
       wordSpacingPx: state.wordSpacing.px,
-      direction: state.direction === 2 ? environment.direction : state.direction,
-      lang: state.lang === "inherit" ? environment.language : state.lang,
+      direction: this.#core.text_direction_inherits() === 1 ? environment.direction : state.direction,
+      lang: this.#core.text_lang_inherits() === 1 ? environment.language : state.lang,
       textAlign: state.textAlign,
       textBaseline: state.textBaseline,
       viewport: environment.viewport,
@@ -2105,48 +2200,32 @@ export class CanvasRenderingContext2D {
     const hasMaxWidth = maxWidth !== undefined;
     const width = hasMaxWidth ? Number(maxWidth) : 0;
     const layout = this.#layoutText(string);
-    const begun = this.#core.text_draw_begin(
-      left,
-      top,
-      layout.alignFactor,
-      layout.baselineY,
-      layout.width,
-      width,
-      hasMaxWidth ? 1 : 0,
-    );
+    const metrics = layout.layout;
+    const begun = this.#core.text_draw_begin(left, top, layout.alignFactor, layout.baselineY, layout.width, width,
+      hasMaxWidth ? 1 : 0, metrics.ascent, metrics.descent, metrics.lineGap);
     if (begun !== 1) return;
-    // Blink's bounds of the draw, from the location of the text (single
-    // precision, as gfx::PointF holds it).
-    const drawn = hasMaxWidth && width < layout.width ? width : layout.width;
-    const bounds = textDrawBounds(
-      layout.layout,
-      Math.fround(Math.fround(left) - layout.alignFactor * drawn),
-      Math.fround(top + layout.baselineY),
-      drawn,
-    );
     const style = member === "fillText" ? STYLE_FILL : STYLE_STROKE;
     this.#stagePaint(style);
     this.#stageFilter(style);
-    if (style === STYLE_FILL) this.#fillGlyphs(layout, bounds);
-    else this.#strokeGlyphs(layout, bounds);
+    if (style === STYLE_FILL) this.#fillGlyphs(layout);
+    else this.#strokeGlyphs(layout);
   }
 
   // One glyph run for each font of the text, its glyphs in order, all in
   // one import buffer. Fonts that the flush does not list yet join its font
   // list when the draw records.
-  #fillGlyphs(layout, bounds) {
+  #fillGlyphs(layout) {
     const core = this.#core;
     const { glyphs, fonts } = layout;
     const counts = new Uint32Array(fonts.length);
     for (const glyph of glyphs) counts[glyph.font] += 1;
     let length = 0;
-    for (const count of counts) if (count > 0) length += 16 + count * 12;
+    for (const count of counts) if (count > 0) length += CANVAS_CORE.TEXT_RUN_HEADER_SIZE + count * CANVAS_CORE.TEXT_GLYPH_SIZE;
     // Text without glyphs still draws (canvas-2d-glyphs.watpart, $textResult).
     const pointer = length === 0 ? -1 : core.import_buffer(length);
     if (pointer === 0) throw new RangeError(`${INTERFACE}.fillText: the command list cannot grow`);
     const view = new DataView(this.#memory.buffer, Math.max(pointer, 0), length);
     const added = [];
-    let skew = 0;
     let at = 0;
     for (let font = 0; font < fonts.length; font++) {
       const count = counts[font];
@@ -2157,35 +2236,22 @@ export class CanvasRenderingContext2D {
         reference = this.#fonts.length + added.length;
         added.push(descriptor);
       }
-      skew = Math.min(skew, obliqueSkew(descriptor));
-      view.setUint32(at, reference, true);
-      view.setUint32(at + 4, count, true);
-      view.setFloat32(at + 8, descriptor.fontSize, true);
-      view.setFloat32(at + 12, obliqueSkew(descriptor), true);
-      at += 16;
+      view.setUint32(at + CANVAS_CORE.TEXT_RUN_FONT, reference, true);
+      view.setUint32(at + CANVAS_CORE.TEXT_RUN_COUNT, count, true);
+      view.setFloat32(at + CANVAS_CORE.TEXT_RUN_FONT_SIZE, descriptor.fontSize, true);
+      view.setUint32(at + CANVAS_CORE.TEXT_RUN_OBLIQUE, descriptor.syntheticOblique ? 1 : 0, true);
+      at += CANVAS_CORE.TEXT_RUN_HEADER_SIZE;
       for (const glyph of glyphs) {
         if (glyph.font !== font) continue;
-        view.setFloat32(at, glyph.x, true);
-        view.setFloat32(at + 4, glyph.y, true);
-        view.setUint32(at + 8, glyph.id, true);
-        at += 12;
+        view.setFloat32(at + CANVAS_CORE.TEXT_GLYPH_X, glyph.x, true);
+        view.setFloat32(at + CANVAS_CORE.TEXT_GLYPH_Y, glyph.y, true);
+        view.setUint32(at + CANVAS_CORE.TEXT_GLYPH_ID, glyph.id, true);
+        at += CANVAS_CORE.TEXT_GLYPH_SIZE;
       }
     }
-    // The ink bounds in text space, widened by a synthetic oblique's slant
-    // (x' = x + skew * y, skew below 0).
-    const ink = layout.layout.inkBounds ?? { x: 0, y: 0, width: 0, height: 0 };
-    const result = core.fill_text(
-      length,
-      ink.x + skew * Math.max(ink.y + ink.height, 0),
-      ink.y,
-      ink.x + ink.width - skew * Math.max(-ink.y, 0),
-      ink.y + ink.height,
-      bounds.x,
-      bounds.y,
-      bounds.width,
-      bounds.height,
-    );
-    if (result === 1) {
+    const ink = layout.layout.ink;
+    const result = core.fill_text(length, ink.x, ink.y, ink.width, ink.height);
+    if (result === RESULT_DONE) {
       for (const descriptor of added) {
         this.#fontIndices.set(descriptor, this.#fonts.length);
         this.#fonts.push(descriptor);
@@ -2194,14 +2260,15 @@ export class CanvasRenderingContext2D {
     this.#record(result);
   }
 
-  // The glyph outlines, each with its origin, its scale from font units to
-  // px and its slant, stroked as one path. The outlines take core path
-  // slot 1, so the Path2D that it held is imported again on its next use.
-  #strokeGlyphs(layout, bounds) {
+  // The glyph outlines, each with its origin, its font size, its face's
+  // units per em and whether it slants, stroked as one path. The outlines
+  // take core path slot 1, so the Path2D that it held is imported again on
+  // its next use.
+  #strokeGlyphs(layout) {
     const { glyphs, fonts } = layout;
     const outlines = glyphs.map((glyph) => fonts[glyph.font].outline(glyph.id));
     let length = 0;
-    for (const outline of outlines) if (outline.length > 0) length += 20 + outline.length;
+    for (const outline of outlines) length += CANVAS_CORE.OUTLINE_HEADER_SIZE + outline.length;
     const core = this.#core;
     const pointer = length === 0 ? -1 : core.import_buffer(length);
     if (pointer === 0) throw new RangeError(`${INTERFACE}.strokeText: the path cannot grow`);
@@ -2210,37 +2277,37 @@ export class CanvasRenderingContext2D {
     let at = 0;
     for (let index = 0; index < glyphs.length; index++) {
       const outline = outlines[index];
-      if (outline.length === 0) continue;
       const glyph = glyphs[index];
       const font = fonts[glyph.font];
-      view.setFloat32(at, glyph.x, true);
-      view.setFloat32(at + 4, glyph.y, true);
-      view.setFloat32(at + 8, font.fontSize / font.upem, true);
-      view.setFloat32(at + 12, obliqueSkew(font), true);
-      view.setUint32(at + 16, outline.length, true);
-      bytes.set(outline, at + 20);
-      at += 20 + outline.length;
+      view.setFloat32(at + CANVAS_CORE.OUTLINE_X, glyph.x, true);
+      view.setFloat32(at + CANVAS_CORE.OUTLINE_Y, glyph.y, true);
+      view.setUint32(at + CANVAS_CORE.OUTLINE_OBLIQUE, font.syntheticOblique ? 1 : 0, true);
+      view.setUint32(at + CANVAS_CORE.OUTLINE_LENGTH, outline.length, true);
+      view.setFloat64(at + CANVAS_CORE.OUTLINE_FONT_SIZE, font.fontSize, true);
+      view.setFloat64(at + CANVAS_CORE.OUTLINE_UPEM, font.upem, true);
+      bytes.set(outline, at + CANVAS_CORE.OUTLINE_HEADER_SIZE);
+      at += CANVAS_CORE.OUTLINE_HEADER_SIZE + outline.length;
     }
     this.#slotPath = null;
-    this.#record(core.stroke_text(length, bounds.x, bounds.y, bounds.width, bounds.height));
+    this.#record(core.stroke_text(length));
   }
 
   // ------------------------------------------------------------- paths
 
   beginPath() {
-    this.#core.path_clear(0);
+    this.#core.path_clear(PATH_SLOT_CURRENT);
   }
 
-  // The core slot of a fill, stroke, clip or hit test: 0 the current path,
-  // 1 the Path2D `path`, imported unless slot 1 holds it unchanged.
+  // The core slot of a fill, stroke, clip or hit test: the current path,
+  // or the Path2D `path`, imported unless its slot holds it unchanged.
   #pathSlot(member, path) {
-    if (path === null) return 0;
-    if (path === this.#slotPath && path2DVersion(path) === this.#slotVersion) return 1;
+    if (path === null) return PATH_SLOT_CURRENT;
+    if (path === this.#slotPath && path2DVersion(path) === this.#slotVersion) return PATH_SLOT_PATH2D;
     this.#slotPath = null;
-    importPath(`${INTERFACE}.${member}`, this.#core, this.#memory, 1, path2DBytes(path));
+    importPath(`${INTERFACE}.${member}`, this.#core, this.#memory, PATH_SLOT_PATH2D, path2DBytes(path));
     this.#slotPath = path;
     this.#slotVersion = path2DVersion(path);
-    return 1;
+    return PATH_SLOT_PATH2D;
   }
 
   fill(first = undefined, second = undefined) {
@@ -2268,7 +2335,7 @@ export class CanvasRenderingContext2D {
     const path = isPath2D(first) ? first : null;
     const rule = fillRuleValue(member, path === null ? first : second);
     const result = this.#core.clip_path(this.#pathSlot("clip", path), rule);
-    if (result === -1) throw new RangeError(`${member}: the clipping region cannot grow`);
+    if (result === RESULT_FULL) throw new RangeError(`${member}: the clipping region cannot grow`);
   }
 
   isPointInPath(first, second, third = undefined, fourth = undefined) {
@@ -2287,8 +2354,8 @@ export class CanvasRenderingContext2D {
       const rule = fillRuleValue(member, third);
       result = this.#core.is_point_in_path(0, x, y, rule);
     }
-    if (result === -1) throw new RangeError(`${member}: the path cannot grow`);
-    return result === 1;
+    if (result === RESULT_FULL) throw new RangeError(`${member}: the path cannot grow`);
+    return result === RESULT_DONE;
   }
 
   isPointInStroke(first, second, third = undefined) {
@@ -2301,8 +2368,8 @@ export class CanvasRenderingContext2D {
     } else {
       result = this.#core.is_point_in_stroke(0, Number(first), Number(second));
     }
-    if (result === -1) throw new RangeError(`${member}: the path cannot grow`);
-    return result === 1;
+    if (result === RESULT_FULL) throw new RangeError(`${member}: the path cannot grow`);
+    return result === RESULT_DONE;
   }
 
   // drawFocusIfNeeded(element) and drawFocusIfNeeded(path, element): a
@@ -2321,7 +2388,10 @@ export class CanvasRenderingContext2D {
       );
     }
     const canvas = this.#canvas;
-    if (element.ownerDocument?.activeElement !== element || element === canvas || !canvas.contains(element)) return;
+    // An element of another DOM core is in another document: never this
+    // canvas's descendant.
+    if (element._domCore !== canvas._domCore) return;
+    if (canvas._domCore.status("canvas_focus_ring_drawn", canvas._coreHandle, element._coreHandle) === 0) return;
     const core = this.#core;
     if (core.save() < 0) throw new RangeError(`${INTERFACE}.drawFocusIfNeeded: the save stack cannot grow`);
     try {
@@ -2332,20 +2402,14 @@ export class CanvasRenderingContext2D {
     }
   }
 
-  // The focus ring of Chrome 151: FOCUS_RING_COLOR, FOCUS_RING_WIDTH
-  // device pixels wide, centered on the path, round joins, solid.
+  // The focus ring of Chrome 151: its color from the DOM core in the
+  // canvas's color space, its stroke state from the canvas core.
   #applyFocusRingStyle() {
-    const core = this.#core;
-    core.set_global_alpha(1);
-    core.set_line_cap(0);
-    core.set_line_join(1);
-    core.set_line_dash(0);
-    core.set_line_width(FOCUS_RING_WIDTH);
-    // Chrome draws the ring straight onto the canvas, without the filter.
-    core.set_filter_handle(0);
-    const color = FOCUS_RING_COLOR;
-    const [drawRed, drawGreen, drawBlue] = convertCanvasColor(color.r, color.g, color.b, "srgb", this.#settings.colorSpace);
-    core.set_style(STYLE_STROKE, color.r, color.g, color.b, color.a, drawRed, drawGreen, drawBlue, color.a, 0);
+    const dom = this.#canvas._domCore;
+    dom.status("canvas_focus_ring_color", this.#settings.colorSpace === "display-p3");
+    const view = new DataView(dom.refreshBytes().buffer, dom.outputPointerRegister.value, DOM_CORE.CANVAS_COLOR_SIZE);
+    this.#core.focus_ring_style(...colorComponents(view, DOM_CORE.CANVAS_COLOR_PARSED),
+      ...colorComponents(view, DOM_CORE.CANVAS_COLOR_DRAWN));
   }
 
   // ------------------------------------------------------ path methods
@@ -2368,8 +2432,8 @@ export class CanvasRenderingContext2D {
   // ----------------------------------------------------------- recording
 
   #record(result) {
-    if (result === -1) throw new RangeError(`${INTERFACE}: the command list cannot grow`);
-    if (result === 1) this.#recorded();
+    if (result === RESULT_FULL) throw new RangeError(`${INTERFACE}: the command list cannot grow`);
+    if (result === RESULT_DONE) this.#recorded();
   }
 
   // The bitmap changes at the next flush: copies of the current state and
@@ -2400,7 +2464,7 @@ export class CanvasRenderingContext2D {
 
   #updateResource(contentChanged) {
     const canvas = this.#canvas;
-    canvas._domCore.resourceUpdate(this.#resourceHandle, 1, canvas.width, canvas.height, contentChanged, 0);
+    canvas._domCore.resourceUpdate(this.#resourceHandle, RESOURCE_READY, canvas.width, canvas.height, contentChanged, 0);
   }
 
   // The pending commands as views of the core's memory: the command
@@ -2411,11 +2475,12 @@ export class CanvasRenderingContext2D {
     const buffer = this.#memory.buffer;
     return {
       bytes: new Uint8Array(buffer, core.command_pointer(), core.command_count() * COMMAND_SIZE),
-      geometry: new Uint8Array(buffer, core.geometry_pointer(), core.geometry_count() * 8),
+      geometry: new Uint8Array(buffer, core.geometry_pointer(), core.geometry_count() * CANVAS_CORE.GEOMETRY_VERTEX_SIZE),
       clips: new Uint8Array(buffer, core.clip_entry_pointer(), core.clip_entry_count() * CLIP_ENTRY_SIZE),
       masks: new Uint8Array(buffer, core.mask_pointer(), core.mask_count() * MASK_SIZE),
-      maskGeometry: new Uint8Array(buffer, core.mask_geometry_pointer(), core.mask_geometry_count() * 8),
-      paints: new Uint8Array(buffer, core.paint_pointer(), core.paint_count() * 16),
+      maskGeometry: new Uint8Array(buffer, core.mask_geometry_pointer(),
+        core.mask_geometry_count() * CANVAS_CORE.GEOMETRY_VERTEX_SIZE),
+      paints: new Uint8Array(buffer, core.paint_pointer(), core.paint_count() * CANVAS_CORE.PAINT_VECTOR_SIZE),
       sources: this.#sources,
       payloads: this.#payloads,
       fonts: this.#fonts,
@@ -2607,8 +2672,8 @@ export class CanvasRenderingContext2D {
   #resetForBitmap(request) {
     this.#discardCommands();
     this.#dropSnapshot();
-    this.#originClean = true;
-    this.#core.context_reset(this.#settings.alpha ? 0 : 1);
+    this.#core.origin_clean_reset();
+    this.#core.context_reset(!this.#settings.alpha);
     this.#slotPath = null;
     this.#paints.clear();
     this.#filters.clear();
@@ -2655,7 +2720,7 @@ export class CanvasRenderingContext2D {
       width: this.#canvas.width,
       height: this.#canvas.height,
       opaque: !this.#settings.alpha,
-      originClean: this.#originClean,
+      originClean: this.#core.origin_clean() === 1,
       naturalDimensions: true,
     };
   }
@@ -2664,19 +2729,20 @@ export class CanvasRenderingContext2D {
     contextImage = (context, device = null) => context.#image(device);
   }
 
-  get _originClean() {
-    return this.#originClean;
+  // The canvas core's check of an export of the bitmap (export_check):
+  // RESULT_DONE, EXPORT_TAINTED or EXPORT_EMPTY.
+  _exportCheck(ignoreTaint = false) {
+    return this.#core.export_check(this.#canvas.width, this.#canvas.height, ignoreTaint);
   }
 
   // Asynchronous exports retain the bitmap state at the call boundary.
   _encodeBitmap(member, type, quality) {
     const encoding = encodingOptions(type, quality);
-    if (!this.#originClean) {
+    const checked = this._exportCheck();
+    if (checked === EXPORT_TAINTED) {
       throw new DOMException(`${member}: Tainted canvases may not be exported.`, "SecurityError");
     }
-    const width = this.#canvas.width;
-    const height = this.#canvas.height;
-    if (width === 0 || height === 0) return Promise.resolve(null);
+    if (checked === EXPORT_EMPTY) return Promise.resolve(null);
     const snapshot = retainSource(this.#snapshotForCopy());
     const document = this.#canvas.ownerDocument;
     return (async () => {
@@ -2713,12 +2779,13 @@ export class CanvasRenderingContext2D {
   }
 
   _toDataURL(encoding) {
-    if (!this.#originClean) {
+    const checked = this._exportCheck();
+    if (checked === EXPORT_TAINTED) {
       throw new DOMException("HTMLCanvasElement.toDataURL: Tainted canvases may not be exported.", "SecurityError");
     }
+    if (checked === EXPORT_EMPTY) return "data:,";
     const width = this.#canvas.width;
     const height = this.#canvas.height;
-    if (width === 0 || height === 0) return "data:,";
     const document = this.#canvas.ownerDocument;
     const device = this.#bitmap?.device ?? document?._preferredCanvasDevice ?? createDefaultGpuDeviceSync();
     if (document) document._preferredCanvasDevice ??= device;
@@ -2775,7 +2842,7 @@ let recorderCore = null;
 
 function recorder() {
   recorderCore ??= instantiateCore();
-  recorderCore.context_reset(0);
+  recorderCore.context_reset(false);
   return recorderCore;
 }
 
@@ -2783,11 +2850,12 @@ function recordedSource(core, width, height, sources, payloads, colorSpace, form
   const buffer = core.memory.buffer;
   const list = {
     bytes: new Uint8Array(buffer, core.command_pointer(), core.command_count() * COMMAND_SIZE).slice(),
-    geometry: new Uint8Array(buffer, core.geometry_pointer(), core.geometry_count() * 8).slice(),
+    geometry: new Uint8Array(buffer, core.geometry_pointer(), core.geometry_count() * CANVAS_CORE.GEOMETRY_VERTEX_SIZE).slice(),
     clips: new Uint8Array(buffer, core.clip_entry_pointer(), core.clip_entry_count() * CLIP_ENTRY_SIZE).slice(),
     masks: new Uint8Array(buffer, core.mask_pointer(), core.mask_count() * MASK_SIZE).slice(),
-    maskGeometry: new Uint8Array(buffer, core.mask_geometry_pointer(), core.mask_geometry_count() * 8).slice(),
-    paints: new Uint8Array(buffer, core.paint_pointer(), core.paint_count() * 16).slice(),
+    maskGeometry: new Uint8Array(buffer, core.mask_geometry_pointer(),
+      core.mask_geometry_count() * CANVAS_CORE.GEOMETRY_VERTEX_SIZE).slice(),
+    paints: new Uint8Array(buffer, core.paint_pointer(), core.paint_count() * CANVAS_CORE.PAINT_VECTOR_SIZE).slice(),
     sources: sources.map(retainSource),
     payloads,
     fonts: [],
@@ -2796,24 +2864,44 @@ function recordedSource(core, width, height, sources, payloads, colorSpace, form
   return { kind: "commands", width, height, opaque: false, persistent: true, colorSpace, format, list, references: 0 };
 }
 
-// The `width` x `height` image of `crop` ([sx, sy, sw, sh] in the pixels
-// of `image`, a resolved source, also beyond its edges, which are
-// transparent), flipped vertically when `flipY`, sampled for `quality`
-// ("pixelated", "low", "medium" or "high") as drawImage() samples with
-// those smoothing settings.
-export function derivedImageSource(image, crop, width, height, flipY, quality) {
+// The ResizeQuality values, in the enumeration order the canvas core
+// reads (BITMAP_RESIZE_PIXELATED first).
+export const RESIZE_QUALITIES = Object.freeze(["pixelated", "low", "medium", "high"]);
+
+// The canvas core's ImageBitmap checks (bitmap_options_check): null, or
+// the BITMAP_ failure.
+export function bitmapOptionsCheck(crop, options) {
+  const result = builder().bitmap_options_check(crop !== null, crop?.[2] ?? 0, crop?.[3] ?? 0,
+    options.resizeWidth !== undefined, options.resizeWidth ?? 0, options.resizeHeight !== undefined, options.resizeHeight ?? 0);
+  return result === RESULT_DONE ? null : result;
+}
+
+// The ImageBitmap of a resolved `image` with `crop` ([sx, sy, sw, sh] or
+// null) and `options` (bitmap_geometry): { result: BITMAP_WHOLE, or a
+// BITMAP_ failure }, or { result: BITMAP_DERIVED, source, width, height }
+// with the source not yet retained.
+export function imageBitmapGeometry(image, crop, options) {
+  const flipY = options.imageOrientation === "flipY";
+  const geometryCore = builder();
+  const result = geometryCore.bitmap_geometry(image.width, image.height, image.naturalDimensions, crop !== null,
+    ...(crop ?? [0, 0, 0, 0]), options.resizeWidth !== undefined, options.resizeWidth ?? 0,
+    options.resizeHeight !== undefined, options.resizeHeight ?? 0, flipY);
+  if (result !== BITMAP_DERIVED) return { result };
+  const geometry = new Float64Array(builderMemory.buffer, geometryCore.output_pointer(), BITMAP_HEIGHT / 8 + 1).slice();
+  const width = geometry[BITMAP_WIDTH / 8];
+  const height = geometry[BITMAP_HEIGHT / 8];
   const core = recorder();
-  if (flipY) core.set_transform(1, 0, 0, -1, 0, height);
-  if (quality === "pixelated") core.set_image_smoothing_enabled(0);
-  else core.set_image_smoothing_quality(IMAGE_SMOOTHING_QUALITIES.indexOf(quality));
   // The list draws in the source's own color space (recordedSource).
-  const result = core.draw_image(0, image.opaque ? 1 : 0, SOURCE_CONVERSION_NONE, image.width, image.height, ...crop, 0, 0, width, height);
-  if (result === -1) throw new RangeError("ImageBitmap: the command list cannot grow");
+  const recorded = core.bitmap_record(image.opaque, SOURCE_CONVERSION_NONE, image.width, image.height,
+    geometry[BITMAP_CROP_X / 8], geometry[BITMAP_CROP_Y / 8], geometry[BITMAP_CROP_WIDTH / 8],
+    geometry[BITMAP_CROP_HEIGHT / 8], width, height, flipY, RESIZE_QUALITIES.indexOf(options.resizeQuality));
+  if (recorded === RESULT_FULL) throw new RangeError("ImageBitmap: the command list cannot grow");
   // The bitmap keeps its source's color space and format (a canvas's; an
   // image's is 8-bit sRGB).
   const colorSpace = image.source.colorSpace ?? "srgb";
   const format = image.source.kind === "image" ? BITMAP_FORMAT : image.source.format;
-  return recordedSource(core, width, height, result === 1 ? [image.source] : [], [], colorSpace, format);
+  const source = recordedSource(core, width, height, recorded === RESULT_DONE ? [image.source] : [], [], colorSpace, format);
+  return { result, source, width, height };
 }
 
 // The image of an ImageData: its bytes, premultiplied as putImageData()
@@ -2821,10 +2909,10 @@ export function derivedImageSource(image, crop, width, height, flipY, quality) {
 export function imageDataSource(imageData) {
   const core = recorder();
   const { width, height } = imageData;
-  core.put_image_data_region(width, height, 0, 0, 0, 0, width, height, width, height);
+  core.put_image_data_region(width, height, 0, 0, false, 0, 0, 0, 0, width, height);
   // The list draws in the data's own color space (recordedSource).
   const result = core.record_put_image_data(0, SOURCE_CONVERSION_NONE);
-  if (result === -1) throw new RangeError("ImageBitmap: the command list cannot grow");
+  if (result === RESULT_FULL) throw new RangeError("ImageBitmap: the command list cannot grow");
   const payloads = [imageDataPayload(imageData, imageData.data, width, height)];
   return recordedSource(core, width, height, [], payloads, imageData.colorSpace, payloads[0].format);
 }

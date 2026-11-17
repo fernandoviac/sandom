@@ -11,6 +11,8 @@ export function createGpuBinding(core, device, effects = {}) {
   const pending = new Set();
   const readbacks = new Map();
   const completions = new Map();
+  let frameToken = 0;
+  let frameFence = null;
   let failure = null;
   let closed = false;
   let recordKind = 0;
@@ -119,6 +121,36 @@ export function createGpuBinding(core, device, effects = {}) {
     }).finally(() => pending.delete(completion));
     pending.add(completion);
   }
+  // Frame fences: the core keeps one frame operation and moves it to the
+  // token of each later frame submission (gpu_frame_submit). One wait is
+  // outstanding at a time. A wait that ends before the newest frame token
+  // waits again; the queue completes submissions in order. A zero frame
+  // token means that the frame operation is settled.
+  function awaitFrameFence() {
+    const token = frameToken;
+    const completion = device.queue.onSubmittedWorkDone().then(() => {
+      pending.delete(completion);
+      if (frameToken !== 0 && frameToken !== token) {
+        awaitFrameFence();
+        return;
+      }
+      frameFence = null;
+      if (frameToken === 0) return;
+      frameToken = 0;
+      completeReadback(token, 0);
+    }, (error) => {
+      pending.delete(completion);
+      frameFence = null;
+      if (frameToken === 0) return;
+      const failed = frameToken;
+      frameToken = 0;
+      core.gpu_completion(stream, failed, 1);
+      failure = new Error(`GPU submission ${failed} failed`, { cause: error });
+      notifyReadbacks();
+    });
+    frameFence = completion;
+    pending.add(completion);
+  }
   function execute() {
     if (closed) throw new Error('GPU binding is closed');
     if (failure !== null) throw failure;
@@ -208,18 +240,16 @@ export function createGpuBinding(core, device, effects = {}) {
             if (second !== 0) buffers.push(requireResource(second));
             buffers.push(requireResource(third));
             try { device.queue.submit(buffers); }
-            catch (error) { if (fourth !== 0) core.gpu_completion(stream, fourth, 1); throw error; }
+            catch (error) {
+              if (fourth !== 0) {
+                frameToken = 0;
+                core.gpu_completion(stream, fourth, 1);
+              }
+              throw error;
+            }
             if (fourth === 0) break;
-            const completion = device.queue.onSubmittedWorkDone().then(() => {
-              completeReadback(fourth, 0);
-              pending.delete(completion);
-            }, (error) => {
-              core.gpu_completion(stream, fourth, 1);
-              failure = new Error(`GPU submission ${fourth} failed`, { cause: error });
-              pending.delete(completion);
-              notifyReadbacks();
-            });
-            pending.add(completion);
+            frameToken = fourth;
+            if (frameFence === null) awaitFrameFence();
             break;
           }
           case 14:
@@ -545,7 +575,8 @@ export function createGpuBinding(core, device, effects = {}) {
     },
     async destroy() {
       if (closed) return;
-      await Promise.all(pending);
+      // A frame fence that ends before the newest frame token waits again.
+      while (pending.size) await Promise.all(pending);
       close();
     },
   };

@@ -1,6 +1,39 @@
 import { readPackageAsset } from "../package-assets.js";
 import createMozJpegModule from "../../vendor/jsquash-jpeg/mozjpeg_enc.js";
 import { initEmscriptenModule } from "../../vendor/jsquash-jpeg/utils.js";
+import * as jpegContainerBinary from "../wasm/jpeg-container-binary.js";
+import { moduleLayoutConstants } from "../wasm/layout-table.js";
+
+const { instantiate } = jpegContainerBinary;
+
+let container = null;
+const encoder8 = new TextEncoder();
+const numberOrNaN = (value) => typeof value === "number" ? value : NaN;
+// The MozJPEG settings of every encode (MOZJPEG_* of the container module).
+const containerConstant = moduleLayoutConstants(jpegContainerBinary, "jpeg container");
+const MOZJPEG = Object.fromEntries(["BASELINE", "PROGRESSIVE", "ARITHMETIC", "OPTIMIZE_CODING", "SMOOTHING", "COLOR_SPACE",
+  "QUANT_TABLE", "TRELLIS_MULTIPASS", "TRELLIS_OPT_ZERO", "TRELLIS_OPT_TABLE", "TRELLIS_LOOPS", "AUTO_SUBSAMPLE",
+  "CHROMA_SUBSAMPLE", "SEPARATE_CHROMA_QUALITY"].map((name) => [name, containerConstant(`MOZJPEG_${name}`)]));
+
+// The JPEG container module (core/engine/jpeg-container.wat).
+function containerExports() {
+  container ??= instantiate({}).exports;
+  return container;
+}
+
+function containerInput(exports, bytes) {
+  const pointer = exports.input_buffer(bytes.length);
+  if (pointer === 0) throw new Error(`JPEG encoder: the container module could not grow its memory for ${bytes.length} bytes`);
+  new Uint8Array(exports.memory.buffer, pointer, bytes.length).set(bytes);
+}
+
+// Throws the error of a nonzero container result (its message length).
+function containerCheck(exports, length) {
+  if (length < 0) throw new Error("JPEG encoder: the container module could not grow its memory");
+  if (length > 0) {
+    throw new Error(new TextDecoder().decode(new Uint8Array(exports.memory.buffer, exports.message_address(), length)));
+  }
+}
 
 let encoderInitialization = null;
 let encoder = null;
@@ -24,31 +57,23 @@ export const JPEG_ENCODER_OPTIONS = Object.freeze({
 
 // options: { quality: integer 0 to 100, profile: an ICC profile (Uint8Array)
 // that APP2 "ICC_PROFILE" segments carry after the JFIF segment, or
-// absent }.
+// absent }. request_check of the container module applies the rules.
 function encodingRequest(image, options) {
   if (image === null || typeof image !== "object") {
     throw new Error("JPEG encoder: image must be an object");
   }
-  if (!Number.isInteger(image.width) || image.width <= 0 ||
-    !Number.isInteger(image.height) || image.height <= 0) {
-    throw new Error("JPEG encoder: width and height must be positive integers");
-  }
-  if (!(image.pixels instanceof Uint8Array || image.pixels instanceof Uint8ClampedArray) ||
-    image.pixels.length !== image.width * image.height * 4) {
-    throw new Error("JPEG encoder: pixels must be a tightly packed RGBA8 array");
-  }
-  if (options === null || typeof options !== "object" ||
-    Object.keys(options).some((key) => key !== "quality" && key !== "profile")) {
-    throw new Error("JPEG encoder: options accept only quality and profile");
-  }
-  const profile = options.profile;
-  if (profile !== undefined && !(profile instanceof Uint8Array && profile.length > 0)) {
-    throw new Error("JPEG encoder: profile must be a non-empty Uint8Array");
-  }
-  const quality = options.quality;
-  if (!Number.isInteger(quality) || quality < 0 || quality > 100) {
-    throw new Error("JPEG encoder: quality must be an integer from 0 through 100");
-  }
+  const exports = containerExports();
+  const pixelBytes = image.pixels instanceof Uint8Array || image.pixels instanceof Uint8ClampedArray;
+  const optionsRecord = options !== null && typeof options === "object";
+  const keys = optionsRecord ? Object.keys(options) : [];
+  const profile = optionsRecord ? options.profile : undefined;
+  const quality = optionsRecord ? options.quality : undefined;
+  containerInput(exports, encoder8.encode(keys.map((key) => `${key}\0`).join("")));
+  containerCheck(exports, exports.request_check(
+    numberOrNaN(image.width), numberOrNaN(image.height), pixelBytes ? 1 : 0, pixelBytes ? image.pixels.length : NaN,
+    optionsRecord ? 1 : 0, keys.length, profile !== undefined ? 1 : 0, profile instanceof Uint8Array ? 1 : 0,
+    profile instanceof Uint8Array ? profile.length : NaN, numberOrNaN(quality),
+  ));
   return { image, profile, quality };
 }
 
@@ -56,20 +81,20 @@ function encodeReady({ image, profile, quality }) {
   if (encoder === null) throw new Error("JPEG encoder: initializeJpegEncoder() must complete before synchronous encoding");
   const encoded = encoder.encode(image.pixels, image.width, image.height, {
     quality,
-    baseline: true,
-    progressive: false,
-    arithmetic: false,
-    optimize_coding: true,
-    smoothing: 0,
-    color_space: 3,
-    quant_table: 3,
-    trellis_multipass: false,
-    trellis_opt_zero: false,
-    trellis_opt_table: false,
-    trellis_loops: 1,
-    auto_subsample: true,
-    chroma_subsample: 2,
-    separate_chroma_quality: false,
+    baseline: MOZJPEG.BASELINE === 1,
+    progressive: MOZJPEG.PROGRESSIVE === 1,
+    arithmetic: MOZJPEG.ARITHMETIC === 1,
+    optimize_coding: MOZJPEG.OPTIMIZE_CODING === 1,
+    smoothing: MOZJPEG.SMOOTHING,
+    color_space: MOZJPEG.COLOR_SPACE,
+    quant_table: MOZJPEG.QUANT_TABLE,
+    trellis_multipass: MOZJPEG.TRELLIS_MULTIPASS === 1,
+    trellis_opt_zero: MOZJPEG.TRELLIS_OPT_ZERO === 1,
+    trellis_opt_table: MOZJPEG.TRELLIS_OPT_TABLE === 1,
+    trellis_loops: MOZJPEG.TRELLIS_LOOPS,
+    auto_subsample: MOZJPEG.AUTO_SUBSAMPLE === 1,
+    chroma_subsample: MOZJPEG.CHROMA_SUBSAMPLE,
+    separate_chroma_quality: MOZJPEG.SEPARATE_CHROMA_QUALITY === 1,
     chroma_quality: quality,
   });
   return profile === undefined ? encoded : withIccProfile(encoded, profile);
@@ -88,39 +113,14 @@ export function encodeJpegRgbaWithCompletion(image, options, operation) {
   operation.reply(bytes);
 }
 
-// The largest ICC profile chunk of one APP2 segment: the segment length
-// (16 bits, itself included) less its length field, the "ICC_PROFILE\0"
-// identifier and the chunk number and count.
-const ICC_CHUNK_CAPACITY = 0xffff - 2 - 12 - 2;
-const ICC_IDENTIFIER = new TextEncoder().encode("ICC_PROFILE\0");
-
 // `jpeg` with `profile` in APP2 segments (ICC.1, annex B.4) after its JFIF
-// APP0 segment, as Chrome writes the JPEG of a display-p3 canvas.
+// APP0 segment (icc_insert of the container module).
 function withIccProfile(jpeg, profile) {
-  if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8) throw new Error("JPEG encoder: the encoded image does not start with SOI");
-  let insertAt = 2;
-  if (jpeg[2] === 0xff && jpeg[3] === 0xe0) insertAt = 4 + ((jpeg[4] << 8) | jpeg[5]);
-  const count = Math.ceil(profile.length / ICC_CHUNK_CAPACITY);
-  if (count > 255) throw new Error(`JPEG encoder: an ICC profile of ${profile.length} bytes needs more than 255 APP2 segments`);
-  const segments = [];
-  for (let index = 0; index < count; index++) {
-    const chunk = profile.subarray(index * ICC_CHUNK_CAPACITY, (index + 1) * ICC_CHUNK_CAPACITY);
-    const length = 2 + ICC_IDENTIFIER.length + 2 + chunk.length;
-    const segment = new Uint8Array(2 + length);
-    segment.set([0xff, 0xe2, length >> 8, length & 0xff]);
-    segment.set(ICC_IDENTIFIER, 4);
-    segment.set([index + 1, count], 4 + ICC_IDENTIFIER.length);
-    segment.set(chunk, 4 + ICC_IDENTIFIER.length + 2);
-    segments.push(segment);
-  }
-  const size = segments.reduce((total, segment) => total + segment.length, jpeg.length);
-  const result = new Uint8Array(size);
-  result.set(jpeg.subarray(0, insertAt));
-  let at = insertAt;
-  for (const segment of segments) {
-    result.set(segment, at);
-    at += segment.length;
-  }
-  result.set(jpeg.subarray(insertAt), at);
-  return result;
+  const exports = containerExports();
+  const input = new Uint8Array(jpeg.length + profile.length);
+  input.set(jpeg);
+  input.set(profile, jpeg.length);
+  containerInput(exports, input);
+  containerCheck(exports, exports.icc_insert(jpeg.length, profile.length));
+  return new Uint8Array(exports.memory.buffer, exports.output_address(), exports.output_length()).slice();
 }

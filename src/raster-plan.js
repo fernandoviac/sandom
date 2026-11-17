@@ -4,8 +4,6 @@ import {
   MAX_SHADER_CLIP_ENTRIES,
 } from "./gpu-composition-clip.js";
 import {
-  CMD_DAMAGE,
-  CMD_IMAGE,
   CMD_IMAGE_FLAG_PIXELATED,
   CMD_PUSH_BLEND_LAYER,
   CMD_PUSH_OPACITY,
@@ -23,9 +21,6 @@ import {
   RASTER_PLAN_HEADER_SIZE,
   RASTER_PLAN_MAGIC,
   RASTER_PLAN_NO_CLIP,
-  RASTER_PLAN_PASS_BOX_BLUR_H,
-  RASTER_PLAN_PASS_BOX_BLUR_V,
-  RASTER_PLAN_PASS_DROP_SHADOW,
   RASTER_PLAN_RECORD_FLAG_NEEDS_BACKDROP_COPY,
   RASTER_PLAN_RECORD_OFFSET_CLIP,
   RASTER_PLAN_RECORD_OFFSET_FLAGS,
@@ -40,6 +35,26 @@ import {
   RASTER_PLAN_RECORD_OFFSET_RESOURCE,
   RASTER_PLAN_RECORD_SIZE,
 } from "./wasm/layout.js";
+import { layoutConstant } from "./wasm/layout-table.js";
+const GROUP_PUSH = Object.fromEntries(["OPACITY", "BLEND_MODE", "FLAGS"]
+  .map((name) => [name, layoutConstant(`RASTER_PLAN_GROUP_PUSH_${name}`)]));
+const GROUP_FLAG_MASK = layoutConstant("RASTER_PLAN_GROUP_FLAG_MASK");
+
+const HEADER = Object.freeze(Object.fromEntries(["MAGIC", "VERSION", "TOTAL", "RECORD_COUNT", "RECORD_TABLE",
+  "RECORD_STRIDE", "CLIP_TABLE", "CLIP_COUNT", "PAYLOAD", "PAYLOAD_BYTES", "PATH_ATLAS"]
+  .map((name) => [name, layoutConstant(`RASTER_PLAN_HEADER_${name}`)])));
+const CLIP_COUNT = layoutConstant("RASTER_PLAN_CLIP_COUNT");
+const CLIP_DATA = layoutConstant("RASTER_PLAN_CLIP_DATA");
+const GRADIENT_STOP_COUNT = layoutConstant("RASTER_PLAN_GRADIENT_STOP_COUNT");
+const FILTER_HEADER_BYTES = layoutConstant("RASTER_PLAN_FILTER_HEADER_BYTES");
+const FILTER_COUNT = layoutConstant("RASTER_PLAN_FILTER_COUNT");
+const FILTER_PASS_KIND = layoutConstant("RASTER_PLAN_FILTER_PASS_KIND");
+const FILTER_PASS_UNIFORM_OFFSET = layoutConstant("RASTER_PLAN_FILTER_PASS_UNIFORM_OFFSET");
+const FILTER_PASS_UNIFORM_BYTES = layoutConstant("RASTER_PLAN_FILTER_PASS_UNIFORM_BYTES");
+const SEQUENCE_ENTRY = Object.freeze(Object.fromEntries(["SIZE", "FIRST", "INSTANCES", "PAYLOAD_START", "PAYLOAD_END", "BOUNDS"]
+  .map((name) => [name, layoutConstant(`GPU_FRAME_ENTRY_${name}`)])));
+const RECT = Object.freeze(Object.fromEntries(["SIZE", "X", "Y", "WIDTH", "HEIGHT"]
+  .map((name) => [name, layoutConstant(`RASTER_PLAN_RECT_${name}`) / 4])));
 
 export const EMPTY_CLIP_STATE = Object.freeze({
   entries: Object.freeze([]),
@@ -59,19 +74,28 @@ export function clipUniformFloats(clipState) {
 }
 export { MAX_SHADER_CLIP_ENTRIES };
 
-// Record table words and halves, for the totals passes below.
-const RECORD_WORDS = RASTER_PLAN_RECORD_SIZE / 4;
-const RECORD_WORD_INSTANCE_COUNT = RASTER_PLAN_RECORD_OFFSET_INSTANCE_COUNT /
-  4;
-const RECORD_WORD_RESOURCE = RASTER_PLAN_RECORD_OFFSET_RESOURCE / 4;
-const RECORD_HALF_KIND = RASTER_PLAN_RECORD_OFFSET_KIND / 2;
-
-export function openRasterPlan(memory, plan) {
+// Opens the raster plan at address `plan` in the memory of `module`: the
+// renderer core exports that built it, or an object that holds them as
+// `exports` beside its `memory`.
+export function openRasterPlan(module, plan) {
+  const memory = module?.memory;
+  const exports = module?.exports ?? module;
   if (!(memory instanceof WebAssembly.Memory)) {
-    throw new TypeError("openRasterPlan: memory must be WebAssembly.Memory");
+    throw new TypeError(
+      `openRasterPlan: the module's memory is ${Object.prototype.toString.call(memory)}; pass the WebAssembly module (or its exports) that built the plan`,
+    );
   }
   if (!Number.isInteger(plan) || plan <= 0) {
     throw new RangeError(`openRasterPlan: plan handle ${plan} is not a positive integer`);
+  }
+  // The renderer core exports that own the plan scans.
+  function planExports() {
+    if (typeof exports?.raster_plan_image_resources !== "function") {
+      throw new TypeError(
+        `raster plan ${plan}: openRasterPlan's module has no raster_plan_image_resources export; pass the renderer core exports that built the plan`,
+      );
+    }
+    return exports;
   }
 
   let view;
@@ -92,8 +116,8 @@ export function openRasterPlan(memory, plan) {
     }
     clipStates.clear();
     view = new DataView(memory.buffer, plan);
-    const magic = view.getUint32(0, true);
-    const abiVersion = view.getUint32(4, true);
+    const magic = view.getUint32(HEADER.MAGIC, true);
+    const abiVersion = view.getUint32(HEADER.VERSION, true);
     if (magic !== RASTER_PLAN_MAGIC) {
       throw new Error(
         `openRasterPlan: magic 0x${magic.toString(16)} does not equal SRPL 0x${RASTER_PLAN_MAGIC.toString(16)}`,
@@ -105,14 +129,14 @@ export function openRasterPlan(memory, plan) {
       );
     }
 
-    const totalBytes = view.getUint32(8, true);
-    recordCount = view.getUint32(12, true);
-    recordTableOffset = view.getUint32(20, true);
-    const recordStride = view.getUint32(24, true);
-    clipTableOffset = view.getUint32(52, true);
-    clipCount = view.getUint32(56, true);
-    payloadRegionOffset = view.getUint32(60, true);
-    payloadRegionBytes = view.getUint32(64, true);
+    const totalBytes = view.getUint32(HEADER.TOTAL, true);
+    recordCount = view.getUint32(HEADER.RECORD_COUNT, true);
+    recordTableOffset = view.getUint32(HEADER.RECORD_TABLE, true);
+    const recordStride = view.getUint32(HEADER.RECORD_STRIDE, true);
+    clipTableOffset = view.getUint32(HEADER.CLIP_TABLE, true);
+    clipCount = view.getUint32(HEADER.CLIP_COUNT, true);
+    payloadRegionOffset = view.getUint32(HEADER.PAYLOAD, true);
+    payloadRegionBytes = view.getUint32(HEADER.PAYLOAD_BYTES, true);
     if (recordTableOffset !== RASTER_PLAN_HEADER_SIZE || recordStride !== RASTER_PLAN_RECORD_SIZE) {
       throw new Error(
         `openRasterPlan: record table offset/stride ${recordTableOffset}/${recordStride} does not equal ${RASTER_PLAN_HEADER_SIZE}/${RASTER_PLAN_RECORD_SIZE}`,
@@ -189,7 +213,7 @@ export function openRasterPlan(memory, plan) {
       const clipOffset = clipTableOffset + clipIndex * RASTER_PLAN_CLIP_ENTRY_SIZE;
       return new Float32Array(
         memory.buffer,
-        plan + clipOffset + 4,
+        plan + clipOffset + CLIP_DATA,
         RASTER_PLAN_CLIP_FLOATS,
       );
     },
@@ -200,7 +224,7 @@ export function openRasterPlan(memory, plan) {
         throw new RangeError(`raster plan clip index ${clipIndex} exceeds count ${clipCount}`);
       }
       return view.getUint32(
-        clipTableOffset + clipIndex * RASTER_PLAN_CLIP_ENTRY_SIZE,
+        clipTableOffset + clipIndex * RASTER_PLAN_CLIP_ENTRY_SIZE + CLIP_COUNT,
         true,
       );
     },
@@ -211,15 +235,16 @@ export function openRasterPlan(memory, plan) {
         throw new RangeError(`raster plan clip index ${clipIndex} exceeds count ${clipCount}`);
       }
       const offset = clipTableOffset + clipIndex * RASTER_PLAN_CLIP_ENTRY_SIZE +
-        4 + (RASTER_PLAN_CLIP_FLOATS + RASTER_PLAN_CLIP_PATH_MASK_FLOATS) * 4;
+        CLIP_DATA + (RASTER_PLAN_CLIP_FLOATS + RASTER_PLAN_CLIP_PATH_MASK_FLOATS) * Float32Array.BYTES_PER_ELEMENT;
+      const F32 = Float32Array.BYTES_PER_ELEMENT;
       const minX = view.getFloat32(offset, true);
       return Number.isNaN(minX)
         ? null
         : {
           minX,
-          minY: view.getFloat32(offset + 4, true),
-          maxX: view.getFloat32(offset + 8, true),
-          maxY: view.getFloat32(offset + 12, true),
+          minY: view.getFloat32(offset + F32, true),
+          maxX: view.getFloat32(offset + 2 * F32, true),
+          maxY: view.getFloat32(offset + 3 * F32, true),
         };
     },
     pathMask(index) {
@@ -231,7 +256,7 @@ export function openRasterPlan(memory, plan) {
       return new Float32Array(
         memory.buffer,
         plan + clipTableOffset + clipIndex * RASTER_PLAN_CLIP_ENTRY_SIZE +
-          4 + RASTER_PLAN_CLIP_FLOATS * 4,
+          CLIP_DATA + RASTER_PLAN_CLIP_FLOATS * 4,
         RASTER_PLAN_CLIP_PATH_MASK_FLOATS,
       );
     },
@@ -278,58 +303,16 @@ export function openRasterPlan(memory, plan) {
         payloadBytes >>> 2,
       );
     },
-    // Totals every backend-independent consumer reads from the record
-    // table: the instances the records draw (a DAMAGE record's count is
-    // its rectangles, which scissor and draw nothing), and whether any
-    // record draws an image whose resource `imageKind` reports as live.
-    recordTotals(imageKind) {
-      ensureCurrentMemory();
-      const words = new Uint32Array(
-        memory.buffer,
-        plan + recordTableOffset,
-        recordCount * RECORD_WORDS,
-      );
-      const halves = new Uint16Array(
-        memory.buffer,
-        plan + recordTableOffset,
-        recordCount * RECORD_WORDS * 2,
-      );
-      let instances = 0;
-      let liveImage = false;
-      for (let index = 0; index < recordCount; index++) {
-        const word = index * RECORD_WORDS;
-        const kind = halves[index * RECORD_WORDS * 2 + RECORD_HALF_KIND];
-        if (kind !== CMD_DAMAGE) {
-          instances += words[word + RECORD_WORD_INSTANCE_COUNT];
-        }
-        if (!liveImage && kind === CMD_IMAGE) {
-          liveImage = imageKind(words[word + RECORD_WORD_RESOURCE]);
-        }
-      }
-      return { instances, liveImage };
+    // The instances the records draw (raster_plan_instance_total).
+    instanceTotal() {
+      return planExports().raster_plan_instance_total(plan) >>> 0;
     },
-    // The image resources that the plan's CMD_IMAGE records draw. A frame
-    // captures only these canvases: the host image map holds every image
-    // of the runtime, other documents' canvases included.
+    // The image resources that the plan's CMD_IMAGE records draw, each once
+    // in the order of its first record (raster_plan_image_resources).
     imageResources() {
-      ensureCurrentMemory();
-      const words = new Uint32Array(
-        memory.buffer,
-        plan + recordTableOffset,
-        recordCount * RECORD_WORDS,
-      );
-      const halves = new Uint16Array(
-        memory.buffer,
-        plan + recordTableOffset,
-        recordCount * RECORD_WORDS * 2,
-      );
-      const resources = new Set();
-      for (let index = 0; index < recordCount; index++) {
-        if (halves[index * RECORD_WORDS * 2 + RECORD_HALF_KIND] === CMD_IMAGE) {
-          resources.add(words[index * RECORD_WORDS + RECORD_WORD_RESOURCE]);
-        }
-      }
-      return resources;
+      const count = planExports().raster_plan_image_resources(plan);
+      if (count < 0) throw new RangeError(`raster plan ${plan}: the list of drawn image resources could not grow`);
+      return Array.from({ length: count }, (_, index) => exports.raster_plan_image_resource(index) >>> 0);
     },
     // The first `byteLength` bytes of the payload region.
     payloadRegion(byteLength) {
@@ -420,7 +403,7 @@ export function openRasterPlan(memory, plan) {
         gradient.byteOffset,
         gradient.byteLength,
       );
-      const stopCount = gradientView.getUint32(12, true);
+      const stopCount = gradientView.getUint32(GRADIENT_STOP_COUNT, true);
       const expectedBytes = GRADIENT_RECORD_STRIDE +
         stopCount * GRADIENT_STOP_STRIDE;
       if (gradient.byteLength !== expectedBytes) {
@@ -436,7 +419,7 @@ export function openRasterPlan(memory, plan) {
     },
     filterPasses(index, listOffset = 0) {
       const payload = reader.payload(index);
-      if (payload.byteLength < listOffset + 4) {
+      if (payload.byteLength < listOffset + FILTER_HEADER_BYTES) {
         throw new Error(
           `native filter pass list at ${listOffset} exceeds ${payload.byteLength}-byte payload`,
         );
@@ -446,8 +429,8 @@ export function openRasterPlan(memory, plan) {
         payload.byteOffset + listOffset,
         payload.byteLength - listOffset,
       );
-      const count = passView.getUint32(0, true);
-      const uniformBase = 4 + count * RASTER_PLAN_FILTER_DESCRIPTOR_BYTES;
+      const count = passView.getUint32(FILTER_COUNT, true);
+      const uniformBase = FILTER_HEADER_BYTES + count * RASTER_PLAN_FILTER_DESCRIPTOR_BYTES;
       const requiredBytes = uniformBase +
         count * RASTER_PLAN_FILTER_UNIFORM_SLOT_BYTES;
       if (requiredBytes > passView.byteLength) {
@@ -457,11 +440,11 @@ export function openRasterPlan(memory, plan) {
       }
       const passes = [];
       for (let passIndex = 0; passIndex < count; passIndex++) {
-        const descriptor = 4 +
+        const descriptor = FILTER_HEADER_BYTES +
           passIndex * RASTER_PLAN_FILTER_DESCRIPTOR_BYTES;
-        const kind = passView.getUint32(descriptor, true);
-        const uniformOffset = passView.getUint32(descriptor + 4, true);
-        const uniformBytes = passView.getUint32(descriptor + 8, true);
+        const kind = passView.getUint32(descriptor + FILTER_PASS_KIND, true);
+        const uniformOffset = passView.getUint32(descriptor + FILTER_PASS_UNIFORM_OFFSET, true);
+        const uniformBytes = passView.getUint32(descriptor + FILTER_PASS_UNIFORM_BYTES, true);
         if (
           uniformOffset < uniformBase ||
           uniformOffset + uniformBytes > passView.byteLength ||
@@ -495,49 +478,10 @@ export function openRasterPlan(memory, plan) {
   return refresh();
 }
 
-// How far each filter pass list reads beyond the pixel it writes, in
-// device pixels per axis: a box pass reads floor(width / 2) texels either
-// side along its direction, a drop shadow reads its offset away, a matrix
-// pass reads only its own pixel. reaches[2k], reaches[2k + 1] is the x and
-// y reach of passes k..end, so reaches[0..1] is the outset the whole list
-// needs around the frame for every frame pixel to see the content it reads
-// (BUG-css-filter-blur-renormalises-at-the-frame-edge, resolved; see
-// design/paint-coverage.md, "Filter passes"), and
-// reaches[2k + 2..3] is the outset over which pass k's output is still read.
-export function filterPassReaches(passes) {
-  const reaches = new Int32Array(2 * passes.length + 2);
-  for (let index = passes.length - 1; index >= 0; index--) {
-    const { kind, uniform } = passes[index];
-    let x = 0;
-    let y = 0;
-    if (
-      kind === RASTER_PLAN_PASS_BOX_BLUR_H ||
-      kind === RASTER_PLAN_PASS_BOX_BLUR_V
-    ) {
-      const radius = Math.floor(uniform[0] / 2);
-      x = Math.ceil(radius * Math.abs(uniform[1]));
-      y = Math.ceil(radius * Math.abs(uniform[2]));
-    } else if (kind === RASTER_PLAN_PASS_DROP_SHADOW) {
-      x = Math.ceil(Math.abs(uniform[0]));
-      y = Math.ceil(Math.abs(uniform[1]));
-    }
-    reaches[2 * index] = reaches[2 * index + 2] + x;
-    reaches[2 * index + 1] = reaches[2 * index + 3] + y;
-  }
-  return reaches;
-}
-
-// The padding, per side of one axis, of the texture a filter pass list
-// runs on: the list's reach rounded up to FILTER_REGION_PADDING_QUANTUM, so
-// a changing blur radius takes the same scratch textures frame after
-// frame, and bounded by the largest texture the device can create
-// (`maxExtent`). A list bounded there sees the box passes' own edge rule
-// at the padded edge instead of the content it would read beyond it.
-const FILTER_REGION_PADDING_QUANTUM = 64;
-export function filterRegionPadding(reach, extent, maxExtent) {
-  const padding = Math.ceil(reach / FILTER_REGION_PADDING_QUANTUM) *
-    FILTER_REGION_PADDING_QUANTUM;
-  return Math.min(padding, Math.floor((maxExtent - extent) / 2));
+// The address of record `index`'s filter pass list in the core's memory,
+// for raster_plan_filter_reach and raster_plan_filter_padding.
+function filterListAddress(reader, index, listOffset) {
+  return reader.payload(index).byteOffset + listOffset;
 }
 
 // Copies the native draw sequence of `reader`'s plan: per entry the first
@@ -553,18 +497,22 @@ function rasterPlanSequence(reader, exports) {
           `${exports.raster_plan_sequence_failure_value(state)}, outside its region or word alignment`,
       );
     }
-    const words = new Uint32Array(count * 12);
-    words.set(new Uint32Array(exports.memory.buffer, exports.raster_plan_sequence_entries(state), count * 12));
+    const entryWords = SEQUENCE_ENTRY.SIZE / 4;
+    const words = new Uint32Array(count * entryWords);
+    words.set(new Uint32Array(exports.memory.buffer, exports.raster_plan_sequence_entries(state), count * entryWords));
     const floats = new Float32Array(words.buffer);
-    const field = (offset) => Uint32Array.from({ length: count }, (_, index) => words[index * 12 + offset]);
+    const field = (offset) => Uint32Array.from({ length: count }, (_, index) => words[index * entryWords + offset / 4]);
     const bounds = new Float32Array(count * 4);
-    for (let index = 0; index < count; index++) bounds.set(floats.subarray(index * 12 + 5, index * 12 + 9), index * 4);
+    const boundsWord = SEQUENCE_ENTRY.BOUNDS / 4;
+    for (let index = 0; index < count; index++) {
+      bounds.set(floats.subarray(index * entryWords + boundsWord, index * entryWords + boundsWord + 4), index * 4);
+    }
     return {
       count,
-      first: field(0),
-      instanceCount: field(2),
-      payloadStart: field(3),
-      payloadEnd: field(4),
+      first: field(SEQUENCE_ENTRY.FIRST),
+      instanceCount: field(SEQUENCE_ENTRY.INSTANCES),
+      payloadStart: field(SEQUENCE_ENTRY.PAYLOAD_START),
+      payloadEnd: field(SEQUENCE_ENTRY.PAYLOAD_END),
       bounds,
       uploadBytes: exports.raster_plan_sequence_upload_bytes(state),
       pathMaskInUse: exports.raster_plan_sequence_path_mask(state) !== 0,
@@ -575,7 +523,7 @@ function rasterPlanSequence(reader, exports) {
 }
 
 // Renderer-core forms the draw sequence (`raster_plan_sequence`,
-// src/wasm/gpu-frame.watpart), as it does for the GPU command stream;
+// core/engine/gpu-frame.watpart), as it does for the GPU command stream;
 // `exports` belong to the core whose memory holds the plan.
 // One mutable cursor serves the complete frame. It walks the reader's draw
 // sequence: selecting an entry changes only numeric indices, and payloads
@@ -589,6 +537,8 @@ export function createRasterPlanCursor(reader, exports, resources = {}) {
   let recordIndex = 0;
   let selectionGradients = null;
   let resolvedImages = resources.images ?? null;
+  const filterListOffset = () =>
+    reader.kind(recordIndex) === CMD_PUSH_OPACITY ? RASTER_PLAN_FILTER_LIST_OFFSET : 0;
   const cursor = {
     // The entries the backend visits, then the payload prefix every draw
     // reads from and whether any clip carries a path mask.
@@ -685,23 +635,22 @@ export function createRasterPlanCursor(reader, exports, resources = {}) {
       return reader.gradientParts(recordIndex);
     },
     get opacity() {
-      return reader.payload(recordIndex)[0];
+      return reader.payload(recordIndex)[GROUP_PUSH.OPACITY];
     },
     get blendMode() {
       return reader.kind(recordIndex) === CMD_PUSH_BLEND_LAYER
         ? reader.resource(recordIndex)
-        : reader.payload(recordIndex)[1];
+        : reader.payload(recordIndex)[GROUP_PUSH.BLEND_MODE];
     },
     get filterPasses() {
-      return reader.filterPasses(
-        recordIndex,
-        reader.kind(recordIndex) === CMD_PUSH_OPACITY
-          ? RASTER_PLAN_FILTER_LIST_OFFSET
-          : 0,
-      );
+      return reader.filterPasses(recordIndex, filterListOffset());
+    },
+    // The address of the selection's filter pass list (see filterPasses).
+    get filterList() {
+      return filterListAddress(reader, recordIndex, filterListOffset());
     },
     get hasMask() {
-      return (reader.payload(recordIndex)[2] & 1) !== 0;
+      return (reader.payload(recordIndex)[GROUP_PUSH.FLAGS] & GROUP_FLAG_MASK) !== 0;
     },
     get nativeComposite() {
       const payload = reader.payload(recordIndex);
@@ -731,12 +680,12 @@ export function createRasterPlanCursor(reader, exports, resources = {}) {
     get rects() {
       const payload = reader.payload(recordIndex);
       const rects = [];
-      for (let offset = 0; offset < payload.length; offset += 4) {
+      for (let offset = 0; offset < payload.length; offset += RECT.SIZE) {
         rects.push({
-          x: payload[offset],
-          y: payload[offset + 1],
-          w: payload[offset + 2],
-          h: payload[offset + 3],
+          x: payload[offset + RECT.X],
+          y: payload[offset + RECT.Y],
+          w: payload[offset + RECT.WIDTH],
+          h: payload[offset + RECT.HEIGHT],
         });
       }
       return rects;
@@ -770,7 +719,8 @@ export function rasterPlanAtlasResources(descriptor) {
     state = { atlasForIdentity };
     plans.set(descriptor.plan, state);
   }
-  const pathIdentity = new DataView(descriptor.memory.buffer, descriptor.plan, RASTER_PLAN_HEADER_SIZE).getUint32(88, true);
+  const pathIdentity = new DataView(descriptor.memory.buffer, descriptor.plan, RASTER_PLAN_HEADER_SIZE)
+    .getUint32(HEADER.PATH_ATLAS, true);
   return { atlasForIdentity: state.atlasForIdentity,
     svgPathAtlas: pathIdentity ? state.atlasForIdentity(pathIdentity) : null };
 }

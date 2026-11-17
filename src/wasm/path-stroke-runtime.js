@@ -30,7 +30,9 @@ export function createPathStrokeService(module) {
         if (dashInput.length) {
           const pointer = module.exports.atlas_strokes_dash_ptr(batch);
           const view = new DataView(module.memory.buffer);
-          for (let index = 0; index < dashInput.length; index++) view.setFloat64(pointer + index * 8, dashInput[index], true);
+          for (let index = 0; index < dashInput.length; index++) {
+            view.setFloat64(pointer + index * Float64Array.BYTES_PER_ELEMENT, dashInput[index], true);
+          }
         }
         if (module.exports.atlas_strokes_execute(batch) !== 1) throw nativeError();
         const pointer = module.exports.atlas_strokes_output_ptr(batch);

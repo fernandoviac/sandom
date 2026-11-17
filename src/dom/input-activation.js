@@ -1,136 +1,261 @@
-import { createEvent, dispatchEvent } from "./events.js";
+import { createEvent, createEventUsing, createSyntheticEvent, dispatchEvent, SDEvent } from "./events.js";
 import { controlSelectionQueued, controlSelectionSet, controlValueEdited } from "./input-controls.js";
 import { documentScripts } from "./scripts.js";
+import { giveSubmissionEntries, queueFormNavigation } from "./form-data.js";
+import { resetOutput } from "./form-dom.js";
+import { nodeMember } from "./node-members.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+import { activationClock } from "./local-time.js";
+
+const INPUT_ACTIVATION_BLUR = layoutConstant("INPUT_ACTIVATION_BLUR");
+const INPUT_ACTIVATION_REQUEST_SUBMIT = layoutConstant("INPUT_ACTIVATION_REQUEST_SUBMIT");
+const INPUT_ACTIVATION_CLICK = layoutConstant("INPUT_ACTIVATION_CLICK");
+const INPUT_ACTIVATION_SYSTEM_BLUR = layoutConstant("INPUT_ACTIVATION_SYSTEM_BLUR");
+const INPUT_ACTIVATION_SYSTEM_FOCUS = layoutConstant("INPUT_ACTIVATION_SYSTEM_FOCUS");
+const FOCUS_CHECK_NOW = layoutConstant("FOCUS_CHECK_NOW");
+const FOCUS_CHECK_QUEUE = layoutConstant("FOCUS_CHECK_QUEUE");
+const FOCUS_CHECK_BLUR = layoutConstant("FOCUS_CHECK_BLUR");
 
 // The JavaScript host of the core's executing input runs
-// (src/dom-wasm/input-run.watpart): Event objects, listener calls and the
+// (core/dom/input-run.watpart): Event objects, listener calls and the
 // facade's effects of each notification. The core chooses every target,
 // state transition, default action and notification order, and executes
 // the default actions.
-const ACTIVATION_EVENTS = [null, "blur", "focusout", "focus", "focusin", "click", "input", "change"];
-const STATES = [null, "hover", "active", "focus", "checked", "selected"];
+// The codes of input-run.watpart, by WAT name.
+const constant = (name) => layoutConstant(name);
+const NOTIFY = Object.freeze({
+  EVENT: constant("INPUT_NOTIFY_EVENT"), STATE: constant("INPUT_NOTIFY_STATE"), EFFECT: constant("INPUT_NOTIFY_EFFECT"),
+  RECORD_HOOK: constant("INPUT_NOTIFY_RECORD_HOOK"),
+});
+const SOURCE_BATCH = constant("INPUT_SOURCE_BATCH");
+const EVENT = Object.freeze(Object.fromEntries(["BLUR", "FOCUSOUT", "FOCUS", "FOCUSIN", "CLICK", "INPUT", "CHANGE", "SUBMIT",
+  "BEFORETOGGLE", "CANCEL", "INVALID", "RESET", "AUTOFILL_KEYDOWN", "AUTOFILL_KEYUP"].map((name) => [name, constant(`INPUT_EVENT_${name}`)])));
+const STATE = Object.freeze(Object.fromEntries(["HOVER", "ACTIVE", "FOCUS", "CHECKED", "SELECTED", "VALUE_EDITED",
+  "SELECTION_SET", "DOCUMENT_SELECTION", "SCROLLED", "DETAILS_OPEN", "SELECTION_QUEUED", "TOP_LAYER", "VALIDITY", "CONTENT_EDITED",
+  "AUTOFILL", "OPEN"].map((name) => [name, constant(`INPUT_STATE_${name}`)])));
+const EFFECT_CLIPBOARD = constant("INPUT_EFFECT_CLIPBOARD");
+const EFFECT_FORM_ENTRY_LIST = constant("INPUT_EFFECT_FORM_ENTRY_LIST");
+const EFFECT_FORM_NAVIGATION = constant("INPUT_EFFECT_FORM_NAVIGATION");
+const EFFECT_TOP_LAYER_TASK = constant("INPUT_EFFECT_TOP_LAYER_TASK");
+const EFFECT_SCROLL_INTO_VIEW = constant("INPUT_EFFECT_SCROLL_INTO_VIEW");
+const EFFECT_RESET_OUTPUT = constant("INPUT_EFFECT_RESET_OUTPUT");
+const EFFECT_FIELD_MENU = constant("INPUT_EFFECT_FIELD_MENU");
+const EFFECT_RESIZE = constant("INPUT_EFFECT_RESIZE");
+const EFFECT_EYEDROPPER = constant("INPUT_EFFECT_EYEDROPPER");
+export const INPUT_OUTCOME = Object.freeze({
+  DONE: constant("INPUT_OUTCOME_DONE"), CANCELED: constant("INPUT_OUTCOME_CANCELED"), FAILED: constant("INPUT_OUTCOME_FAILED"),
+});
+// The pseudo-class name of a state notification that a style rule reads.
+const STATE_NAMES = new Map([
+  [STATE.HOVER, "hover"], [STATE.ACTIVE, "active"], [STATE.FOCUS, "focus"], [STATE.CHECKED, "checked"],
+  [STATE.SELECTED, "selected"], [STATE.AUTOFILL, "autofill"], [STATE.OPEN, "open"],
+]);
 
-// Calls an input export and throws its error, with the input error code's
-// message when it has one.
-export function inputInvoke(core, operation, ...args) {
-  const result = core.exports[operation](...args);
-  if (core.exports.abi_error_kind()) {
-    const code = core.exports.input_error_code();
-    if (code === 1 || code === 2) {
-      const id = core.exports.input_error_pointer_id();
-      throw new Error(`Pointer ${id} is ${code === 2 ? "already" : "not"} active`);
-    }
-    if (code === 3) throw new Error("A text composition is already active");
-    if (code === 4) throw new Error("Composition update requires an active composition");
-    if (code === 5) throw new Error("Composition end requires an active composition");
-    if (code === 6 || code === 7) throw new Error(`No ${code === 7 ? "vertical" : "horizontal"} scrollbar exists for the element`);
-    if (code === 8) throw new Error("Text composition requires an enabled focused text control");
-    if (code === 9) throw new Error("A text edit cannot run during an active text composition: end it with compositionEnd first");
-    core.throwIfError();
-  }
-  return result;
-}
+// The tasks of the top layer operations (core/dom/top-layer.watpart):
+// the core queues them, and each asks the core whether it fires.
+const TOP_LAYER_CLAIM = Object.freeze(Object.fromEntries(["SIZE", "ELEMENT", "SOURCE", "OLD_STATE", "NEW_STATE"]
+  .map((name) => [name, layoutConstant(`TOP_LAYER_CLAIM_${name}`)])));
+const TOP_LAYER_TASK_TOGGLE = layoutConstant("TOP_LAYER_TASK_TOGGLE");
+const TOP_LAYER_TASK_CLOSE = layoutConstant("TOP_LAYER_TASK_CLOSE");
+const TOGGLE_DETAIL_STATE_MASK = layoutConstant("TOGGLE_DETAIL_STATE_MASK");
+const TOGGLE_DETAIL_NEW_SHIFT = layoutConstant("TOGGLE_DETAIL_NEW_SHIFT");
+const TOGGLE_DETAIL_CANCELABLE = layoutConstant("TOGGLE_DETAIL_CANCELABLE");
+// The ToggleEvent state keywords by the core's toggle state.
+const TOGGLE_STATES = new Map([
+  [layoutConstant("TOGGLE_STATE_CLOSED"), "closed"],
+  [layoutConstant("TOGGLE_STATE_OPEN"), "open"],
+]);
 
-function readNotification(core) {
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 80);
-  // Capture the borrowed record before resolving a wrapper can reenter the core.
+// The toggle state of a beforetoggle notification's aux word.
+function toggleEventInit(core, notification) {
   return {
-    kind: view.getUint32(0, true), code: view.getUint32(4, true), flags: view.getUint32(8, true), aux: view.getUint32(12, true),
-    target: view.getBigUint64(16, true), related: view.getBigUint64(24, true),
-    a: view.getFloat64(32, true), b: view.getFloat64(40, true), c: view.getFloat64(48, true), d: view.getFloat64(56, true),
-    record: view.getInt32(64, true), token: view.getBigUint64(72, true), source: view.getUint32(68, true),
+    cancelable: (notification.aux & TOGGLE_DETAIL_CANCELABLE) !== 0,
+    oldState: TOGGLE_STATES.get(notification.aux & TOGGLE_DETAIL_STATE_MASK),
+    newState: TOGGLE_STATES.get((notification.aux >> TOGGLE_DETAIL_NEW_SHIFT) & TOGGLE_DETAIL_STATE_MASK),
+    source: core.wrapperFor(notification.related),
   };
 }
 
-function activationEvent(core, notification) {
-  const { code } = notification;
-  if (code === 15) {
-    return createEvent("submit", { bubbles: true, cancelable: true, submitter: core.wrapperFor(notification.related) });
-  }
-  let options;
-  if (code <= 4) {
-    options = { composed: true, relatedTarget: core.wrapperFor(notification.related) };
-    if (code === 2 || code === 4) options.bubbles = true;
-  } else if (code === 5) {
-    options = { bubbles: true, cancelable: true, detail: 1 };
-  } else if (code === 6) {
-    options = { bubbles: true, composed: true, inputType: null, data: null };
-  } else if (code === 7) {
-    options = { bubbles: true };
-  } else {
-    throw new Error(`Unknown native activation event ${code}`);
-  }
-  return createEvent(ACTIVATION_EVENTS[code], options);
+// A task of the core's top layer task queue (a queue task notification,
+// or a details toggle task of details.watpart): the task runs on the
+// document's task queue and asks the core whether it fires.
+export function queueTopLayerTask(core, element, token) {
+  documentScripts(nodeMember(element, "ownerDocument")).queueTask(() => {
+    const kind = core.status("top_layer_task_claim", token);
+    if (kind === 0) return;
+    const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), TOP_LAYER_CLAIM.SIZE);
+    const target = core.wrapperFor(view.getBigUint64(TOP_LAYER_CLAIM.ELEMENT, true));
+    const source = core.wrapperFor(view.getBigUint64(TOP_LAYER_CLAIM.SOURCE, true));
+    if (kind === TOP_LAYER_TASK_TOGGLE) {
+      const oldState = TOGGLE_STATES.get(view.getUint32(TOP_LAYER_CLAIM.OLD_STATE, true));
+      const newState = TOGGLE_STATES.get(view.getUint32(TOP_LAYER_CLAIM.NEW_STATE, true));
+      dispatchEvent(target, createEvent("toggle", { oldState, newState, source }));
+    } else if (kind === TOP_LAYER_TASK_CLOSE) {
+      dispatchEvent(target, createEvent("close"));
+    } else {
+      throw new Error(`Unknown top layer task kind ${kind}`);
+    }
+  });
 }
 
-// Executes one notification; returns the outcome, 1 for a canceled event.
+// The notification of input-run.watpart, by WAT name.
+const NOTIFICATION = Object.freeze(Object.fromEntries(["SIZE", "KIND", "CODE", "FLAGS", "AUX", "TARGET", "RELATED", "A",
+  "B", "C", "D", "RECORD", "SOURCE", "TOKEN"].map((name) => [name, layoutConstant(`INPUT_NOTIFICATION_${name}`)])));
+
+function readNotification(core) {
+  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), NOTIFICATION.SIZE);
+  // Capture the borrowed record before resolving a wrapper can reenter the core.
+  return {
+    kind: view.getUint32(NOTIFICATION.KIND, true), code: view.getUint32(NOTIFICATION.CODE, true),
+    flags: view.getUint32(NOTIFICATION.FLAGS, true), aux: view.getUint32(NOTIFICATION.AUX, true),
+    target: view.getBigUint64(NOTIFICATION.TARGET, true), related: view.getBigUint64(NOTIFICATION.RELATED, true),
+    a: view.getFloat64(NOTIFICATION.A, true), b: view.getFloat64(NOTIFICATION.B, true),
+    c: view.getFloat64(NOTIFICATION.C, true), d: view.getFloat64(NOTIFICATION.D, true),
+    record: view.getInt32(NOTIFICATION.RECORD, true), token: view.getBigUint64(NOTIFICATION.TOKEN, true),
+    source: view.getUint32(NOTIFICATION.SOURCE, true),
+  };
+}
+
+// The Event object of an activation event notification. The clicks of a
+// click() run are synthetic: their isTrusted is false (HTML "fire a
+// synthetic pointer event" with the not trusted flag). A user's click is
+// trusted.
+function activationEvent(core, notification, syntheticClicks) {
+  const related = core.wrapperFor(notification.related);
+  switch (notification.code) {
+    case EVENT.BLUR: return createEvent("blur", { composed: true, relatedTarget: related });
+    case EVENT.FOCUSOUT: return createEvent("focusout", { bubbles: true, composed: true, relatedTarget: related });
+    case EVENT.FOCUS: return createEvent("focus", { composed: true, relatedTarget: related });
+    case EVENT.FOCUSIN: return createEvent("focusin", { bubbles: true, composed: true, relatedTarget: related });
+    // The core gives the click count of the press as notification a (1
+    // for a click without one; input-activation.watpart). A click is
+    // composed, as are the clicks of click() (HTML "fire a synthetic
+    // pointer event").
+    case EVENT.CLICK: return (syntheticClicks ? createSyntheticEvent : createEvent)("click", { bubbles: true, cancelable: true, composed: true, detail: notification.a });
+    case EVENT.INPUT: return createEvent("input", { bubbles: true, composed: true, inputType: null, data: null });
+    case EVENT.CHANGE: return createEvent("change", { bubbles: true });
+    case EVENT.SUBMIT: return createEvent("submit", { bubbles: true, cancelable: true, submitter: related });
+    case EVENT.BEFORETOGGLE: return createEvent("beforetoggle", toggleEventInit(core, notification));
+    case EVENT.CANCEL: return createEvent("cancel", { cancelable: (notification.aux & 1) !== 0 });
+    case EVENT.INVALID: return createEvent("invalid", { cancelable: true });
+    case EVENT.RESET: return createEvent("reset", { bubbles: true, cancelable: true });
+    // The key events of a fill are plain events, as Chrome fires them
+    // (core/dom/autofill.watpart).
+    case EVENT.AUTOFILL_KEYDOWN: return createEventUsing(SDEvent, "keydown", { bubbles: true });
+    case EVENT.AUTOFILL_KEYUP: return createEventUsing(SDEvent, "keyup", { bubbles: true });
+    default: throw new Error(`Unknown native activation event ${notification.code}`);
+  }
+
+}
+
+// Executes one notification; returns its INPUT_OUTCOME.
 // `host` answers what only an input batch's host knows: its events, the
 // scroll owner's surface, the clipboard text and the record hooks.
 function executeNotification(core, notification, host) {
   const { kind, code } = notification;
-  if (kind === 1) {
-    if (notification.source === 0) return host.batchEvent(notification);
+  if (kind === NOTIFY.EVENT) {
+    if (notification.source === SOURCE_BATCH) return host.batchEvent(notification);
     const target = core.wrapperFor(notification.target);
-    return dispatchEvent(target, activationEvent(core, notification)) ? 0 : 1;
+    const event = activationEvent(core, notification, host.syntheticClicks === true);
+    return dispatchEvent(target, event) ? INPUT_OUTCOME.DONE : INPUT_OUTCOME.CANCELED;
   }
-  if (kind === 2) {
+  if (kind === NOTIFY.STATE) {
     const target = core.wrapperFor(notification.target);
-    if (code >= 1 && code <= 5) {
+    if (STATE_NAMES.has(code)) {
       // The core invalidated the style that the state affects.
-      target._notifyMutation("state", code === 3 && notification.a ? "focus-within" : STATES[code], null, true);
-    } else if (code === 6) {
+      target._notifyMutation("state", code === STATE.FOCUS && notification.a ? "focus-within" : STATE_NAMES.get(code));
+    } else if (code === STATE.VALUE_EDITED) {
       controlValueEdited(target, Boolean(notification.a), Boolean(notification.b));
       host.valueEdited?.(notification);
-    } else if (code === 7) {
+    } else if (code === STATE.SELECTION_SET) {
       controlSelectionSet(target);
-    } else if (code === 8) {
+    } else if (code === STATE.DOCUMENT_SELECTION) {
       core.wrapperFor(notification.related).getSelection()._onChange(target);
-    } else if (code === 9) {
+    } else if (code === STATE.SCROLLED) {
       host.scrolled(notification);
-    } else if (code === 10) {
-      target._deliverToggledAttribute(Boolean(notification.a));
-    } else if (code === 11) {
+    } else if (code === STATE.DETAILS_OPEN) {
+      target._deliverToggledAttribute();
+    } else if (code === STATE.CONTENT_EDITED) {
+      // The core edited the content of the editing host: its tree and text
+      // records reach the facade as the DOM methods' do.
+      target._dispatchCoreTreeRecords();
+    } else if (code === STATE.SELECTION_QUEUED) {
       controlSelectionQueued(target);
+    } else if (code === STATE.TOP_LAYER) {
+      // The core changed the element's top layer state (:modal, the top
+      // layer) and invalidated its style.
+      target._notifyMutation("state", "modal");
+    } else if (code === STATE.VALIDITY) {
+      host.validity(notification);
     } else {
       throw new Error(`Unknown native input state ${code}`);
     }
-    return 0;
+    return INPUT_OUTCOME.DONE;
   }
-  if (kind === 3) {
-    if (code === 1) {
+  if (kind === NOTIFY.EFFECT) {
+    if (code === EFFECT_CLIPBOARD) {
       host.clipboard(notification);
-    } else if (code === 2) {
-      // The submission reached navigation, which Sandom does not
-      // perform: the document stays as it is, and says so.
-      const detail = Object.freeze({ submitter: core.wrapperFor(notification.related) });
-      dispatchEvent(core.wrapperFor(notification.target), createEvent("sandom-form-submission", { bubbles: true, composed: true, detail }));
+    } else if (code === EFFECT_FORM_ENTRY_LIST) {
+      giveSubmissionEntries(core.wrapperFor(notification.target), core.wrapperFor(notification.related));
+    } else if (code === EFFECT_FORM_NAVIGATION) {
+      queueFormNavigation(core.wrapperFor(notification.target), notification.a);
+    } else if (code === EFFECT_TOP_LAYER_TASK) {
+      queueTopLayerTask(core, core.wrapperFor(notification.target), BigInt(notification.a));
+    } else if (code === EFFECT_RESET_OUTPUT) {
+      resetOutput(core.wrapperFor(notification.target));
+    } else if (code === EFFECT_SCROLL_INTO_VIEW) {
+      core.wrapperFor(notification.target).scrollIntoView({ block: "nearest", inline: "nearest" });
+    } else if (code === EFFECT_FIELD_MENU) {
+      host.fieldMenu(notification);
+    } else if (code === EFFECT_RESIZE) {
+      // A drag of a textarea's resize handle (core/dom/textarea-resize.watpart)
+      // writes the box's size in its style attribute, as Chrome does.
+      const target = core.wrapperFor(notification.target);
+      if (Number.isFinite(notification.a)) target.style.width = `${notification.a}px`;
+      if (Number.isFinite(notification.b)) target.style.height = `${notification.b}px`;
+    } else if (code === EFFECT_EYEDROPPER) {
+      host.eyedropper(notification);
     } else {
       throw new Error(`Unknown native host effect ${code}`);
     }
-    return 0;
+    return INPUT_OUTCOME.DONE;
   }
-  if (kind === 4) {
+  if (kind === NOTIFY.RECORD_HOOK) {
     host.recordHook(notification);
-    return 0;
+    return INPUT_OUTCOME.DONE;
   }
   throw new Error(`Unknown native input notification ${kind}`);
 }
 
+// Reads the run's next notification, or null at its end. A run opens no
+// custom element reaction scope: the reactions that a step enqueues (a
+// form reset's formResetCallback) go to the scope of the [CEReactions]
+// method that started the run, or else to the backup element queue, and
+// so no callback reenters the core while the run holds a notification.
+function nextNotification(core, run) {
+  return core.status("input_run_next", run) ? readNotification(core) : null;
+}
+
 // Drives run `run` to its end and releases it. A host exception resumes
-// the notification with outcome 2, which ends the run, and is rethrown.
+// the notification with INPUT_OUTCOME.FAILED, which ends the run, and is
+// rethrown.
 export function executeInputRun(core, run, host) {
   try {
-    while (inputInvoke(core, "input_run_next", run)) {
-      const notification = readNotification(core);
+    for (let notification; (notification = nextNotification(core, run));) {
+      // A step of the run that changed a select's selection updated its
+      // selectedcontent: its records reach the facade before the next
+      // notification, an input or change event among them, runs.
+      core.deliverSelectedContent();
       let outcome;
       try {
         outcome = executeNotification(core, notification, host);
       } catch (error) {
-        try { inputInvoke(core, "input_run_resume", run, notification.token, 2); } catch { /* Preserve the original listener/host exception. */ }
+        try { core.status("input_run_resume", run, notification.token, INPUT_OUTCOME.FAILED); } catch { /* Preserve the original listener/host exception. */ }
         throw error;
       }
-      inputInvoke(core, "input_run_resume", run, notification.token, outcome);
+      core.status("input_run_resume", run, notification.token, outcome);
     }
+    core.deliverSelectedContent();
   } finally {
     // Release keeps an active native error for the throw above.
     core.exports.input_run_release(run);
@@ -141,8 +266,14 @@ const activationHost = {
   batchEvent() { throw new Error("An activation run has no input batch event"); },
   scrolled() { throw new Error("An activation run does not scroll"); },
   clipboard() { throw new Error("An activation run has no clipboard text"); },
+  fieldMenu() { throw new Error("An activation run has no context menu"); },
+  eyedropper() { throw new Error("An activation run has no colour picker eyedropper"); },
   recordHook() { throw new Error("An activation run has no input records"); },
+  validity() { throw new Error("An activation run has no validity result"); },
 };
+
+// The run of click(): the clicks it fires are synthetic.
+const clickMethodHost = { ...activationHost, syntheticClicks: true };
 
 export function executeActivationRun(core, run) {
   executeInputRun(core, run, activationHost);
@@ -150,7 +281,28 @@ export function executeActivationRun(core, run) {
 
 export function runInputActivation(node, operation) {
   const core = node._domCore;
-  executeInputRun(core, inputInvoke(core, "input_run_activation_begin", node._coreHandle, operation), activationHost);
+  executeInputRun(core, core.status("input_run_activation_begin", node._coreHandle, operation, activationClock(node)),
+    operation === INPUT_ACTIVATION_CLICK ? clickMethodHost : activationHost);
+}
+
+// The host gives document system focus or takes it away
+// (core/dom/input-activation.watpart, $inputActivationSystemFocus).
+export function setSystemFocus(document, focused) {
+  runInputActivation(document, focused ? INPUT_ACTIVATION_SYSTEM_FOCUS : INPUT_ACTIVATION_SYSTEM_BLUR);
+}
+
+// checkValidity() and reportValidity() of an element or a form
+// (core/dom/constraint-validation.watpart): the run fires the invalid
+// events that the core requests and ends with the core's result.
+export function runValidation(node, operation) {
+  const core = node._domCore;
+  let result = null;
+  executeInputRun(core, core.status("input_run_activation_begin", node._coreHandle, operation, activationClock(node)), {
+    ...activationHost,
+    validity(notification) { result = notification.aux === 1; },
+  });
+  if (result === null) throw new Error("The validation run ended without its result");
+  return result;
 }
 
 // Runs `operation` with the geometry snapshot `handle` as the focus
@@ -189,7 +341,7 @@ function focusFixupTarget(document) {
     core.wrapperFor(core.handle("input_focus_fixup", document._coreHandle)));
 }
 export function scheduleFocusFixup(root) {
-  const document = root.ownerDocument ?? root;
+  const document = nodeMember(root, "ownerDocument") ?? root;
   if (pendingFocusFixups.has(document) || focusFixupTarget(document) === null) return;
   pendingFocusFixups.add(document);
   // The document's own task queue, where its page timers run: the blur
@@ -197,24 +349,25 @@ export function scheduleFocusFixup(root) {
   documentScripts(document).queueTask(() => {
     pendingFocusFixups.delete(document);
     const focused = focusFixupTarget(document);
-    if (focused !== null) runInputActivation(focused, 2);
+    if (focused !== null) runInputActivation(focused, INPUT_ACTIVATION_BLUR);
   });
 }
 
 // Chrome's focus check inside an attribute change
 // (input_focus_attribute_check): it blurs the focused element at once
-// when it is no longer a focusable area (1) or unconditionally (3), or
-// queues the focus fixup (2).
+// when it is no longer a focusable area (FOCUS_CHECK_NOW) or
+// unconditionally (FOCUS_CHECK_BLUR), or queues the focus fixup
+// (FOCUS_CHECK_QUEUE).
 export function focusAttributeChanged(element, name) {
   const core = element._domCore;
   const action = core.status("input_focus_attribute_check", element._coreHandle, ...core.input(String(name)));
-  if (action === 1) {
-    const focused = focusFixupTarget(element.ownerDocument);
-    if (focused !== null) runInputActivation(focused, 2);
-  } else if (action === 2) {
+  if (action === FOCUS_CHECK_NOW) {
+    const focused = focusFixupTarget(nodeMember(element, "ownerDocument"));
+    if (focused !== null) runInputActivation(focused, INPUT_ACTIVATION_BLUR);
+  } else if (action === FOCUS_CHECK_QUEUE) {
     scheduleFocusFixup(element);
-  } else if (action === 3) {
-    runInputActivation(element, 2);
+  } else if (action === FOCUS_CHECK_BLUR) {
+    runInputActivation(element, INPUT_ACTIVATION_BLUR);
   }
 }
 
@@ -224,7 +377,7 @@ export function focusAttributeChanged(element, name) {
 export function blurBeforeRemoval(node, childrenOnly = false) {
   const core = node._domCore;
   const focused = core.wrapperFor(core.handle("input_focus_removal", node._coreHandle, childrenOnly ? 1 : 0));
-  if (focused !== null) runInputActivation(focused, 2);
+  if (focused !== null) runInputActivation(focused, INPUT_ACTIVATION_BLUR);
 }
 
 // HTMLFormElement.requestSubmit: a submitter must be a submit button whose
@@ -239,5 +392,5 @@ export function requestSubmit(form, submitter = null) {
       throw new DOMException("requestSubmit: the submitter is not owned by this form", "NotFoundError");
     }
   }
-  runInputActivation(submitter ?? form, 4);
+  runInputActivation(submitter ?? form, INPUT_ACTIVATION_REQUEST_SUBMIT);
 }

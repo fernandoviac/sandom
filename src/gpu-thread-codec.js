@@ -96,14 +96,23 @@ export function gpuErrorRecord(error) {
     reason: error.reason, stack: error.stack };
 }
 
+// The synchronous reply buffer that the GPU thread writes and the
+// requesting thread waits on: i32 control words (GPU_REPLY.READY, 1 when
+// the reply is written; GPU_REPLY.LENGTH, its UTF-8 byte length), then the
+// reply's JSON text from GPU_REPLY.TEXT. Both sides are JavaScript, so this
+// module owns the layout.
+export const GPU_REPLY = Object.freeze({ CONTROL_WORDS: 4, READY: 0, LENGTH: 1, TEXT: 16 });
+
+// Browsers encode and decode text only in memory that is not shared, so the
+// text passes through an unshared copy on both sides.
 export function writeGpuReply(memory, value) {
-  const text = JSON.stringify(value);
-  const length = 16 + text.length * 3;
+  const bytes = textEncoder.encode(JSON.stringify(value));
+  const length = GPU_REPLY.TEXT + bytes.length;
   if (length > memory.byteLength) memory.grow(length);
-  const destination = new Uint8Array(memory, 16);
-  const { written } = textEncoder.encodeInto(text, destination);
-  const control = new Int32Array(memory, 0, 4);
-  Atomics.store(control, 1, written);
-  Atomics.store(control, 0, 1);
-  Atomics.notify(control, 0);
+  new Uint8Array(memory, GPU_REPLY.TEXT, bytes.length).set(bytes);
+  const written = bytes.length;
+  const control = new Int32Array(memory, 0, GPU_REPLY.CONTROL_WORDS);
+  Atomics.store(control, GPU_REPLY.LENGTH, written);
+  Atomics.store(control, GPU_REPLY.READY, 1);
+  Atomics.notify(control, GPU_REPLY.READY);
 }

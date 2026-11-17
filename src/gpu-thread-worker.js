@@ -13,6 +13,7 @@ let provider = null;
 let providerOptions = null;
 let rootHandle = 0;
 let closed = false;
+let terminalError = null;
 
 function resource(handle) {
   if (!objects.has(handle)) throw new Error(`GPU-thread handle ${handle} is absent`);
@@ -107,10 +108,37 @@ function flushMappedRanges(handle, discard) {
   }
   mappedRanges.delete(handle);
 }
+// Runs calls that the script thread queued without waiting for replies, in
+// order. Objects they create take the handles that the script thread
+// allocated. A queued call has no reply to fail, so its error ends the binding.
+function runQueued(requests) {
+  for (const request of requests) {
+    try {
+      const target = resource(request.target);
+      if (typeof target[request.member] !== 'function') throw unsupported(request.interfaceName, request.member);
+      const value = Reflect.apply(target[request.member], target, decodeGpuValue(request.arguments, resource));
+      if (request.resultType !== 'value') describe(value, request);
+    } catch (cause) {
+      terminalFailure(new Error(`Queued ${request.interfaceName}.${request.member} failed on the GPU thread: ${cause?.message ?? cause}`, { cause }));
+      return;
+    }
+  }
+}
 function dispatch(request) {
+  // A browser worker's requests come over the port of its script thread,
+  // which delivers them while that thread waits (src/gpu-thread.js).
+  if (request.kind === 'attach') {
+    request.port.onmessage = ({ data }) => dispatch(data);
+    request.port.onmessageerror = () => terminalFailure(new Error('A GPU-thread request could not be decoded'));
+    return;
+  }
+  if (request.kind === 'batch') {
+    if (!closed) runQueued(request.requests);
+    return;
+  }
   if (request.replyMemory) synchronousReplies.add(request.replyMemory);
   try {
-    if (closed) throw new Error('GPU-thread binding is closed');
+    if (closed) throw terminalError ?? new Error('GPU-thread binding is closed');
     if (request.kind === 'boot') {
       const initialize = async () => {
         if (request.gpuModule !== null) await import(request.gpuModule);
@@ -132,8 +160,12 @@ function dispatch(request) {
     if (request.kind === 'close') {
       const losses = [...devices].map((device) => { device.destroy(); return device.lost; });
       Promise.all(losses).then(() => {
-        objects.clear(); mappedRanges.clear(); closed = true;
+        objects.clear(); mappedRanges.clear(); devices.clear(); closed = true;
         success(request, undefined);
+        // Deno's node:worker_threads parentPort has no close method; its
+        // worker realm exposes the native WorkerGlobalScope.close instead.
+        if (typeof Deno !== 'undefined' || parentPort === null) globalThis.close();
+        else parentPort.close();
       }, (error) => failure(request, error));
       return;
     }
@@ -143,6 +175,21 @@ function dispatch(request) {
       let ranges = mappedRanges.get(request.target);
       if (!ranges) mappedRanges.set(request.target, ranges = []);
       ranges.push({ handle: request.range, shared: request.shared, write: request.write });
+      success(request, undefined);
+      return;
+    }
+    // A presenter's host canvas, transferred here so that it presents from
+    // the device that renders (src/canvas-presentation.js).
+    if (request.kind === 'adopt-canvas') {
+      const context = request.canvas.getContext('webgpu');
+      if (context === null) throw new TypeError('The adopted canvas gives no WebGPU context; transfer a canvas without a context');
+      success(request, context);
+      return;
+    }
+    if (request.kind === 'size-canvas') {
+      const canvas = resource(request.target).canvas;
+      if (canvas.width !== request.width) canvas.width = request.width;
+      if (canvas.height !== request.height) canvas.height = request.height;
       success(request, undefined);
       return;
     }
@@ -191,6 +238,7 @@ if (parentPort) parentPort.on('message', dispatch);
 else globalThis.onmessage = ({ data }) => dispatch(data);
 function terminalFailure(error) {
   closed = true;
+  terminalError = error;
   const value = { success: false, error: gpuErrorRecord(error) };
   for (const memory of synchronousReplies) writeGpuReply(memory, value);
   synchronousReplies.clear();

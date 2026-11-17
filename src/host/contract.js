@@ -412,23 +412,39 @@ function missingCapability(capability, subject) {
   );
 }
 
-// A host for a pure Document Object Model tree. Its first external demand
-// fails with a typed host-capability error.
+// A host for a pure Document Object Model tree. It serves data: locators,
+// whose bytes the locator itself holds; its first external demand fails
+// with a typed host-capability error. The data: provider imports this
+// module, so the host loads it on its first data: demand.
+const dataURLProvider = () => import("./data-url.js");
 export function createNoResourceHost() {
   return Object.freeze({
     backend: "no-resource",
     openResourceSession() {
       return Object.freeze({
         request(demand) {
-          return Promise.reject(missingCapability(
-            "resource",
-            `the ${demand.destination} demand ${JSON.stringify(demand.reference)} against ${demand.baseURL} has no provider`,
-          ));
+          return Promise.try(() => {
+            const requestedURL = resolveDemandURL(demand);
+            if (requestedURL.protocol === "data:") {
+              return dataURLProvider().then(({ dataURLResponse }) => dataURLResponse(requestedURL.href));
+            }
+            throw missingCapability(
+              "resource",
+              `the ${demand.destination} demand ${JSON.stringify(demand.reference)} against ${demand.baseURL} has no provider`,
+            );
+          });
         },
         fetch(input) {
-          return Promise.reject(
-            missingCapability("script fetch", `fetch(${JSON.stringify(String(input?.url ?? input))}) has no provider`),
-          );
+          return Promise.try(() => {
+            const locator = String(input?.url ?? input);
+            if (locator.startsWith("data:")) {
+              return dataURLProvider().then(({ dataURLResponse }) => {
+                const response = dataURLResponse(locator);
+                return new Response(response.body, { headers: { "content-type": response.mediaType } });
+              });
+            }
+            throw missingCapability("script fetch", `fetch(${JSON.stringify(locator)}) has no provider`);
+          });
         },
         release() {},
       });

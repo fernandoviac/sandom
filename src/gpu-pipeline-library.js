@@ -1,5 +1,5 @@
 // The shared pipeline library binding. Renderer-core
-// (src/wasm/gpu-pipelines.watpart) records the shader modules, pipeline
+// (core/engine/gpu-pipelines.watpart) records the shader modules, pipeline
 // descriptors, blend states, vertex layouts, the unit quad, and the
 // placeholder texture of one device and color format. This module composes
 // the WGSL sources, reports compilation errors, and answers record 17
@@ -8,8 +8,12 @@ import { createGpuBinding } from "./gpu-binding.js";
 import { composeShaderBytes } from "./shaders/compose.js";
 import { PIPELINE_LIBRARY_SHADERS, SHADER_CONSTANTS } from "./shaders/constants.js";
 import { instantiateRendererCore } from "./wasm/renderer-core-binary.js";
+import { layoutConstant } from "./wasm/layout-table.js";
 
 const FORMATS = ["rgba8unorm", "rgba16float"];
+// The shader source rows of gpu-pipelines.watpart, by WAT name.
+const GPU_PIPELINE_SOURCE = Object.freeze(Object.fromEntries(["SIZE", "POINTER", "LENGTH"]
+  .map((name) => [name, layoutConstant(`GPU_PIPELINE_SOURCE_${name}`)])));
 const decoder = new TextDecoder();
 let libraryCore;
 
@@ -24,10 +28,10 @@ export async function createGpuPipelineLibrary(device, colorFormat) {
     name,
     ...composeShaderBytes(core, name, { ...SHADER_CONSTANTS, ...variant }),
   }));
-  const table = gpu.input(sources.length * 8);
+  const table = gpu.input(sources.length * GPU_PIPELINE_SOURCE.SIZE);
   sources.forEach((source, index) => {
-    table.setUint32(index * 8, source.pointer, true);
-    table.setUint32(index * 8 + 4, source.length, true);
+    table.setUint32(index * GPU_PIPELINE_SOURCE.SIZE + GPU_PIPELINE_SOURCE.POINTER, source.pointer, true);
+    table.setUint32(index * GPU_PIPELINE_SOURCE.SIZE + GPU_PIPELINE_SOURCE.LENGTH, source.length, true);
   });
   const state = core.gpu_pipeline_library_create(gpu.stream, format, table.byteOffset);
   gpu.execute();

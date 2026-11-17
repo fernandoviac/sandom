@@ -4,6 +4,16 @@ import { createRenderContext, render } from './rasterize.js';
 import { createWebgl2ColorGlyphCachePage } from './rasterize-webgl2.js';
 import { releaseRasterPlan } from './raster-plan.js';
 import { createGpuBinding } from './gpu-binding.js';
+import { layoutConstant } from './wasm/layout-table.js';
+
+// The cache, frame, page, device and rectangle fields of
+// gpu-color-glyph.watpart, by WAT name.
+const COLOR = Object.freeze(Object.fromEntries([
+  'CACHE_ERROR', 'CACHE_OBSERVED', 'CACHE_LIMIT', 'FRAME_GENERATION', 'PAGE_INDEX', 'PAGE_WIDTH', 'PAGE_HEIGHT',
+  'DEVICE_FLAGS', 'DEVICE_SCRATCH_WIDTH', 'DEVICE_SCRATCH_HEIGHT', 'DEVICE_RECTANGLE_COUNT', 'DEVICE_RECTANGLES',
+  'DEVICE_COMMANDS', 'DEVICE_COMMANDS_LENGTH', 'RECTANGLE_SIZE', 'RECTANGLE_X', 'RECTANGLE_Y', 'RECTANGLE_WIDTH',
+  'RECTANGLE_HEIGHT', 'DEVICE_NEW_PAGE', 'DEVICE_SCRATCH_GROWN',
+].map((name) => [name, layoutConstant(`COLOR_${name}`)])));
 
 const TRANSPARENT = Object.freeze({ r: 0, g: 0, b: 0, a: 0 });
 
@@ -25,9 +35,9 @@ export function createColorGlyphCache({ engine, graphicsStateOwner, pathAtlas,
     }
     try {
       const frame = native.gpu_color_prepare(cache, input, bytes, deviceScale);
-      const error = unsigned(cache + 44);
-      if (error) throw new Error(`Native color glyph cache error ${error}: observed ${unsigned(cache + 48)}, limit ${unsigned(cache + 52)}; supply a complete command stream and a frame within the eight-page cache limit`);
-      return frame ? { handle: frame, generation: unsigned(frame + 12), deviceScale } : null;
+      const error = unsigned(cache + COLOR.CACHE_ERROR);
+      if (error) throw new Error(`Native color glyph cache error ${error}: observed ${unsigned(cache + COLOR.CACHE_OBSERVED)}, limit ${unsigned(cache + COLOR.CACHE_LIMIT)}; supply a complete command stream and a frame within the eight-page cache limit`);
+      return frame ? { handle: frame, generation: unsigned(frame + COLOR.FRAME_GENERATION), deviceScale } : null;
     } finally { if (allocation) native.abi_free(allocation); }
   }
 
@@ -65,20 +75,20 @@ export function createColorGlyphCache({ engine, graphicsStateOwner, pathAtlas,
     await retire();
     let pagePointer;
     while ((pagePointer = native.gpu_color_next(handle, frame.handle)) !== 0) {
-      const pageNumber = unsigned(pagePointer + 4);
-      const width = unsigned(pagePointer + 8);
-      const height = unsigned(pagePointer + 12);
-      const flags = unsigned(handle + 28);
-      if (flags & 2) {
+      const pageNumber = unsigned(pagePointer + COLOR.PAGE_INDEX);
+      const width = unsigned(pagePointer + COLOR.PAGE_WIDTH);
+      const height = unsigned(pagePointer + COLOR.PAGE_HEIGHT);
+      const flags = unsigned(handle + COLOR.DEVICE_FLAGS);
+      if (flags & COLOR.DEVICE_SCRATCH_GROWN) {
         if (state.scratch) await state.scratch.destroy();
         state.scratch = await createRenderContext({
-          width: unsigned(handle + 32), height: unsigned(handle + 36),
+          width: unsigned(handle + COLOR.DEVICE_SCRATCH_WIDTH), height: unsigned(handle + COLOR.DEVICE_SCRATCH_HEIGHT),
           graphicsBackend: context.kind, sharedStateOwner: graphicsStateOwner,
           renderMode: context.renderMode, renderPrecision: context.renderPrecision,
         });
       }
-      const pointer = unsigned(handle + 112);
-      const length = unsigned(handle + 116);
+      const pointer = unsigned(handle + COLOR.DEVICE_COMMANDS);
+      const length = unsigned(handle + COLOR.DEVICE_COMMANDS_LENGTH);
       if (length) {
         const stream = new DataView(new Uint8Array(engine.memory.buffer, pointer, length).slice().buffer);
         const { ensures } = svgPathEnsures(stream, length, frame.deviceScale);
@@ -101,24 +111,24 @@ export function createColorGlyphCache({ engine, graphicsStateOwner, pathAtlas,
         state.binding.beginFrame();
         const texture = native.gpu_color_copy(handle, state.binding.stream, state.binding.importResource(state.scratch.mainTexture));
         state.binding.execute();
-        if (flags & 1) {
+        if (flags & COLOR.DEVICE_NEW_PAGE) {
           page = { image: { kind: 'color-glyph-cache-page', width, height, texture: state.binding.resource(texture) } };
           state.pages.set(pageNumber, page);
         }
       } else {
         native.gpu_color_copy(handle, 0, 0);
-        if (flags & 1) {
+        if (flags & COLOR.DEVICE_NEW_PAGE) {
           const gpu = createWebgl2ColorGlyphCachePage(context, width, height);
           page = { gpu, image: { kind: 'color-glyph-cache-page', width, height, texture: gpu.texture } };
           state.pages.set(pageNumber, page);
         }
-        const rectangles = unsigned(handle + 48);
-        const count = unsigned(handle + 44);
+        const rectangles = unsigned(handle + COLOR.DEVICE_RECTANGLES);
+        const count = unsigned(handle + COLOR.DEVICE_RECTANGLE_COUNT);
         const view = new DataView(engine.memory.buffer);
         page.gpu.copyFrom(state.scratch, Array.from({ length: count }, (_, index) => {
-          const row = rectangles + index * 32;
-          return { x: view.getUint32(row + 8, true), y: view.getUint32(row + 12, true),
-            width: view.getUint32(row + 16, true), height: view.getUint32(row + 20, true) };
+          const row = rectangles + index * COLOR.RECTANGLE_SIZE;
+          return { x: view.getUint32(row + COLOR.RECTANGLE_X, true), y: view.getUint32(row + COLOR.RECTANGLE_Y, true),
+            width: view.getUint32(row + COLOR.RECTANGLE_WIDTH, true), height: view.getUint32(row + COLOR.RECTANGLE_HEIGHT, true) };
         }));
       }
       native.gpu_color_commit(handle);

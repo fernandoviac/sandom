@@ -88,11 +88,11 @@ export function enterDocumentRealm(document, installTasks, reportRejection) {
     if (typeof session.trackUnhandledRejections !== "function" && typeof RealmPromiseRejectionEvent === "function") {
       const windowDispatchEvent = globalObject.dispatchEvent;
       globalObject.dispatchEvent = function dispatchEvent(event) {
-        if (event instanceof RealmPromiseRejectionEvent && event.type === "unhandledrejection") {
+        if ((this ?? globalObject) === globalObject && event instanceof RealmPromiseRejectionEvent && event.type === "unhandledrejection") {
           onUnhandledRejection(event);
           return false;
         }
-        return Reflect.apply(windowDispatchEvent, this, [event]);
+        return Reflect.apply(windowDispatchEvent, this, arguments);
       };
     }
     installWindowEventHandlers(globalObject, { replace: true });

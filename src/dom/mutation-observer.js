@@ -1,5 +1,17 @@
 import { createMutationObserverClass } from "./dom-bindings.generated.js";
 import { enterComponentCode } from "./component-code.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+
+const OBSERVER_MUTATION = layoutConstant("OBSERVER_MUTATION");
+
+// The queue node of observers.watpart and the callback record it holds
+// (records.watpart), by WAT name.
+const OBSERVER_QUEUED = Object.freeze(Object.fromEntries(["SIZE", "NEXT", "OLD_PRESENT", "RECORD", "NAMESPACE",
+  "NAMESPACE_LENGTH"].map((name) => [name, layoutConstant(`OBSERVER_QUEUED_${name}`)])));
+const CALLBACK_FIELD = Object.freeze(Object.fromEntries(["KIND", "TARGET", "RELATED_A", "RELATED_B", "PREVIOUS", "NEXT",
+  "NAME_POINTER", "NAME_LENGTH", "OLD_VALUE_POINTER", "OLD_VALUE_LENGTH"]
+  .map((name) => [name, layoutConstant(`CALLBACK_FIELD_${name}`)])));
+const CALLBACK_RECORD_ATTRIBUTES = layoutConstant("CALLBACK_RECORD_ATTRIBUTES");
 
 function normalizeOptions(options) {
   return {
@@ -43,6 +55,7 @@ export class MutationRecord {
     Object.freeze(this);
   }
 }
+Object.defineProperty(MutationRecord.prototype, Symbol.toStringTag, { value: "MutationRecord", configurable: true });
 
 // JavaScript retains wrapper and callback identity; queued records and every
 // checkpoint/drain decision are owned by the core.
@@ -52,7 +65,7 @@ class MutationObserverRuntime {
     this._document = document;
     this._ownerHandle = document._coreHandle;
     this._id = this._core.registerObserver(this);
-    this._core.status("observer_create", this._id, this._ownerHandle, 0);
+    this._core.status("observer_create", this._id, this._ownerHandle, OBSERVER_MUTATION);
     this._callback = callback;
     this._targets = new Set();
   }
@@ -71,7 +84,7 @@ class MutationObserverRuntime {
 
   _transportObserve(target, options) {
     this._core.observe(this._id, target._coreHandle, options);
-    this._core.observersById.set(this._id, this);
+    this._core.retainObserver(this);
     this._targets.add(target);
   }
 
@@ -108,27 +121,30 @@ function checkpointRecords(core, checkpoint, owner) {
   let pointer = core.status("observer_checkpoint_records", checkpoint, owner);
   const records = [];
   while (pointer) {
-    const view = new DataView(core.memory.buffer, pointer, 88);
-    const next = view.getUint32(0, true);
-    const hasOldValue = view.getUint32(4, true) !== 0;
-    const kind = view.getUint32(8, true);
-    const target = view.getBigUint64(16, true);
-    const added = view.getBigUint64(24, true);
-    const removed = view.getBigUint64(32, true);
-    const previous = view.getBigUint64(40, true);
-    const following = view.getBigUint64(48, true);
-    const stringAt = (offset) => {
+    const view = new DataView(core.memory.buffer, pointer, OBSERVER_QUEUED.SIZE);
+    const field = (name) => OBSERVER_QUEUED.RECORD + CALLBACK_FIELD[name];
+    const next = view.getUint32(OBSERVER_QUEUED.NEXT, true);
+    const hasOldValue = view.getUint32(OBSERVER_QUEUED.OLD_PRESENT, true) !== 0;
+    const kind = view.getUint32(field("KIND"), true);
+    const target = view.getBigUint64(field("TARGET"), true);
+    const added = view.getBigUint64(field("RELATED_A"), true);
+    const removed = view.getBigUint64(field("RELATED_B"), true);
+    const previous = view.getBigUint64(field("PREVIOUS"), true);
+    const following = view.getBigUint64(field("NEXT"), true);
+    const stringAt = (offset, lengthOffset) => {
       const start = view.getUint32(offset, true);
-      const length = view.getUint32(offset + 4, true);
+      const length = view.getUint32(lengthOffset, true);
       return core.decoder.decode(
         core.refreshBytes().subarray(start, start + length),
       );
     };
-    const attributeName = kind === 2 ? stringAt(56) : null;
-    const attributeNamespace = kind === 2 && view.getUint32(84, true)
-      ? stringAt(80)
+    const attributeName = kind === CALLBACK_RECORD_ATTRIBUTES
+      ? stringAt(field("NAME_POINTER"), field("NAME_LENGTH"))
       : null;
-    const oldValue = hasOldValue ? stringAt(64) : null;
+    const attributeNamespace = kind === CALLBACK_RECORD_ATTRIBUTES && view.getUint32(OBSERVER_QUEUED.NAMESPACE_LENGTH, true)
+      ? stringAt(OBSERVER_QUEUED.NAMESPACE, OBSERVER_QUEUED.NAMESPACE_LENGTH)
+      : null;
+    const oldValue = hasOldValue ? stringAt(field("OLD_VALUE_POINTER"), field("OLD_VALUE_LENGTH")) : null;
     // Decode all borrowed fields before wrapper creation can grow memory.
     records.push(
       new MutationRecord({
@@ -174,7 +190,7 @@ function deliverMutationCheckpoint(core, owner) {
       if (!id) break;
       token = core.status("observer_checkpoint_token", checkpoint, owner);
       const records = checkpointRecords(core, checkpoint, owner);
-      const observer = core.observersById.get(id);
+      const observer = core.observersById.get(id)?.deref();
       let outcome = 0;
       try {
         if (observer) {

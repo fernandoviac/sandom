@@ -1,3 +1,7 @@
+// canvas-presentation.js reads the host's navigator.gpu, HTMLCanvasElement
+// and OffscreenCanvas when it loads. It loads before installComponentGlobals
+// replaces them with the component's.
+import "../canvas-presentation.js";
 import { parseHTMLDocument } from "./html.js";
 import { installComponentGlobals } from "./component-globals.js";
 import { createSandomRuntime } from "../runtime.js";

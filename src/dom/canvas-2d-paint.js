@@ -7,7 +7,7 @@
 // a draw reads the paint as it is when the draw is made. It returns the
 // paint's definition as a Float32Array; its first word names the paint kind.
 // The core copies the words after the current transform into the draw's
-// paint block (src/wasm/canvas-2d-paint.watpart), which the rasterizer
+// paint block (core/engine/canvas-2d-paint.watpart), which the rasterizer
 // (src/shaders/canvas-raster.wgsl) evaluates. `context.addSource(source)` keeps a
 // texture or command-list source alive for the flush and returns its index in
 // the command list's sources, as drawImage() records its source.

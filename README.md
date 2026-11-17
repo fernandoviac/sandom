@@ -19,10 +19,10 @@ the same plain ES modules for Node and Bun hosts.
 
 ## Coverage
 
-Sandom is measured against Chrome: more than ninety maintained test files
-compare its layout boxes, pixels, glyph advances, computed styles, or event
-records with a pinned Chrome 151 build, and seeded fuzz corpora hold inline,
-flex, grid, table, and stacking layout to Chrome's boxes.
+Sandom is tested against the specifications: the Web Platform Tests run in
+Sandom, and the maintained tests derive layout boxes, colors, and reference
+pixels from the specification rules, with a stated reason for each value the
+specifications leave to the user agent.
 
 - **Documents and DOM:** an HTML parser with templates and declarative shadow
   DOM; a WebAssembly DOM core; shadow DOM, custom elements, observers,
@@ -244,7 +244,7 @@ import {
   bindProjectedInput,
   createCanvasPresenter,
   createRenderSurface,
-  createSceneRenderer,
+  openSceneRenderer,
   projectOntoRectangle,
 } from "sandom";
 
@@ -256,7 +256,7 @@ const surface = createRenderSurface(root, {
   viewportHeight: 400,
   deviceScale: devicePixelRatio,
   createPersistentRenderer: (options) =>
-    createSceneRenderer({ ...options, graphicsDevice: device }),
+    openSceneRenderer({ ...options, graphicsDevice: device }),
   presentFrame: (frame) => presenter.present(frame.textureImage),
 });
 await surface.renderNow(); // input needs a presented frame
@@ -428,5 +428,6 @@ defaults, and cross-document navigation are not implemented.
 ## Project status
 
 Sandom renders the documents described in Coverage, and its maintained tests
-hold that coverage to a pinned Chrome build. Unsupported records and invalid
-public inputs fail loudly instead of producing a partial result.
+hold that coverage to the specifications, the Web Platform Tests, and
+expectations calculated from them. Unsupported records and invalid public
+inputs fail loudly instead of producing a partial result.

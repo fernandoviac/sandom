@@ -1,17 +1,23 @@
-import { resolvedElementFields } from "./style.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 import { withScrollGeometry } from "./scroll-core.js";
 import { scrollbarColors } from "./scrollbar-paint.js";
+const SIDES = new Map([["BOTTOM", "bottom"], ["LEFT", "left"], ["RIGHT", "right"]]
+  .map(([name, side]) => [layoutConstant(`SCROLLBAR_SIDE_${name}`), side]));
+const SLOT = Object.freeze(Object.fromEntries(["VALUE", "MINIMUM", "MAXIMUM", "RANGE", "VIEWPORT_LENGTH", "SCROLL_LENGTH",
+  "THICKNESS", "TRACK", "THUMB", "CLIP", "HAS_CLIP", "AXIS", "SIDE", "RESIZER"].map((name) => [name, layoutConstant(`SCROLLBAR_SLOT_${name}`)])));
 function describe(core, record, element, viewport, root, style) {
   try {
     const value = (slot) => core.status("scrollbar_value", record, slot);
     const rectangle = (slot) => ({ x: value(slot), y: value(slot + 1), width: value(slot + 2), height: value(slot + 3) });
-    const axis = value(20);
     const isViewport = element === viewport;
     const owner = isViewport ? root : element;
-    // A vertical bar sits on the left of a right-to-left element scroller;
-    // the viewport's stays on the right (scroll.watpart $scrollbarBuild).
-    const side = !axis ? "bottom" : !isViewport && resolvedElementFields(element).direction === "rtl" ? "left" : "right";
-    return { element, orientation: axis ? "vertical" : "horizontal", value: value(0), minimum: value(1), maximum: value(2), range: value(3), viewportLength: value(4), scrollLength: value(5), thickness: value(6), track: rectangle(7), thumb: rectangle(11), side, colors: scrollbarColors(owner, isViewport, style), role: "scrollbar", ...(isViewport ? {} : { clip: value(19) ? rectangle(15) : null }) };
+    return {
+      element, orientation: value(SLOT.AXIS) ? "vertical" : "horizontal", value: value(SLOT.VALUE), minimum: value(SLOT.MINIMUM),
+      maximum: value(SLOT.MAXIMUM), range: value(SLOT.RANGE), viewportLength: value(SLOT.VIEWPORT_LENGTH),
+      scrollLength: value(SLOT.SCROLL_LENGTH), thickness: value(SLOT.THICKNESS), track: rectangle(SLOT.TRACK),
+      thumb: rectangle(SLOT.THUMB), side: SIDES.get(value(SLOT.SIDE)), resizer: value(SLOT.RESIZER), colors: scrollbarColors(owner, isViewport, style),
+      role: "scrollbar", ...(isViewport ? {} : { clip: value(SLOT.HAS_CLIP) ? rectangle(SLOT.CLIP) : null }),
+    };
   } finally { core.status("scrollbar_release", record); }
 }
 // Every scrollbar of a geometry snapshot (viewport first, then elements in

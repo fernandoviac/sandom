@@ -1,6 +1,6 @@
 import { createRenderSurface as createDOMRenderSurface } from "./render-surface.js";
 import { CustomElementRegistry } from "./custom-elements.js";
-import { markHostEventListener, normalizeListenerOptions } from "./events.js";
+import { markHostEventListener, normalizeListenerOptions, SDCustomEvent, SDEvent } from "./events.js";
 import { SDDocument } from "./node.js";
 import { isStyleDeclaration, supportsStyleProperty } from "./style.js";
 
@@ -315,8 +315,8 @@ export function createMothershipBackend({
       }
       return encode(
         custom
-          ? new CustomEvent(String(type), normalizedInit)
-          : new Event(String(type), normalizedInit),
+          ? new SDCustomEvent(String(type), normalizedInit)
+          : new SDEvent(String(type), normalizedInit),
       );
     },
     async readMember(resource, propertyName, { reactionContext = null } = {}) {

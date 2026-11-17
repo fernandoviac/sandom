@@ -127,6 +127,7 @@ function preparedDocument({
       return Object.freeze([
         ...document._styleSystem.resourceDiagnostics,
         ...document._brokenImageDiagnostics.values(),
+        ...document._fileChooserDiagnostics.values(),
         ...[...document._unanimatedPropertyDiagnostics.values()].flatMap((properties) => [...properties.values()]),
         ...mathmlDiagnostics(document),
         ...(document._scriptProcessing?.diagnostics ?? []),
@@ -152,6 +153,13 @@ function preparedDocument({
         await resources.release();
       } catch (error) {
         errors.push(...(error instanceof AggregateError ? error.errors : [error]));
+      }
+      // Each canvas context gives back its resource, so the image index
+      // the canvas holds returns to the table.
+      try {
+        await document._shutdownCanvasContexts();
+      } catch (error) {
+        errors.push(error);
       }
       // The document's nodes give back the resources they bind now, rather
       // than when the garbage collector finalizes the document, so a

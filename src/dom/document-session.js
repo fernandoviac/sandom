@@ -1,7 +1,7 @@
 import { hostNow } from "../host-clock.js";
 import {
   inspectAnimationPreparedInput,
-  inspectDocumentLayout,
+  inspectDocumentPaint,
   inspectPreparedInput,
   prepareRenderInput,
   renderPreparedInput,
@@ -14,11 +14,35 @@ import {
 } from "./render-surface.js";
 import { createSandomDOM } from "./sandom-dom.js";
 import { normalizeInputBatch } from "./interaction.js";
+import {
+  closeDocumentScope,
+  documentLogBytes,
+  documentLogEntries,
+  gateDocument,
+  loadDocumentLog,
+  logInteraction,
+  openDocumentScope,
+  replayDocumentLog,
+  withDocumentScope,
+} from "./document-operations.js";
 import { recommendViewportFromInspection } from "./viewport-recommendation.js";
-import { serializeToScene } from "./serialize.js";
-import { serializeSnapshotNode } from "./html.js";
+import {
+  captureDocumentMetrics,
+  captureDocumentPaint,
+  copyRasterArtifact,
+  captureDocumentRaster,
+  captureDocumentStructure,
+  inspectDocumentWorld,
+  loadDocumentMetrics,
+  readRasterArtifact,
+} from "./document-observation.js";
+import { compareObservations } from "./artifact-comparison.js";
+import { selectPaintRecord } from "./paint-projection.js";
 import { buildAccessibilitySnapshot } from "./accessibility.js";
 import { assertScrollbarStyle } from "./scrollbar-visibility.js";
+import { createRetainedInstance } from "./retained-transitions.js";
+import { readDocumentOutline } from "./document-outline.js";
+import { prepareSceneDocument } from "./serialize.js";
 
 const SESSION_STATE = new WeakMap();
 
@@ -51,45 +75,6 @@ function clonePreparedDocument(preparedInput) {
   return document;
 }
 
-// One closed change shape per mutation-record type. The change carries the
-// from and to values that the raw effect log needs for the edit loop. An
-// unknown record type is a programming error, not a skippable record.
-function normalizeMutationChange(node, record, identify) {
-  if (record === null || record === undefined) return null;
-  if (record.type === "attributes") {
-    const namespace = record.attributeNamespace ?? null;
-    const to = namespace === null
-      ? node.getAttribute?.(record.attributeName) ?? null
-      : node.getAttributeNS?.(namespace, record.attributeName) ?? null;
-    return Object.freeze({
-      type: "attribute",
-      attribute: record.attributeName,
-      namespace,
-      from: record.oldValue ?? null,
-      to,
-    });
-  }
-  if (record.type === "characterData") {
-    return Object.freeze({
-      type: "text",
-      from: record.oldValue ?? null,
-      to: node.data ?? null,
-    });
-  }
-  if (record.type === "childList") {
-    return Object.freeze({
-      type: "structure",
-      addedNodeIdentifiers: Object.freeze(
-        [...(record.addedNodes ?? [])].map(identify),
-      ),
-      removedNodeIdentifiers: Object.freeze(
-        [...(record.removedNodes ?? [])].map(identify),
-      ),
-    });
-  }
-  throw new RangeError(`Unknown mutation record type: ${record.type}`);
-}
-
 export class DocumentSession {
   // `scrollbarStyle` ("overlay" or "classic") is the style of every surface
   // and layout the session creates (design/scrollbars.md,
@@ -99,9 +84,8 @@ export class DocumentSession {
     if (!preparedInput?.document?.documentElement) {
       throw new TypeError("DocumentSession requires a prepared render input.");
     }
-    const containsCustomElement = [
-      ...preparedInput.document.querySelectorAll("*"),
-    ].some((element) => element._customElementState === "custom");
+    const document = preparedInput.document;
+    const containsCustomElement = document._domCore.status("custom_element_in_tree", document._coreHandle) === 1;
     const state = {
       preparedInput,
       // Undefined when the creator named no style: a request then reports
@@ -114,13 +98,15 @@ export class DocumentSession {
         : clonePreparedDocument(preparedInput),
       disposed: false,
       nextInstanceIdentifier: 2,
-      nextNodeIdentifier: 1,
       nextTargetIdentifier: 1,
       instances: new Map(),
       targets: new Map(),
-      nodeIdentifiers: new WeakMap(),
-      nodesByIdentifier: new Map(),
       operationChain: Promise.resolve(),
+      // The projections that the session captured and has not released.
+      projections: new Set(),
+      // The render surfaces of raster projections, by environment key,
+      // that no raster target registered first. They live until disposal.
+      projectionSurfaces: new Map(),
     };
     SESSION_STATE.set(this, state);
     this.#addInstance("instance-1", preparedInput.document);
@@ -163,7 +149,9 @@ export class DocumentSession {
     return identifier;
   }
 
-  mutate(operation, { instance = "instance-1" } = {}) {
+  // Runs `operation(document)` with the instance's origin scope open: the
+  // core logs each change with `origin` ("script", "agent" or "inspector").
+  mutate(operation, { instance = "instance-1", origin = "script" } = {}) {
     const state = requiredState(this);
     if (typeof operation !== "function") {
       throw new TypeError("mutate requires a function.");
@@ -172,11 +160,7 @@ export class DocumentSession {
     if (!current) {
       throw new RangeError(`Unknown document instance: ${instance}`);
     }
-    if (current.mutating) {
-      throw new Error("A document instance is already mutating.");
-    }
-    current.mutating = true;
-    try {
+    return withDocumentScope(current.document, origin, () => {
       const result = operation(current.document);
       if (result instanceof Promise) {
         throw new TypeError(
@@ -186,22 +170,153 @@ export class DocumentSession {
       current.revision += 1;
       current.worlds.clear();
       return result;
-    } finally {
-      current.mutating = false;
-    }
+    });
   }
 
-  // The ordered mutation-effect log of one instance. Each effect carries
-  // the mutation kind, the node identifier, the caller detail (for style
-  // effects, the property name), and a normalized change with from and to
-  // values. The edit loop consumes this log as the change ground truth.
-  mutationEffects(instance = "instance-1") {
-    const state = requiredState(this);
-    const current = state.instances.get(instance);
+  // A copy of the instance's document log
+  // (docs/design/dom-webassembly-core.md, "Document operation log").
+  documentLog(instance = "instance-1") {
+    return documentLogBytes(this.#instanceState(instance).document);
+  }
+
+  // Resolves to a new instance of the session's source with `log` replayed
+  // on it; its own log holds the same entries. `interact(document, record)`
+  // dispatches each input record of the log, and `present(document, time)`
+  // renders each frame of the log at its time.
+  async replay(log, { interact, present } = {}) {
+    const identifier = this.createInstance();
+    const current = this.#instanceState(identifier);
+    await replayDocumentLog(current.document, log, {
+      interact: interact && ((record) => interact(current.document, record)),
+      present: present && ((time) => present(current.document, time)),
+    });
+    current.revision += 1;
+    current.worlds.clear();
+    return identifier;
+  }
+
+  #instanceState(instance) {
+    const current = requiredState(this).instances.get(instance);
     if (!current) {
       throw new RangeError(`Unknown document instance: ${instance}`);
     }
-    return Object.freeze([...current.effects]);
+    return current;
+  }
+
+  // Queues one transition of a document instance and returns its handle at
+  // once (docs/design/component-rendering.md#retained-transitions).
+  // `applicator({ document }, context)` mutates the live document
+  // synchronously, or calls `context.deferSettlement()` and then `settle()`
+  // or `fail(error)`; document writes are open until the step ends. The
+  // transition renders nothing; completion arrives through
+  // `onPublished(revision)` or `onFailed(error)`. A document with custom
+  // elements takes transitions on its one instance.
+  transition(applicator, { instance = "instance-1", ...options } = {}) {
+    return this.#retainedInstance(instance).transition(applicator, options);
+  }
+
+  // Queues a reset of a document instance: its document is replaced by a
+  // clone of the prepared source. Completion arrives through
+  // `onReady(revision)` or `onFailed(error)`.
+  reset({ instance = "instance-1", ...options } = {}) {
+    return this.#retainedInstance(instance).reset(options);
+  }
+
+  // The published revision of a document instance.
+  revision(instance = "instance-1") {
+    return this.#retainedInstance(instance).revision;
+  }
+
+  // Throws unless `revisionHandle` names the published revision of the
+  // document instance.
+  requireCurrentRevision(revisionHandle, { instance = "instance-1" } = {}) {
+    this.#retainedInstance(instance).requireCurrentRevision(revisionHandle);
+  }
+
+  // Names what a projection observes in a document instance: the document
+  // (no address), the subtree of the one node that `address` resolves to,
+  // or the compositing layer at paint group index `layer` (a raster only).
+  // Returns { handle, release() }.
+  select({ address, layer, instance = "instance-1" } = {}) {
+    if (layer !== undefined) return this.#retainedInstance(instance).selectLayer(layer);
+    const effectiveInstance = this.#addressInstance(address, instance);
+    let root = null;
+    if (address !== undefined) {
+      const nodes = this.#resolveNodes(address, effectiveInstance);
+      if (nodes.length !== 1) {
+        throw new RangeError(`A selection requires an address that resolves to one node; it resolves to ${nodes.length}.`);
+      }
+      [root] = nodes;
+    }
+    return this.#retainedInstance(effectiveInstance).select(root);
+  }
+
+  // Names how to raster a selection of a document instance: { environment,
+  // rectangle, backdrop, offset } (createRetainedInstance's place()).
+  // Returns { handle, release() }.
+  place(selection, options, { instance = "instance-1" } = {}) {
+    return this.#retainedInstance(instance).place(selection, options);
+  }
+
+  // Reads a raster artifact back, optionally into a shared destination
+  // buffer at the artifact's offset (readRasterArtifact).
+  readback(artifact, destination = null) {
+    requiredState(this);
+    return readRasterArtifact(artifact, destination);
+  }
+
+  // Copies a raster artifact's GPU texture into a shared `texture` at the
+  // artifact's offset, with no readback (copyRasterArtifact).
+  copyRaster(artifact, texture) {
+    requiredState(this);
+    return copyRasterArtifact(artifact, texture);
+  }
+
+  // Compares two captured projections of `kind` (compareObservations) and
+  // delivers { kind, changes, left, right } through onCompared, or the
+  // incompatibility through onFailed. It applies no transition.
+  compare(left, right, { kind } = {}, { onCompared, onFailed } = {}) {
+    requiredState(this);
+    Promise.resolve().then(() => compareObservations(left, right, kind)).then(onCompared, onFailed);
+  }
+
+  // Loads the bytes of a metrics record (its bytes()) into the core of a
+  // document instance, as { artifact, provenance } that compare() and
+  // compareLayerMetrics() take. The session releases the record at
+  // disposal; `artifact.release()` frees it earlier.
+  loadMetrics(bytes, { instance = "instance-1" } = {}) {
+    const state = requiredState(this);
+    const current = state.instances.get(instance);
+    if (!current) throw new RangeError(`Unknown document instance: ${instance}`);
+    const loaded = loadDocumentMetrics(current.document, bytes, {
+      onRelease: (released) => state.projections.delete(released),
+    });
+    state.projections.add(loaded.artifact);
+    return loaded;
+  }
+
+  // Requests one projection of a published revision of the instance that
+  // `revision` names: { kind: "structure" | "metrics" | "paint", selection,
+  // environment } or { kind: "raster", placement }. Returns its handle at
+  // once; the request runs after the instance's queued transitions, and
+  // completion arrives through onCaptured({ artifact, provenance }) or
+  // onFailed(error). A structure or metrics artifact belongs to the
+  // session, as a snapshot() or metrics() record does.
+  project(revision, request, callbacks) {
+    const state = requiredState(this);
+    for (const current of state.instances.values()) {
+      if (current.retained?.revision.instance === revision?.instance) {
+        return current.retained.project(revision, request, callbacks);
+      }
+    }
+    throw new RangeError(`No document instance of this session published revision ${revision?.handle}.`);
+  }
+
+  // The entries of the instance's document log: its load, then one entry
+  // per change, each with its origin, operation and authoring batch.
+  mutationEffects(instance = "instance-1") {
+    const { document } = this.#instanceState(instance);
+    return Object.freeze(documentLogEntries(document._domCore, documentLogBytes(document)));
   }
 
   async layout({
@@ -241,30 +356,9 @@ export class DocumentSession {
           }; one instance cannot use multiple environment worlds.`,
         );
       }
-      const inspectedLayout = await inspectDocumentLayout(
-        renderRoot,
-        environment,
-        { scrollbarStyle: this.scrollbarStyle },
-      );
-      const serialized = serializeToScene(renderRoot, {
-        viewportWidth: environment.width,
-        viewportHeight: environment.height,
-      });
-      const elementsByIndex = new Map(
-        [...serialized.indexOf].map(([element, index]) => [index, element]),
-      );
-      const layout = Object.freeze({
-        ...inspectedLayout,
-        nodes: Object.freeze(
-          inspectedLayout.nodes.map((node, index) =>
-            Object.freeze({
-              ...node,
-              nodeIdentifier: elementsByIndex.has(index)
-                ? this.#nodeIdentifier(elementsByIndex.get(index))
-                : null,
-            })
-          ),
-        ),
+      const { layout, scene } = await inspectDocumentWorld(renderRoot, environment, {
+        scrollbarStyle: this.scrollbarStyle,
+        identify: (node) => this.#nodeIdentifier(node),
       });
       world = Object.freeze({
         kind: "document-layout-world",
@@ -278,15 +372,46 @@ export class DocumentSession {
           height: Number(environment.height),
         }),
         layout,
-        scene: Object.freeze({
-          width: serialized.width,
-          height: serialized.height,
-          nodes: Object.freeze(serialized.nodes),
-        }),
+        scene,
       });
       current.worlds.set(key, world);
     }
     return world;
+  }
+
+  // The document outline of the instance (document-outline.js) under the
+  // media of `environment`'s viewport, with each element as its node
+  // identifier: { level, label, state, nodeIdentifier, children }. The
+  // document's own environment returns afterwards.
+  async documentOutline({ instance = "instance-1", root = null, environment }) {
+    const state = requiredState(this);
+    const current = state.instances.get(instance);
+    if (!current) {
+      throw new RangeError(`Unknown document instance: ${instance}`);
+    }
+    const renderRoot = root ?? current.document.documentElement;
+    if (renderRoot.ownerDocument !== current.document) {
+      throw new Error("The outline root does not belong to the selected instance.");
+    }
+    environmentKey(environment);
+    const width = Number(environment.width);
+    const height = Number(environment.height);
+    const styleSystem = current.document._styleSystem;
+    const previousEnvironment = { ...styleSystem.environment };
+    let outline;
+    try {
+      await current.document._readyForRendering();
+      styleSystem.setEnvironment({ viewportWidth: width, viewportHeight: height });
+      await current.document._readyForRendering();
+      prepareSceneDocument(current.document.documentElement, { viewportWidth: width, viewportHeight: height });
+      outline = readDocumentOutline(renderRoot);
+    } finally {
+      styleSystem.setEnvironment(previousEnvironment);
+      await current.document._readyForRendering();
+    }
+    const identify = (entries) => entries.map(({ level, label, state, element, children }) =>
+      Object.freeze({ level, label, state, nodeIdentifier: this.#nodeIdentifier(element), children: Object.freeze(identify(children)) }));
+    return Object.freeze(identify(outline));
   }
 
   async recommendViewport({
@@ -398,10 +523,7 @@ export class DocumentSession {
       if (!world) {
         throw new RangeError(`Unknown layout world: ${address.worldKey}`);
       }
-      const nodeIdentifier = String(address.nodeIdentifier);
-      if (!state.nodesByIdentifier.has(nodeIdentifier)) {
-        throw new RangeError(`Unknown node: ${address.nodeIdentifier}`);
-      }
+      const nodeIdentifier = this.#nodeIdentifier(this.#nodeOf(current.document, address.nodeIdentifier));
       return world.layout.nodes.find((entry) =>
         entry.nodeIdentifier === nodeIdentifier
       ) ?? null;
@@ -451,6 +573,10 @@ export class DocumentSession {
     });
   }
 
+  // The structure of one document instance, captured by the core
+  // (core/engine/native-projections.watpart): a retained record that the
+  // facade reads when a caller reads a field. The session releases its
+  // snapshots at disposal; `snapshot.release()` frees one earlier.
   snapshot({
     address,
     instance = "instance-1",
@@ -471,98 +597,23 @@ export class DocumentSession {
         "A document snapshot requires an address that resolves to one node.",
       );
     }
-    const [snapshotRoot] = selectedNodes;
-    const serialized = serializeToScene(current.document.documentElement, {
-      viewportWidth: environment.width,
-      viewportHeight: environment.height,
-    });
-    const sourceNodeByIndex = new Map(
-      [...serialized.indexOf].map(([node, index]) => [index, node]),
-    );
-    const parentIndices = new Array(serialized.nodes.length).fill(null);
-    serialized.nodes.forEach((node, nodeIndex) => {
-      for (const childIndex of node.children ?? []) {
-        parentIndices[childIndex] = nodeIndex;
-      }
-    });
-    const rootIndex = address === undefined
-      ? 0
-      : serialized.indexOf.get(snapshotRoot);
-    if (rootIndex === undefined) {
-      throw new RangeError(
-        "The snapshot node is not present in the rendered tree.",
-      );
-    }
-    const includedIndices = new Set();
-    const pendingIndices = [rootIndex];
-    while (pendingIndices.length > 0) {
-      const nodeIndex = pendingIndices.pop();
-      if (includedIndices.has(nodeIndex)) continue;
-      includedIndices.add(nodeIndex);
-      pendingIndices.push(...(serialized.nodes[nodeIndex].children ?? []));
-    }
-    const identifier = (nodeIndex) => `scene-node-${nodeIndex}`;
-    const nodes = serialized.nodes
-      .map((sceneNode, nodeIndex) => {
-        if (!includedIndices.has(nodeIndex)) return null;
-        const sourceNode = sourceNodeByIndex.get(nodeIndex);
-        let source;
-        if (sourceNode?.nodeType === 1) {
-          source = {
-            kind: "element",
-            localName: sourceNode.localName,
-            namespace: sourceNode.namespaceURI,
-            attributes: Object.freeze(
-              sourceNode.getAttributeNames().map((name) => {
-                const metadata = sourceNode._attributeMetadata.get(name);
-                return Object.freeze({
-                  name: metadata?.localName ?? name,
-                  value: sourceNode.getAttribute(name),
-                  namespace: metadata?.namespaceURI ?? null,
-                  prefix: metadata?.prefix ?? null,
-                });
-              }),
-            ),
-          };
-        } else if (sourceNode?.nodeType === 3) {
-          source = { kind: "text", text: sourceNode.data };
-        } else {
-          source = {
-            kind: nodeIndex === 0 ? "viewport" : "generated",
-            generated: nodeIndex !== 0,
-            display: sceneNode.display,
-          };
-        }
-        const parentIndex = parentIndices[nodeIndex];
-        return Object.freeze({
-          identifier: identifier(nodeIndex),
-          sceneIndex: nodeIndex,
-          parentIdentifier: parentIndex === null ||
-              !includedIndices.has(parentIndex)
-            ? null
-            : identifier(parentIndex),
-          childIdentifiers: Object.freeze(
-            (sceneNode.children ?? [])
-              .filter((childIndex) => includedIndices.has(childIndex))
-              .map(identifier),
-          ),
-          source: Object.freeze(source),
-        });
-      })
-      .filter((node) => node !== null);
-    return Object.freeze({
-      kind: "document-html-snapshot",
-      version: 2,
+    const projection = captureDocumentStructure(current.document, {
+      root: address === undefined ? null : selectedNodes[0],
       instance: effectiveInstance,
       revision: current.revision,
-      rootIdentifier: identifier(rootIndex),
-      html: serializeSnapshotNode(
-        address === undefined ? current.document : snapshotRoot,
-      ),
-      nodes: Object.freeze(nodes),
+      environment,
+      onRelease: (released) => state.projections.delete(released),
     });
+    state.projections.add(projection);
+    return projection;
   }
 
+  // The layer metrics of the addressed nodes and their subtrees, as a
+  // retained core record (src/dom/metrics-projection.js, version 3): their
+  // layout boxes and their text chunks. The text chunks are the text
+  // operations of the paint command record (inspectDocumentPaint). The
+  // session releases its records at disposal; `metrics.release()` frees one
+  // earlier.
   async metrics({
     address,
     constraint = "auto",
@@ -570,6 +621,7 @@ export class DocumentSession {
     deviceScale = 1,
     ...options
   } = {}) {
+    const state = requiredState(this);
     const effectiveInstance = this.#addressInstance(address, instance);
     const selectedNodes = this.#resolveNodes(address, effectiveInstance);
     if (selectedNodes.length === 0) {
@@ -577,6 +629,7 @@ export class DocumentSession {
         "Metrics require an address that resolves to at least one node.",
       );
     }
+    const current = state.instances.get(effectiveInstance);
     const resolution = await this.resolveViewport({
       constraint,
       instance: effectiveInstance,
@@ -587,90 +640,34 @@ export class DocumentSession {
       instance: effectiveInstance,
       environment: resolution.viewport,
     });
-    const isolation = await this.isolate({
-      address,
-      environment: resolution.viewport,
-      instance: effectiveInstance,
-    });
-    const includedNodeIdentifiers = new Set(isolation.includedNodeIdentifiers);
-    const layoutRectangles = world.layout.nodes
-      .filter((node) =>
-        node.nodeIdentifier !== null &&
-        includedNodeIdentifiers.has(node.nodeIdentifier)
-      )
-      .map((node) =>
-        Object.freeze({
-          nodeIdentifier: node.nodeIdentifier,
-          borderBox: node.borderBox,
-          textChunks: node.textChunks ?? Object.freeze([]),
-        })
-      );
-    const textChunks = isolation.operations
-      .filter((operation) =>
-        operation.kind === "text" || operation.kind === "text-shadow"
-      )
-      .map((operation) =>
-        Object.freeze({
-          nodeIdentifier: operation.nodeIdentifier,
-          operationIndex: operation.operationIndex,
-          text: operation.text,
-          fontSize: operation.fontSize,
-          lineHeight: operation.lineHeight,
-          ascent: operation.ascent,
-          descent: operation.descent,
-          baseline: operation.baseline,
-          glyphAdvances: operation.glyphAdvances,
-        })
-      );
-    const orderedNodes = [];
-    const visitedNodes = new Set();
-    const visit = (node) => {
-      if (visitedNodes.has(node)) return;
-      visitedNodes.add(node);
-      const nodeIdentifier = this.#nodeIdentifier(node);
-      if (!includedNodeIdentifiers.has(nodeIdentifier)) return;
-      orderedNodes.push(node);
-      for (const child of node.childNodes) visit(child);
-    };
-    for (const selectedNode of selectedNodes) visit(selectedNode);
-    const layoutByNodeIdentifier = new Map(
-      layoutRectangles.map((record) => [record.nodeIdentifier, record]),
-    );
-    const reportNodes = orderedNodes.map((node) => {
-      const nodeIdentifier = this.#nodeIdentifier(node);
-      return Object.freeze({
-        nodeIdentifier,
-        childIdentifiers: Object.freeze(
-          [...node.childNodes]
-            .map((child) => this.#nodeIdentifier(child))
-            .filter((identifier) => includedNodeIdentifiers.has(identifier)),
-        ),
-        rectangle: layoutByNodeIdentifier.get(nodeIdentifier)?.borderBox ??
-          null,
-        textChunks: Object.freeze(
-          textChunks.filter((chunk) => chunk.nodeIdentifier === nodeIdentifier),
-        ),
-        paintOperations: Object.freeze(
-          isolation.operations.filter((operation) =>
-            operation.nodeIdentifier === nodeIdentifier
-          ),
-        ),
-      });
-    });
-    return Object.freeze({
-      kind: "document-layer-metrics",
-      version: 2,
+    const projection = await captureDocumentMetrics(current.document, {
+      selectedNodes,
+      world,
       sizingSource: resolution.source,
-      worldKey: world.key,
-      viewport: world.environment,
-      nodeIdentifiers: isolation.nodeIdentifiers,
-      includedNodeIdentifiers: isolation.includedNodeIdentifiers,
-      layoutRectangles: Object.freeze(layoutRectangles),
-      nodes: Object.freeze(reportNodes),
-      textChunks: Object.freeze(textChunks),
-      paintOperations: isolation.operations,
-      compositingGroups: isolation.compositingGroups,
+      scrollbarStyle: this.scrollbarStyle,
+      identify: (node) => this.#nodeIdentifier(node),
+      onRelease: (released) => state.projections.delete(released),
     });
+    state.projections.add(projection);
+    return projection;
+  }
+
+  // The paint command record of the instance in `environment`
+  // (src/dom/paint-projection.js): its operations, its compositing groups
+  // and its scene tree, which comparePaintArtifacts aligns. The record
+  // lives while the returned value is reachable; `paint.release()` frees
+  // it earlier.
+  async paint({ environment, instance = "instance-1" } = {}) {
+    const state = requiredState(this);
+    const current = state.instances.get(instance);
+    if (!current) {
+      throw new RangeError(`Unknown document instance: ${instance}`);
+    }
+    environmentKey(environment);
+    const inspection = await inspectDocumentPaint(current.document.documentElement, environment, {
+      scrollbarStyle: this.scrollbarStyle,
+    });
+    return inspection.paintArtifact;
   }
 
   async isolate({
@@ -696,53 +693,38 @@ export class DocumentSession {
         pendingNodes.push(...node.childNodes);
       }
     }
-    let frame;
+    let inspection;
     if (address?.system === "output") {
       const target = state.targets.get(String(address.target));
       const layer = target?.outputLayers.get(Number(address.layer));
       if (!layer) {
         throw new RangeError(`Unknown output layer: ${address.layer}`);
       }
-      frame = layer.frame;
+      inspection = layer.frame.inspection;
     } else {
-      const surface = createRenderSurface(current.document.documentElement, {
-        viewportWidth: environment.width,
-        viewportHeight: environment.height,
-        deviceScale: environment.deviceScale ?? 1,
-        capturePaintArtifact: true,
+      // The paint command record (inspectDocumentPaint).
+      inspection = await inspectDocumentPaint(current.document.documentElement, environment, {
         scrollbarStyle: this.scrollbarStyle,
       });
-      try {
-        frame = await surface.renderNow();
-      } finally {
-        await surface.shutdown();
-      }
     }
-    const artifact = frame.inspection.paintArtifact;
-    const includedIndices = new Set();
+    // The core selects the subtrees of every included node that has a scene
+    // row (paint_select), so a node without one keeps its descendants.
+    const sceneRows = [];
     for (const node of includedNodes) {
-      const index = frame.inspection.elementAtIndex.indexOf(node);
-      if (index >= 0) includedIndices.add(index);
+      const index = inspection.elementAtIndex.indexOf(node);
+      if (index >= 0) sceneRows.push(index);
     }
-    const operations = artifact.operations.filter((operation) =>
-      includedIndices.has(operation.nodeIndex)
-    );
-    const strippedCompositingGroups = artifact.compositingGroups.filter((
-      group,
-    ) =>
-      !includedIndices.has(group.nodeIndex) &&
-      operations.some((operation) =>
-        operation.commandIndex > group.startCommandIndex &&
-        operation.commandIndex < group.endCommandIndex
-      )
-    );
-    const compositingGroups = artifact.compositingGroups.filter((group) =>
-      includedIndices.has(group.nodeIndex) ||
-      operations.some((operation) =>
-        operation.commandIndex > group.startCommandIndex &&
-        operation.commandIndex < group.endCommandIndex
-      )
-    );
+    const selected = selectPaintRecord(inspection.paintArtifact, sceneRows);
+    let operations;
+    let compositingGroups;
+    let strippedCompositingGroups;
+    try {
+      operations = selected.operations.map((operation) => ({ ...operation }));
+      compositingGroups = selected.compositingGroups;
+      strippedCompositingGroups = selected.outsideCompositingGroups;
+    } finally {
+      selected.release();
+    }
     return Object.freeze({
       kind: "document-in-place-isolation",
       version: 1,
@@ -756,7 +738,7 @@ export class DocumentSession {
         Object.freeze({
           ...operation,
           nodeIdentifier: this.#nodeIdentifier(
-            frame.inspection.elementAtIndex[operation.nodeIndex],
+            inspection.elementAtIndex[operation.nodeIndex],
           ),
         })
       )),
@@ -767,7 +749,7 @@ export class DocumentSession {
             nodeIdentifier: group.nodeIndex === null
               ? null
               : this.#nodeIdentifier(
-                frame.inspection.elementAtIndex[group.nodeIndex],
+                inspection.elementAtIndex[group.nodeIndex],
               ),
           })
         ),
@@ -779,7 +761,7 @@ export class DocumentSession {
             nodeIdentifier: group.nodeIndex === null
               ? null
               : this.#nodeIdentifier(
-                frame.inspection.elementAtIndex[group.nodeIndex],
+                inspection.elementAtIndex[group.nodeIndex],
               ),
           })
         ),
@@ -949,22 +931,15 @@ export class DocumentSession {
         );
       }
       const root = placement.root ?? current.document.documentElement;
-      // A render surface cannot rasterize a connected subtree: it remaps a
-      // connected root to the document element and silently renders the
-      // whole document. Reject the placement until subtree rasterization
-      // exists. A detached tree root and the document element remain valid.
-      if (
-        placement.root &&
-        placement.root !== current.document.documentElement &&
-        placement.root.parentElement
-      ) {
-        throw new Error(
-          `Placement ${placement.identifier} addresses a connected subtree ` +
-            `root. Subtree rasterization does not exist yet; the surface ` +
-            `would silently render the whole document. Use the document ` +
-            `element or a detached tree root.`,
-        );
-      }
+      // A connected subtree renders on a surface over its document, with
+      // the subtree as the surface's selected root. A detached tree root
+      // and the document element are surface roots of their own.
+      const selectedRoot = placement.root &&
+          placement.root !== current.document.documentElement &&
+          placement.root.parentElement
+        ? placement.root
+        : null;
+      const surfaceRoot = selectedRoot === null ? root : current.document.documentElement;
       const environment = placement.environment;
       const placementEnvironmentKey = environmentKey(environment);
       let surface = surfaces[index];
@@ -972,7 +947,7 @@ export class DocumentSession {
       if (
         !surface ||
         surface._shutdown ||
-        surface.root !== root ||
+        surface.root !== surfaceRoot ||
         surface.viewport.width !== environment.width ||
         surface.viewport.height !== environment.height ||
         surface.viewport.deviceScale !== (environment.deviceScale ?? 1)
@@ -986,7 +961,7 @@ export class DocumentSession {
         // so a FOREIGN registered surface is preserved. The target's OWN
         // surfaces still serialize: a duplicate (root, environment)
         // placement displaces this target's earlier occupant.
-        const occupying = root._renderSurfaces?.get(placementEnvironmentKey);
+        const occupying = surfaceRoot._renderSurfaces?.get(placementEnvironmentKey);
         if (
           occupying && !occupying._shutdown &&
           (target.displacesRegisteredSurfaces ||
@@ -1003,7 +978,7 @@ export class DocumentSession {
             if (occupyingIndex !== -1) candidateSurfaces[occupyingIndex] = undefined;
           }
         }
-        surface = target.createSurface(root, {
+        surface = target.createSurface(surfaceRoot, {
           viewportWidth: environment.width,
           viewportHeight: environment.height,
           deviceScale: environment.deviceScale ?? 1,
@@ -1014,6 +989,12 @@ export class DocumentSession {
         surfaces[index] = surface;
         createdSurface = true;
       }
+      if (selectedRoot !== null && typeof surface.setSelectedRoot !== "function") {
+        throw new TypeError(
+          `Placement ${placement.identifier} selects a subtree, and the surface of target ${target.identifier} has no setSelectedRoot().`,
+        );
+      }
+      surface.setSelectedRoot?.(selectedRoot);
       if (frameTransaction) surface._beginFrameTransaction?.(frameTransaction);
       const documentRevision = current.revision;
       const interactionRevision = frameTransaction?.instances.get(current)?.interactionRevision ??
@@ -1303,7 +1284,7 @@ export class DocumentSession {
       });
       this.mutate(() => {
         backend.dispatchInputRecords(root, dispatchRecords, {
-          beforeRecord(record) {
+          beforeRecord(record, index) {
             const activeBinding = instance.pointerBindings.get(record.pointerId);
             if (
               activeBinding !== undefined &&
@@ -1317,6 +1298,7 @@ export class DocumentSession {
             if (record.kind === "pointer-down" && activeBinding !== undefined) {
               throw new Error(`Pointer ${record.pointerId} is already active.`);
             }
+            logInteraction(instance.document, records[index]);
           },
           afterRecord: (record, _index, result, scrolled) => {
             if (record.kind === "pointer-down" && result) {
@@ -1337,7 +1319,7 @@ export class DocumentSession {
             }));
           },
         });
-      }, { instance: placement.instance });
+      }, { instance: placement.instance, origin: "input" });
       const mutationCompletedAt = hostNow();
       const affectedTargets = [...state.targets.values()].filter((candidate) =>
         candidate.placements.some(({ instance: candidateInstance }) =>
@@ -1467,6 +1449,8 @@ export class DocumentSession {
       for (const [name, value] of Object.entries(attributes)) {
         document.documentElement.setAttribute(name, value);
       }
+      // The replaced instance ends its retained steps as cancelled.
+      current.retained?.dispose();
       state.instances.delete(identifier);
       this.#addInstance(identifier, document);
       state.instances.get(identifier).creationAttributes = attributes;
@@ -1598,6 +1582,9 @@ export class DocumentSession {
       width: target.output.width,
       height: target.output.height,
       pixels: target.output.pixels,
+      // A texture target has no pixels: its placements' frames carry the
+      // GPU textures that a presenter draws.
+      layers: target.output.layers,
     });
   }
 
@@ -1632,14 +1619,116 @@ export class DocumentSession {
 
   async dispose() {
     const state = requiredState(this);
+    // Every queued and running step ends as cancelled first.
+    for (const instance of state.instances.values()) instance.retained?.dispose();
+    for (const projection of state.projections) projection.release();
+    state.disposed = true;
+    for (const surface of state.projectionSurfaces.values()) await surface.shutdown();
+    state.projectionSurfaces.clear();
     for (const target of state.targets.values()) {
       for (const surface of target.surfaces) {
         if (surface) await surface.shutdown();
       }
     }
     state.targets.clear();
-    state.disposed = true;
     await state.preparedInput.release();
+  }
+
+  // The retained instance of a document instance, made at its first use.
+  #retainedInstance(identifier) {
+    const state = requiredState(this);
+    const current = state.instances.get(String(identifier));
+    if (!current) {
+      throw new RangeError(`Unknown document instance: ${identifier}`);
+    }
+    current.retained ??= createRetainedInstance({
+      core: current.document._domCore,
+      runOperation: (operation) => {
+        if (state.disposed) {
+          return Promise.reject(new Error("The document session is disposed."));
+        }
+        const result = state.operationChain.then(operation, operation);
+        state.operationChain = result.then(() => undefined, () => undefined);
+        return result;
+      },
+      apply: (applicator, context) =>
+        applicator(Object.freeze({ document: current.document }), context),
+      // A projection of the live document: the subtree of `root`, or the
+      // whole document.
+      capture: async (kind, { root, layer, environment, placement }) => {
+        const address = root === null ? undefined : { system: "dom", nodeIdentifier: this.#nodeIdentifier(root) };
+        if (kind === "structure") {
+          return this.snapshot({ address, instance: identifier, environment });
+        }
+        if (kind === "paint") {
+          return captureDocumentPaint(current.document, {
+            root,
+            environment,
+            scrollbarStyle: this.scrollbarStyle,
+            identify: (node) => this.#nodeIdentifier(node),
+          });
+        }
+        if (kind === "raster") {
+          return captureDocumentRaster(current.document, {
+            root,
+            environment,
+            placement,
+            layer,
+            surfaces: state.projectionSurfaces,
+            scrollbarStyle: this.scrollbarStyle,
+            identify: (node) => this.#nodeIdentifier(node),
+          });
+        }
+        return this.metrics({
+          address: address ?? { system: "dom" },
+          instance: identifier,
+          constraint: { width: environment.width, height: environment.height },
+          deviceScale: environment.deviceScale,
+        });
+      },
+      replace: async () => {
+        if (state.baselineDocument === null) {
+          throw new Error(
+            "A document with custom elements cannot reset: its prepared source cannot be cloned. Create a new document session.",
+          );
+        }
+        for (const target of state.targets.values()) {
+          if (
+            target.placements.some(({ instance, root }) =>
+              instance === identifier && root !== null && root !== undefined
+            )
+          ) {
+            throw new Error(
+              `Cannot reset ${identifier} while a placement addresses an explicit root.`,
+            );
+          }
+        }
+        const document = clonePreparedDocument({
+          ...state.preparedInput,
+          document: state.baselineDocument,
+        });
+        for (const [name, value] of Object.entries(current.creationAttributes)) {
+          document.documentElement.setAttribute(name, value);
+        }
+        current.document = document;
+        this.#startSpan(document);
+      },
+      // Document writes are open from the start of the step to its end, so
+      // an update that settles later can write.
+      // A reset replaces the document during the step: the step closes
+      // the scope of the document it opened.
+      stepStarted() {
+        current.scopedDocument = current.document;
+        openDocumentScope(current.scopedDocument, "script");
+      },
+      stepEnded() {
+        closeDocumentScope(current.scopedDocument);
+        current.scopedDocument = null;
+        current.revision += 1;
+        current.worlds.clear();
+      },
+    });
+    return current.retained;
   }
 
   #withScrollbarStyle(request) {
@@ -1656,34 +1745,19 @@ export class DocumentSession {
       creationAttributes: Object.freeze({}),
       revision: 0,
       interactionRevision: 0,
-      mutating: false,
       worlds: new Map(),
-      effects: [],
       interactionBackends: new Map(),
       pointerBindings: new Map(),
     };
-    document._documentSessionMutationGate = {
-      assert: () => {
-        if (!instance.mutating) {
-          throw new Error(
-            "Document writes require an active document session mutation.",
-          );
-        }
-      },
-      record: (kind, node, detail, mutationRecord) => {
-        instance.effects.push(Object.freeze({
-          kind,
-          nodeIdentifier: this.#nodeIdentifier(node),
-          detail: detail ?? null,
-          change: normalizeMutationChange(
-            node,
-            mutationRecord,
-            (member) => this.#nodeIdentifier(member),
-          ),
-        }));
-      },
-    };
     state.instances.set(identifier, instance);
+    this.#startSpan(instance.document);
+  }
+
+  // Gates the document, so a write outside mutate() or a transition step
+  // throws, and starts its log with the session's source.
+  #startSpan(document) {
+    gateDocument(document, true);
+    loadDocumentLog(document, requiredState(this).preparedInput.sourceBytes);
   }
 
   #addressInstance(address, fallback) {
@@ -1708,13 +1782,7 @@ export class DocumentSession {
     }
     if (address?.system === "dom") {
       if (address.nodeIdentifier !== undefined) {
-        const node = state.nodesByIdentifier.get(
-          String(address.nodeIdentifier),
-        );
-        if (!node || node.ownerDocument !== instance.document) {
-          throw new RangeError(`Unknown node: ${address.nodeIdentifier}`);
-        }
-        return [node];
+        return [this.#nodeOf(instance.document, address.nodeIdentifier)];
       }
       return address.selector === undefined
         ? [instance.document.documentElement]
@@ -1725,14 +1793,8 @@ export class DocumentSession {
       if (!world) {
         throw new RangeError(`Unknown layout world: ${address.worldKey}`);
       }
-      const node = state.nodesByIdentifier.get(String(address.nodeIdentifier));
-      if (
-        !node ||
-        node.ownerDocument !== instance.document ||
-        !world.layout.nodes.some((entry) =>
-          entry.nodeIdentifier === String(address.nodeIdentifier)
-        )
-      ) {
+      const node = this.#nodeOf(instance.document, address.nodeIdentifier);
+      if (!world.layout.nodes.some((entry) => entry.nodeIdentifier === address.nodeIdentifier)) {
         throw new RangeError(
           `Unknown node in layout world: ${address.nodeIdentifier}`,
         );
@@ -1749,28 +1811,26 @@ export class DocumentSession {
         throw new RangeError(`Unknown output layer: ${address.layer}`);
       }
       if (address.nodeIdentifier !== undefined) {
-        const node = state.nodesByIdentifier.get(
-          String(address.nodeIdentifier),
-        );
-        if (!node || node.ownerDocument !== instance.document) {
-          throw new RangeError(`Unknown node: ${address.nodeIdentifier}`);
-        }
-        return [node];
+        return [this.#nodeOf(instance.document, address.nodeIdentifier)];
       }
       return [layer.placement.root ?? instance.document.documentElement];
     }
     throw new RangeError(`Unknown document address system: ${address?.system}`);
   }
 
+  // The core's durable identifier of `node` (core/dom/node-identity.watpart).
   #nodeIdentifier(node) {
-    const state = requiredState(this);
-    let identifier = state.nodeIdentifiers.get(node);
-    if (!identifier) {
-      identifier = `node-${state.nextNodeIdentifier++}`;
-      state.nodeIdentifiers.set(node, identifier);
-      state.nodesByIdentifier.set(identifier, node);
+    return node._domCore.nodeIdentifier(node._coreHandle);
+  }
+
+  // The live node of durable identifier `identifier` in `document`.
+  #nodeOf(document, identifier) {
+    if (!Number.isInteger(identifier) || identifier < 1) {
+      throw new TypeError(`A node identifier is a positive integer; received ${String(identifier)}`);
     }
-    return identifier;
+    const node = document._domCore.nodeByIdentifier(document._coreHandle, identifier);
+    if (!node) throw new RangeError(`Unknown node: ${identifier}`);
+    return node;
   }
 }
 

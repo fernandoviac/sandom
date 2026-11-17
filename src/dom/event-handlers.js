@@ -4,7 +4,8 @@
 // the handler compiles in the document realm, with the scope chain of
 // element, form owner and document, when its event first fires or a script
 // reads the IDL attribute.
-import { addEventListener, removeAllEventListeners, removeEventListener } from "./events.js";
+import { addEventListener, removeAllEventListeners, removeEventListener, SDErrorEvent } from "./events.js";
+import { nodeMember } from "./node-members.js";
 
 // GlobalEventHandlers, with the pointer, animation, transition and
 // selection handlers that Chrome supports.
@@ -53,9 +54,11 @@ function isWindow(target) {
   return target?.nodeType === undefined && target?.document?.defaultView === target;
 }
 
+// A form's controls can shadow its members (node-members.js).
 function documentOf(target) {
-  if (target.nodeType === 9) return target;
-  if (target.nodeType !== undefined) return target.ownerDocument;
+  const nodeType = nodeMember(target, "nodeType");
+  if (nodeType === 9) return target;
+  if (nodeType !== undefined) return nodeMember(target, "ownerDocument");
   return target.document ?? null;
 }
 
@@ -63,11 +66,12 @@ function documentOf(target) {
 // `element` sets, or null when the attribute is no event handler there.
 function contentAttributeTarget(element, name) {
   if (name.length < 3 || !name.startsWith("on")) return null;
-  if (element.namespaceURI !== HTML_NS && element.namespaceURI !== SVG_NS) return null;
+  const namespaceURI = nodeMember(element, "namespaceURI");
+  if (namespaceURI !== HTML_NS && namespaceURI !== SVG_NS) return null;
   const type = name.slice(2);
-  const local = element.localName;
-  if ((local === "body" || local === "frameset") && element.namespaceURI === HTML_NS && windowReflectingTypes.has(type)) {
-    const window = element.ownerDocument?.defaultView ?? null;
+  const local = nodeMember(element, "localName");
+  if ((local === "body" || local === "frameset") && namespaceURI === HTML_NS && windowReflectingTypes.has(type)) {
+    const window = nodeMember(element, "ownerDocument")?.defaultView ?? null;
     return window === null ? null : { target: window, type };
   }
   return globalTypes.has(type) ? { target: element, type } : null;
@@ -90,7 +94,7 @@ function invokeHandler(record, target, type, event) {
   const callback = currentValue(target, type, record);
   if (typeof callback !== "function") return;
   // A Window's onerror receives the error event's fields, and true cancels.
-  if (type === "error" && isWindow(target) && event instanceof ErrorEvent) {
+  if (type === "error" && isWindow(target) && event instanceof SDErrorEvent) {
     const result = callback.call(target, event.message, event.filename, event.lineno, event.colno, event.error);
     if (result === true) event.preventDefault();
     return;

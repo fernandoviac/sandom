@@ -23,8 +23,23 @@ export const SHADER_CONSTANTS = Object.freeze({
   GRAD_XYZ_TO_REC2020: wgslMat3(
     KERNEL_MATRICES[KERNEL_MATRIX_INDEX.xyzToRec2020],
   ),
+  GRAD_XYZ_TO_DISPLAY_P3: wgslMat3(
+    KERNEL_MATRICES[KERNEL_MATRIX_INDEX.xyzToDisplayP3],
+  ),
   GRAD_ADAPT_D50_TO_D65: wgslMat3(
     KERNEL_MATRICES[KERNEL_MATRIX_INDEX.adaptD50ToD65],
+  ),
+  GRAD_DISPLAY_P3_TO_XYZ: wgslMat3(
+    KERNEL_MATRICES[KERNEL_MATRIX_INDEX.displayP3ToXyz],
+  ),
+  GRAD_A98_RGB_TO_XYZ: wgslMat3(
+    KERNEL_MATRICES[KERNEL_MATRIX_INDEX.a98RgbToXyz],
+  ),
+  GRAD_PROPHOTO_RGB_TO_XYZ_D50: wgslMat3(
+    KERNEL_MATRICES[KERNEL_MATRIX_INDEX.prophotoRgbToXyz],
+  ),
+  GRAD_REC2020_TO_XYZ: wgslMat3(
+    KERNEL_MATRICES[KERNEL_MATRIX_INDEX.rec2020ToXyz],
   ),
   GRAD_OKLAB_LAB_TO_LMS: wgslMat3(
     KERNEL_MATRICES[KERNEL_MATRIX_INDEX.oklabLabToLms],
@@ -50,7 +65,7 @@ export const SOURCE_CONVERT_CONSTANTS = Object.freeze({
   }),
 });
 
-// The shader sources of src/wasm/gpu-pipelines.watpart, in its order.
+// The shader sources of core/engine/gpu-pipelines.watpart, in its order.
 export const PIPELINE_LIBRARY_SHADERS = Object.freeze([
   ["rect", {}],
   ["tile-clear", {}],

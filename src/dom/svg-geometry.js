@@ -1,13 +1,28 @@
 // SVGGraphicsElement getBBox, getCTM and getScreenCTM, and the SVGMatrix
 // and SVGRect objects they return. The core computes every value
-// (src/dom-wasm/svg-graphics.watpart); these bindings convert WebIDL
+// (core/dom/svg-graphics.watpart); these bindings convert WebIDL
 // arguments and carry the values.
 import { sharedDomCore } from "../dom-wasm/core.js";
 import { withLiveGeometry } from "./live-geometry.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+
+// The SVGMatrix operations of svg_matrix_operation, by the names of their
+// WAT globals.
+const SVG_MATRIX_MULTIPLY = layoutConstant("SVG_MATRIX_MULTIPLY");
+const SVG_MATRIX_INVERSE = layoutConstant("SVG_MATRIX_INVERSE");
+const SVG_MATRIX_TRANSLATE = layoutConstant("SVG_MATRIX_TRANSLATE");
+const SVG_MATRIX_SCALE = layoutConstant("SVG_MATRIX_SCALE");
+const SVG_MATRIX_SCALE_NON_UNIFORM = layoutConstant("SVG_MATRIX_SCALE_NON_UNIFORM");
+const SVG_MATRIX_ROTATE = layoutConstant("SVG_MATRIX_ROTATE");
+const SVG_MATRIX_ROTATE_FROM_VECTOR = layoutConstant("SVG_MATRIX_ROTATE_FROM_VECTOR");
+const SVG_MATRIX_FLIP_X = layoutConstant("SVG_MATRIX_FLIP_X");
+const SVG_MATRIX_FLIP_Y = layoutConstant("SVG_MATRIX_FLIP_Y");
+const SVG_MATRIX_SKEW_X = layoutConstant("SVG_MATRIX_SKEW_X");
+const SVG_MATRIX_SKEW_Y = layoutConstant("SVG_MATRIX_SKEW_Y");
 
 function outputValues(core, count) {
-  const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * 8);
-  return Array.from({ length: count }, (_, index) => view.getFloat64(index * 8, true));
+  const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * Float64Array.BYTES_PER_ELEMENT);
+  return Array.from({ length: count }, (_, index) => view.getFloat64(index * Float64Array.BYTES_PER_ELEMENT, true));
 }
 
 function illegalInvocation() {
@@ -73,38 +88,39 @@ const matrixMethods = {
     if (!matrixValues.has(secondMatrix)) {
       throw new TypeError("Failed to execute 'multiply' on 'SVGMatrix': parameter 1 is not of type 'SVGMatrix'.");
     }
-    return matrixOperation(this, 1, ...matrixValues.get(secondMatrix));
+    return matrixOperation(this, SVG_MATRIX_MULTIPLY, ...matrixValues.get(secondMatrix));
   },
-  inverse() { return matrixOperation(this, 2); },
+  inverse() { return matrixOperation(this, SVG_MATRIX_INVERSE); },
   translate(x, y) {
     requireArguments(arguments.length, 2, "translate");
-    return matrixOperation(this, 3, webIDLFloat(x, "translate"), webIDLFloat(y, "translate"));
+    return matrixOperation(this, SVG_MATRIX_TRANSLATE, webIDLFloat(x, "translate"), webIDLFloat(y, "translate"));
   },
   scale(scaleFactor) {
     requireArguments(arguments.length, 1, "scale");
-    return matrixOperation(this, 4, webIDLFloat(scaleFactor, "scale"));
+    return matrixOperation(this, SVG_MATRIX_SCALE, webIDLFloat(scaleFactor, "scale"));
   },
   scaleNonUniform(scaleFactorX, scaleFactorY) {
     requireArguments(arguments.length, 2, "scaleNonUniform");
-    return matrixOperation(this, 5, webIDLFloat(scaleFactorX, "scaleNonUniform"), webIDLFloat(scaleFactorY, "scaleNonUniform"));
+    return matrixOperation(this, SVG_MATRIX_SCALE_NON_UNIFORM, webIDLFloat(scaleFactorX, "scaleNonUniform"),
+      webIDLFloat(scaleFactorY, "scaleNonUniform"));
   },
   rotate(angle) {
     requireArguments(arguments.length, 1, "rotate");
-    return matrixOperation(this, 6, webIDLFloat(angle, "rotate"));
+    return matrixOperation(this, SVG_MATRIX_ROTATE, webIDLFloat(angle, "rotate"));
   },
   rotateFromVector(x, y) {
     requireArguments(arguments.length, 2, "rotateFromVector");
-    return matrixOperation(this, 7, webIDLFloat(x, "rotateFromVector"), webIDLFloat(y, "rotateFromVector"));
+    return matrixOperation(this, SVG_MATRIX_ROTATE_FROM_VECTOR, webIDLFloat(x, "rotateFromVector"), webIDLFloat(y, "rotateFromVector"));
   },
-  flipX() { return matrixOperation(this, 8); },
-  flipY() { return matrixOperation(this, 9); },
+  flipX() { return matrixOperation(this, SVG_MATRIX_FLIP_X); },
+  flipY() { return matrixOperation(this, SVG_MATRIX_FLIP_Y); },
   skewX(angle) {
     requireArguments(arguments.length, 1, "skewX");
-    return matrixOperation(this, 10, webIDLFloat(angle, "skewX"));
+    return matrixOperation(this, SVG_MATRIX_SKEW_X, webIDLFloat(angle, "skewX"));
   },
   skewY(angle) {
     requireArguments(arguments.length, 1, "skewY");
-    return matrixOperation(this, 11, webIDLFloat(angle, "skewY"));
+    return matrixOperation(this, SVG_MATRIX_SKEW_Y, webIDLFloat(angle, "skewY"));
   },
 };
 // Chrome's generated binding installs the operations in name order.
@@ -171,9 +187,9 @@ export const svgGraphicsRuntime = {
     });
   },
   getCTM(node, options) {
-    return graphicsMatrix(node, options, 0);
+    return graphicsMatrix(node, options, false);
   },
   getScreenCTM(node, options) {
-    return graphicsMatrix(node, options, 1);
+    return graphicsMatrix(node, options, true);
   },
 };

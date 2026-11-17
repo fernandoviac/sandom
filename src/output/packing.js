@@ -1,5 +1,20 @@
-// Generic sample packing through @sandom/color. Container framing stays local.
+// Generic sample packing through @sandom/color; core/engine/sample-packing.wat
+// checks the arguments. Container framing stays local.
 import { colorRuntime } from "../wasm/color-runtime.js";
+import { instantiate } from "../wasm/sample-packing-binary.js";
+
+const numberOrNaN = (value) => typeof value === "number" ? value : NaN;
+let checks = null;
+
+// Throws the RangeError of a nonzero check result (its message length).
+function check(name, ...parameters) {
+  checks ??= instantiate({}).exports;
+  const length = checks[name](...parameters);
+  if (length !== 0) {
+    throw new RangeError(new TextDecoder().decode(new Uint8Array(checks.memory.buffer, checks.message_address(), length)));
+  }
+  return checks;
+}
 
 const SAMPLE_TYPES = Object.freeze({
   uint8: Uint8Array,
@@ -9,10 +24,7 @@ const SAMPLE_TYPES = Object.freeze({
 });
 
 function dimensions(width, height) {
-  if (!Number.isInteger(width) || !Number.isInteger(height) ||
-      width <= 0 || height <= 0 || width > 0x7fffffff || height > 0x7fffffff) {
-    throw new RangeError("color packing requires positive signed-32-bit dimensions");
-  }
+  check("dimensions_check", numberOrNaN(width), numberOrNaN(height));
 }
 
 function floatSamples(pixels) {
@@ -44,14 +56,8 @@ export function float16BitsToFloat32(bits) {
 
 export function packSignal(pixels, bits = 8, channels = 4) {
   floatSamples(pixels);
-  if (bits !== 8 && bits !== 10 && bits !== 12 && bits !== 16) {
-    throw new RangeError("color signal packing requires 8, 10, 12, or 16 bits");
-  }
-  if (channels !== 3 && channels !== 4) throw new RangeError("color signal packing requires 3 or 4 channels");
-  if (channels === 3 && pixels.length % 4 !== 0) throw new RangeError("RGB packing requires complete RGBA pixels");
-  const count = channels === 4 ? pixels.length : pixels.length / 4 * 3;
-  return packedBuffer(pixels, count * (bits === 8 ? 1 : 2), Uint8Array,
-    "color_pack_signal", [pixels.length, bits, channels]);
+  const byteLength = check("signal_check", pixels.length, numberOrNaN(bits), numberOrNaN(channels)).packed_length();
+  return packedBuffer(pixels, byteLength, Uint8Array, "color_pack_signal", [pixels.length, bits, channels]);
 }
 
 export function packHalf(pixels) {
@@ -75,9 +81,7 @@ export function expandImageSamples(descriptor) {
     throw new RangeError("unknown color sample type or channel layout");
   }
   if (!(pixels instanceof ArrayConstructor)) throw new TypeError("color sample type does not match its typed array");
-  if (!Number.isInteger(rowStride) || rowStride < 0 || rowStride > 0xffffffff) {
-    throw new RangeError("color row stride must be an unsigned-32-bit byte count");
-  }
+  check("row_stride_check", numberOrNaN(rowStride));
   return packedBuffer(pixels, width * height * 4 * ArrayConstructor.BYTES_PER_ELEMENT,
     ArrayConstructor, "color_expand_samples", [pixels.byteLength, width, height, rowStride, sample, layout]);
 }
@@ -86,6 +90,6 @@ export function packBytes(bytes) {
   if (!(bytes instanceof Uint8Array)) throw new TypeError("color byte packing requires Uint8Array");
   const runtime = colorRuntime();
   const byteLength = runtime.exports.color_packing_size(bytes.byteLength, 1, 1);
-  if (byteLength !== bytes.byteLength) throw new RangeError("color byte packing size rejected");
+  check("bytes_check", byteLength, bytes.byteLength);
   return packedBuffer(bytes, byteLength, Uint8Array, "color_pack_image", [bytes.byteLength]);
 }

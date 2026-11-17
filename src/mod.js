@@ -21,7 +21,9 @@ export {
   createSceneRenderer,
   DEFAULT_GLYPH_RESOURCE_LIMITS,
   GlyphResourceManager,
+  openSceneRenderer,
   releaseRenderContexts,
+  useGraphicsDevice,
 } from "./scene-renderer.js";
 export {
   createDocumentSession,
@@ -46,8 +48,9 @@ export {
   createTexturePresenter,
   projectOntoRectangle,
 } from "./dom/projected-surface.js";
+export { bindWorkerInput } from "./dom/worker-input.js";
 export { createGpuCompositor } from "./gpu-compositor.js";
-export { createGpuThread } from "./gpu-thread.js";
+export { createGpuThread, closeDefaultGpuThread } from "./gpu-thread.js";
 export {
   encodeImage,
   OUTPUT_FORMATS,

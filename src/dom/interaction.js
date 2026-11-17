@@ -1,18 +1,12 @@
 import { sharedDomCore } from "../dom-wasm/core.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+import { decodeInputRecord, encodeInputRecord } from "../dom-wasm/input-record-encoding.js";
 
-// These codes select native schema domains, not host validation policy.
-const POINTER_KEYS = 1;
-const WHEEL_KEYS = 6;
-const CANCEL_KEYS = 4;
-const KEYBOARD_KEYS = 7;
-const COMPOSITION_KEYS = 9;
-const COMPOSITION_END_KEYS = 11;
-const ACCESSIBILITY_ACTION_KEYS = 12;
-
-function schemaEnum(domain, value) {
-  if (typeof value !== "string") return 0;
-  return sharedDomCore.status("input_schema_enum", domain, ...sharedDomCore.input(value));
-}
+const INPUT_SCHEMA_FINITE = layoutConstant("INPUT_SCHEMA_FINITE");
+const INPUT_COALESCE_START = layoutConstant("INPUT_COALESCE_START");
+const INPUT_COALESCE_READ_KIND = layoutConstant("INPUT_COALESCE_READ_KIND");
+const INPUT_COALESCE_READ_IDENTITY = layoutConstant("INPUT_COALESCE_READ_IDENTITY");
+const INPUT_COALESCE_REPLACE = layoutConstant("INPUT_COALESCE_REPLACE");
 
 function schemaNumber(kind, value) {
   return sharedDomCore.status("input_schema_number", kind, value) !== 0;
@@ -20,183 +14,18 @@ function schemaNumber(kind, value) {
 
 function finite(value, name) {
   const number = Number(value);
-  if (!schemaNumber(0, number)) throw new TypeError(`${name} must be finite`);
+  if (!schemaNumber(INPUT_SCHEMA_FINITE, number)) throw new TypeError(`${name} must be finite`);
   return number;
 }
 
-function integer(value, name) {
-  const number = Number(value);
-  if (!schemaNumber(1, number)) {
-    throw new TypeError(`${name} must be an integer`);
-  }
-  return number;
-}
-
-function exactKeys(record, allowed) {
-  for (const key of Object.keys(record)) {
-    if (!sharedDomCore.status("input_schema_field", allowed, ...sharedDomCore.input(key))) {
-      throw new TypeError(`Unknown ${record.kind} field: ${key}`);
-    }
-  }
-}
-
-function modifiers(record) {
-  return Object.freeze({
-    altKey: Boolean(record.altKey),
-    ctrlKey: Boolean(record.controlKey),
-    metaKey: Boolean(record.metaKey),
-    shiftKey: Boolean(record.shiftKey),
-  });
-}
-function keyboardString(value, name, { allowEmpty = false } = {}) {
-  if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
-    throw new TypeError(`${name} must be ${allowEmpty ? "a string" : "a nonempty string"}`);
-  }
-  return value;
-}
-
-
+// The core checks and normalizes the record (core/dom/input-record.watpart).
 export function normalizeInputRecord(record) {
   if (!record || typeof record !== "object" || Array.isArray(record)) {
     throw new TypeError("An input record must be an object.");
   }
-  if (!schemaEnum(0, record.kind)) {
-    throw new RangeError(`Unknown input record kind: ${record.kind}`);
-  }
-  if (record.kind === "pointer-cancel" || record.kind === "pointer-leave") {
-    exactKeys(record, CANCEL_KEYS);
-    return Object.freeze({
-      kind: record.kind,
-      pointerId: integer(record.pointerId, "pointerId"),
-    });
-  }
-  if (record.kind.startsWith("composition-")) {
-    exactKeys(
-      record,
-      record.kind === "composition-end"
-        ? COMPOSITION_END_KEYS
-        : COMPOSITION_KEYS,
-    );
-    return Object.freeze({
-      kind: record.kind,
-      text: keyboardString(record.text, "text", { allowEmpty: true }),
-      ...(record.kind === "composition-end"
-        ? { cancelled: Boolean(record.cancelled) }
-        : {}),
-      ...modifiers(record),
-    });
-  }
-  if (record.kind === "accessibility-action") {
-    exactKeys(record, ACCESSIBILITY_ACTION_KEYS);
-    const action = String(record.action);
-    if (!schemaEnum(2, action)) {
-      throw new RangeError(`Unknown accessibility action ${action}`);
-    }
-    const normalized = {
-      kind: record.kind,
-      accessibilityRevision: integer(
-        record.accessibilityRevision,
-        "accessibilityRevision",
-      ),
-      nodeIdentifier: keyboardString(
-        record.nodeIdentifier,
-        "nodeIdentifier",
-      ),
-      action,
-    };
-    if (action === "set-value") {
-      normalized.value = keyboardString(record.value, "value", {
-        allowEmpty: true,
-      });
-      if (
-        record.selectionStart !== undefined ||
-        record.selectionEnd !== undefined
-      ) {
-        throw new TypeError(
-          "set-value does not accept selectionStart or selectionEnd",
-        );
-      }
-    } else if (action === "selection") {
-      normalized.selectionStart = integer(
-        record.selectionStart,
-        "selectionStart",
-      );
-      normalized.selectionEnd = integer(record.selectionEnd, "selectionEnd");
-      if (record.value !== undefined) {
-        throw new TypeError("selection does not accept value");
-      }
-    } else if (
-      record.value !== undefined ||
-      record.selectionStart !== undefined ||
-      record.selectionEnd !== undefined
-    ) {
-      throw new TypeError(`${action} does not accept a value or selection`);
-    }
-    return Object.freeze(normalized);
-  }
-  if (record.kind === "wheel") {
-    exactKeys(record, WHEEL_KEYS);
-    const deltaMode = integer(record.deltaMode ?? 0, "deltaMode");
-    if (!schemaNumber(3, deltaMode)) {
-      throw new RangeError(`Unknown wheel deltaMode ${deltaMode}`);
-    }
-    return Object.freeze({
-      kind: record.kind,
-      x: finite(record.x, "x"),
-      y: finite(record.y, "y"),
-      deltaX: finite(record.deltaX, "deltaX"),
-      deltaY: finite(record.deltaY, "deltaY"),
-      deltaMode,
-      ...modifiers(record),
-    });
-  }
-  if (record.kind === "key-down" || record.kind === "key-up") {
-    exactKeys(record, KEYBOARD_KEYS);
-    const location = integer(record.location ?? 0, "location");
-    if (!schemaNumber(4, location)) {
-      throw new RangeError(`Unknown keyboard location ${location}`);
-    }
-    return Object.freeze({
-      kind: record.kind,
-      key: keyboardString(record.key, "key"),
-      code: keyboardString(record.code ?? "", "code", { allowEmpty: true }),
-      location,
-      repeat: Boolean(record.repeat),
-      ...modifiers(record),
-    });
-  }
-  exactKeys(record, POINTER_KEYS);
-  const pointerType = String(record.pointerType ?? "mouse");
-  if (!schemaEnum(1, pointerType)) {
-    throw new RangeError(`Unknown pointerType ${pointerType}`);
-  }
-  const pressure = finite(
-    record.pressure ?? (record.kind === "pointer-up" ? 0 : 0.5),
-    "pressure",
-  );
-  if (!schemaNumber(2, pressure)) {
-    throw new RangeError("pressure must be between zero and one");
-  }
-  return Object.freeze({
-    kind: record.kind,
-    pointerId: integer(record.pointerId, "pointerId"),
-    pointerType,
-    isPrimary: Boolean(record.isPrimary ?? true),
-    button: integer(record.button ?? 0, "button"),
-    buttons: integer(
-      record.buttons ?? (record.kind === "pointer-up" ? 0 : 1),
-      "buttons",
-    ),
-    x: finite(record.x, "x"),
-    y: finite(record.y, "y"),
-    pressure,
-    // A record without a time takes the time of the surface's clock when it
-    // is dispatched (input-controller.js), the clock its frames run on.
-    ...((record.timeMilliseconds ?? undefined) === undefined
-      ? {}
-      : { timeMilliseconds: finite(record.timeMilliseconds, "timeMilliseconds") }),
-    ...modifiers(record),
-  });
+  const length = sharedDomCore.statusRaw("input_record_normalize", ...sharedDomCore.byteInput(encodeInputRecord(record)));
+  const pointer = sharedDomCore.exports.abi_output_pointer();
+  return decodeInputRecord(sharedDomCore.refreshBytes().slice(pointer, pointer + length));
 }
 
 const bigintHex = BigInt.prototype.toString;
@@ -314,22 +143,22 @@ export function enqueueInputRecord(records, record) {
   // Each native step requests only the next observable host read. In particular,
   // do not cache at(-1), or convert arbitrary pointer identities to numbers.
   let step = sharedDomCore.exports.input_schema_coalesce(
-    0,
+    INPUT_COALESCE_START,
     record?.kind === "pointer-move",
   );
-  if (step === 1) {
+  if (step === INPUT_COALESCE_READ_KIND) {
     step = sharedDomCore.exports.input_schema_coalesce(
-      1,
+      step,
       records.at(-1)?.kind === "pointer-move",
     );
   }
-  if (step === 2) {
+  if (step === INPUT_COALESCE_READ_IDENTITY) {
     step = sharedDomCore.exports.input_schema_coalesce(
-      2,
+      step,
       records.at(-1).pointerId === record.pointerId,
     );
   }
-  if (step === 3) {
+  if (step === INPUT_COALESCE_REPLACE) {
     records[records.length - 1] = record;
   } else {
     records.push(record);

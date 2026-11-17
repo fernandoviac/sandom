@@ -1,6 +1,7 @@
 // HTML parsing and serialization are owned by the WebAssembly core. Host
 // wrappers materialize lazily; declarative shadow roots activate here because
 // attaching a shadow root is a host-visible element operation.
+import { layoutConstant } from "../wasm/layout-table.js";
 
 // Templates in a parsed subtree, in tree order, each followed by the
 // templates of its content: an inner declarative shadow root activates after
@@ -50,6 +51,9 @@ function activateDeclarativeShadowRoots(root, fragmentHost = null, isOpen = null
       }
       continue;
     }
+    // HTML parser: a declarative shadow root is available to element
+    // internals.
+    shadowRoot._domCore.status("node_mark_declarative_shadow_root", shadowRoot._coreHandle);
     while (template.content.firstChild) {
       shadowRoot.appendChild(template.content.firstChild);
     }
@@ -67,7 +71,13 @@ export function parseHTMLDocument(source, documentFactory) {
   return document;
 }
 
-const RUN_STATUS = ["finished", "script", "insertion-point", "input"];
+const HTML_RUN_FINISHED = layoutConstant("HTML_RUN_FINISHED");
+const HTML_RUN_SCRIPT = layoutConstant("HTML_RUN_SCRIPT");
+// The run statuses that return with only their keyword.
+const RUN_STATUS = new Map([
+  [layoutConstant("HTML_RUN_INSERTION_POINT"), "insertion-point"],
+  [layoutConstant("HTML_RUN_INPUT"), "input"],
+]);
 
 // The parser of a document that receives its input in pieces and returns to
 // the caller after each script end tag (the script processing model). The
@@ -144,7 +154,7 @@ class HTMLDocumentParser {
       throw error;
     }
     const handlers = this._core.htmlParserTakeHandlerElements(parser);
-    if (status === 0) {
+    if (status === HTML_RUN_FINISHED) {
       // The finished record stays until its handler elements are taken.
       this.abort();
       activateDeclarativeShadowRoots(this._document);
@@ -155,7 +165,7 @@ class HTMLDocumentParser {
       null,
       (template) => this._core.htmlParserOpen(parser, template._coreHandle),
     );
-    if (status === 1) {
+    if (status === HTML_RUN_SCRIPT) {
       const { line, column } = this._core.htmlParserScriptPosition(parser);
       return {
         status: "script",
@@ -165,7 +175,7 @@ class HTMLDocumentParser {
         handlers,
       };
     }
-    return { status: RUN_STATUS[status], handlers };
+    return { status: RUN_STATUS.get(status), handlers };
   }
 
   // The position after the last token the parser consumed: 1-based line,
@@ -216,10 +226,4 @@ export function serializeNodeContents(node) {
 
 export function serializeNode(node) {
   return node._domCore.string("html_serialize_node", node._coreHandle, 0);
-}
-
-// Snapshot output includes every shadow root as a declarative shadow root
-// template placed before the host's light children.
-export function serializeSnapshotNode(node) {
-  return node._domCore.string("html_serialize_node", node._coreHandle, 1);
 }

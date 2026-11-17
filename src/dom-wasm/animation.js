@@ -1,5 +1,149 @@
 import { sharedDomCore as core } from "./core.js";
 import { parseCSSEasing } from "./easing.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+
+const ANIMATION_ENUMERATION_EVENT_TYPE = layoutConstant("ANIMATION_ENUMERATION_EVENT_TYPE");
+const U32 = Uint32Array.BYTES_PER_ELEMENT;
+const F64 = Float64Array.BYTES_PER_ELEMENT;
+const KEYFRAME_OFFSET_SIZE = layoutConstant("KEYFRAME_OFFSET_SIZE");
+const KEYFRAME_OFFSET_VALUE = layoutConstant("KEYFRAME_OFFSET_VALUE");
+const KEYFRAME_OFFSET_SOURCE = layoutConstant("KEYFRAME_OFFSET_SOURCE");
+const KEYFRAME_OFFSET_SPECIFIED = layoutConstant("KEYFRAME_OFFSET_SPECIFIED");
+const KEYFRAME_PROPERTY_SIZE = layoutConstant("KEYFRAME_PROPERTY_SIZE");
+const KEYFRAME_PROPERTY_NAME = layoutConstant("KEYFRAME_PROPERTY_NAME");
+const KEYFRAME_PROPERTY_NAME_LENGTH = layoutConstant("KEYFRAME_PROPERTY_NAME_LENGTH");
+const KEYFRAME_PROPERTY_VALUES = layoutConstant("KEYFRAME_PROPERTY_VALUES");
+const KEYFRAME_ARRANGEMENT_FRAMES = layoutConstant("KEYFRAME_ARRANGEMENT_FRAMES");
+const KEYFRAME_ARRANGEMENT_ASSIGNMENTS = layoutConstant("KEYFRAME_ARRANGEMENT_ASSIGNMENTS");
+const KEYFRAME_ARRANGEMENT_HEADER_SIZE = layoutConstant("KEYFRAME_ARRANGEMENT_HEADER_SIZE");
+const KEYFRAME_SLOT_SIZE = layoutConstant("KEYFRAME_SLOT_SIZE");
+const KEYFRAME_SLOT_OFFSET = layoutConstant("KEYFRAME_SLOT_OFFSET");
+const KEYFRAME_SLOT_EASING = layoutConstant("KEYFRAME_SLOT_EASING");
+const KEYFRAME_SLOT_COMPOSITE = layoutConstant("KEYFRAME_SLOT_COMPOSITE");
+const KEYFRAME_ASSIGNMENT_SIZE = layoutConstant("KEYFRAME_ASSIGNMENT_SIZE");
+const KEYFRAME_ASSIGNMENT_FIELDS = [
+  layoutConstant("KEYFRAME_ASSIGNMENT_NAME"),
+  layoutConstant("KEYFRAME_ASSIGNMENT_VALUE"),
+  layoutConstant("KEYFRAME_ASSIGNMENT_FRAME"),
+];
+const TEXT_ROW_SIZE = layoutConstant("TEXT_ROW_SIZE");
+const TEXT_ROW_POINTER = layoutConstant("TEXT_ROW_POINTER");
+const TEXT_ROW_LENGTH = layoutConstant("TEXT_ROW_LENGTH");
+const TRACK_EVENT_SIZE = layoutConstant("TRACK_EVENT_SIZE");
+const TRACK_EVENT_SLOT = layoutConstant("TRACK_EVENT_SLOT");
+const TRACK_EVENT_TYPE = layoutConstant("TRACK_EVENT_TYPE");
+const TRACK_SETTLED_SIZE = layoutConstant("TRACK_SETTLED_SIZE");
+const TRACK_SETTLED_IDENTITY = layoutConstant("TRACK_SETTLED_IDENTITY");
+const TRACK_SETTLED_ANIMATION = layoutConstant("TRACK_SETTLED_ANIMATION");
+const TRACK_SETTLED_GENERATION = layoutConstant("TRACK_SETTLED_GENERATION");
+const TRACK_ENDED_SIZE = layoutConstant("TRACK_ENDED_SIZE");
+const ANIMATION_FEEDBACK_SIZE = layoutConstant("ANIMATION_FEEDBACK_SIZE");
+const ANIMATION_FEEDBACK_IDENTITY = layoutConstant("ANIMATION_FEEDBACK_IDENTITY");
+const ANIMATION_FEEDBACK_SLOT = layoutConstant("ANIMATION_FEEDBACK_SLOT");
+// Each feedback field and the engine track record field it carries.
+const ANIMATION_FEEDBACK_FIELDS = Object.freeze([
+  ["ANIMATION_FEEDBACK_NODE", "ANIMATION_RECORD_NODE", "getUint16"],
+  ["ANIMATION_FEEDBACK_PROPERTY", "ANIMATION_RECORD_PROPERTY", "getUint16"],
+  ["ANIMATION_FEEDBACK_FLAGS", "ANIMATION_RECORD_FLAGS", "getUint8"],
+  ["ANIMATION_FEEDBACK_STATE", "ANIMATION_RECORD_STATE", "getUint8"],
+  ["ANIMATION_FEEDBACK_STARTED", "ANIMATION_RECORD_STARTED", "getUint8"],
+  ["ANIMATION_FEEDBACK_SEQUENCE", "ANIMATION_RECORD_SEQUENCE", "getUint32"],
+  ["ANIMATION_FEEDBACK_COMPOSITE", "ANIMATION_RECORD_COMPOSITE", "getUint8"],
+].map(([feedback, record, read]) => [layoutConstant(feedback), layoutConstant(record), read]));
+const VALUE_ENVELOPE_KIND = layoutConstant("VALUE_ENVELOPE_KIND");
+const VALUE_ENVELOPE_TAG = layoutConstant("VALUE_ENVELOPE_TAG");
+const VALUE_ENVELOPE_COUNT = layoutConstant("VALUE_ENVELOPE_COUNT");
+const VALUE_ENVELOPE_VALUES = layoutConstant("VALUE_ENVELOPE_VALUES");
+// A canonical animation value (ANIMATION_VALUE_*), the result of
+// animation_value_from_text and animation_value_compose.
+const ANIMATION_VALUE = Object.freeze(Object.fromEntries(["COMPONENT_COUNT", "TEXT_POINTER", "TEXT_LENGTH", "COMPONENTS",
+  "COMPONENT_SIZE", "COMPONENT_KIND", "COMPONENT_NAME", "COMPONENT_PARAMETERS"]
+  .map((name) => [name, layoutConstant(`ANIMATION_VALUE_${name}`)])));
+export const ANIMATION_VALUE_TAG_IN_VALUES = layoutConstant("ANIMATION_VALUE_TAG_IN_VALUES");
+const KEYFRAME_VALUE_NEEDS_COLOR = layoutConstant("KEYFRAME_VALUE_NEEDS_COLOR");
+const KEYFRAME_VALUE_NEEDS_PARENT_COLOR = layoutConstant("KEYFRAME_VALUE_NEEDS_PARENT_COLOR");
+const KEYFRAME_VALUE_UNSET = layoutConstant("KEYFRAME_VALUE_UNSET");
+const KEYFRAME_VALUE_KEYWORD = layoutConstant("KEYFRAME_VALUE_KEYWORD");
+const COMPUTED_TIMING_LOCAL = layoutConstant("COMPUTED_TIMING_LOCAL");
+const COMPUTED_TIMING_ACTIVE = layoutConstant("COMPUTED_TIMING_ACTIVE");
+const COMPUTED_TIMING_END = layoutConstant("COMPUTED_TIMING_END");
+const COMPUTED_TIMING_ITERATION = layoutConstant("COMPUTED_TIMING_ITERATION");
+const COMPUTED_TIMING_PROGRESS = layoutConstant("COMPUTED_TIMING_PROGRESS");
+const EASING_KIND_KEYWORD = layoutConstant("EASING_KIND_KEYWORD");
+const EASING_KIND_CUBIC = layoutConstant("EASING_KIND_CUBIC");
+const EASING_KIND_STEPS = layoutConstant("EASING_KIND_STEPS");
+const EASING_KIND_LINEAR = layoutConstant("EASING_KIND_LINEAR");
+const EASING_KIND_UNSUPPORTED = layoutConstant("EASING_KIND_UNSUPPORTED");
+const EASING_RECORD_KIND = layoutConstant("EASING_RECORD_KIND");
+const EASING_RECORD_PAYLOAD = layoutConstant("EASING_RECORD_PAYLOAD");
+const EASING_RECORD_POINT_COUNT = layoutConstant("EASING_RECORD_POINT_COUNT");
+const EASING_RECORD_HEADER_SIZE = layoutConstant("EASING_RECORD_HEADER_SIZE");
+const EASING_POINT_SIZE = layoutConstant("EASING_POINT_SIZE");
+const EASING_POINT_INPUT = layoutConstant("EASING_POINT_INPUT");
+const EASING_POINT_OUTPUT = layoutConstant("EASING_POINT_OUTPUT");
+const CSS_DEFINITION_SIZE = layoutConstant("CSS_DEFINITION_SIZE");
+const CSS_DEFINITION_NAME = layoutConstant("CSS_DEFINITION_NAME");
+const CSS_DEFINITION_NAME_LENGTH = layoutConstant("CSS_DEFINITION_NAME_LENGTH");
+const CSS_DEFINITION_SIGNATURE = layoutConstant("CSS_DEFINITION_SIGNATURE");
+const CSS_DEFINITION_SIGNATURE_LENGTH = layoutConstant("CSS_DEFINITION_SIGNATURE_LENGTH");
+const CSS_DEFINITION_OCCURRENCE = layoutConstant("CSS_DEFINITION_OCCURRENCE");
+const CSS_DEFINITION_INDEX = layoutConstant("CSS_DEFINITION_INDEX");
+const CSS_RECONCILED_SIZE = layoutConstant("CSS_RECONCILED_SIZE");
+const CSS_RECONCILED_REUSE = layoutConstant("CSS_RECONCILED_REUSE");
+const CSS_RECONCILED_OCCURRENCE = layoutConstant("CSS_RECONCILED_OCCURRENCE");
+const CSS_RECONCILED_MATCH = layoutConstant("CSS_RECONCILED_MATCH");
+const CSS_PREVIOUS_TIMELINE_SIZE = layoutConstant("CSS_PREVIOUS_TIMELINE_SIZE");
+const CSS_PREVIOUS_TIMELINE_HANDLE = layoutConstant("CSS_PREVIOUS_TIMELINE_HANDLE");
+const CSS_PREVIOUS_TIMELINE_TEXT = layoutConstant("CSS_PREVIOUS_TIMELINE_TEXT");
+const CSS_PREVIOUS_TIMELINE_TEXT_LENGTH = layoutConstant("CSS_PREVIOUS_TIMELINE_TEXT_LENGTH");
+const CSS_DESIRED_TIMELINE_SIZE = layoutConstant("CSS_DESIRED_TIMELINE_SIZE");
+const CSS_DESIRED_TIMELINE_TEXT = layoutConstant("CSS_DESIRED_TIMELINE_TEXT");
+const CSS_DESIRED_TIMELINE_TEXT_LENGTH = layoutConstant("CSS_DESIRED_TIMELINE_TEXT_LENGTH");
+const CSS_PLAN_SIZE = layoutConstant("CSS_PLAN_SIZE");
+const CSS_PLAN_RETAINED = layoutConstant("CSS_PLAN_RETAINED");
+const CSS_PLAN_KIND = layoutConstant("CSS_PLAN_KIND");
+const CSS_PLAN_OCCURRENCE = layoutConstant("CSS_PLAN_OCCURRENCE");
+const CSS_PLAN_MATCH = layoutConstant("CSS_PLAN_MATCH");
+export const CSS_PLAN_KEEP = layoutConstant("CSS_PLAN_KEEP");
+export const CSS_PLAN_UPDATE = layoutConstant("CSS_PLAN_UPDATE");
+const CSS_PLACE_SIZE = layoutConstant("CSS_PLACE_SIZE");
+const CSS_PLACE_POSITION = layoutConstant("CSS_PLACE_POSITION");
+const CSS_PLACE_RETAINED = layoutConstant("CSS_PLACE_RETAINED");
+const CSS_PLACE_MATCH = layoutConstant("CSS_PLACE_MATCH");
+const FRAME_PRESENCE_SIZE = layoutConstant("FRAME_PRESENCE_SIZE");
+const FRAME_PRESENCE_OFFSET = layoutConstant("FRAME_PRESENCE_OFFSET");
+const FRAME_PRESENCE_PRESENT = layoutConstant("FRAME_PRESENCE_PRESENT");
+// The CONTENT_FRAME rows of animation_content_sample.
+const CONTENT_FRAME = Object.freeze(Object.fromEntries([
+  "SIZE", "OFFSET", "PRESENT", "EASING_KIND", "EASING_POINTER", "EASING_COUNT",
+].map((name) => [name, layoutConstant(`CONTENT_FRAME_${name}`)])));
+const CONTENT_TIMES_START = layoutConstant("CONTENT_TIMES_START");
+const CONTENT_TIMES_HOLD = layoutConstant("CONTENT_TIMES_HOLD");
+// FRAME_PRESENCE rows of $keyframes: each offset, and whether $present.
+function framePresenceRows(keyframes, offsetOf, present) {
+  const pointer = core.exports.abi_allocate(keyframes.length * FRAME_PRESENCE_SIZE);
+  const view = new DataView(core.refreshBytes().buffer);
+  keyframes.forEach((keyframe, index) => {
+    view.setFloat64(pointer + index * FRAME_PRESENCE_SIZE + FRAME_PRESENCE_OFFSET, offsetOf(keyframe), true);
+    view.setUint32(pointer + index * FRAME_PRESENCE_SIZE + FRAME_PRESENCE_PRESENT, present(keyframe) ? 1 : 0, true);
+  });
+  return pointer;
+}
+const TRANSITION_DEFINITION_SIZE = layoutConstant("TRANSITION_DEFINITION_SIZE");
+const TRANSITION_DEFINITION_NAME = layoutConstant("TRANSITION_DEFINITION_NAME");
+const TRANSITION_DEFINITION_NAME_LENGTH = layoutConstant("TRANSITION_DEFINITION_NAME_LENGTH");
+const TRANSITION_DEFINITION_DURATION = layoutConstant("TRANSITION_DEFINITION_DURATION");
+const TRANSITION_DEFINITION_DELAY = layoutConstant("TRANSITION_DEFINITION_DELAY");
+const TRANSITION_DEFINITION_EASING = layoutConstant("TRANSITION_DEFINITION_EASING");
+const TRANSITION_DEFINITION_EASING_LENGTH = layoutConstant("TRANSITION_DEFINITION_EASING_LENGTH");
+const BINDING_COMMAND_PAUSE = layoutConstant("BINDING_COMMAND_PAUSE");
+const BINDING_COMMAND_RESUME = layoutConstant("BINDING_COMMAND_RESUME");
+const BINDING_COMMAND_SEEK = layoutConstant("BINDING_COMMAND_SEEK");
+const BINDING_COMMAND_CANCEL = layoutConstant("BINDING_COMMAND_CANCEL");
+const BINDING_COMMAND_SIZE = layoutConstant("BINDING_COMMAND_SIZE");
+const BINDING_COMMAND_KIND = layoutConstant("BINDING_COMMAND_KIND");
+const BINDING_COMMAND_LOCAL = layoutConstant("BINDING_COMMAND_LOCAL");
+const BINDING_COMMAND_SAMPLE = layoutConstant("BINDING_COMMAND_SAMPLE");
 
 // Calls a validation operation of the animation core. Its error names the
 // reason and the limit; $subject names what failed and its observed value.
@@ -21,7 +165,7 @@ function observedText(value) {
 export function normalizeAnimationOffsets(keyframes) {
   const frames = keyframes.map((frame) => ({ ...frame }));
   if (frames.length === 0) return frames;
-  const pointer = core.exports.abi_allocate(frames.length * 16);
+  const pointer = core.exports.abi_allocate(frames.length * KEYFRAME_OFFSET_SIZE);
   let view = new DataView(core.refreshBytes().buffer);
   for (let index = 0; index < frames.length; index++) {
     const offset = frames[index].offset;
@@ -29,9 +173,10 @@ export function normalizeAnimationOffsets(keyframes) {
     if (index > 0 && offset != null && typeof offset !== "number") {
       throw new TypeError("keyframe offset must be finite");
     }
-    view.setFloat64(pointer + index * 16, offset ?? NaN, true);
-    view.setUint32(pointer + index * 16 + 8, index, true);
-    view.setUint32(pointer + index * 16 + 12, offset == null ? 0 : 1, true);
+    const at = pointer + index * KEYFRAME_OFFSET_SIZE;
+    view.setFloat64(at + KEYFRAME_OFFSET_VALUE, offset ?? NaN, true);
+    view.setUint32(at + KEYFRAME_OFFSET_SOURCE, index, true);
+    view.setUint32(at + KEYFRAME_OFFSET_SPECIFIED, offset == null ? 0 : 1, true);
   }
   const count = animationStatus(() => `The keyframe offsets [${frames.map(({ offset }) => String(offset ?? null)).join(", ")}]`,
     "animation_offsets", pointer, frames.length);
@@ -39,8 +184,9 @@ export function normalizeAnimationOffsets(keyframes) {
   const output = core.exports.abi_output_pointer();
   const result = new Array(count);
   for (let index = 0; index < count; index++) {
-    const frame = frames[view.getUint32(output + index * 16 + 8, true)];
-    frame.offset = view.getFloat64(output + index * 16, true);
+    const at = output + index * KEYFRAME_OFFSET_SIZE;
+    const frame = frames[view.getUint32(at + KEYFRAME_OFFSET_SOURCE, true)];
+    frame.offset = view.getFloat64(at + KEYFRAME_OFFSET_VALUE, true);
     result[index] = frame;
   }
   return result;
@@ -53,82 +199,148 @@ export function normalizeAnimationOffsets(keyframes) {
 // keyframeIndex] in the order their values enter the keyframes.
 export function arrangeKeyframes(properties, offsetCount, easingCount, compositeCount) {
   const names = properties.map(([name]) => core.input(name));
-  const rows = core.exports.abi_allocate(Math.max(1, properties.length) * 16);
+  const rows = core.exports.abi_allocate(Math.max(1, properties.length) * KEYFRAME_PROPERTY_SIZE);
   let view = new DataView(core.refreshBytes().buffer);
   for (let index = 0; index < properties.length; index++) {
-    view.setUint32(rows + index * 16, names[index][0], true);
-    view.setUint32(rows + index * 16 + 4, names[index][1], true);
-    view.setUint32(rows + index * 16 + 8, properties[index][1].length, true);
+    const at = rows + index * KEYFRAME_PROPERTY_SIZE;
+    view.setUint32(at + KEYFRAME_PROPERTY_NAME, names[index][0], true);
+    view.setUint32(at + KEYFRAME_PROPERTY_NAME_LENGTH, names[index][1], true);
+    view.setUint32(at + KEYFRAME_PROPERTY_VALUES, properties[index][1].length, true);
   }
   const output = core.status("animation_keyframes_arrange", rows, properties.length, offsetCount, easingCount, compositeCount);
   view = new DataView(core.refreshBytes().buffer);
-  const frameCount = view.getUint32(output, true);
+  const frameCount = view.getUint32(output + KEYFRAME_ARRANGEMENT_FRAMES, true);
+  const slots = output + KEYFRAME_ARRANGEMENT_HEADER_SIZE;
   const frames = Array.from({ length: frameCount }, (_, index) => ({
-    offsetIndex: view.getInt32(output + 8 + index * 12, true),
-    easingIndex: view.getInt32(output + 12 + index * 12, true),
-    compositeIndex: view.getInt32(output + 16 + index * 12, true),
+    offsetIndex: view.getInt32(slots + index * KEYFRAME_SLOT_SIZE + KEYFRAME_SLOT_OFFSET, true),
+    easingIndex: view.getInt32(slots + index * KEYFRAME_SLOT_SIZE + KEYFRAME_SLOT_EASING, true),
+    compositeIndex: view.getInt32(slots + index * KEYFRAME_SLOT_SIZE + KEYFRAME_SLOT_COMPOSITE, true),
   }));
-  const base = output + 8 + frameCount * 12;
-  const assignments = Array.from({ length: view.getUint32(output + 4, true) }, (_, index) =>
-    [0, 4, 8].map((field) => view.getUint32(base + index * 12 + field, true)));
+  const base = slots + frameCount * KEYFRAME_SLOT_SIZE;
+  const assignments = Array.from({ length: view.getUint32(output + KEYFRAME_ARRANGEMENT_ASSIGNMENTS, true) }, (_, index) =>
+    KEYFRAME_ASSIGNMENT_FIELDS.map((field) => view.getUint32(base + index * KEYFRAME_ASSIGNMENT_SIZE + field, true)));
   return { frames, assignments };
 }
 
-// The numbers of a transform component, as animation_keyframe_value_text
-// reads them for its function name.
-function componentNumbers(component) {
-  switch (component.kind) {
-    case "translate": return [component.x.pixels, component.x.percentage, component.y.pixels, component.y.percentage];
-    case "translateX": case "translateY": return [component.value.pixels, component.value.percentage];
-    case "scale": return [component.x, component.y];
-    case "skew": return [component.xRadians, component.yRadians];
-    case "matrix": return component.value;
-    case "rotate": case "skewX": case "skewY": return [component.radians];
-    default: return [component.value];
+// A canonical animation value of one animation property: the core's
+// normalized envelope (`kind`, `tag`, `values`), its `components` (a
+// transform's functions or a shadow list's geometry and colour pairs, each
+// `{ kind, name, parameters }`) and its CSS `text`, as Chrome reports a
+// keyframe's computed value. The engine declares tracks from it; the host
+// only carries it.
+export class AnimationValue {
+  constructor(propertyId, kind, tag, values, components, text) {
+    this.propertyId = propertyId;
+    this.kind = kind;
+    this.tag = tag;
+    this.values = Object.freeze(values);
+    this.components = Object.freeze(components.map((component) => Object.freeze(component)));
+    this.text = text;
+    Object.freeze(this);
   }
+  toString() { return this.text; }
 }
-// The items and numbers of a canonical keyframe value.
-function keyframeValueItems(value) {
-  switch (value?.kind) {
-    case "scalar": return [{ kind: "scalar", numbers: [value.value] }];
-    case "scale": return [{ kind: "scale", numbers: [value.x, value.y] }];
-    case "lengthPercentage": return [{ kind: value.kind, numbers: [value.pixels, value.percentage] }];
-    case "color": return [{ kind: "color", numbers: value.value }];
-    case "keyword": return [{ kind: "keyword", text: value.keyword }];
-    case "lineHeight": return [{ kind: value.kind, text: value.unit, numbers: [value.value] }];
-    case "translate":
-      return [{ kind: value.kind, numbers: [value.x.pixels, value.x.percentage, value.y.pixels, value.y.percentage] }];
-    case "transform":
-      return [{ kind: "transform" },
-        ...value.components.map((component) => ({ kind: component.kind, numbers: componentNumbers(component) }))];
-    case "shadowList":
-      return [{ kind: value.kind }, ...value.shadows.map((shadow) => ({ kind: "shadow",
-        numbers: [...shadow.color, shadow.offsetX, shadow.offsetY, shadow.blur, shadow.spread, shadow.inset ? 1 : 0] }))];
-    default: return [{ kind: String(value?.kind) }];
-  }
+// The canonical value $native published as its standard output.
+function readAnimationValue(native, propertyId) {
+  const output = native.exports.abi_output_pointer();
+  const bytes = native.refreshBytes();
+  const view = new DataView(bytes.buffer);
+  const count = view.getUint32(output + VALUE_ENVELOPE_COUNT, true);
+  const components = Array.from({ length: view.getUint32(output + ANIMATION_VALUE.COMPONENT_COUNT, true) }, (_, index) => {
+    const row = output + ANIMATION_VALUE.COMPONENTS + index * ANIMATION_VALUE.COMPONENT_SIZE;
+    return {
+      kind: view.getUint32(row + ANIMATION_VALUE.COMPONENT_KIND, true),
+      name: view.getUint32(row + ANIMATION_VALUE.COMPONENT_NAME, true),
+      parameters: Array.from({ length: 6 }, (_, parameter) =>
+        view.getFloat64(row + ANIMATION_VALUE.COMPONENT_PARAMETERS + parameter * F64, true)),
+    };
+  });
+  const text = view.getUint32(output + ANIMATION_VALUE.TEXT_POINTER, true);
+  return new AnimationValue(propertyId, view.getUint32(output + VALUE_ENVELOPE_KIND, true),
+    view.getUint32(output + VALUE_ENVELOPE_TAG, true),
+    Array.from({ length: count }, (_, index) => view.getFloat64(output + VALUE_ENVELOPE_VALUES + index * F64, true)),
+    components, native.decoder.decode(bytes.subarray(text, text + view.getUint32(output + ANIMATION_VALUE.TEXT_LENGTH, true))));
 }
-// The CSS text of a canonical keyframe value of $propertyName
-// (animation_keyframe_value_text). A string value is already CSS text.
-export function keyframeValueText(value, propertyName) {
-  if (typeof value === "string") return value;
-  const items = keyframeValueItems(value);
-  const texts = items.map((item) => [core.input(item.kind), core.input(String(item.text ?? ""))]);
-  const numberCount = items.reduce((sum, item) => sum + (item.numbers?.length ?? 0), 0);
-  const property = core.input(String(propertyName));
-  const rows = core.exports.abi_allocate(items.length * 24);
-  const numbers = core.exports.abi_allocate(Math.max(1, numberCount) * 8);
-  const view = new DataView(core.refreshBytes().buffer);
-  let numberIndex = 0;
-  for (let index = 0; index < items.length; index++) {
-    const row = rows + index * 24;
-    const itemNumbers = items[index].numbers ?? [];
-    view.setUint32(row, texts[index][0][0], true); view.setUint32(row + 4, texts[index][0][1], true);
-    view.setUint32(row + 8, texts[index][1][0], true); view.setUint32(row + 12, texts[index][1][1], true);
-    view.setUint32(row + 16, numberIndex, true); view.setUint32(row + 20, itemNumbers.length, true);
-    for (const number of itemNumbers) view.setFloat64(numbers + 8 * numberIndex++, number, true);
+// The canonical value of animation property $property from CSS text
+// (animation_value_from_text), computed in $element's context on its core.
+// $context (animationKeyframeContext) gives the colour currentcolor names
+// (`currentColor(parent)`: { r, g, b, a }), the element's underlying value
+// (`underlyingValue(name)`), which a value invalid at computed-value time
+// takes (it is unset), and the value a CSS-wide keyword computes to on the
+// element (`keywordValue(name, keyword)`). Without $context, a value that
+// names currentcolor is a TypeError.
+export function animationValueFromText(property, text, element = null, context = null) {
+  const native = element?._domCore ?? core;
+  const source = String(text);
+  const call = (color) => {
+    try {
+      return native.statusRaw("animation_value_from_text", property.id, ...native.input(source), element?._coreHandle ?? 0n,
+        color ? 1 : 0, color?.r ?? 0, color?.g ?? 0, color?.b ?? 0, color?.a ?? 0);
+    } catch (error) {
+      if (!(error instanceof TypeError || error instanceof RangeError)) throw error;
+      throw new error.constructor(`The ${property.name} keyframe value ${source.trim()} ${error.message}`, { cause: error });
+    }
+  };
+  const status = call(null);
+  if (status === KEYFRAME_VALUE_UNSET) {
+    if (context === null) throw new Error(`The ${property.name} keyframe value ${source.trim()} became unset without its element's context`);
+    return animationValueFromText(property, context.underlyingValue(property.name), element, context);
   }
-  return animationStatus(() => `The ${propertyName} keyframe value ${JSON.stringify(value)}`,
-    "animation_keyframe_value_text", ...property, rows, items.length, numbers) ? core.outputString() : null;
+  if (status === KEYFRAME_VALUE_KEYWORD) {
+    if (context === null) {
+      throw new TypeError(`The ${property.name} keyframe value ${source.trim()} is a CSS-wide keyword, which needs its target element`);
+    }
+    return animationValueFromText(property, context.keywordValue(property.name, source.trim()), element, context);
+  }
+  if (status === KEYFRAME_VALUE_NEEDS_COLOR || status === KEYFRAME_VALUE_NEEDS_PARENT_COLOR) {
+    if (context === null) {
+      throw new TypeError(`The ${property.name} keyframe value ${source.trim()} needs the color of its target element`);
+    }
+    call(context.currentColor(status === KEYFRAME_VALUE_NEEDS_PARENT_COLOR));
+  }
+  return readAnimationValue(native, property.id);
+}
+// The canonical value of animation property $property from an engine
+// value: its `tag` (ANIMATION_VALUE_TAG_IN_VALUES when its second number
+// carries it), up to six `values` and its `components` ({ kind, parameters
+// }); a transform's functions take their names after the canonical value
+// $source (animation_value_compose).
+export function composeAnimationValue(property, { tag, values, components = [] }, source = null) {
+  const write = (value) => {
+    const pointer = core.exports.abi_allocate(ANIMATION_VALUE.COMPONENTS + value.components.length * ANIMATION_VALUE.COMPONENT_SIZE);
+    const bytes = core.refreshBytes();
+    bytes.fill(0, pointer, pointer + ANIMATION_VALUE.COMPONENTS + value.components.length * ANIMATION_VALUE.COMPONENT_SIZE);
+    const view = new DataView(bytes.buffer);
+    view.setUint32(pointer + VALUE_ENVELOPE_TAG, value.tag, true);
+    value.values.forEach((number, index) => view.setFloat64(pointer + VALUE_ENVELOPE_VALUES + index * F64, number, true));
+    view.setUint32(pointer + ANIMATION_VALUE.COMPONENT_COUNT, value.components.length, true);
+    value.components.forEach((component, index) => {
+      const row = pointer + ANIMATION_VALUE.COMPONENTS + index * ANIMATION_VALUE.COMPONENT_SIZE;
+      view.setUint32(row + ANIMATION_VALUE.COMPONENT_KIND, component.kind, true);
+      view.setUint32(row + ANIMATION_VALUE.COMPONENT_NAME, component.name ?? 0, true);
+      component.parameters.forEach((number, parameter) =>
+        view.setFloat64(row + ANIMATION_VALUE.COMPONENT_PARAMETERS + parameter * F64, number, true));
+    });
+    return pointer;
+  };
+  const sourcePointer = source === null ? 0 : write(source);
+  core.status("animation_value_compose", property.id, write({ tag, values, components }), sourcePointer);
+  return readAnimationValue(core, property.id);
+}
+// The canonical value of a keyframe or transition value of $property:
+// a canonical value of the property, or CSS text computed without an
+// element.
+export function canonicalAnimationValue(property, value) {
+  if (value instanceof AnimationValue) {
+    if (value.propertyId !== property.id) {
+      throw new TypeError(`A ${animationPropertyName(value.propertyId)} value ${value.text} does not apply to ${property.name}`);
+    }
+    return value;
+  }
+  if (typeof value !== "string") {
+    throw new TypeError(`The ${property.name} value ${observedText(value)} is neither CSS text nor a canonical animation value`);
+  }
+  return animationValueFromText(property, value);
 }
 
 // The composite operation of a track declaration after its node, property
@@ -140,9 +352,9 @@ export function checkAnimationTrack(nodeIndex, capacity, property, propertyName,
 }
 // The value kind of a track of normalized $frames (animation_track_kind).
 export function animationTrackKind(propertyKind, composite, frames) {
-  const kinds = core.exports.abi_allocate(Math.max(1, frames.length) * 4);
+  const kinds = core.exports.abi_allocate(Math.max(1, frames.length) * U32);
   const view = new DataView(core.refreshBytes().buffer);
-  for (let index = 0; index < frames.length; index++) view.setUint32(kinds + index * 4, frames[index].value.kind, true);
+  for (let index = 0; index < frames.length; index++) view.setUint32(kinds + index * U32, frames[index].value.kind, true);
   return core.status("animation_track_kind", propertyKind, composite, kinds, frames.length);
 }
 
@@ -157,7 +369,7 @@ export function animationEnumerationName(enumeration, value) {
 }
 // The DOM event type of an engine animation event type id.
 export function animationEventName(typeId) {
-  return animationEnumerationName(3, typeId);
+  return animationEnumerationName(ANIMATION_ENUMERATION_EVENT_TYPE, typeId);
 }
 // The engine fill and direction modes of fill and direction keyword text
 // (animation_fill_mode, animation_direction_mode).
@@ -167,90 +379,124 @@ export function animationFillMode(fill) {
 export function animationDirectionMode(direction) {
   return core.exports.animation_direction_mode(...core.input(String(direction)));
 }
+// Records in animation `animationId` of core `native` whether its keyframe
+// `values` follow its element (animation_keyframes_follow_element_set).
+export function recordKeyframesFollowElement(native, animationId, values) {
+  const inputs = values.map((value) => native.input(String(value)));
+  const rows = native.exports.abi_allocate(Math.max(1, values.length) * TEXT_ROW_SIZE);
+  const view = new DataView(native.refreshBytes().buffer);
+  inputs.forEach(([pointer, length], index) => {
+    view.setUint32(rows + index * TEXT_ROW_SIZE + TEXT_ROW_POINTER, pointer, true);
+    view.setUint32(rows + index * TEXT_ROW_SIZE + TEXT_ROW_LENGTH, length, true);
+  });
+  native.status("animation_keyframes_follow_element_set", animationId, rows, values.length);
+}
+// The member kind of keyframe key `name` (animation_keyframe_member):
+// KEYFRAME_MEMBER.PROPERTY for an animated property, else the reserved
+// key it is.
+export const KEYFRAME_MEMBER = Object.freeze(Object.fromEntries(["PROPERTY", "OFFSET", "EASING", "COMPOSITE"]
+  .map((name) => [name, layoutConstant(`ANIMATION_KEYFRAME_MEMBER_${name}`)])));
+export function keyframeMember(name) {
+  return core.exports.animation_keyframe_member(...core.input(String(name)));
+}
+export function keyframePropertyNames(keyframe) {
+  return Object.keys(keyframe).filter((name) => keyframeMember(name) === KEYFRAME_MEMBER.PROPERTY);
+}
 // Throws the failure of an engine animation_track_declare result code.
 export function throwAnimationDeclarationError(code) {
   core.status("animation_declaration_error", code);
   throw new Error(`animation_declaration_error reported no failure for code ${code}`);
 }
-const TRANSFORM_FUNCTION_SHAPES = [
-  (p) => ({ kind: "translate", x: { pixels: p[0], percentage: p[1] }, y: { pixels: p[2], percentage: p[3] } }),
-  (p) => ({ kind: "translateX", value: { pixels: p[0], percentage: p[1] } }),
-  (p) => ({ kind: "translateY", value: { pixels: p[2], percentage: p[3] } }),
-  (p) => ({ kind: "scale", x: p[0], y: p[1] }),
-  (p) => ({ kind: "scaleX", value: p[0] }),
-  (p) => ({ kind: "scaleY", value: p[1] }),
-  (p) => ({ kind: "rotate", radians: p[0] }),
-  (p) => ({ kind: "skew", xRadians: p[0], yRadians: p[1] }),
-  (p) => ({ kind: "skewX", radians: p[0] }),
-  (p) => ({ kind: "skewY", radians: p[1] }),
-  (p) => ({ kind: "matrix", value: p.slice(0, 6) }),
-];
-// The script transform components of engine $components ({ kind,
-// parameters }), named after $sourceNames, the function names of the
-// transform list they came from (null for none), whose normalized engine
-// kinds are $normalizedKinds (animation_transform_frame_names). The index
-// order of TRANSFORM_FUNCTION_SHAPES is the core's name order.
-export function transformFrameComponents(components, normalizedKinds, sourceNames) {
-  const names = (sourceNames ?? []).map((name) => core.input(String(name ?? "")));
-  const rows = core.exports.abi_allocate(Math.max(1, components.length) * 56);
-  const kinds = core.exports.abi_allocate(Math.max(1, normalizedKinds.length) * 4);
-  const nameRows = core.exports.abi_allocate(Math.max(1, names.length) * 8);
-  let view = new DataView(core.refreshBytes().buffer);
-  components.forEach(({ kind, parameters }, index) => {
-    view.setUint32(rows + index * 56, kind, true);
-    for (let parameter = 0; parameter < 6; parameter++) {
-      view.setFloat64(rows + index * 56 + 8 + parameter * 8, parameters[parameter], true);
-    }
+
+// The table of the engine tracks one animation controller holds
+// (animation-track-table.watpart).
+export function createAnimationTrackTable() {
+  return core.handle("animation_tracks_create");
+}
+export function releaseAnimationTrackTable(table) {
+  core.status("animation_tracks_release", table);
+}
+export function bindAnimationTrack(table, slot, animationId, generation) {
+  return core.handle("animation_tracks_bind", table, slot, animationId ?? 0n, generation ?? 0);
+}
+// The identity of a held slot, or 0n.
+export function animationTrackIdentity(table, slot) {
+  return core.status("animation_tracks_identity", table, slot);
+}
+export function animationTrackAnimationId(table, slot) {
+  return core.status("animation_tracks_animation_id", table, slot);
+}
+export function animationTrackCount(table) {
+  return core.status("animation_tracks_count", table);
+}
+// The held slots in ascending order.
+export function animationTrackSlots(table) {
+  const count = core.status("animation_tracks_slots", table);
+  const pointer = core.exports.abi_output_pointer();
+  return Array.from(new Uint32Array(core.refreshBytes().buffer.slice(pointer, pointer + count * 4)));
+}
+// Takes what one engine operation queued: `events` of { slot, type } and
+// the `ended` slots. Returns each event's { identity, animationId,
+// trackGeneration } and each ended track's identity. With `deliver`, the
+// events open a delivery batch that endAnimationTrackBatch closes.
+export function settleAnimationTracks(table, events, ended, deliver) {
+  const endedStart = events.length * TRACK_EVENT_SIZE;
+  const input = new DataView(new ArrayBuffer(Math.max(4, endedStart + ended.length * 4)));
+  events.forEach(({ slot, type }, index) => {
+    input.setUint32(index * TRACK_EVENT_SIZE + TRACK_EVENT_SLOT, slot, true);
+    input.setUint32(index * TRACK_EVENT_SIZE + TRACK_EVENT_TYPE, type, true);
   });
-  normalizedKinds.forEach((kind, index) => view.setUint32(kinds + index * 4, kind, true));
-  names.forEach(([pointer, length], index) => {
-    view.setUint32(nameRows + index * 8, pointer, true);
-    view.setUint32(nameRows + index * 8 + 4, length, true);
-  });
-  const count = core.status("animation_transform_frame_names", rows, components.length, kinds, nameRows,
-    sourceNames === null || normalizedKinds.length !== components.length ? -1 : components.length);
+  ended.forEach((slot, index) => input.setUint32(endedStart + index * U32, slot, true));
+  const [pointer] = core.byteInput(new Uint8Array(input.buffer));
+  core.status("animation_tracks_settle", table, pointer, events.length, pointer + endedStart,
+    ended.length, deliver);
   const output = core.exports.abi_output_pointer();
-  view = new DataView(core.refreshBytes().buffer);
-  return Array.from({ length: count }, (_, index) =>
-    TRANSFORM_FUNCTION_SHAPES[view.getUint32(output + index * 4, true)](components[index].parameters));
+  const view = new DataView(core.refreshBytes().buffer);
+  return {
+    events: events.map((_, index) => ({
+      identity: view.getBigUint64(output + index * TRACK_SETTLED_SIZE + TRACK_SETTLED_IDENTITY, true),
+      animationId: view.getBigUint64(output + index * TRACK_SETTLED_SIZE + TRACK_SETTLED_ANIMATION, true),
+      trackGeneration: view.getUint32(output + index * TRACK_SETTLED_SIZE + TRACK_SETTLED_GENERATION, true),
+    })),
+    ended: ended.map((_, index) =>
+      view.getBigUint64(output + events.length * TRACK_SETTLED_SIZE + index * TRACK_ENDED_SIZE, true)),
+  };
 }
-
-// The value kind of an animation property id (animation_property_value_kind).
-export function animationPropertyValueKind(id) {
-  return core.status("animation_property_value_kind", id);
+export function animationTrackBatchLive(table, index) {
+  return core.status("animation_tracks_batch_live", table, index) !== 0;
 }
-
-export function createAnimationTrackIdentity(owner = 0n) {
-  return core.handle("animation_track_identity_create", owner);
+export function endAnimationTrackBatch(table) {
+  core.status("animation_tracks_batch_end", table);
 }
-export function releaseAnimationTrackIdentity(handle) {
-  core.status("animation_track_identity_release", handle);
-}
-function snapshotAnimationTracks(engineView, allocations, tableBase, recordSize) {
-  // Read the engine rows first: abi_allocate can grow the shared memory,
-  // which detaches the caller's engine view.
-  const rows = [];
-  for (const [slot, allocation] of allocations) {
+// The feedback rows of `candidates`, the tracks that may animate property
+// $propertyId of node $nodeIndex (the chain of the owner's effect stack
+// there): the only rows a replacement request can choose, so a declaration
+// reads a few track identities, not one per held track. A slot the table
+// does not hold has identity 0, which the request skips.
+function snapshotAnimationTracks(engine, table, recordSize, candidates) {
+  const identities = candidates.map((slot) => animationTrackIdentity(table, slot));
+  // The core calls can grow the shared memory, so the engine rows are read
+  // through a view taken after them.
+  const engineView = new DataView(engine.memory.buffer);
+  const tableBase = engine.exports.animation_table_base();
+  const rows = candidates.map((slot, index) => {
     const address = tableBase + slot * recordSize;
-    rows.push([allocation.identity, slot,
-      engineView.getUint16(address, true), engineView.getUint16(address + 2, true),
-      engineView.getUint8(address + 5), engineView.getUint8(address + 4),
-      engineView.getUint8(address + 59), engineView.getUint32(address + 96, true),
-      engineView.getUint8(address + 6)]);
-  }
-  const pointer = core.exports.abi_allocate(rows.length * 40);
+    return { identity: identities[index], slot,
+      fields: ANIMATION_FEEDBACK_FIELDS.map(([, field, read]) => engineView[read](address + field, true)) };
+  });
+  const pointer = core.exports.abi_allocate(Math.max(1, rows.length) * ANIMATION_FEEDBACK_SIZE);
   const view = new DataView(core.refreshBytes().buffer);
   for (let index = 0; index < rows.length; index++) {
-    const row = pointer + index * 40;
-    const fields = rows[index];
-    view.setBigUint64(row, fields[0], true);
-    for (let field = 1; field < 9; field++) view.setUint32(row + 4 + field * 4, fields[field], true);
+    const row = pointer + index * ANIMATION_FEEDBACK_SIZE;
+    view.setBigUint64(row + ANIMATION_FEEDBACK_IDENTITY, rows[index].identity, true);
+    view.setUint32(row + ANIMATION_FEEDBACK_SLOT, rows[index].slot, true);
+    ANIMATION_FEEDBACK_FIELDS.forEach(([field], position) => view.setUint32(row + field, rows[index].fields[position], true));
   }
-  return pointer;
+  return { pointer, count: rows.length };
 }
-export function nextAnimationReplacement(engineView, allocations, tableBase, recordSize, nodeIndex, propertyId, cursor) {
-  return core.status("animation_replacement_next", snapshotAnimationTracks(engineView, allocations, tableBase, recordSize),
-    allocations.size, nodeIndex, propertyId, cursor);
+export function nextAnimationReplacement(engine, table, recordSize, candidates, nodeIndex, propertyId, cursor) {
+  const snapshot = snapshotAnimationTracks(engine, table, recordSize, candidates);
+  return core.status("animation_replacement_next", snapshot.pointer, snapshot.count, nodeIndex, propertyId, cursor);
 }
 export function animationTransitionProperties(name) {
   const count = core.status("animation_transition_properties", ...core.input(name));
@@ -258,10 +504,26 @@ export function animationTransitionProperties(name) {
   const bytes = core.refreshBytes();
   const view = new DataView(bytes.buffer);
   return Array.from({ length: count }, (_, index) => {
-    const row = pointer + index * 8;
-    const text = view.getUint32(row, true);
-    return core.decoder.decode(bytes.subarray(text, text + view.getUint32(row + 4, true)));
+    const row = pointer + index * TEXT_ROW_SIZE;
+    const text = view.getUint32(row + TEXT_ROW_POINTER, true);
+    return core.decoder.decode(bytes.subarray(text, text + view.getUint32(row + TEXT_ROW_LENGTH, true)));
   });
+}
+// The indices of $names in the order the transitions of one style change
+// take (animation_transition_name_order).
+export function animationTransitionNameOrder(names) {
+  if (names.length < 2) return names.map((_, index) => index);
+  const inputs = names.map((name) => core.input(name));
+  const rows = core.exports.abi_allocate(names.length * TEXT_ROW_SIZE);
+  const input = new DataView(core.refreshBytes().buffer);
+  inputs.forEach(([pointer, length], index) => {
+    input.setUint32(rows + index * TEXT_ROW_SIZE + TEXT_ROW_POINTER, pointer, true);
+    input.setUint32(rows + index * TEXT_ROW_SIZE + TEXT_ROW_LENGTH, length, true);
+  });
+  const count = core.status("animation_transition_name_order", rows, names.length);
+  const output = core.exports.abi_output_pointer();
+  const order = new DataView(core.refreshBytes().buffer);
+  return Array.from({ length: count }, (_, index) => order.getUint32(output + index * U32, true));
 }
 
 export function reconcileAnimationDefinitions(definitions, previous = []) {
@@ -270,202 +532,209 @@ export function reconcileAnimationDefinitions(definitions, previous = []) {
     signature: JSON.stringify({ name: definition.name, keyframes: definition.keyframes,
       composition: definition.composition, timing: definition.timing, paused: definition.paused }),
   }));
-  const pointer = core.exports.abi_allocate((previous.length + desired.length) * 24);
-  const rows = [...previous, ...desired];
-  for (let index = 0; index < rows.length; index++) {
-    const record = rows[index];
-    const [name, nameLength] = core.input(record.definition.name);
-    const [signature, signatureLength] = core.input(record.signature);
-    const view = new DataView(core.refreshBytes().buffer);
-    const row = pointer + index * 24;
-    view.setUint32(row, name, true); view.setUint32(row + 4, nameLength, true);
-    view.setUint32(row + 8, signature, true); view.setUint32(row + 12, signatureLength, true);
-    view.setUint32(row + 16, record.occurrence ?? 0, true);
-    view.setUint32(row + 20, index, true);
-  }
+  const pointer = writeCSSDefinitionRows(core, [...previous, ...desired]);
   core.status("animation_css_reconcile", pointer, previous.length,
-    pointer + previous.length * 24, desired.length);
+    pointer + previous.length * CSS_DEFINITION_SIZE, desired.length);
   const output = core.exports.abi_output_pointer();
   const view = new DataView(core.refreshBytes().buffer);
   for (let index = 0; index < desired.length; index++) {
     const record = desired[index];
-    const row = output + index * 16;
-    record.occurrence = view.getUint32(row + 4, true);
+    const row = output + index * CSS_RECONCILED_SIZE;
+    record.occurrence = view.getUint32(row + CSS_RECONCILED_OCCURRENCE, true);
     record.identity = `${record.definition.name}\u0000${record.occurrence}`;
-    record.reusable = previous[view.getInt32(row, true)];
-    record.previous = previous[view.getInt32(row + 8, true)];
+    record.reusable = previous[view.getInt32(row + CSS_RECONCILED_REUSE, true)];
+    record.previous = previous[view.getInt32(row + CSS_RECONCILED_MATCH, true)];
   }
   return desired;
 }
-export function animationCSSInsertion(following, preceding, previous, first, count) {
-  return core.status("animation_css_insertion", following, preceding, previous ?? -1, first, count);
+// CSS_DEFINITION rows of `records`, each with its definition name,
+// signature and occurrence, in the memory of core `native`.
+function writeCSSDefinitionRows(native, records) {
+  const pointer = native.exports.abi_allocate(Math.max(1, records.length) * CSS_DEFINITION_SIZE);
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    const [name, nameLength] = native.input(record.definition.name);
+    const [signature, signatureLength] = native.input(record.signature);
+    const view = new DataView(native.refreshBytes().buffer);
+    const row = pointer + index * CSS_DEFINITION_SIZE;
+    view.setUint32(row + CSS_DEFINITION_NAME, name, true);
+    view.setUint32(row + CSS_DEFINITION_NAME_LENGTH, nameLength, true);
+    view.setUint32(row + CSS_DEFINITION_SIGNATURE, signature, true);
+    view.setUint32(row + CSS_DEFINITION_SIGNATURE_LENGTH, signatureLength, true);
+    view.setUint32(row + CSS_DEFINITION_OCCURRENCE, record.occurrence ?? 0, true);
+    view.setUint32(row + CSS_DEFINITION_INDEX, index, true);
+  }
+  return pointer;
+}
+// The plan of the CSS animations of `element` after a style change
+// (animation_css_plan): `previous` is the element's records, each with its
+// definition, signature, occurrence and animation. Returns the desired
+// records with their occurrence, `retained` (the index of the previous
+// record that continues, -1 none), `kind` (CSS_PLAN_KEEP, CSS_PLAN_UPDATE or
+// CSS_PLAN_CREATE) and `match` (the index of the previous record of the same
+// identity, -1 none), and `cancelled`, the previous records to cancel.
+export function planCSSAnimations(element, definitions, previous) {
+  const native = element._domCore;
+  const desired = definitions.map((definition) => ({
+    definition,
+    signature: JSON.stringify({ name: definition.name, keyframes: definition.keyframes,
+      composition: definition.composition, timing: definition.timing, paused: definition.paused }),
+  }));
+  const definitionRows = writeCSSDefinitionRows(native, [...previous, ...desired]);
+  const previousTimelines = native.exports.abi_allocate(Math.max(1, previous.length) * CSS_PREVIOUS_TIMELINE_SIZE);
+  for (let index = 0; index < previous.length; index++) {
+    const animation = previous[index].animation;
+    const [text, length] = native.input(String(animation._timelineValue()));
+    const view = new DataView(native.refreshBytes().buffer);
+    const row = previousTimelines + index * CSS_PREVIOUS_TIMELINE_SIZE;
+    view.setBigUint64(row + CSS_PREVIOUS_TIMELINE_HANDLE, BigInt.asUintN(64, BigInt(animation._animationId)), true);
+    view.setUint32(row + CSS_PREVIOUS_TIMELINE_TEXT, text, true);
+    view.setUint32(row + CSS_PREVIOUS_TIMELINE_TEXT_LENGTH, length, true);
+  }
+  const desiredTimelines = native.exports.abi_allocate(Math.max(1, desired.length) * CSS_DESIRED_TIMELINE_SIZE);
+  for (let index = 0; index < desired.length; index++) {
+    const [text, length] = native.input(String(desired[index].definition.timing.timeline));
+    const view = new DataView(native.refreshBytes().buffer);
+    const row = desiredTimelines + index * CSS_DESIRED_TIMELINE_SIZE;
+    view.setUint32(row + CSS_DESIRED_TIMELINE_TEXT, text, true);
+    view.setUint32(row + CSS_DESIRED_TIMELINE_TEXT_LENGTH, length, true);
+  }
+  native.status("animation_css_plan", definitionRows, previous.length,
+    definitionRows + previous.length * CSS_DEFINITION_SIZE, desired.length, previousTimelines, desiredTimelines);
+  const output = native.exports.abi_output_pointer();
+  const view = new DataView(native.refreshBytes().buffer);
+  for (let index = 0; index < desired.length; index++) {
+    const row = output + index * CSS_PLAN_SIZE;
+    desired[index].retained = view.getInt32(row + CSS_PLAN_RETAINED, true);
+    desired[index].kind = view.getInt32(row + CSS_PLAN_KIND, true);
+    desired[index].occurrence = view.getUint32(row + CSS_PLAN_OCCURRENCE, true);
+    desired[index].match = view.getInt32(row + CSS_PLAN_MATCH, true);
+  }
+  const cancelFlags = output + desired.length * CSS_PLAN_SIZE;
+  const cancelled = previous.filter((_, index) => view.getInt32(cancelFlags + index * U32, true) !== 0);
+  return { desired, cancelled };
+}
+// The list position of the animation that definition `index` of a plan
+// creates and the indices of the definitions it is declared before
+// (animation_css_place). `positions` holds the current list position of
+// each definition's record animation (-1 none), `previousPositions` the
+// positions of the previous animations before the plan's cancellations.
+export function placeCSSAnimation(index, desired, positions, previousPositions, count) {
+  const rows = core.exports.abi_allocate(Math.max(1, desired.length) * CSS_PLACE_SIZE);
+  const previousRows = core.exports.abi_allocate(Math.max(1, previousPositions.length) * U32);
+  const view = new DataView(core.refreshBytes().buffer);
+  desired.forEach((record, row) => {
+    const at = rows + row * CSS_PLACE_SIZE;
+    view.setInt32(at + CSS_PLACE_POSITION, positions[row], true);
+    view.setInt32(at + CSS_PLACE_RETAINED, record.retained, true);
+    view.setInt32(at + CSS_PLACE_MATCH, record.match, true);
+  });
+  previousPositions.forEach((position, row) => view.setInt32(previousRows + row * U32, position, true));
+  const insertionIndex = core.status("animation_css_place", index, rows, desired.length,
+    previousRows, previousPositions.length, count);
+  const output = core.exports.abi_output_pointer();
+  const result = new DataView(core.refreshBytes().buffer);
+  const before = Array.from({ length: core.exports.abi_output_length() / U32 },
+    (_, row) => result.getUint32(output + row * U32, true));
+  return { insertionIndex, before };
+}
+// The list places of an element's CSS animations at `positions`, -1 for one
+// not in the list (animation_css_slots).
+export function cssAnimationSlots(positions) {
+  const input = core.exports.abi_allocate(Math.max(1, positions.length) * U32);
+  const view = new DataView(core.refreshBytes().buffer);
+  positions.forEach((position, row) => view.setInt32(input + row * U32, position, true));
+  const count = core.status("animation_css_slots", input, positions.length);
+  const output = core.exports.abi_output_pointer();
+  const result = new DataView(core.refreshBytes().buffer);
+  return Array.from({ length: count }, (_, row) => result.getInt32(output + row * U32, true));
 }
 
-export function animationTransitionDefinitions(element) {
+// The transition lists of an element, or with `pseudo` 1 or 2 of its
+// ::before or ::after (animation_transition_definitions).
+export function animationTransitionDefinitions(element, pseudo = 0) {
   const native = element._domCore;
-  const count = native.status("animation_transition_definitions", element._coreHandle);
+  const count = native.status("animation_transition_definitions", element._coreHandle, pseudo);
   const pointer = native.exports.abi_output_pointer();
   const bytes = native.refreshBytes();
   const view = new DataView(bytes.buffer);
   const result = new Array(count);
   for (let index = 0; index < count; index++) {
-    const row = pointer + index * 40;
-    const name = view.getUint32(row, true);
-    const nameLength = view.getUint32(row + 4, true);
-    const easing = view.getUint32(row + 24, true);
-    const easingLength = view.getUint32(row + 28, true);
+    const row = pointer + index * TRANSITION_DEFINITION_SIZE;
+    const name = view.getUint32(row + TRANSITION_DEFINITION_NAME, true);
+    const nameLength = view.getUint32(row + TRANSITION_DEFINITION_NAME_LENGTH, true);
+    const easing = view.getUint32(row + TRANSITION_DEFINITION_EASING, true);
+    const easingLength = view.getUint32(row + TRANSITION_DEFINITION_EASING_LENGTH, true);
     result[index] = {
       propertyName: native.decoder.decode(bytes.subarray(name, name + nameLength)),
-      duration: view.getFloat64(row + 8, true), delay: view.getFloat64(row + 16, true),
+      duration: view.getFloat64(row + TRANSITION_DEFINITION_DURATION, true),
+      delay: view.getFloat64(row + TRANSITION_DEFINITION_DELAY, true),
       easing: native.decoder.decode(bytes.subarray(easing, easing + easingLength)),
     };
   }
-  for (const definition of result) definition.easing = parseCSSEasing(definition.easing);
+  for (const definition of result) {
+    definition.easing = parseCSSEasing(definition.easing);
+    // A logical longhand transitions the physical longhand of the
+    // element's writing mode and direction (animation_property_for).
+    if (animationProperty(definition.propertyName) === null) {
+      definition.propertyName = animationPropertyFor(definition.propertyName, element)?.name ?? definition.propertyName;
+    }
+  }
   return result;
 }
 
-// A box-shadow or text-shadow list travels as component pairs in the
-// transform component pool (engine-layout.watpart
-// $animationWriteShadowSample): geometry (offset-x, offset-y, blur, spread;
-// kind bit 0 = inset; a text shadow's spread is 0) then colour.
-export const SHADOW_COMPONENT_GEOMETRY = 0x40;
-export const SHADOW_COMPONENT_COLOR = 0x41;
-export const SHADOW_LIST_MAX = 8;
-function nativeTransform(component) {
-  const kind = component.kind;
-  let values;
-  if (kind === "translate") {
-    const x = normalizeAnimationValue({ id: 1, kind: 2 }, component.x ?? { pixels: 0, percentage: 0 });
-    const y = normalizeAnimationValue({ id: 1, kind: 2 }, component.y ?? { pixels: 0, percentage: 0 });
-    values = [x.values[0], x.values[1], y.values[0], y.values[1]];
-  } else if (kind === "translateX" || kind === "translateY") {
-    values = normalizeAnimationValue({ id: 1, kind: 2 }, component.value).values;
-  } else if (kind === "scale") values = [component.x, component.y];
-  else if (kind === "scaleX" || kind === "scaleY") values = [component.value];
-  else if (kind === "rotate" || kind === "skewX" || kind === "skewY") values = [component.radians];
-  else if (kind === "skew") values = [component.xRadians, component.yRadians];
-  else if (kind === "matrix") {
-    if (!Array.isArray(component.value) || component.value.length !== 6) throw new TypeError("A matrix component needs six values");
-    values = component.value;
-  } else values = [];
-  const pointer = core.exports.abi_allocate(48);
-  let view = new DataView(core.refreshBytes().buffer);
-  for (let index = 0; index < 6; index++) {
-    const value = index < values.length ? values[index] : 0;
-    view.setFloat64(pointer + index * 8, typeof value === "number" ? value : NaN, true);
+// The animation lists of an element (animation_definitions), one row for
+// each animation-name item, the shorter lists repeated: `current` reads the
+// record the cascade resolved last (a pseudo-element).
+const ANIMATION_DEFINITION = Object.freeze(Object.fromEntries([
+  "SIZE", "NAME", "COMPOSITION", "EASING", "DIRECTION", "FILL", "PLAY_STATE", "TIMELINE", "RANGE_START", "RANGE_END",
+  "TEXT_LENGTH", "DURATION", "DELAY", "ITERATIONS",
+].map((name) => [name, layoutConstant(`ANIMATION_DEFINITION_${name}`)])));
+export function animationListDefinitions(element, current = false) {
+  const native = element._domCore;
+  const count = native.status("animation_definitions", element._coreHandle, current ? 1 : 0);
+  const pointer = native.exports.abi_output_pointer();
+  const bytes = native.refreshBytes();
+  const view = new DataView(bytes.buffer);
+  const rows = new Array(count);
+  for (let index = 0; index < count; index++) {
+    const row = pointer + index * ANIMATION_DEFINITION.SIZE;
+    const text = (field) => {
+      const at = view.getUint32(row + field, true);
+      return native.decoder.decode(bytes.subarray(at, at + view.getUint32(row + field + ANIMATION_DEFINITION.TEXT_LENGTH, true)));
+    };
+    rows[index] = {
+      name: text(ANIMATION_DEFINITION.NAME),
+      composition: text(ANIMATION_DEFINITION.COMPOSITION),
+      easing: text(ANIMATION_DEFINITION.EASING),
+      direction: text(ANIMATION_DEFINITION.DIRECTION),
+      fill: text(ANIMATION_DEFINITION.FILL),
+      playState: text(ANIMATION_DEFINITION.PLAY_STATE),
+      timeline: text(ANIMATION_DEFINITION.TIMELINE),
+      rangeStart: text(ANIMATION_DEFINITION.RANGE_START),
+      rangeEnd: text(ANIMATION_DEFINITION.RANGE_END),
+      duration: view.getFloat64(row + ANIMATION_DEFINITION.DURATION, true),
+      delay: view.getFloat64(row + ANIMATION_DEFINITION.DELAY, true),
+      iterations: view.getFloat64(row + ANIMATION_DEFINITION.ITERATIONS, true),
+    };
   }
-  const output = animationStatus(() => `The ${kind} transform function ${observedText(component)}`,
-    "animation_transform_normalize", ...core.input(String(kind)), pointer);
-  view = new DataView(core.refreshBytes().buffer);
-  return { kind: view.getUint32(output, true),
-    parameters: Array.from({ length: 6 }, (_, index) => view.getFloat64(output + 16 + index * 8, true)) };
-}
-export function normalizeAnimationValue(property, input) {
-  let kind = 0, keyword = "", values = [], components;
-  if (input?.kind === "keyword") {
-    kind = 5; keyword = String(input.keyword);
-  } else if (property.kind === 2) {
-    if (input?.kind === "lengthPercentage" || (input && "pixels" in input && "percentage" in input)) {
-      kind = 2; values = [input.pixels, input.percentage, 0];
-    }
-  } else if (property.kind === 1) {
-    if (input?.kind === "scalar") { kind = 1; values = [input.value]; }
-    else if (input?.kind === "lengthPercentage") {
-      kind = 2; values = [input.pixels, input.percentage];
-    }
-  } else if (property.kind === 3) {
-    if (input?.kind === "color" && Array.isArray(input.value) && input.value.length === 4) {
-      kind = 3; values = input.value;
-    }
-  } else if (property.kind === 6) {
-    kind = 6; keyword = String(input?.keyword ?? input);
-  } else if (property.kind === 4) {
-    if (input?.kind === "transform" && Array.isArray(input.components)) {
-      kind = 4; values = [0, 0, 0, 0, 0, 0];
-      components = input.components.map(nativeTransform);
-    }
-  } else if (property.kind === 7) {
-    if (input?.kind === "shadowList" && Array.isArray(input.shadows)) {
-      if (input.shadows.length > SHADOW_LIST_MAX) {
-        throw new RangeError(`A shadow list animates at most ${SHADOW_LIST_MAX} shadows, got ${input.shadows.length}`);
-      }
-      kind = 7;
-      // The envelope's vector is the first shadow's numbers (the reversing
-      // rule measures progress along it; every shadow shares the progress).
-      const first = input.shadows[0];
-      values = first
-        ? [first.offsetX, first.offsetY, first.blur, first.spread, first.color[3], 0]
-        : [0, 0, 0, 0, 0, 0];
-      components = input.shadows.flatMap((shadow) => {
-        for (const number of [shadow.offsetX, shadow.offsetY, shadow.blur, shadow.spread, ...shadow.color]) {
-          if (!Number.isFinite(number)) throw new TypeError("A shadow needs finite lengths and colour channels");
-        }
-        return [
-          { kind: SHADOW_COMPONENT_GEOMETRY | (shadow.inset ? 1 : 0), parameters: [shadow.offsetX, shadow.offsetY, shadow.blur, shadow.spread, 0, 0] },
-          { kind: SHADOW_COMPONENT_COLOR, parameters: [shadow.color[0], shadow.color[1], shadow.color[2], shadow.color[3], 0, 0] },
-        ];
-      });
-    }
-  } else if (property.kind === 8 && input?.kind === "lineHeight") {
-    kind = 8; keyword = String(input.unit);
-    values = [input.value, 0];
-  } else if (property.kind === 9 && input?.kind === "translate") {
-    const x = input.x ?? { pixels: 0, percentage: 0 };
-    const y = input.y ?? { pixels: 0, percentage: 0 };
-    kind = 9;
-    values = [x.pixels, x.percentage, y.pixels, y.percentage];
-  } else if (property.kind === 10 && input?.kind === "scale") {
-    kind = 10;
-    values = [input.x, input.y];
-  }
-  const keywordInput = core.input(keyword);
-  const pointer = core.exports.abi_allocate(64);
-  let view = new DataView(core.refreshBytes().buffer);
-  new Uint8Array(view.buffer, pointer, 64).fill(0);
-  view.setUint32(pointer, kind, true);
-  view.setUint32(pointer + 8, values.length, true);
-  for (let index = 0; index < values.length; index++) {
-    view.setFloat64(pointer + 16 + index * 8, typeof values[index] === "number" ? values[index] : NaN, true);
-  }
-  const output = animationStatus(() => `The ${property.name ?? "length"} value ${observedText(input)}`,
-    "animation_value_normalize", property.id, pointer, ...keywordInput);
-  view = new DataView(core.refreshBytes().buffer);
-  const normalized = { kind: view.getUint32(output, true), tag: view.getUint32(output + 4, true),
-    values: Array.from({ length: view.getUint32(output + 8, true) }, (_, index) => view.getFloat64(output + 16 + index * 8, true)) };
-  if (components) normalized.components = components;
-  return normalized;
+  for (const row of rows) row.easing = parseCSSEasing(row.easing);
+  return rows;
 }
 
 export function animationProperty(name) {
   const id = core.status("animation_property", ...core.input(name));
   return id ? { id, name: core.outputString() } : null;
 }
-// A keyframe length as a pixel and percentage pair, or the keyword text
-// of a value that does not interpolate. With $element, the font-relative
-// and viewport-relative units compute against it (animation_length_parse).
-export function animationLength(value, element = null) {
-  if (typeof value === "number") return { kind: "lengthPercentage", pixels: value, percentage: 0 };
+// The animation property of keyframe property `name` of `element`: a
+// logical longhand animates the physical longhand of the element's
+// computed writing mode and direction (animation_property_for), which the
+// element's own core holds.
+export function animationPropertyFor(name, element) {
   const native = element?._domCore ?? core;
-  const pointer = native.status("animation_length_parse", ...native.input(String(value)), element?._coreHandle ?? 0n);
-  const bytes = native.refreshBytes();
-  const view = new DataView(bytes.buffer);
-  if (view.getUint32(pointer + 16, true) === 2) {
-    return { kind: "lengthPercentage", pixels: view.getFloat64(pointer, true), percentage: view.getFloat64(pointer + 8, true) };
-  }
-  const text = view.getUint32(pointer + 24, true);
-  const length = view.getUint32(pointer + 28, true);
-  return { kind: "keyword", keyword: native.decoder.decode(bytes.subarray(text, text + length)) };
+  const id = native.status("animation_property_for", element?._coreHandle ?? 0n, ...native.input(name));
+  return id ? { id, name: native.outputString() } : null;
 }
-export function animationLineHeight(value, element = null) {
-  const native = element?._domCore ?? core;
-  const pointer = native.status("animation_length_parse", ...native.input(String(value)), element?._coreHandle ?? 0n);
-  const view = new DataView(native.refreshBytes().buffer);
-  const number = view.getFloat64(pointer, true);
-  const unit = view.getUint32(pointer + 20, true);
-  // Unit 3 (not a line height) has no name.
-  return { kind: "lineHeight", value: number, unit: native.string("animation_enumeration_name", 4, unit) || undefined };
-}
-
 
 // A number of the animation timing or of an easing. $label names it in an
 // error: mode 0 takes a finite number, mode 1 a positive integer, mode 2 a
@@ -478,41 +747,54 @@ export function animationNumber(value, label, mode = 0) {
     throw new error.constructor(`${label} ${observedText(value)} ${error.message}`, { cause: error });
   }
 }
-// The animation_easing_normalize input of $easing: [kind, pointer, count].
-function animationEasingInput(easing) {
-  if (typeof easing === "string") return [0, ...core.input(easing)];
+// The easing in the animation_easing_normalize input language, as the
+// kind and either the keyword text or the numbers. It calls the core, so
+// it runs before the inputs of a call are allocated.
+function animationEasingValues(easing) {
+  if (typeof easing === "string") return { kind: EASING_KIND_KEYWORD, text: easing };
   let kind, values;
   if (easing.kind === "cubicBezier") {
-    kind = 1;
+    kind = EASING_KIND_CUBIC;
     values = [easing.x1, easing.y1, easing.x2, easing.y2].map((value) => animationNumber(value, "The cubic-bezier() number"));
   } else if (easing.kind === "steps") {
-    kind = 2;
+    kind = EASING_KIND_STEPS;
     const steps = animationNumber(easing.count, "The steps() count", 1);
     values = [steps, core.exports.animation_step_position_index(...core.input(String(easing.position)))];
   } else if (easing.kind === "linear") {
-    kind = 3;
+    kind = EASING_KIND_LINEAR;
     if (!Array.isArray(easing.points)) throw new TypeError("linear() needs at least one point");
     values = easing.points.flatMap((point) => [
       animationNumber(point.input, "The linear() input"), animationNumber(point.output, "The linear() output"),
     ]);
-  } else { kind = 4; values = []; }
-  const pointer = core.exports.abi_allocate(values.length * 8);
+  } else { kind = EASING_KIND_UNSUPPORTED; values = []; }
+  return { kind, values };
+}
+// The animation_easing_normalize input of animationEasingValues: [kind,
+// pointer, count].
+function animationEasingAllocation({ kind, text, values }) {
+  if (text !== undefined) return [kind, ...core.input(text)];
+  const pointer = core.exports.abi_allocate(values.length * F64);
   const view = new DataView(core.refreshBytes().buffer);
-  for (let index = 0; index < values.length; index++) view.setFloat64(pointer + index * 8, values[index], true);
-  return [kind, pointer, kind === 3 ? values.length / 2 : values.length];
+  for (let index = 0; index < values.length; index++) view.setFloat64(pointer + index * F64, values[index], true);
+  return [kind, pointer, kind === EASING_KIND_LINEAR ? values.length / 2 : values.length];
+}
+function animationEasingInput(easing) {
+  return animationEasingAllocation(animationEasingValues(easing));
 }
 export function normalizeAnimationEasing(easing = "linear") {
   const output = animationStatus(() => `The easing ${observedText(easing)}`,
     "animation_easing_normalize", ...animationEasingInput(easing));
   const view = new DataView(core.refreshBytes().buffer);
-  const result = { kind: view.getUint32(output, true) };
-  if (result.kind === 3) {
-    result.points = Array.from({ length: view.getUint32(output + 40, true) }, (_, index) => ({
-      input: view.getFloat64(output + 48 + index * 16, true), output: view.getFloat64(output + 56 + index * 16, true),
+  const result = { kind: view.getUint32(output + EASING_RECORD_KIND, true) };
+  if (result.kind === EASING_KIND_LINEAR) {
+    const points = output + EASING_RECORD_HEADER_SIZE;
+    result.points = Array.from({ length: view.getUint32(output + EASING_RECORD_POINT_COUNT, true) }, (_, index) => ({
+      input: view.getFloat64(points + index * EASING_POINT_SIZE + EASING_POINT_INPUT, true),
+      output: view.getFloat64(points + index * EASING_POINT_SIZE + EASING_POINT_OUTPUT, true),
     }));
   } else {
-    result.payload = Array.from({ length: result.kind === 1 ? 4 : result.kind === 2 ? 2 : 0 },
-      (_, index) => view.getFloat64(output + 8 + index * 8, true));
+    result.payload = Array.from({ length: result.kind === EASING_KIND_CUBIC ? 4 : result.kind === EASING_KIND_STEPS ? 2 : 0 },
+      (_, index) => view.getFloat64(output + EASING_RECORD_PAYLOAD + index * F64, true));
   }
   return result;
 }
@@ -531,8 +813,8 @@ export function animationComputedTiming(handle, now, { endDelay, iterationStart,
     return Number.isNaN(value) ? null : value;
   };
   return {
-    activeDuration: read(8), currentIteration: read(24), endTime: read(16),
-    localTime: read(0), progress: read(32),
+    activeDuration: read(COMPUTED_TIMING_ACTIVE), currentIteration: read(COMPUTED_TIMING_ITERATION),
+    endTime: read(COMPUTED_TIMING_END), localTime: read(COMPUTED_TIMING_LOCAL), progress: read(COMPUTED_TIMING_PROGRESS),
   };
 }
 
@@ -541,12 +823,9 @@ export function animationComputedTiming(handle, now, { endDelay, iterationStart,
 // of the property, as { offset, easing, composite, value }. The core
 // selects them and requires values at offsets 0 and 1.
 export function animationPropertyFrames(keyframes, propertyName) {
-  const pointer = core.exports.abi_allocate(keyframes.length * 16);
-  let view = new DataView(core.refreshBytes().buffer);
-  for (let index = 0; index < keyframes.length; index++) {
-    view.setFloat64(pointer + index * 16, keyframes[index].offset, true);
-    view.setUint32(pointer + index * 16 + 8, keyframes[index][propertyName] === undefined ? 0 : 1, true);
-  }
+  const pointer = framePresenceRows(keyframes, (keyframe) => keyframe.offset,
+    (keyframe) => keyframe[propertyName] !== undefined);
+  let view;
   const count = core.exports.animation_property_frames(pointer, keyframes.length);
   try {
     core.throwIfError(true);
@@ -556,26 +835,148 @@ export function animationPropertyFrames(keyframes, propertyName) {
   view = new DataView(core.refreshBytes().buffer);
   const output = core.exports.abi_output_pointer();
   return Array.from({ length: count }, (_, index) => {
-    const frame = keyframes[view.getUint32(output + index * 4, true)];
+    const frame = keyframes[view.getUint32(output + index * U32, true)];
     return { offset: frame.offset, easing: frame.easing, composite: frame.composite, value: frame[propertyName] };
   });
 }
-export function sampleAnimationContent(record, timeMilliseconds) {
-  const { timing, keyframes } = record.definition;
-  const easing = keyframes[0]?.easing ?? timing.easing;
-  const easingInput = animationEasingInput(typeof easing === "string" ? parseCSSEasing(easing) : easing);
-  const pointer = core.exports.abi_allocate(keyframes.length * 16);
+// The start time and held time of a ::before or ::after content animation
+// record after a style change (animation_content_times): `previous` is the
+// record of the same name and occurrence that continues, or undefined;
+// `timeMilliseconds` is null for a read between frames, whose time is
+// `currentTimeMilliseconds`. A time without a value is null.
+export function contentAnimationTimes(previous, paused, timeMilliseconds, currentTimeMilliseconds) {
+  core.status("animation_content_times", previous ? 1 : 0, previous?.startTimeMilliseconds ?? NaN,
+    previous?.holdTimeMilliseconds ?? NaN, previous?.definition.paused ? 1 : 0, paused ? 1 : 0,
+    timeMilliseconds ?? NaN, currentTimeMilliseconds);
+  return contentAnimationTimesOutput();
+}
+// The times of ::before or ::after content animation `record` at frame
+// time `timeMilliseconds` (animation_content_frame_start).
+export function contentAnimationFrameStart(record, timeMilliseconds) {
+  core.status("animation_content_frame_start", record.startTimeMilliseconds ?? NaN,
+    record.holdTimeMilliseconds ?? NaN, record.definition.paused ? 1 : 0, timeMilliseconds);
+  return contentAnimationTimesOutput();
+}
+// The start time and held time that animation_content_times or
+// animation_content_frame_start wrote; null for none.
+function contentAnimationTimesOutput() {
+  const output = core.exports.abi_output_pointer();
   const view = new DataView(core.refreshBytes().buffer);
-  for (let index = 0; index < keyframes.length; index++) {
-    view.setFloat64(pointer + index * 16, keyframes[index].offset ?? NaN, true);
-    view.setUint32(pointer + index * 16 + 8, keyframes[index].content === undefined ? 0 : 1, true);
-  }
-  const index = animationStatus(() => `Animation ${JSON.stringify(record.definition.name)}`,
-    "animation_content_sample", pointer, keyframes.length,
-    Number(timing.duration), Number(timing.iterations), timeMilliseconds, record.startTimeMilliseconds,
+  const time = (offset) => {
+    const value = view.getFloat64(output + offset, true);
+    return Number.isNaN(value) ? null : value;
+  };
+  return { startTimeMilliseconds: time(CONTENT_TIMES_START), holdTimeMilliseconds: time(CONTENT_TIMES_HOLD) };
+}
+// The content that the ::before or ::after content animation `records`
+// show at `timeMilliseconds`, in animation-name order
+// (animation_content_sample, animation_content_stack); undefined when none
+// has an effect.
+export function stackedAnimationContent(records, timeMilliseconds) {
+  const samples = records.map((record) => sampleAnimationContent(record, timeMilliseconds));
+  const input = core.exports.abi_allocate(Math.max(1, samples.length) * U32);
+  const view = new DataView(core.refreshBytes().buffer);
+  samples.forEach((sample, index) => view.setInt32(input + index * U32, sample, true));
+  const shown = core.status("animation_content_stack", input, samples.length);
+  return shown < 0 ? undefined : records[shown].definition.keyframes[samples[shown]].content;
+}
+// The keyframe index that a ::before or ::after content animation record
+// shows at `timeMilliseconds` (animation_content_sample); -1 where the
+// animation has no effect or shows the underlying content.
+function sampleAnimationContent(record, timeMilliseconds) {
+  const { timing, keyframes, implicitKeyframe } = record.definition;
+  // The easings call the core; the rows below are allocated after them,
+  // with no core call until animation_content_sample reads them.
+  const easingValues = (easing) =>
+    animationEasingValues(typeof easing === "string" ? parseCSSEasing(easing) : easing ?? "linear");
+  const frameEasings = keyframes.map((keyframe) => easingValues(keyframe.easing));
+  const implicitEasing = easingValues(implicitKeyframe?.easing);
+  const rows = core.exports.abi_allocate(keyframes.length * CONTENT_FRAME.SIZE);
+  keyframes.forEach((keyframe, index) => {
+    const row = rows + index * CONTENT_FRAME.SIZE;
+    const easing = animationEasingAllocation(frameEasings[index]);
+    const view = new DataView(core.refreshBytes().buffer);
+    view.setFloat64(row + CONTENT_FRAME.OFFSET, keyframe.offset ?? NaN, true);
+    view.setUint32(row + CONTENT_FRAME.PRESENT, keyframe.content !== undefined ? 1 : 0, true);
+    view.setUint32(row + CONTENT_FRAME.EASING_KIND, easing[0], true);
+    view.setUint32(row + CONTENT_FRAME.EASING_POINTER, easing[1], true);
+    view.setUint32(row + CONTENT_FRAME.EASING_COUNT, easing[2], true);
+  });
+  return animationStatus(() => `Animation ${JSON.stringify(record.definition.name)}`,
+    "animation_content_sample", rows, keyframes.length,
+    Number(timing.duration), Number(timing.iterations), record.startTimeMilliseconds ?? NaN,
+    record.holdTimeMilliseconds ?? NaN, timeMilliseconds,
     Number(timing.delay ?? 0), ...core.input(String(timing.direction)), ...core.input(String(timing.fill)),
-    record.definition.paused ? 1 : 0, ...easingInput);
-  return index < 0 ? record.initialContent : keyframes[index]?.content;
+    ...animationEasingAllocation(implicitEasing));
+}
+
+// The rows of animation_dependency_set (animation-dependencies.watpart).
+const DEPENDENCY_FRAME = Object.freeze(Object.fromEntries([
+  "SIZE", "OFFSET", "VALUE", "TEXT_POINTER", "TEXT_LENGTH", "EASING_KIND", "EASING_POINTER", "EASING_COUNT",
+  "COMPOSITE_POINTER", "COMPOSITE_LENGTH",
+].map((name) => [name, layoutConstant(`ANIMATION_DEPENDENCY_FRAME_${name}`)])));
+// The property of a custom property effect of animation_dependency_set.
+export const ANIMATION_DEPENDENCY_CUSTOM = layoutConstant("ANIMATION_DEPENDENCY_CUSTOM");
+
+// Whether the effects on animation property `propertyId` apply in the
+// core's computed resolution instead of an engine track: values of the
+// element depend on them (font-size).
+export function isAnimationDependency(propertyId) {
+  return core.exports.animation_dependency_property(propertyId) === 1;
+}
+// Whether a transition of the transition-property name covers a property
+// whose animated value computed resolution owns
+// (animation_transition_dependency).
+export function transitionCoversAnimationDependency(name) {
+  return core.exports.animation_transition_dependency(...core.input(String(name))) === 1;
+}
+
+// Registers the effect of animation `animationId` on dependency property
+// `property` ({ id, name }; id ANIMATION_DEPENDENCY_CUSTOM for a custom
+// property) of `element` at the animation time `now` of its document,
+// with the effect's timing members; `transition` marks a CSS transition's
+// effect. Each frame is { offset, easing, composite, value }: the value a
+// number in the property's canonical unit, a custom property's text, or
+// null for the underlying value of an implicit keyframe.
+export function setAnimationDependency({ animationId, element, property, order, now, timing, frames, transition = false }) {
+  // The easings call the core; the inputs below are allocated after them,
+  // with no core call until animation_dependency_set reads them.
+  const parsedEasing = typeof timing.easing === "string" ? parseCSSEasing(timing.easing) : timing.easing;
+  const effectEasing = animationEasingValues(parsedEasing ?? "linear");
+  const frameEasings = frames.map((frame) =>
+    animationEasingValues(typeof frame.easing === "string" && frame.easing !== "linear" ? parseCSSEasing(frame.easing) : frame.easing ?? "linear"));
+  const rows = core.exports.abi_allocate(frames.length * DEPENDENCY_FRAME.SIZE);
+  frames.forEach((frame, index) => {
+    const row = rows + index * DEPENDENCY_FRAME.SIZE;
+    const easing = animationEasingAllocation(frameEasings[index]);
+    const [compositePointer, compositeLength] = core.input(String(frame.composite ?? "auto"));
+    const [textPointer, textLength] = typeof frame.value === "string" ? core.input(frame.value) : [0, -1];
+    const view = new DataView(core.refreshBytes().buffer);
+    view.setFloat64(row + DEPENDENCY_FRAME.OFFSET, frame.offset, true);
+    if (property.id === ANIMATION_DEPENDENCY_CUSTOM) {
+      view.setUint32(row + DEPENDENCY_FRAME.TEXT_POINTER, textPointer, true);
+      view.setInt32(row + DEPENDENCY_FRAME.TEXT_LENGTH, textLength, true);
+    } else {
+      view.setFloat64(row + DEPENDENCY_FRAME.VALUE, frame.value, true);
+    }
+    view.setUint32(row + DEPENDENCY_FRAME.EASING_KIND, easing[0], true);
+    view.setUint32(row + DEPENDENCY_FRAME.EASING_POINTER, easing[1], true);
+    view.setUint32(row + DEPENDENCY_FRAME.EASING_COUNT, easing[2], true);
+    view.setUint32(row + DEPENDENCY_FRAME.COMPOSITE_POINTER, compositePointer, true);
+    view.setUint32(row + DEPENDENCY_FRAME.COMPOSITE_LENGTH, compositeLength, true);
+  });
+  animationStatus(() => `The ${property.name} effect of the animation`, "animation_dependency_set",
+    animationId, element._coreHandle, property.id, ...core.input(property.name), transition ? 1 : 0, order,
+    Number(timing.iterationStart ?? 0), now,
+    ...core.input(String(timing.direction ?? "normal")), ...core.input(String(timing.fill ?? "none")),
+    ...animationEasingAllocation(effectEasing), ...core.input(String(timing.composite ?? "replace")),
+    rows, frames.length);
+}
+
+// Sets the animation time of the dependency effects of `document`: an
+// element whose effect progress changed resolves again.
+export function setAnimationDependencyTime(document, now) {
+  document._domCore.status("animation_dependency_time", document._coreHandle, now);
 }
 
 const deferredBindingFinalizer = new FinalizationRegistry((handle) => {
@@ -589,11 +990,13 @@ export function deferAnimationBinding(declare) {
   };
   const handle = Object.freeze({
     get trackIndices() { return engineHandle?.trackIndices ?? []; },
-    pause(time) { if (engineHandle) engineHandle.pause(time); else command(1, time); },
-    resume(time) { if (engineHandle) engineHandle.resume(time); else command(2, time); },
-    seek(local, sample) { if (engineHandle) engineHandle.seek(local, sample); else command(3, local, sample); },
-    cancelSilently() { if (engineHandle) engineHandle.cancelSilently(); else command(4); },
-    cancel() { if (engineHandle) engineHandle.cancel(); else command(4); },
+    pause(time) { if (engineHandle) engineHandle.pause(time); else command(BINDING_COMMAND_PAUSE, time); },
+    resume(time) { if (engineHandle) engineHandle.resume(time); else command(BINDING_COMMAND_RESUME, time); },
+    seek(local, sample) { if (engineHandle) engineHandle.seek(local, sample); else command(BINDING_COMMAND_SEEK, local, sample); },
+    cancelSilently() { if (engineHandle) engineHandle.cancelSilently(); else command(BINDING_COMMAND_CANCEL); },
+    cancel() { if (engineHandle) engineHandle.cancel(); else command(BINDING_COMMAND_CANCEL); },
+    // An undeclared track has no row and no sample to capture.
+    captureSamples(time) { if (engineHandle) engineHandle.captureSamples(time); },
   });
   deferredBindingFinalizer.register(handle, binding, handle);
   const release = () => {
@@ -612,12 +1015,13 @@ export function deferAnimationBinding(declare) {
       const pointer = core.exports.abi_output_pointer();
       const view = new DataView(core.refreshBytes().buffer);
       const commands = Array.from({ length: count }, (_, index) => {
-        const row = pointer + index * 24;
-        return [view.getUint32(row, true), view.getFloat64(row + 8, true), view.getFloat64(row + 16, true)];
+        const row = pointer + index * BINDING_COMMAND_SIZE;
+        return [view.getUint32(row + BINDING_COMMAND_KIND, true), view.getFloat64(row + BINDING_COMMAND_LOCAL, true),
+          view.getFloat64(row + BINDING_COMMAND_SAMPLE, true)];
       });
       for (const [kind, value, sample] of commands) {
-        if (kind === 3) engineHandle.seek(value, sample);
-        else engineHandle[kind === 1 ? "pause" : "resume"](value);
+        if (kind === BINDING_COMMAND_SEEK) engineHandle.seek(value, sample);
+        else engineHandle[kind === BINDING_COMMAND_PAUSE ? "pause" : "resume"](value);
       }
       release();
     },

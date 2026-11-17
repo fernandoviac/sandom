@@ -1,3 +1,6 @@
+import { domCoreForWrapper } from "../dom-wasm/core.js";
+import { createXMLSerializerClass } from "./dom-bindings.generated.js";
+
 // XML parsing and serialization are owned by the freestanding DOM core.
 // This binding only creates host wrappers and marshals strings/handles.
 
@@ -33,3 +36,27 @@ export function serializeXMLNode(node) {
 export function serializeXMLNodeContents(node) {
   return node._domCore.string("xml_serialize_children", node._coreHandle);
 }
+
+// XMLSerializer (DOM Parsing and Serialization). The core runs the
+// serialization (xml_serialize_to_string).
+const serializers = new WeakSet();
+export const XMLSerializer = createXMLSerializerClass({
+  Base: class {
+    constructor() {
+      serializers.add(this);
+    }
+  },
+  requireSerializer(serializer) {
+    if (!serializers.has(serializer)) throw new TypeError("Illegal invocation");
+  },
+  node(value) {
+    if (domCoreForWrapper(value) === undefined) {
+      throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'.");
+    }
+    return value;
+  },
+  serialize(node) {
+    return node._domCore.string("xml_serialize_to_string", node._coreHandle);
+  },
+});
+Object.defineProperty(XMLSerializer.prototype, Symbol.toStringTag, { value: "XMLSerializer", configurable: true });

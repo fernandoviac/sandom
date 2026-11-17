@@ -1,10 +1,21 @@
+import { layoutConstant } from './wasm/layout-table.js';
+
 const formats = ['rgba8unorm', 'rgba16float', 'rgba16uint', 'rgba32float'];
+// The image record and frame entry fields of gpu-frame.watpart, by WAT name.
+const layoutConstants = (prefix, names) =>
+  Object.freeze(Object.fromEntries(names.map((name) => [name, layoutConstant(`${prefix}${name}`)])));
+const GPU_IMAGE = layoutConstants('GPU_IMAGE_', ['SIZE', 'FLAGS', 'WIDTH', 'HEIGHT', 'FORMAT', 'TEXTURE', 'IDENTITY',
+  'UPLOAD', 'UPLOAD_LENGTH', 'ROW_BYTES', 'UNIFORM']);
+const GPU_IMAGE_FLAG = layoutConstants('GPU_IMAGE_FLAG_', ['GPU_TEXTURE', 'GLYPH_PAGE', 'OPAQUE', 'RETAINED', 'ABSENT',
+  'UNAVAILABLE']);
+const GPU_FRAME_ENTRY = layoutConstants('GPU_FRAME_ENTRY_', ['SIZE', 'RESOURCE', 'REQUEST', 'REQUESTED']);
+const GPU_FRAME_REQUEST = layoutConstants('GPU_FRAME_REQUEST_', ['ATLAS', 'IMAGE']);
 const emptyBytes = new Uint8Array(0);
 const emptyConversion = new Float32Array(20);
 
 // Transport only: the draw sequence, group steps, pool selection, cache
 // comparison, shaders, samplers, image conversion passes, mip levels and
-// draw records belong to renderer-core (src/wasm/gpu-frame.watpart).
+// draw records belong to renderer-core (core/engine/gpu-frame.watpart).
 export function createGpuSceneResources(gpu, width, height, colorFormat) {
   const { core, stream } = gpu;
   core.gpu_scene_create(stream, width, height, formats.indexOf(colorFormat));
@@ -63,39 +74,35 @@ export function createGpuSceneResources(gpu, width, height, colorFormat) {
     return plan;
   }
   // Writes the image record of one image entry (gpu-frame.watpart).
+  function flagRecord(flag) {
+    const view = gpu.input(GPU_IMAGE.SIZE);
+    new Uint8Array(core.memory.buffer, view.byteOffset, GPU_IMAGE.SIZE).fill(0);
+    view.setUint32(GPU_IMAGE.FLAGS, flag, true);
+    return view.byteOffset;
+  }
   function imageRecord(image, imageIndex, resources) {
-    if (resources.unavailableImages.has(imageIndex)) {
-      const view = gpu.input(40);
-      new Uint8Array(core.memory.buffer, view.byteOffset, 40).fill(0);
-      view.setUint32(0, 512, true);
-      return view.byteOffset;
-    }
-    if (image === undefined) {
-      const view = gpu.input(40);
-      new Uint8Array(core.memory.buffer, view.byteOffset, 40).fill(0);
-      view.setUint32(0, 256, true);
-      return view.byteOffset;
-    }
+    if (resources.unavailableImages.has(imageIndex)) return flagRecord(GPU_IMAGE_FLAG.UNAVAILABLE);
+    if (image === undefined) return flagRecord(GPU_IMAGE_FLAG.ABSENT);
     const conversion = image.kind === 'gpu-texture'
       ? { uniformData: resources.imageConversionUniformFor(image.descriptor), upload: null }
       : image.kind === 'color-glyph-cache-page'
       ? { uniformData: emptyConversion, upload: null }
       : resources.imageConversionFor(image);
     const upload = conversion.upload;
-    const { view, pointers } = transport(40, [conversion.uniformData, upload?.data ?? emptyBytes]);
-    view.setUint32(0, (image.kind === 'gpu-texture' ? 1 : 0) |
-      (image.kind === 'color-glyph-cache-page' ? 2 : 0) |
-      (image.contentsOpaque === true ? 4 : 0) |
-      (resources.images?.get(imageIndex) === image ? 8 : 0), true);
-    view.setUint32(4, image.width, true);
-    view.setUint32(8, image.height, true);
-    view.setUint32(12, upload ? formats.indexOf(upload.format) : 1, true);
-    view.setUint32(16, image.texture ? gpu.importResource(image.texture) : 0, true);
-    view.setUint32(20, identity(image), true);
-    view.setUint32(24, pointers[1], true);
-    view.setUint32(28, upload?.data.byteLength ?? 0, true);
-    view.setUint32(32, upload?.bytesPerRow ?? 0, true);
-    view.setUint32(36, pointers[0], true);
+    const { view, pointers } = transport(GPU_IMAGE.SIZE, [conversion.uniformData, upload?.data ?? emptyBytes]);
+    view.setUint32(GPU_IMAGE.FLAGS, (image.kind === 'gpu-texture' ? GPU_IMAGE_FLAG.GPU_TEXTURE : 0) |
+      (image.kind === 'color-glyph-cache-page' ? GPU_IMAGE_FLAG.GLYPH_PAGE : 0) |
+      (image.contentsOpaque === true ? GPU_IMAGE_FLAG.OPAQUE : 0) |
+      (resources.images?.get(imageIndex) === image ? GPU_IMAGE_FLAG.RETAINED : 0), true);
+    view.setUint32(GPU_IMAGE.WIDTH, image.width, true);
+    view.setUint32(GPU_IMAGE.HEIGHT, image.height, true);
+    view.setUint32(GPU_IMAGE.FORMAT, upload ? formats.indexOf(upload.format) : 1, true);
+    view.setUint32(GPU_IMAGE.TEXTURE, image.texture ? gpu.importResource(image.texture) : 0, true);
+    view.setUint32(GPU_IMAGE.IDENTITY, identity(image), true);
+    view.setUint32(GPU_IMAGE.UPLOAD, pointers[1], true);
+    view.setUint32(GPU_IMAGE.UPLOAD_LENGTH, upload?.data.byteLength ?? 0, true);
+    view.setUint32(GPU_IMAGE.ROW_BYTES, upload?.bytesPerRow ?? 0, true);
+    view.setUint32(GPU_IMAGE.UNIFORM, pointers[0], true);
     return view.byteOffset;
   }
   return {
@@ -123,20 +130,20 @@ export function createGpuSceneResources(gpu, width, height, colorFormat) {
     // its group step and draw.
     drawEntries(count, resources) {
       for (let entry = 0; entry < count; entry++) {
-        const at = core.gpu_frame_entries(stream) + entry * 48;
-        const fields = new DataView(core.memory.buffer, at, 48);
-        const request = fields.getUint32(40, true);
-        const resource = fields.getUint32(44, true);
+        const at = core.gpu_frame_entries(stream) + entry * GPU_FRAME_ENTRY.SIZE;
+        const fields = new DataView(core.memory.buffer, at, GPU_FRAME_ENTRY.SIZE);
+        const request = fields.getUint32(GPU_FRAME_ENTRY.REQUEST, true);
+        const resource = fields.getUint32(GPU_FRAME_ENTRY.REQUESTED, true);
         let handle = 0;
-        if (request === 1) {
+        if (request === GPU_FRAME_REQUEST.ATLAS) {
           if (!resources.atlasForIdentity) {
             throw new Error(`Native atlas ${resource} requires the raster plan's graphics resource reader`);
           }
           handle = gpu.importResource(resources.atlasTexture(resources.atlasForIdentity(resource)));
-        } else if (request === 2) {
+        } else if (request === GPU_FRAME_REQUEST.IMAGE) {
           handle = imageRecord(resources.resolvedImages?.get(resource), resource, resources);
         }
-        new DataView(core.memory.buffer, at, 48).setUint32(36, handle, true);
+        new DataView(core.memory.buffer, at, GPU_FRAME_ENTRY.SIZE).setUint32(GPU_FRAME_ENTRY.RESOURCE, handle, true);
         const status = core.gpu_frame_draw_entry(stream, entry);
         gpu.execute();
         if (status === 0) continue;
@@ -145,10 +152,7 @@ export function createGpuSceneResources(gpu, width, height, colorFormat) {
         if (status === 1) {
           throw new Error(`render: unknown raster-plan record kind 0x${(value & 65535).toString(16)} at index ${record}`);
         }
-        if (status === 2) {
-          throw new Error(`native CMD_IMAGE resource ${value} is absent from the host image map`);
-        }
-        throw new RangeError(`instance buffer overflow at record ${record}: the batch exceeds limit ${value}; split the batch`);
+        throw new Error(`native CMD_IMAGE resource ${value} is absent from the host image map`);
       }
     },
     finishGroups() { core.gpu_groups_finish(stream); gpu.execute(); },

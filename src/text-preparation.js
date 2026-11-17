@@ -101,6 +101,24 @@ export function createTextPreparationRuntime(engine) {
           }));
           return copiedRuns;
         },
+        // Each node's run where the batch holds it: the core address and
+        // length of its bytes and its source id, or null for a node that is
+        // not text. The spans stay valid until the batch is released.
+        runSpans() {
+          const base = resultsBase();
+          const view = new DataView(engine.memory.buffer);
+          return nodes.map((node, index) => {
+            if (node.display !== "text") return null;
+            const result = base + index * TEXT_PREPARATION_RESULT_SIZE;
+            return {
+              bytes: {
+                pointer: view.getUint32(result + TEXT_PREPARATION_RESULT.BYTES, true),
+                length: view.getUint32(result + TEXT_PREPARATION_RESULT.LENGTH, true),
+              },
+              sourceId: view.getUint32(result + TEXT_PREPARATION_RESULT.SOURCE_ID, true),
+            };
+          });
+        },
         release() {
           assertLive();
           check(native.text_prepare_release(handle), "release");

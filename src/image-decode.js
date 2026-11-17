@@ -9,6 +9,10 @@
 // decode: this step parses and checks the SVG document and gives its
 // natural size, and the renderer paints the vector source at that size.
 import { svgImageSource } from "./jpeg.js";
+import { layoutConstant } from "./wasm/layout-table.js";
+
+const SVG_IMAGE_SIZE = Object.fromEntries(["WIDTH", "HEIGHT", "RATIO", "NATURAL_DIMENSIONS", "DEFAULT_SIZED"]
+  .map((name) => [name, layoutConstant(`SVG_IMAGE_SIZE_${name}`)]));
 
 // The bytes do not decode: the image is broken, as in a browser.
 export class UndecodableImageError extends Error {}
@@ -67,75 +71,25 @@ async function decode(bytes, locator, codecRuntime) {
   });
 }
 
-const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
-
-// CSS pixels per unit of an absolute length, and of the font-relative
-// lengths at the initial font size of an SVG image (16px). A viewport
-// length is 0: an image has no viewport of its own.
-const PIXELS_PER_UNIT = Object.freeze({
-  "": 1,
-  px: 1,
-  in: 96,
-  cm: 96 / 2.54,
-  mm: 96 / 25.4,
-  q: 96 / 101.6,
-  pt: 4 / 3,
-  pc: 16,
-  em: 16,
-  rem: 16,
-  ex: 8,
-  ch: 8,
-  vw: 0,
-  vh: 0,
-  vmin: 0,
-  vmax: 0,
-});
-
-// A width or height attribute of the root as a natural dimension in CSS
-// pixels: null for a percentage, "auto" or a value that does not parse; a
-// negative length is 0, as Chrome measures.
-function naturalDimension(value) {
-  if (value === null) return null;
-  const match = /^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)([a-zA-Z]*)\s*$/.exec(value);
-  if (match === null) return null;
-  const scale = PIXELS_PER_UNIT[match[2].toLowerCase()];
-  if (scale === undefined) return null;
-  return Math.max(0, Number(match[1]) * scale);
-}
-
-function viewBoxRatio(value) {
-  if (value === null) return null;
-  const numbers = value.trim().split(/[\s,]+/).map(Number);
-  if (numbers.length !== 4 || numbers.some((number) => !Number.isFinite(number))) return null;
-  const [, , width, height] = numbers;
-  return width > 0 && height > 0 ? width / height : null;
-}
-
-// The natural size of an SVG image, as Chrome gives it: the root's width
-// and height attributes; a missing one from the viewBox ratio, else from
-// the default object size (300 x 150); with a ratio only, the ratio
-// contained in the default object size. naturalDimensions tells whether
-// the image has natural dimensions: a size that does not come from the
-// default object size (createImageBitmap() needs one). defaultSized tells
-// that the image has neither a natural width nor a natural height: CSS
-// sizes it by the default sizing algorithm (CSS Images 3 §5.2), with the
-// natural ratio of its viewBox (naturalRatio, width / height, or null).
-function svgNaturalSize(root) {
-  const width = naturalDimension(root.getAttribute("width"));
-  const height = naturalDimension(root.getAttribute("height"));
-  const ratio = viewBoxRatio(root.getAttribute("viewBox"));
-  const size = (naturalWidth, naturalHeight, naturalDimensions) => ({
-    naturalWidth,
-    naturalHeight,
-    naturalDimensions,
-    defaultSized: width === null && height === null,
-    naturalRatio: ratio,
-  });
-  if (width !== null && height !== null) return size(width, height, true);
-  if (width !== null) return ratio === null ? size(width, 150, false) : size(width, width / ratio, true);
-  if (height !== null) return ratio === null ? size(300, height, false) : size(height * ratio, height, true);
-  if (ratio === null) return size(300, 150, false);
-  return ratio >= 2 ? size(300, 300 / ratio, false) : size(150 * ratio, 150, false);
+// The natural size of an SVG image's document (svg_image_natural_size):
+// naturalWidth and naturalHeight, naturalDimensions (whether the size does
+// not come from the default object size; createImageBitmap() needs one),
+// defaultSized (neither a width nor a height: CSS sizes it by the default
+// sizing algorithm, CSS Images 3 §5.2) and naturalRatio (width / height of
+// its viewBox, or null). null when the document element is not an SVG svg
+// element.
+function svgNaturalSize(document) {
+  const core = document._domCore;
+  if (core.status("svg_image_natural_size", document._coreHandle) === 0) return null;
+  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), core.exports.abi_output_length());
+  const ratio = view.getFloat64(SVG_IMAGE_SIZE.RATIO, true);
+  return {
+    naturalWidth: view.getFloat64(SVG_IMAGE_SIZE.WIDTH, true),
+    naturalHeight: view.getFloat64(SVG_IMAGE_SIZE.HEIGHT, true),
+    naturalDimensions: view.getUint32(SVG_IMAGE_SIZE.NATURAL_DIMENSIONS, true) === 1,
+    defaultSized: view.getUint32(SVG_IMAGE_SIZE.DEFAULT_SIZED, true) === 1,
+    naturalRatio: Number.isNaN(ratio) ? null : ratio,
+  };
 }
 
 async function svgImage(source, locator) {
@@ -148,9 +102,9 @@ async function svgImage(source, locator) {
     "image/svg+xml",
     () => new SDDocument({ url: new URL(locator ?? "about:blank", "file:///").href }),
   );
-  const root = document.documentElement;
-  if (root?.localName !== "svg" || root.namespaceURI !== SVG_NAMESPACE) {
+  const size = svgNaturalSize(document);
+  if (size === null) {
     throw new UndecodableImageError(`Invalid SVG image at ${locator}: expected an SVG root`);
   }
-  return Object.freeze({ kind: "svg", source, ...svgNaturalSize(root) });
+  return Object.freeze({ kind: "svg", source, ...size });
 }

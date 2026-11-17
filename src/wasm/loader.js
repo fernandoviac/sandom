@@ -19,11 +19,7 @@
 import { readPackageAsset } from '../package-assets.js';
 import { createTextPreparationRuntime } from '../text-preparation.js';
 import { createAllocatorCore, observeMemoryGrowth } from '../dom-wasm/core.js';
-import {
-  ACTUAL_INITIAL_PAGES,
-  HB_INITIAL_PAGES,
-  verifyLayout,
-} from './layout.js';
+import { ACTUAL_INITIAL_PAGES, HB_INITIAL_PAGES } from './layout.js';
 
 // The HarfBuzz static-data base baked into vendor/hb.wasm at link time
 // (-sGLOBAL_BASE). MUST equal the layout reservation boundary; the
@@ -47,7 +43,7 @@ const TRAP_SITE_NAMES = new Map([
   [2, "vertical-fit retry budget (first loop)"],
   [3, "vertical-fit retry budget (separated-stage loop)"],
   [4, "BFC level stack exhausted and ungrowable"],
-  [5, "exclusions per BFC level exhausted"],
+  [5, "exclusion entries of a BFC level ungrowable (the allocator refused the doubled stack)"],
   [6, "no next float edge below the probe"],
   [7, "shelf index past the rebuilt shelf list"],
   [8, "no next shelf edge below the probe"],
@@ -56,7 +52,7 @@ const TRAP_SITE_NAMES = new Map([
   [11, "flex items past this level's record budget"],
   [12, "flex scratch ungrowable"],
   [13, "layout-cache hit on a collapsed table with moved pristine positions"],
-  [14, "multi-column fragment pool exhausted"],
+  [14, "the allocator refused a chunk of the multi-column fragment entries; the page holds too many column fragments for memory"],
   [15, "color glyph paint operation without a command"],
   [16, "command space exhausted: a command writer needs more bytes than the command buffer (or the stream it writes) holds"],
   [17, "color glyph path slots exhausted"],
@@ -70,7 +66,14 @@ const TRAP_SITE_NAMES = new Map([
   [25, "a table has more rows than u16 row ordinals hold; split the table"],
   [27, "a table is larger than the table scratch that layout entry sized ($tableScratchEnsure missed it)"],
   [28, "a collapsed-border table needs more edge records than the collapsed arena holds; reserve more node tables"],
-  [29, "the paint walk nested past the scroll save stack's frames; the page nests too many clipping or scrolling boxes"],
+  [29, "the allocator refused the paint walk's save stack; free memory or nest fewer boxes"],
+  [33, "a multi-column row ended at its spanner without a break before it"],
+  [34, "the allocator refused a grid's layout scratch, in MiB; the grid has too many items or tracks"],
+  [35, "a grid axis has more tracks than the grid track limit"],
+  [36, "grid automatic placement found no free area inside the bounds of the implicit grid"],
+  [37, "the allocator refused the float shelf geometry, in MiB"],
+  [39, "the allocator refused the explicit frame stack of a recursive call cycle; the tree nests deeper than memory holds"],
+  [40, "the allocator refused a chunk of the clip arena; the page nests too many clipping boxes for memory"],
 ]);
 
 // Trap site 15 carries the glyph in trap_value and the operation in
@@ -96,6 +99,19 @@ function trapMessage(name, site, observed, limit) {
     return `sandom engine trap in ${name}: a box's face is font index ${observed}, ` +
       `but the font table holds ${limit} face(s); register the face with register_font (trap site 22)`;
   }
+  if (site === 30) {
+    return `sandom engine trap in ${name}: table box ${observed} has child box ${limit}, which is not a table caption, ` +
+      "column, column group or row group; a table's children must be those boxes (the DOM scene build wraps " +
+      "others in anonymous table boxes, CSS 2.1 §17.2.1; an authored scene gives them itself) (trap site 30)";
+  }
+  if (site === 31) {
+    return `sandom engine trap in ${name}: box ${observed} in a table row group is not a table row; ` +
+      "a row group's children must be table rows (trap site 31)";
+  }
+  if (site === 32) {
+    return `sandom engine trap in ${name}: table row box ${observed} has child box ${limit}, which is not a table cell; ` +
+      "a row's children must be table cells (trap site 32)";
+  }
   if (site === 15) {
     const operation = limit === 400
       ? "an sbix graphic type other than 'png ' (and 'dupe')"
@@ -105,7 +121,7 @@ function trapMessage(name, site, observed, limit) {
       ? `pop_group with composite mode ${COMPOSITE_MODE_NAMES[limit - 100] ?? limit - 100}`
       : COLOR_GLYPH_OPERATION_NAMES.get(limit) ?? `operation ${limit}`;
     return `sandom engine trap in ${name}: color glyph ${observed} paints ${operation}, ` +
-      "which no command expresses (trap site 15); see plans/text/PLAN-color-glyphs.md";
+      "which no command expresses (trap site 15); see design/text-rendering.md, \"Colour glyphs\"";
   }
   return `sandom engine trap in ${name}: ${
     TRAP_SITE_NAMES.get(site) ?? "unnamed guard"
@@ -261,7 +277,6 @@ async function initializeEngine(core, harfbuzzBytes) {
   );
 
   exports.init();
-  verifyLayout(exports);
   exports.harfbuzz_callbacks_initialize(callbackBase);
 
   const engine = {

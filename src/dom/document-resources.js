@@ -67,6 +67,12 @@ export function createDocumentResourceLoader({
   // (src/dom/images.js) and the scene renderer request an image through
   // the same demand, so the host fetches it once.
   const imageDemands = new Map();
+  // The resources of demands that set a request field (mode, credentials,
+  // integrity, referrer policy: an attribute such as crossorigin, or a
+  // url() request modifier): each field value selects its own resource, by
+  // URL, then mode, credentials, integrity and referrer policy.
+  const resourcesByRequest = new Map();
+  const requestResources = new Set();
   let resourceSession = null;
   let moduleSession = null;
   let classicScriptSession = null;
@@ -98,7 +104,7 @@ export function createDocumentResourceLoader({
   // the renderer resolved for its cache identity, `authoredURL` the text
   // the author wrote, `baseURL` the base Sandom selected.
   const resolveResource = (demand) => {
-    if (demand.kind !== "image" || demand.signal !== undefined) return requestResource(demand);
+    if (demand.kind !== "image" || demand.signal !== undefined || requestQualified(demand)) return requestResource(demand);
     const requestedFinalURL = URL.parse(
       demand.requestedURL,
       demand.baseURL ?? normalizedDocumentURL,
@@ -112,6 +118,21 @@ export function createDocumentResourceLoader({
     return pending;
   };
 
+  const requestQualified = ({ mode, credentials, integrity, referrerPolicy }) =>
+    mode !== undefined || credentials !== undefined || integrity !== undefined || referrerPolicy !== undefined;
+
+  // The level of resourcesByRequest for the demand's fields; the last
+  // level maps the referrer policy to the resource.
+  const requestLevel = (url, { mode, credentials, integrity }) => {
+    let level = resourcesByRequest;
+    for (const key of [url, mode, credentials, integrity]) {
+      let next = level.get(key);
+      if (next === undefined) level.set(key, next = new Map());
+      level = next;
+    }
+    return level;
+  };
+
   const requestResource = async ({
     requestedURL,
     authoredURL = requestedURL,
@@ -121,7 +142,10 @@ export function createDocumentResourceLoader({
     initiator = null,
     mode,
     credentials,
+    integrity,
+    referrerPolicy,
   }) => {
+    const qualified = requestQualified({ mode, credentials, integrity, referrerPolicy });
     const resourceSessionForDemand = session();
     const destination = DESTINATION_BY_KIND[kind];
     if (destination === undefined) {
@@ -135,7 +159,9 @@ export function createDocumentResourceLoader({
       // The host resolves the reference and reports its own failure.
     }
     if (requestedFinalURL !== null) {
-      const cached = resourcesByURL.get(requestedFinalURL);
+      const cached = qualified
+        ? requestLevel(requestedFinalURL, { mode, credentials, integrity }).get(referrerPolicy)
+        : resourcesByURL.get(requestedFinalURL);
       if (cached) return cached;
       const suppliedSource = kind === "stylesheet"
         ? suppliedStylesheetSources.get(requestedFinalURL)
@@ -170,6 +196,8 @@ export function createDocumentResourceLoader({
       topLevelOrigin: topLevelOrigin ?? clientOrigin,
       mode,
       credentials,
+      integrity,
+      referrerPolicy,
       generation,
       signal,
     });
@@ -221,6 +249,12 @@ export function createDocumentResourceLoader({
       opaque: received.provenance.responseType === "opaque",
       kind,
     });
+    if (qualified && requestedFinalURL !== null) {
+      requestLevel(requestedFinalURL, { mode, credentials, integrity }).set(referrerPolicy, resource);
+      requestResources.add(resource);
+      cachedRecords = null;
+      return resource;
+    }
     return remember(resource, requestedFinalURL);
   };
 
@@ -320,7 +354,7 @@ export function createDocumentResourceLoader({
     get records() {
       if (cachedRecords) return cachedRecords;
       cachedRecords = Object.freeze(
-        [...new Set(resourcesByURL.values())]
+        [...new Set([...resourcesByURL.values(), ...requestResources])]
           .map((resource) =>
             Object.freeze({
               requestedFinalURL: resource.requestedFinalURL,

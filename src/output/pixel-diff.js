@@ -1,4 +1,27 @@
 import { quantizeWorkingPixels } from "./color-transform.js";
+import { instantiate } from "../wasm/pixel-diff-binary.js";
+
+// The classification, verdict and arc check run in core/engine/pixel-diff.wat;
+// ray directions use the host's Math.cos and Math.sin.
+let module = null;
+function diffModule() {
+  module ??= instantiate({ math: { cos: Math.cos, sin: Math.sin } }).exports;
+  return module;
+}
+
+function moduleText(exports, length) {
+  return new TextDecoder().decode(new Uint8Array(exports.memory.buffer, exports.text_address(), length));
+}
+
+// Copies the two pixel buffers (and optional f64 records after them, at an
+// eight-byte boundary) into the module's input buffer.
+function writePixels(exports, sandom, chrome, records = null) {
+  const recordOffset = Math.ceil((sandom.length + chrome.length) / 8) * 8;
+  const pointer = exports.input_buffer(recordOffset + (records === null ? 0 : records.byteLength));
+  new Uint8Array(exports.memory.buffer, pointer, sandom.length).set(sandom);
+  new Uint8Array(exports.memory.buffer, pointer + sandom.length, chrome.length).set(chrome);
+  if (records !== null) new Float64Array(exports.memory.buffer, pointer + recordOffset, records.length).set(records);
+}
 
 // Canonical RGBA pixel comparison — the SINGLE source of truth for both the
 // browser gallery (examples/layout-gallery.js) and the headless parity test
@@ -73,15 +96,6 @@ export const STRUCT_FLOOR = 24;
 // is sized with margin above the measured 62, not tuned to just clear it.
 export const IMAGE_STRUCT_FLOOR = 100;
 
-// Max per-channel (RGB) difference at pixel offset o between two RGBA buffers.
-function channelDelta(a, b, o) {
-  return Math.max(
-    Math.abs(a[o] - b[o]),
-    Math.abs(a[o + 1] - b[o + 1]),
-    Math.abs(a[o + 2] - b[o + 2]),
-  );
-}
-
 // Compare two equal-length RGBA buffers. Returns counts + a visual diff image
 // (gray = identical, blue = edge-AA, magenta = structural). `aa`/`struct` let a
 // caller override thresholds but default to the shared constants so both sides
@@ -97,64 +111,55 @@ export function classifyDiff(
   // against an eight-bit oracle is a byte-domain operation, so quantize
   // at this sink, explicitly.
   const sandom = quantizeWorkingPixels(rawSandom);
-  if (sandom.length !== chrome.length) {
-    throw new Error(
-      `pixel buffers differ in length: ${sandom.length} vs ${chrome.length}`,
-    );
-  }
+  const exports = diffModule();
+  const mismatch = exports.length_check(sandom.length, chrome.length);
+  if (mismatch !== 0) throw new Error(moduleText(exports, mismatch));
   const total = width * height;
-  const diffImage = new Uint8Array(sandom.length);
-  let identical = 0, edgeAA = 0, structural = 0, maxDelta = 0;
-
-  for (let i = 0; i < total; i++) {
-    const o = i * 4;
-    const d = channelDelta(sandom, chrome, o);
-    if (d > maxDelta) maxDelta = d;
-    if (d <= aa) {
-      const g = Math.round(
-        (sandom[o] * 0.299 + sandom[o + 1] * 0.587 + sandom[o + 2] * 0.114) *
-            0.35 + 40,
-      );
-      diffImage[o] = g;
-      diffImage[o + 1] = g;
-      diffImage[o + 2] = g;
-      diffImage[o + 3] = 255;
-      identical++;
-    } else if (d < struct) {
-      diffImage[o] = 40;
-      diffImage[o + 1] = 90;
-      diffImage[o + 2] = 200;
-      diffImage[o + 3] = 255;
-      edgeAA++;
-    } else {
-      diffImage[o] = 255;
-      diffImage[o + 1] = 0;
-      diffImage[o + 2] = 255;
-      diffImage[o + 3] = 255;
-      structural++;
-    }
-  }
-
+  writePixels(exports, sandom, chrome);
+  exports.classify(total, sandom.length, aa, struct, structFloor);
   return {
     width,
     height,
     total,
-    identical,
-    edgeAA,
-    structural,
-    maxDelta,
-    diffImage,
-    ok: structural <= structFloor,
+    identical: exports.identical(),
+    edgeAA: exports.edge(),
+    structural: exports.structural(),
+    maxDelta: exports.max_delta(),
+    diffImage: new Uint8Array(exports.memory.buffer, exports.diff_image_address(), sandom.length).slice(),
+    ok: exports.ok() === 1,
   };
+}
+
+// Compares two read-back rasters ({ width, height, pixels, deviceScale,
+// colorEncoding, alphaMode }) as facts: pixel counts by delta class, the
+// largest channel delta, and the diff image. It gives no verdict. Rasters of
+// another size, device scale, color encoding, or alpha mode throw.
+export function compareRasters(left, right) {
+  const exports = diffModule();
+  const sameEncoding = left.colorEncoding === right.colorEncoding;
+  const sameAlpha = left.alphaMode === right.alphaMode;
+  const failure = exports.raster_compare_check(
+    left.width, left.height, right.width, right.height,
+    left.deviceScale, right.deviceScale, sameEncoding ? 1 : 0, sameAlpha ? 1 : 0,
+  );
+  if (failure !== 0) {
+    // An encoding or alpha message ends with "received "; the names follow.
+    const message = moduleText(exports, failure);
+    const names = !message.endsWith("received ")
+      ? ""
+      : sameEncoding
+      ? `${left.alphaMode} and ${right.alphaMode}.`
+      : `${left.colorEncoding} and ${right.colorEncoding}.`;
+    throw new RangeError(message + names);
+  }
+  const { ok: _verdict, ...facts } = classifyDiff(left.pixels, quantizeWorkingPixels(right.pixels), left.width, left.height);
+  return facts;
 }
 
 // One-line verdict — same wording the gallery badge uses.
 export function diffSummary(r) {
-  if (!r.ok) {
-    return `${r.structural} STRUCTURAL px (maxΔ ${r.maxDelta}), ${r.edgeAA} edge-AA`;
-  }
-  const corners = r.structural > 0 ? `, ${r.structural} corner-AA` : "";
-  return `PASS — no structural diff (${r.edgeAA} edge-AA px${corners}, maxΔ ${r.maxDelta})`;
+  const exports = diffModule();
+  return moduleText(exports, exports.summary(r.ok ? 1 : 0, r.structural, r.maxDelta, r.edgeAA));
 }
 
 // =========================================================================
@@ -185,62 +190,13 @@ export function diffSummary(r) {
 //
 // Angle convention: screen coordinates, y down — angle 0 points +x, π/2
 // points +y (downward). A top-left corner's outward quadrant is [π, 1.5π].
-
-// Sub-pixel step along each ray. 0.25px keeps the interpolated crossing
-// well under the tolerance's resolution while staying cheap.
-const ARC_STEP = 0.25;
-// A ray is only measurable when Chrome's inside/outside reference colors
-// differ by at least this much on some channel — below it there is no edge
-// to locate on the ground-truth side (occlusion or same-color background).
-const ARC_EDGE_CONTRAST_MIN = 32;
-// Chrome's own crossing must sit within this distance of the expected
-// radius for the ray to count — a ground-truth edge far from the model arc
-// means something OTHER than this corner's contour crossed the ray (an
-// overlapping box, a neighboring edge), so comparing against it would
-// measure the wrong feature. Sandom's crossing is NOT gated this way — a
-// wrong sandom contour is exactly what must be measured, not skipped.
-const ARC_CHROME_VALIDITY = 2.5;
-
-// Bilinear RGB sample at a floating-point pixel position.
-function sampleRGB(px, width, height, x, y) {
-  const fx = Math.min(Math.max(x - 0.5, 0), width - 1.001);
-  const fy = Math.min(Math.max(y - 0.5, 0), height - 1.001);
-  const x0 = Math.floor(fx), y0 = Math.floor(fy);
-  const tx = fx - x0, ty = fy - y0;
-  const o00 = (y0 * width + x0) * 4, o10 = o00 + 4;
-  const o01 = ((y0 + 1) * width + x0) * 4, o11 = o01 + 4;
-  const out = [0, 0, 0];
-  for (let c = 0; c < 3; c++) {
-    const top = px[o00 + c] * (1 - tx) + px[o10 + c] * tx;
-    const bot = px[o01 + c] * (1 - tx) + px[o11 + c] * tx;
-    out[c] = top * (1 - ty) + bot * ty;
-  }
-  return out;
-}
-
-// First sustained crossing of the 0.5 midpoint in a projected-sample array,
-// as a fractional index (linear interpolation between the straddling pair),
-// or null if the projection never crosses. "Sustained" = the next ~1px of
-// samples stay past the midpoint, so a single noisy AA pixel can't fake a
-// crossing. Index 0 means "already outside at scan start" (a contour that
-// recedes even deeper than the scan window — clamped, still a divergence).
-function firstMidpointCrossing(proj) {
-  if (proj[0] >= 0.5) return 0;
-  const sustain = Math.round(1 / ARC_STEP);
-  for (let i = 1; i < proj.length; i++) {
-    if (proj[i] < 0.5) continue;
-    let ok = true;
-    for (let j = i + 1; j < Math.min(i + sustain, proj.length); j++) {
-      if (proj[j] < 0.5) {
-        ok = false;
-        break;
-      }
-    }
-    if (!ok) continue;
-    return i - 1 + (0.5 - proj[i - 1]) / (proj[i] - proj[i - 1]);
-  }
-  return null;
-}
+//
+// core/engine/pixel-diff.wat samples every 0.25 px along each ray, measures a
+// ray only when Chrome's inside and outside reference colours differ by at
+// least 32 on some channel (otherwise the ground truth shows no edge), and
+// only when Chrome's own crossing lies within 2.5 px of the expected radius
+// (otherwise another feature crossed the ray). Sandom's crossing is not
+// gated: a wrong Sandom contour is what the check measures.
 
 // Compare the two rasters' actual contour positions along every expected
 // arc. `arcs`: [{cx, cy, r, a0, a1, label}] in the rasters' own pixel space.
@@ -251,96 +207,19 @@ function firstMidpointCrossing(proj) {
 // still fails loudly rather than skipping.
 export function compareArcCrossings(rawSandom, chrome, width, height, arcs) {
   const sandom = quantizeWorkingPixels(rawSandom);
-  let measured = 0, skipped = 0, maxDivergence = 0, worst = null;
-  for (const arc of arcs) {
-    const { cx, cy, r, a0, a1 } = arc;
-    // Scan window: 4px inside the expected arc out to 1.5r+3 beyond it —
-    // far enough to catch a fully SQUARE corner (its 45° contour sits at
-    // r*sqrt(2) ≈ 1.41r) without scanning the whole scene.
-    const tStart = Math.max(0.5, r - 4);
-    const tEnd = r * 1.5 + 3;
-    const steps = Math.floor((tEnd - tStart) / ARC_STEP) + 1;
-    const angleStep = Math.PI / 36; // 5°
-    for (let a = a0; a <= a1 + 1e-9; a += angleStep) {
-      const dx = Math.cos(a), dy = Math.sin(a);
-      // Sample both rasters along the ray. Rays that leave the canvas are
-      // truncated at the boundary (sampleRGB clamps; measuring a clamped
-      // duplicate row would fake a flat edge, so stop instead).
-      const chromeSamples = [], sandomSamples = [];
-      for (let i = 0; i < steps; i++) {
-        const t = tStart + i * ARC_STEP;
-        const x = cx + dx * t, y = cy + dy * t;
-        if (x < 0.5 || y < 0.5 || x > width - 0.5 || y > height - 0.5) break;
-        chromeSamples.push(sampleRGB(chrome, width, height, x, y));
-        sandomSamples.push(sampleRGB(sandom, width, height, x, y));
-      }
-      if (chromeSamples.length < steps * 0.6) {
-        skipped++;
-        continue;
-      }
-      // Ground-truth reference colors, from CHROME only: just inside and
-      // just outside the expected contour, offset past the ~1px AA band.
-      const avgWindow = (lo, hi) => {
-        const out = [0, 0, 0];
-        let n = 0;
-        for (let i = 0; i < chromeSamples.length; i++) {
-          const t = tStart + i * ARC_STEP;
-          if (t < lo || t > hi) continue;
-          for (let c = 0; c < 3; c++) out[c] += chromeSamples[i][c];
-          n++;
-        }
-        return n === 0 ? null : out.map((v) => v / n);
-      };
-      const inside = avgWindow(r - 3.5, r - 1.5);
-      const outside = avgWindow(r + 1.5, r + 3.5);
-      if (!inside || !outside) {
-        skipped++;
-        continue;
-      }
-      const contrast = Math.max(
-        Math.abs(inside[0] - outside[0]),
-        Math.abs(inside[1] - outside[1]),
-        Math.abs(inside[2] - outside[2]),
-      );
-      if (contrast < ARC_EDGE_CONTRAST_MIN) {
-        skipped++;
-        continue;
-      }
-      const axis = [
-        outside[0] - inside[0],
-        outside[1] - inside[1],
-        outside[2] - inside[2],
-      ];
-      const den = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
-      const project = (s) =>
-        ((s[0] - inside[0]) * axis[0] + (s[1] - inside[1]) * axis[1] +
-          (s[2] - inside[2]) * axis[2]) / den;
-      const chromeCrossIdx = firstMidpointCrossing(chromeSamples.map(project));
-      if (chromeCrossIdx === null) {
-        skipped++;
-        continue;
-      }
-      const chromeT = tStart + chromeCrossIdx * ARC_STEP;
-      if (Math.abs(chromeT - r) > ARC_CHROME_VALIDITY) {
-        skipped++;
-        continue;
-      }
-      const sandomCrossIdx = firstMidpointCrossing(sandomSamples.map(project));
-      const sandomT = sandomCrossIdx === null
-        ? tStart + (sandomSamples.length - 1) * ARC_STEP
-        : tStart + sandomCrossIdx * ARC_STEP;
-      const divergence = Math.abs(sandomT - chromeT);
-      measured++;
-      if (divergence > maxDivergence) {
-        maxDivergence = divergence;
-        worst = {
-          label: arc.label,
-          angleDeg: Math.round((a * 180) / Math.PI),
-          chromeT: Math.round(chromeT * 100) / 100,
-          sandomT: Math.round(sandomT * 100) / 100,
-        };
-      }
-    }
-  }
-  return { measured, skipped, maxDivergence, worst };
+  const exports = diffModule();
+  writePixels(exports, sandom, chrome, new Float64Array(arcs.flatMap(({ cx, cy, r, a0, a1 }) => [cx, cy, r, a0, a1])));
+  exports.arcs(sandom.length, width, height, arcs.length);
+  const worstArc = exports.worst_arc();
+  return {
+    measured: exports.measured(),
+    skipped: exports.skipped(),
+    maxDivergence: exports.max_divergence(),
+    worst: worstArc < 0 ? null : {
+      label: arcs[worstArc].label,
+      angleDeg: exports.worst_angle(),
+      chromeT: exports.worst_chrome(),
+      sandomT: exports.worst_sandom(),
+    },
+  };
 }

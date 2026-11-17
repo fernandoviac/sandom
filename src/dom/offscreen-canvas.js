@@ -16,15 +16,21 @@
 // the pinned Chrome 151, test/canvas/canvas_2d_image_parity_test.js). Sandom gives
 // an OffscreenCanvas a 2D context only: getContext() with "webgpu",
 // "webgl", "webgl2" or "bitmaprenderer" returns null.
+import { SDEventTarget } from "./events.js";
 import {
   CanvasRenderingContext2D,
   convertCanvas2DSettings,
   createCanvasRenderingContext2D,
+  EXPORT_EMPTY,
+  EXPORT_TAINTED,
   registerOffscreenCanvasState,
   releaseSource,
 } from "./canvas-2d.js";
 import { createImageBitmapOf } from "./canvas-image-bitmap.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 
+const RESOURCE_TYPE_CANVAS = layoutConstant("RESOURCE_TYPE_CANVAS");
+const RESOURCE_PENDING = layoutConstant("RESOURCE_PENDING");
 const INTERFACE = "OffscreenCanvas";
 const CONTEXT_TYPES = ["2d", "bitmaprenderer", "webgl", "webgl2", "webgpu"];
 // The document of the window whose OffscreenCanvas constructor made the
@@ -46,7 +52,7 @@ function enforcedDimension(prefix, value) {
   return truncated;
 }
 
-export class OffscreenCanvas extends EventTarget {
+export class OffscreenCanvas extends SDEventTarget {
   #document;
   #width;
   #height;
@@ -142,8 +148,8 @@ export class OffscreenCanvas extends EventTarget {
       resourceHandle = element.webgpuContext._resourceHandle;
       this.#document._canvasContexts?.delete(element.webgpuContext);
     } else {
-      resourceHandle = core.resourceRegister(2, `offscreen:${nextOffscreenIdentifier++}`);
-      core.resourceUpdate(resourceHandle, 0, this.#width, this.#height);
+      resourceHandle = core.resourceRegister(RESOURCE_TYPE_CANVAS, `offscreen:${nextOffscreenIdentifier++}`);
+      core.resourceUpdate(resourceHandle, RESOURCE_PENDING, this.#width, this.#height);
     }
     this.#resourceHandle = resourceHandle;
     const host = Object.freeze({
@@ -162,7 +168,7 @@ export class OffscreenCanvas extends EventTarget {
       _notifyCanvasSize: () => placeholder?._notifyCanvasSize(),
     });
     const context = createCanvasRenderingContext2D(host, settings, resourceHandle, this);
-    Object.setPrototypeOf(context, offscreenContextPrototype());
+    Object.setPrototypeOf(context, OffscreenCanvasRenderingContext2D.prototype);
     this.#document._canvasContexts?.add(context);
     return context;
   }
@@ -179,13 +185,14 @@ export class OffscreenCanvas extends EventTarget {
       if (options.type !== undefined) type = String(options.type);
     }
     const context = this.#context;
-    if (context !== null && !context._originClean) {
-      return Promise.reject(new DOMException(`${member}: Tainted "OffscreenCanvas" may not be exported.`, "SecurityError"));
-    }
     if (context === null) {
       return Promise.reject(new DOMException(`${member}: "OffscreenCanvas" has no rendering context.`, "InvalidStateError"));
     }
-    if (this.#width === 0 || this.#height === 0) {
+    const checked = context._exportCheck();
+    if (checked === EXPORT_TAINTED) {
+      return Promise.reject(new DOMException(`${member}: Tainted "OffscreenCanvas" may not be exported.`, "SecurityError"));
+    }
+    if (checked === EXPORT_EMPTY) {
       return Promise.reject(new DOMException(`${member}: The size of "OffscreenCanvas" is zero.`, "IndexSizeError"));
     }
     try {
@@ -203,7 +210,7 @@ export class OffscreenCanvas extends EventTarget {
         "InvalidStateError",
       );
     }
-    if (this.#width === 0 || this.#height === 0) {
+    if (this.#context._exportCheck(true) === EXPORT_EMPTY) {
       throw new DOMException(`${member}: ImageBitmap construction failed`, "UnknownError");
     }
     const image = this.#context._transferImage();
@@ -212,11 +219,8 @@ export class OffscreenCanvas extends EventTarget {
     return bitmap;
   }
 
-  get [Symbol.toStringTag]() {
-    return INTERFACE;
-  }
-
   static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: INTERFACE, configurable: true });
     canvasState = (value) =>
       #width in value ? { width: value.#width, height: value.#height, context: value.#context } : undefined;
   }
@@ -256,23 +260,20 @@ const OffscreenCanvasBase = OffscreenCanvas;
 //
 // The members of CanvasRenderingContext2D except drawFocusIfNeeded(), as
 // Chrome has them, on a prototype of its own: a context of an
-// OffscreenCanvas is not an instance of CanvasRenderingContext2D.
-
-let offscreenPrototype = null;
+// OffscreenCanvas is not an instance of CanvasRenderingContext2D. The members
+// exist when the module loads, so the interface object has its whole surface
+// before any context exists.
 
 export function OffscreenCanvasRenderingContext2D() {
   throw new TypeError("Failed to construct 'OffscreenCanvasRenderingContext2D': Illegal constructor");
 }
 
-function offscreenContextPrototype() {
-  if (offscreenPrototype !== null) return offscreenPrototype;
+{
   const descriptors = Object.getOwnPropertyDescriptors(CanvasRenderingContext2D.prototype);
   delete descriptors.drawFocusIfNeeded;
   delete descriptors.constructor;
-  descriptors[Symbol.toStringTag] = { configurable: true, get: () => "OffscreenCanvasRenderingContext2D" };
-  offscreenPrototype = OffscreenCanvasRenderingContext2D.prototype;
-  Object.defineProperties(offscreenPrototype, descriptors);
-  return offscreenPrototype;
+  descriptors[Symbol.toStringTag] = { value: "OffscreenCanvasRenderingContext2D", configurable: true };
+  Object.defineProperties(OffscreenCanvasRenderingContext2D.prototype, descriptors);
 }
 
 // ------------------------------------------------ transferControlToOffscreen

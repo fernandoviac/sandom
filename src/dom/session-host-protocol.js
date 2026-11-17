@@ -5,7 +5,7 @@
 //
 // Main -> worker:
 //   { kind: SESSION_HOST_START_KIND, version, canvas, width, height,
-//     deviceScale, module, component, schema, instance, contractModule,
+//     deviceScale, module, component, schema, instance,
 //     fonts: [{ family, url }], stylesheets: [{ url, source } | { locator }] }
 //   { kind: SESSION_HOST_PRESENT_KIND, version, enabled }
 //   { kind: SESSION_HOST_INPUT_KIND, version, records }

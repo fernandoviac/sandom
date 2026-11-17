@@ -15,9 +15,47 @@ import { documentClockFromOptions } from "./document-clock.js";
 import { assertScrollbarStyle } from "./scrollbar-visibility.js";
 import { SDDocument } from "./node.js";
 import { serializeToScene } from "./serialize.js";
-import { resolvedElementFields } from "./style.js";
-import { createLayoutArtifact } from "../scene-renderer.js";
+import { nodeMember } from "./node-members.js";
+
+import { createLayoutArtifact, createPaintRecord } from "../scene-renderer.js";
 import { createPreparedDocument } from "./prepared-document.js";
+import { sharedDomCore } from "../dom-wasm/core.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+import { createSandomDOM } from "./sandom-dom.js";
+
+const numberOrNaN = (value) => typeof value === "number" ? value : NaN;
+// The render request, plan request and frame metadata outputs of the
+// output-render watparts, by WAT name.
+const OUTPUT_RENDER_REQUEST = Object.freeze(Object.fromEntries(["SIZE", "HIGH_DYNAMIC_RANGE", "GIF_WIDTH", "GIF_HEIGHT"]
+  .map((name) => [name, layoutConstant(`OUTPUT_RENDER_REQUEST_${name}`)])));
+const OUTPUT_PLAN_REQUEST = Object.freeze(Object.fromEntries(["SIZE", "LOOP_COUNT"]
+  .map((name) => [name, layoutConstant(`OUTPUT_PLAN_REQUEST_${name}`)])));
+const OUTPUT_FRAME_METADATA = Object.freeze(Object.fromEntries(["SIZE", "SEQUENCE", "DURATION"]
+  .map((name) => [name, layoutConstant(`OUTPUT_FRAME_METADATA_${name}`)])));
+// The codes of the output watparts: formats (output-plan.watpart),
+// preprocessor choices (output-render-input.watpart) and inspection checks
+// (output-inspection.watpart).
+const OUTPUT_CODE = Object.freeze(Object.fromEntries([
+  "PLAN_FORMAT_PNG", "PLAN_FORMAT_GIF", "PLAN_FORMAT_JPEG_XL", "PLAN_FORMAT_JPEG_GAIN_MAP",
+  "PREPROCESSOR_EXPLICIT", "PREPROCESSOR_BY_MEDIA_TYPE", "PREPROCESSOR_BY_EXTENSION",
+  "INSPECTION_CHECK_VIEWPORT", "INSPECTION_CHECK_MODE", "INSPECTION_CHECK_ANIMATION",
+  "INSPECTION_ANALYTICAL_LAYOUT", "INSPECTION_HIGH_DYNAMIC_RANGE", "INSPECTION_TEXT_OPERATION",
+].map((name) => [name, layoutConstant(`OUTPUT_${name}`)])));
+
+// The inspection node records of output-inspection.watpart and
+// frame-inspection.watpart, by WAT name.
+const INSPECTION = Object.freeze(Object.fromEntries([
+  "NODE_SIZE", "NODE_PARENT", "NODE_FLAGS", "NODE_DECLARED_WIDTH", "NODE_DECLARED_HEIGHT", "SOURCE_MASK",
+  "BACKGROUND", "TEXT", "KIND_SHIFT", "KIND_MASK",
+].map((name) => [name, layoutConstant(`INSPECTION_${name}`)])));
+const FRAME_INSPECTION = Object.freeze(Object.fromEntries([
+  "NODE_SIZE", "NODE_PARENT", "NODE_FLAGS", "NODE_DECLARED_WIDTH", "NODE_DECLARED_HEIGHT", "NODE_X", "NODE_Y",
+  "NODE_WIDTH", "NODE_HEIGHT", "NODE_SCROLL_WIDTH", "NODE_SCROLL_HEIGHT", "NODE_INTRINSIC_WIDTH",
+  "NODE_INTRINSIC_HEIGHT", "NODE_RESULT", "DOCUMENT_ROOT", "PARTICIPATES", "INTRINSIC", "VIEWPORT_BACKGROUND",
+  "AGGREGATE_SCROLL_WIDTH",
+  "AGGREGATE_SCROLL_HEIGHT", "AGGREGATE_OVERFLOW_LEFT", "AGGREGATE_OVERFLOW_TOP", "AGGREGATE_OVERFLOW_RIGHT",
+  "AGGREGATE_OVERFLOW_BOTTOM",
+].map((name) => [name, layoutConstant(`FRAME_INSPECTION_${name}`)])));
 
 const REC2100_PQ_OUTPUT_ENCODING = Object.freeze({
   primaries: "rec2020",
@@ -61,16 +99,12 @@ const ADAPTIVE_OUTPUT_REQUEST = Object.freeze({
   }),
 });
 
-async function digest(bytes) {
-  const digestBytes = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", bytes),
-  );
-  return `sha256:${
-    Array.from(digestBytes, (byte) => byte.toString(16).padStart(2, "0")).join(
-      "",
-    )
-  }`;
+// The SHA-256 digest text of the bytes (output_input_digest).
+function digest(bytes) {
+  sharedDomCore.status("output_input_digest", ...sharedDomCore.byteInput(bytes));
+  return sharedDomCore.outputString();
 }
+// Each prepared input's lifecycle record (output-render-input.watpart).
 const preparedInputStates = new WeakMap();
 
 function preparedInputState(preparedInput) {
@@ -78,30 +112,31 @@ function preparedInputState(preparedInput) {
   if (!state) {
     throw new TypeError("operation requires a prepared render input");
   }
-  if (state.released) {
-    throw new Error("prepared render input has been released");
-  }
-  if (state.active) {
-    throw new Error("prepared render input already has an active operation");
-  }
   return state;
 }
 
 async function performPreparedOperation(preparedInput, operation) {
   const state = preparedInputState(preparedInput);
-  state.active = true;
+  sharedDomCore.statusRaw("output_prepared_input_begin", state.handle);
   try {
     return await operation(state);
   } finally {
-    state.active = false;
+    sharedDomCore.status("output_prepared_input_end", state.handle);
   }
 }
 
 function frameMetadata(frame) {
+  const hasSequence = frame.sequence !== null && frame.sequence !== undefined;
+  const hasDuration = frame.durationMilliseconds !== null && frame.durationMilliseconds !== undefined;
+  sharedDomCore.status("output_frame_metadata", hasSequence ? 1 : 0, hasSequence ? Number(frame.sequence) : NaN,
+    Number(frame.frameSequence), hasDuration ? 1 : 0, hasDuration ? Number(frame.durationMilliseconds) : NaN);
+  const output = new DataView(sharedDomCore.refreshBytes().buffer, sharedDomCore.exports.abi_output_pointer(), OUTPUT_FRAME_METADATA.SIZE);
+  const sequence = output.getFloat64(OUTPUT_FRAME_METADATA.SEQUENCE, true);
+  const durationMilliseconds = output.getFloat64(OUTPUT_FRAME_METADATA.DURATION, true);
   return Object.freeze({
-    sequence: frame.sequence ?? frame.frameSequence - 1,
+    sequence: hasSequence ? frame.sequence : sequence,
     timeMilliseconds: frame.timeMilliseconds,
-    durationMilliseconds: frame.durationMilliseconds ?? 0,
+    durationMilliseconds: hasDuration ? frame.durationMilliseconds : durationMilliseconds,
     dirtyRectangles: frame.dirtyRectangles,
     readbackByteLength: frame.readbackByteLength,
   });
@@ -121,21 +156,14 @@ export async function renderDocumentAnimation(document, options = {}) {
     scrollbarStyle = "overlay",
   } = options;
   assertScrollbarStyle(scrollbarStyle, "render options");
-  if (!["gif", "png", "jpeg-xl", "jpeg-gain-map"].includes(format)) {
-    throw new RangeError(`Unsupported render format ${JSON.stringify(format)}`);
-  }
-  if (
-    !Number.isFinite(width) || width <= 0 || !Number.isFinite(height) ||
-    height <= 0
-  ) {
-    throw new RangeError("width and height must be positive numbers");
-  }
-  if (!Number.isFinite(deviceScale) || deviceScale <= 0) {
-    throw new RangeError("deviceScale must be a positive number");
-  }
-  if (format === "gif" && (!Number.isInteger(frameBudget) || frameBudget < 1)) {
-    throw new RangeError("frameBudget must be a positive integer");
-  }
+  const core = sharedDomCore;
+  const formatIndex = core.statusRaw("output_render_request",
+    ...core.input(typeof format === "string" ? format : ""), ...core.input(String(JSON.stringify(format))),
+    numberOrNaN(width), numberOrNaN(height), numberOrNaN(deviceScale), numberOrNaN(frameBudget));
+  const checked = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), OUTPUT_RENDER_REQUEST.SIZE);
+  const highDynamicRangeStillOutput = checked.getUint32(OUTPUT_RENDER_REQUEST.HIGH_DYNAMIC_RANGE, true) !== 0;
+  const gifWidth = checked.getUint32(OUTPUT_RENDER_REQUEST.GIF_WIDTH, true);
+  const gifHeight = checked.getUint32(OUTPUT_RENDER_REQUEST.GIF_HEIGHT, true);
   if (!(document instanceof SDDocument)) {
     throw new TypeError("renderDocumentAnimation requires an SDDocument");
   }
@@ -143,8 +171,6 @@ export async function renderDocumentAnimation(document, options = {}) {
     throw new Error("The preprocessor did not populate a document element");
   }
 
-  const highDynamicRangeStillOutput = format === "jpeg-xl" ||
-    format === "jpeg-gain-map";
   await document._readyForRendering();
   const surface = createRenderSurface(document.documentElement, {
     viewportWidth: width,
@@ -160,7 +186,7 @@ export async function renderDocumentAnimation(document, options = {}) {
     // otherwise race the explicit render.
     surface.stop();
     const initialFrame = await surface.renderNow({ pixels: true });
-    if (format !== "gif") {
+    if (formatIndex !== OUTPUT_CODE.PLAN_FORMAT_GIF) {
       const frame = frameMetadata(initialFrame);
       const descriptor = {
         pixels: initialFrame.pixels,
@@ -176,12 +202,12 @@ export async function renderDocumentAnimation(document, options = {}) {
       };
       let bytes;
       let outputFacts;
-      if (format === "png") {
+      if (formatIndex === OUTPUT_CODE.PLAN_FORMAT_PNG) {
         bytes = await encodeImage(descriptor, PNG_OUTPUT_REQUEST, {
           encodePngOutput: document._sandomSceneRendererRuntime?.codecRuntime
             ?.encodePngOutput,
         });
-      } else if (format === "jpeg-xl") {
+      } else if (formatIndex === OUTPUT_CODE.PLAN_FORMAT_JPEG_XL) {
         bytes = await encodeImage(descriptor, JPEG_XL_OUTPUT_REQUEST, {
           renderPrecision: "rgba16float",
         });
@@ -198,7 +224,7 @@ export async function renderDocumentAnimation(document, options = {}) {
       }
       return Object.freeze({
         bytes,
-        ...(format === "png" ? { png: bytes } : {}),
+        ...(formatIndex === OUTPUT_CODE.PLAN_FORMAT_PNG ? { png: bytes } : {}),
         ...(outputFacts === undefined ? {} : { outputFacts }),
         pixels: new Float32Array(initialFrame.pixels),
         rowStride: initialFrame.rowStride,
@@ -227,8 +253,8 @@ export async function renderDocumentAnimation(document, options = {}) {
     }
 
     const recorder = createGifRecorder({
-      width: Math.ceil(width * deviceScale),
-      height: Math.ceil(height * deviceScale),
+      width: gifWidth,
+      height: gifHeight,
       loopCount,
     });
     const frames = [];
@@ -249,16 +275,12 @@ export async function renderDocumentAnimation(document, options = {}) {
     return Object.freeze({
       bytes,
       format: "gif",
-      width: Math.ceil(width * deviceScale),
-      height: Math.ceil(height * deviceScale),
+      width: gifWidth,
+      height: gifHeight,
       graphicsBackend: initialFrame.graphicsBackend,
       graphicsBackendInfo: initialFrame.graphicsBackendInfo,
       scrollbarStyle: surface.scrollbarStyle,
-      durationMilliseconds: durationMilliseconds ??
-        frames.reduce(
-          (total, frame) => total + frame.durationMilliseconds,
-          0,
-        ),
+      durationMilliseconds: durationMilliseconds ?? gifDuration(frames),
       frameCount: frames.length,
       fullReadbackByteLength: initialFrame.readbackByteLength,
       frames: Object.freeze(frames),
@@ -268,43 +290,27 @@ export async function renderDocumentAnimation(document, options = {}) {
   }
 }
 
-// Primary-input media types that select a preprocessor without an explicit
-// name. A network input never selects by its path extension.
-const PREPROCESSOR_BY_MEDIA_TYPE = Object.freeze({
-  "text/html": "html",
-  "application/xhtml+xml": "html",
-  "text/javascript": "javascript",
-  "application/javascript": "javascript",
-});
+// The sum of captured frame durations (output_gif_duration).
+function gifDuration(frames) {
+  const durations = new Float64Array(frames.map((frame) => frame.durationMilliseconds));
+  const [pointer] = sharedDomCore.byteInput(new Uint8Array(durations.buffer));
+  return sharedDomCore.exports.output_gif_duration(pointer, durations.length);
+}
 
-// A primary input that the host fetched over the network selects its
-// preprocessor by response media type. Supplied bytes carry a caller-chosen
-// URL, so they select by their media type when one is given, and otherwise by
-// the URL path extension, as a file input does.
+// The preprocessor of a primary input (output_preprocessor_choice): a
+// network input that the host fetched selects by response media type;
+// supplied bytes select by their media type when one is given, and
+// otherwise by the URL path extension, as a file input does.
 function selectInputPreprocessor(registry, inputURL, mediaType, explicitName, fetched) {
-  if (explicitName !== undefined && explicitName !== null) {
-    return selectPreprocessor(registry, inputURL, explicitName);
-  }
-  if (!fetched) {
-    const name = mediaType === null ? undefined : PREPROCESSOR_BY_MEDIA_TYPE[mediaType];
-    return selectPreprocessor(registry, inputURL, name);
-  }
-  if (inputURL.protocol === "http:" || inputURL.protocol === "https:") {
-    const name = mediaType === null ? undefined : PREPROCESSOR_BY_MEDIA_TYPE[mediaType];
-    if (name === undefined) {
-      throw new SandomHostError(
-        "response-media-type",
-        `Network input ${inputURL.href} has media type ${
-          mediaType === null ? "(absent)" : JSON.stringify(mediaType)
-        }; supported input media types are ${
-          Object.keys(PREPROCESSOR_BY_MEDIA_TYPE).join(", ")
-        }, or name a preprocessor`,
-        { details: { mediaType } },
-      );
-    }
-    return selectPreprocessor(registry, inputURL, name);
-  }
-  return selectPreprocessor(registry, inputURL, undefined);
+  const explicit = explicitName !== undefined && explicitName !== null;
+  const choice = sharedDomCore.status("output_preprocessor_choice", explicit ? 1 : 0, fetched ? 1 : 0,
+    ...sharedDomCore.input(inputURL.protocol), mediaType === null ? 0 : 1,
+    ...sharedDomCore.input(typeof mediaType === "string" ? mediaType : ""),
+    ...sharedDomCore.input(String(JSON.stringify(mediaType))), ...sharedDomCore.input(inputURL.href));
+  if (choice === OUTPUT_CODE.PREPROCESSOR_EXPLICIT) return selectPreprocessor(registry, inputURL, explicitName);
+  if (choice === OUTPUT_CODE.PREPROCESSOR_BY_MEDIA_TYPE) return selectPreprocessor(registry, inputURL, sharedDomCore.outputString());
+  if (choice === OUTPUT_CODE.PREPROCESSOR_BY_EXTENSION) return selectPreprocessor(registry, inputURL, undefined);
+  throw new SandomHostError("response-media-type", sharedDomCore.outputString(), { details: { mediaType } });
 }
 
 // Obtains the primary input through the host as a document demand. The
@@ -454,8 +460,7 @@ export async function prepareRenderInput(input, options = {}) {
   }
 
   const state = {
-    active: false,
-    released: false,
+    handle: sharedDomCore.exports.output_prepared_input_create(),
     preparedDocument,
     resourceRecords: () => preparedDocument.resources,
     diagnosticRecords: () => preparedDocument.diagnostics,
@@ -463,6 +468,8 @@ export async function prepareRenderInput(input, options = {}) {
   const preparedInput = Object.freeze({
     document,
     input: inputRecord,
+    // The source document, the source of each document log's load entry.
+    sourceBytes: inputBytes,
     get resources() {
       return preparedDocument.resources;
     },
@@ -470,13 +477,8 @@ export async function prepareRenderInput(input, options = {}) {
       return preparedDocument.diagnostics;
     },
     async release() {
-      if (state.released) return;
-      if (state.active) {
-        throw new Error(
-          "cannot release a prepared render input during an active operation",
-        );
-      }
-      state.released = true;
+      if (sharedDomCore.statusRaw("output_prepared_input_release", state.handle) === 0) return;
+      state.handle = 0n;
       await state.preparedDocument.release();
     },
   });
@@ -485,82 +487,32 @@ export async function prepareRenderInput(input, options = {}) {
 }
 
 function renderRequestFromPlan(plan) {
-  if (plan.version !== 1) {
-    throw new RangeError(`Unsupported render plan version ${plan.version}`);
-  }
-  const format = plan.output?.format;
-  const width = plan.viewport?.width;
-  const height = plan.viewport?.height;
-  const deviceScale = plan.viewport?.deviceScale;
+  const core = sharedDomCore;
   const graphicsBackend = plan.graphicsBackend ?? "auto";
-  if (!["auto", "webgpu", "webgl2"].includes(graphicsBackend)) {
-    throw new RangeError("render plan graphics backend is unsupported");
-  }
+  core.statusRaw("output_render_plan_backend", numberOrNaN(plan.version), ...core.input(String(plan.version)),
+    ...core.input(typeof graphicsBackend === "string" ? graphicsBackend : ""));
   const scrollbarStyle = assertScrollbarStyle(
     plan.scrollbarStyle ?? "overlay",
     "render plan",
   );
-  if (!["png", "gif", "jpeg-xl", "jpeg-gain-map"].includes(format)) {
-    throw new RangeError("render plan output format is unsupported");
-  }
-  if (
-    ![width, height, deviceScale].every((value) =>
-      Number.isFinite(value) && value > 0
-    )
-  ) {
-    throw new RangeError(
-      "render plan viewport width, height, and deviceScale must be positive",
-    );
-  }
-  if (format !== "gif") {
-    if (plan.capture?.kind !== "still") {
-      throw new RangeError("non-GIF render plans must describe still capture");
-    }
-    return {
-      format,
-      width,
-      height,
-      deviceScale,
-      graphicsBackend,
-      scrollbarStyle,
-      ...(format === "jpeg-gain-map"
-        ? { adaptiveCodecOptions: plan.output.codecOptions ?? {} }
-        : {}),
-    };
-  }
+  const format = plan.output?.format;
+  const width = plan.viewport?.width;
+  const height = plan.viewport?.height;
+  const deviceScale = plan.viewport?.deviceScale;
   const durationMilliseconds = plan.capture?.durationMilliseconds;
   const frameBudget = plan.capture?.sampling?.recommendedFrameBudget;
-  if (!(Number.isFinite(durationMilliseconds) && durationMilliseconds > 0)) {
-    throw new RangeError(
-      "animated render plan durationMilliseconds must be positive",
-    );
-  }
-  if (!(Number.isInteger(frameBudget) && frameBudget > 0)) {
-    throw new RangeError(
-      "animated render plan recommendedFrameBudget must be a positive integer",
-    );
-  }
   const repetition = plan.capture?.repetition;
-  const loopCount = repetition?.kind === "infinite"
-    ? 0
-    : repetition?.kind === "count" && Number.isInteger(repetition.count) &&
-        repetition.count > 0
-    ? repetition.count
-    : null;
-  if (loopCount === null) {
-    throw new RangeError("animated render plan repetition is invalid");
-  }
-  return {
-    format,
-    width,
-    height,
-    deviceScale,
-    graphicsBackend,
-    scrollbarStyle,
-    durationMilliseconds,
-    frameBudget,
-    loopCount,
-  };
+  const formatIndex = core.statusRaw("output_render_plan_request",
+    ...core.input(typeof format === "string" ? format : ""),
+    numberOrNaN(width), numberOrNaN(height), numberOrNaN(deviceScale), plan.capture?.kind === "still" ? 1 : 0,
+    numberOrNaN(durationMilliseconds), numberOrNaN(frameBudget),
+    ...core.input(typeof repetition?.kind === "string" ? repetition.kind : ""), numberOrNaN(repetition?.count));
+  const request = { format, width, height, deviceScale, graphicsBackend, scrollbarStyle };
+  if (formatIndex === OUTPUT_CODE.PLAN_FORMAT_JPEG_GAIN_MAP) return { ...request, adaptiveCodecOptions: plan.output.codecOptions ?? {} };
+  if (formatIndex !== OUTPUT_CODE.PLAN_FORMAT_GIF) return request;
+  const loopCount = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), OUTPUT_PLAN_REQUEST.SIZE)
+    .getUint32(OUTPUT_PLAN_REQUEST.LOOP_COUNT, true);
+  return { ...request, durationMilliseconds, frameBudget, loopCount };
 }
 
 export async function renderPreparedInput(preparedInput, renderRequest = {}) {
@@ -587,7 +539,7 @@ export async function renderPreparedInput(preparedInput, renderRequest = {}) {
 
 export async function startPreparedRenderSurface(preparedInput, options = {}) {
   const state = preparedInputState(preparedInput);
-  state.active = true;
+  sharedDomCore.statusRaw("output_prepared_input_begin", state.handle);
   let surface;
   try {
     surface = createRenderSurface(preparedInput.document.documentElement, {
@@ -597,7 +549,7 @@ export async function startPreparedRenderSurface(preparedInput, options = {}) {
     surface.start();
   } catch (error) {
     if (surface) await surface.shutdown();
-    state.active = false;
+    sharedDomCore.status("output_prepared_input_end", state.handle);
     throw error;
   }
   let released = false;
@@ -609,34 +561,100 @@ export async function startPreparedRenderSurface(preparedInput, options = {}) {
       try {
         await surface.shutdown();
       } finally {
-        state.active = false;
+        sharedDomCore.status("output_prepared_input_end", state.handle);
       }
     },
   });
 }
 
-// The inspected style facts of a scene node: a declared pixel size and
-// whether it paints a background. A DOM-backed box answers from its
-// resolved fields (its scene node carries no style); a scene-written node
-// from its own fields.
-function inspectedStyle(sceneNode, element) {
-  if (sceneNode._coreBox !== undefined && element !== null) {
-    const fields = resolvedElementFields(element);
-    return {
-      hasBackground: fields.bg !== undefined ||
-        fields.backgroundImages?.length > 0,
-      declaredWidth: Number.isFinite(fields.width) ? fields.width : null,
-      declaredHeight: Number.isFinite(fields.height) ? fields.height : null,
-    };
+// Attaches a prepared input's document (prepareRenderInput) to `target`,
+// as dom.attach does (src/dom/attach.js). The prepared input stays in use
+// until view.detach().
+export async function attachPreparedInput(preparedInput, target, options = {}) {
+  const state = preparedInputState(preparedInput);
+  sharedDomCore.statusRaw("output_prepared_input_begin", state.handle);
+  let view;
+  try {
+    view = await createSandomDOM({ document: preparedInput.document }).attach(target, options);
+  } catch (error) {
+    sharedDomCore.status("output_prepared_input_end", state.handle);
+    throw error;
   }
-  return {
-    hasBackground: sceneNode.bg !== undefined ||
-      sceneNode.backgroundImages?.length > 0,
-    declaredWidth: Number.isFinite(sceneNode.width) ? sceneNode.width : null,
-    declaredHeight: Number.isFinite(sceneNode.height)
-      ? sceneNode.height
-      : null,
+  // The view, with a detach that also ends the prepared input's use.
+  let detached = false;
+  const descriptors = Object.getOwnPropertyDescriptors(view);
+  descriptors.detach = {
+    enumerable: true,
+    value: async () => {
+      if (detached) return;
+      detached = true;
+      try {
+        await view.detach();
+      } finally {
+        sharedDomCore.status("output_prepared_input_end", state.handle);
+      }
+    },
   };
+  return Object.freeze(Object.defineProperties({}, descriptors));
+}
+
+const SOURCE_KINDS = Object.freeze(["element", "text", "viewport", "generated"]);
+
+// The inspection facts of each scene node (output_inspection_nodes of
+// core/dom/output-inspection.watpart): parent, text, source kind, the
+// frame inspection source flags and the declared size. styleSourceAt names
+// where the style facts come from: the handle of a DOM-backed box's element
+// (its scene node carries no style; the core reads the element's stored
+// fields), a scene-written node's own fields, or null.
+function inspectionNodes(sceneNodes, sourceNodeAt, styleSourceAt) {
+  const core = sharedDomCore;
+  const values = [];
+  sceneNodes.forEach((sceneNode, sceneIndex) => {
+    const sourceNode = sourceNodeAt(sceneIndex);
+    const source = styleSourceAt(sceneIndex);
+    const style = typeof source === "number" ? null : source;
+    // A form's controls can shadow its members (form-dom.js, nodeMember).
+    values.push(
+      sceneNode.children, sceneNode.text, sourceNode ? nodeMember(sourceNode, "nodeType") : 0,
+      typeof source === "number" ? source : 0,
+      style?.bg !== undefined, style?.backgroundImages?.length, style?.width, style?.height,
+      sceneNode.display, sourceNode ? nodeMember(sourceNode, "nodeName") : undefined, sceneNode.src,
+    );
+  });
+  core.status("output_inspection_nodes", sceneNodes.length, ...core.valueListInput(values));
+  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(),
+    sceneNodes.length * INSPECTION.NODE_SIZE);
+  const optional = (number) => Number.isNaN(number) ? null : number;
+  return sceneNodes.map((_, sceneIndex) => {
+    const at = sceneIndex * INSPECTION.NODE_SIZE;
+    const parentIndex = view.getInt32(at + INSPECTION.NODE_PARENT, true);
+    const flags = view.getUint32(at + INSPECTION.NODE_FLAGS, true);
+    return {
+      parentIndex: parentIndex < 0 ? null : parentIndex,
+      sourceFlags: flags & INSPECTION.SOURCE_MASK,
+      hasText: (flags & INSPECTION.TEXT) !== 0,
+      sourceKind: SOURCE_KINDS[(flags >> INSPECTION.KIND_SHIFT) & INSPECTION.KIND_MASK],
+      hasBackground: (flags & INSPECTION.BACKGROUND) !== 0,
+      declaredWidth: optional(view.getFloat64(at + INSPECTION.NODE_DECLARED_WIDTH, true)),
+      declaredHeight: optional(view.getFloat64(at + INSPECTION.NODE_DECLARED_HEIGHT, true)),
+    };
+  });
+}
+
+// A scene node identifier (output_inspection_identifier).
+function inspectionIdentifier(sceneIndex) {
+  sharedDomCore.status("output_inspection_identifier", sceneIndex);
+  return sharedDomCore.outputString();
+}
+
+// The device-pixel numbers of logical numbers (output_inspection_scale).
+function devicePixelNumbers(numbers, deviceScale) {
+  const core = sharedDomCore;
+  const [pointer] = core.byteInput(new Uint8Array(numbers.buffer, numbers.byteOffset, numbers.byteLength));
+  core.status("output_inspection_scale", pointer, numbers.length, deviceScale);
+  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), numbers.byteLength);
+  return Float64Array.from({ length: numbers.length },
+    (_, index) => view.getFloat64(index * Float64Array.BYTES_PER_ELEMENT, true));
 }
 
 function immutableLayoutFacts(
@@ -650,18 +668,13 @@ function immutableLayoutFacts(
   for (const [element, sceneIndex] of serialized.indexOf) {
     if (sceneIndex !== null) elementsBySceneIndex.set(sceneIndex, element);
   }
-  const parentIndexBySceneIndex = new Map();
-  for (
-    let parentIndex = 0;
-    parentIndex < serialized.nodes.length;
-    parentIndex++
-  ) {
-    for (const childIndex of serialized.nodes[parentIndex].children ?? []) {
-      parentIndexBySceneIndex.set(childIndex, parentIndex);
-    }
-  }
+  const elementAt = (sceneIndex) => elementsBySceneIndex.get(sceneIndex) ?? null;
+  const facts = inspectionNodes(serialized.nodes, elementAt, (sceneIndex) => {
+    const sceneNode = serialized.nodes[sceneIndex];
+    const element = elementAt(sceneIndex);
+    return sceneNode._coreBox !== undefined && element !== null ? Number(element._coreHandle) : sceneNode;
+  });
   const core = document._domCore;
-  const styles = new Array(serialized.nodes.length);
   const documentElement = document.documentElement;
   const documentBody = document.body;
   const inspection = core.status(
@@ -671,67 +684,63 @@ function immutableLayoutFacts(
   const input = core.status("frame_inspection_input", inspection);
   let view = new DataView(core.refreshBytes().buffer);
   for (let index = 0; index < serialized.nodes.length; index++) {
-    const sceneNode = serialized.nodes[index];
-    const element = elementsBySceneIndex.get(index) ?? null;
-    const style = styles[index] = inspectedStyle(sceneNode, element);
+    const element = elementAt(index);
+    const fact = facts[index];
     const box = artifact.boxes[index];
-    const at = input + index * 96;
-    const flags =
-      (sceneNode.display === "svg" ? 1 : 0) |
-      (sceneNode.src ? 2 : 0) |
-      (style.hasBackground ? 4 : 0) |
-      (element === documentElement || element === documentBody ? 8 : 0) |
-      (element?.nodeName?.toLowerCase() === "svg" ? 16 : 0);
+    const at = input + index * FRAME_INSPECTION.NODE_SIZE;
+    const flags = fact.sourceFlags |
+      (element === documentElement || element === documentBody ? FRAME_INSPECTION.DOCUMENT_ROOT : 0);
     if (view.buffer !== core.memory.buffer) view = new DataView(core.refreshBytes().buffer);
-    view.setInt32(at, parentIndexBySceneIndex.get(index) ?? -1, true);
-    view.setUint32(at + 4, flags, true);
-    view.setFloat64(at + 8, style.declaredWidth ?? NaN, true);
-    view.setFloat64(at + 16, style.declaredHeight ?? NaN, true);
-    view.setFloat64(at + 24, box?.borderBox.x ?? 0, true);
-    view.setFloat64(at + 32, box?.borderBox.y ?? 0, true);
-    view.setFloat64(at + 40, box?.borderBox.width ?? 0, true);
-    view.setFloat64(at + 48, box?.borderBox.height ?? 0, true);
-    view.setFloat64(at + 56, box?.scroll.width ?? 0, true);
-    view.setFloat64(at + 64, box?.scroll.height ?? 0, true);
-    view.setFloat64(at + 72, box?.contentBox.width ?? 0, true);
-    view.setFloat64(at + 80, box?.contentBox.height ?? 0, true);
+    view.setInt32(at + FRAME_INSPECTION.NODE_PARENT, fact.parentIndex ?? -1, true);
+    view.setUint32(at + FRAME_INSPECTION.NODE_FLAGS, flags, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_DECLARED_WIDTH, fact.declaredWidth ?? NaN, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_DECLARED_HEIGHT, fact.declaredHeight ?? NaN, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_X, box?.borderBox.x ?? 0, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_Y, box?.borderBox.y ?? 0, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_WIDTH, box?.borderBox.width ?? 0, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_HEIGHT, box?.borderBox.height ?? 0, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_SCROLL_WIDTH, box?.scroll.width ?? 0, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_SCROLL_HEIGHT, box?.scroll.height ?? 0, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_INTRINSIC_WIDTH, box?.contentBox.width ?? 0, true);
+    view.setFloat64(at + FRAME_INSPECTION.NODE_INTRINSIC_HEIGHT, box?.contentBox.height ?? 0, true);
   }
+  // The host writes each record up to its result field.
   globalThis[Symbol.for("sandom.domCore.measurement")]?.record({
     category: "geometry", operation: "frame_inspection_input",
-    direction: "host-to-core", bytes: serialized.nodes.length * 88,
+    direction: "host-to-core", bytes: serialized.nodes.length * FRAME_INSPECTION.NODE_RESULT,
   });
   core.status("frame_inspection_resolve", inspection);
   const aggregate = core.exports.abi_output_pointer();
   view = new DataView(core.refreshBytes().buffer);
-  const scrollWidth = view.getFloat64(aggregate, true);
-  const scrollHeight = view.getFloat64(aggregate + 8, true);
-  const overflowLeft = view.getFloat64(aggregate + 16, true);
-  const overflowTop = view.getFloat64(aggregate + 24, true);
-  const overflowRight = view.getFloat64(aggregate + 32, true);
-  const overflowBottom = view.getFloat64(aggregate + 40, true);
+  const scrollWidth = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_SCROLL_WIDTH, true);
+  const scrollHeight = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_SCROLL_HEIGHT, true);
+  const overflowLeft = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_OVERFLOW_LEFT, true);
+  const overflowTop = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_OVERFLOW_TOP, true);
+  const overflowRight = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_OVERFLOW_RIGHT, true);
+  const overflowBottom = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_OVERFLOW_BOTTOM, true);
   const nodes = serialized.nodes.map((sceneNode, sceneIndex) => {
-    const element = elementsBySceneIndex.get(sceneIndex) ?? null;
+    const element = elementAt(sceneIndex);
     const box = artifact.boxes[sceneIndex];
     if (view.buffer !== core.memory.buffer) view = new DataView(core.refreshBytes().buffer);
-    const flags = view.getUint32(input + sceneIndex * 96 + 88, true);
-    const nodeScrollWidth = view.getFloat64(input + sceneIndex * 96 + 56, true);
-    const nodeScrollHeight = view.getFloat64(input + sceneIndex * 96 + 64, true);
-    const participatesInLayout = (flags & 1) !== 0;
-    const style = styles[sceneIndex];
+    const at = input + sceneIndex * FRAME_INSPECTION.NODE_SIZE;
+    const flags = view.getUint32(at + FRAME_INSPECTION.NODE_RESULT, true);
+    const nodeScrollWidth = view.getFloat64(at + FRAME_INSPECTION.NODE_SCROLL_WIDTH, true);
+    const nodeScrollHeight = view.getFloat64(at + FRAME_INSPECTION.NODE_SCROLL_HEIGHT, true);
+    const participatesInLayout = (flags & FRAME_INSPECTION.PARTICIPATES) !== 0;
+    const fact = facts[sceneIndex];
     return Object.freeze({
       nodeIndex: sceneIndex,
-      parentIndex: parentIndexBySceneIndex.get(sceneIndex) ?? null,
+      parentIndex: fact.parentIndex,
       nodeName: element?.nodeName ?? null,
       id: element?.getAttribute?.("id") ?? null,
       display: sceneNode.display,
       participatesInLayout,
-      hasText: typeof sceneNode.text === "string" &&
-        sceneNode.text.trim().length > 0,
+      hasText: fact.hasText,
       hasImage: sceneNode.src !== undefined,
-      hasBackground: style.hasBackground,
+      hasBackground: fact.hasBackground,
       children: Object.freeze([...(sceneNode.children ?? [])]),
-      declaredWidth: style.declaredWidth,
-      declaredHeight: style.declaredHeight,
+      declaredWidth: fact.declaredWidth,
+      declaredHeight: fact.declaredHeight,
       borderBox: participatesInLayout
         ? Object.freeze({ ...box.borderBox })
         : null,
@@ -745,13 +754,13 @@ function immutableLayoutFacts(
             },
           )
         : null,
-      intrinsicDimensions: (flags & 2) !== 0
+      intrinsicDimensions: (flags & FRAME_INSPECTION.INTRINSIC) !== 0
         ? Object.freeze({
           width: box.contentBox.width,
           height: box.contentBox.height,
         })
         : null,
-      viewportSizedBackground: (flags & 4) !== 0,
+      viewportSizedBackground: (flags & FRAME_INSPECTION.VIEWPORT_BACKGROUND) !== 0,
     });
   });
   globalThis[Symbol.for("sandom.domCore.measurement")]?.record({
@@ -820,11 +829,7 @@ export async function inspectDocumentLayout(
   const width = Number(viewport.width);
   const height = Number(viewport.height);
   const deviceScale = Number(viewport.deviceScale ?? 1);
-  if (!(width > 0) || !(height > 0) || !(deviceScale > 0)) {
-    throw new RangeError(
-      "inspection viewport width, height, and deviceScale must be positive",
-    );
-  }
+  sharedDomCore.status("output_inspection_check", OUTPUT_CODE.INSPECTION_CHECK_VIEWPORT, width, height, deviceScale, ...sharedDomCore.valueListInput([]));
   const previousCallbackSuppression = document._suppressAuthoredCallbacks;
   const styleSystem = document._styleSystem;
   const previousEnvironment = { ...styleSystem.environment };
@@ -847,6 +852,7 @@ export async function inspectDocumentLayout(
       width,
       height,
       nodes: serialized.nodes,
+      generatedBoxRows: serialized.generatedBoxRows,
       imageSources: serialized.imageSources,
     }, {
       resolveResource,
@@ -882,6 +888,81 @@ export async function inspectDocumentLayout(
   return layout;
 }
 
+// The paint artifact of `renderRoot` at `viewport` without a raster target:
+// the scene serializes as a render surface serializes it (with the viewport
+// row), and the renderer emits its commands and captures the paint record
+// (createPaintRecord). No GPU submission, readback or encoding takes part.
+// Returns the paint artifact and the source node of each scene row.
+export async function inspectDocumentPaint(
+  renderRoot,
+  viewport,
+  {
+    createRecord = createPaintRecord,
+    resolveResource = renderRoot.ownerDocument._resolveResource,
+    scrollbarStyle = "overlay",
+  } = {},
+) {
+  assertScrollbarStyle(scrollbarStyle, "paint inspection options");
+  const document = renderRoot.ownerDocument;
+  const width = Number(viewport.width);
+  const height = Number(viewport.height);
+  const deviceScale = Number(viewport.deviceScale ?? 1);
+  sharedDomCore.status("output_inspection_check", OUTPUT_CODE.INSPECTION_CHECK_VIEWPORT, width, height, deviceScale, ...sharedDomCore.valueListInput([]));
+  const previousCallbackSuppression = document._suppressAuthoredCallbacks;
+  const styleSystem = document._styleSystem;
+  const previousEnvironment = { ...styleSystem.environment };
+  document._suppressAuthoredCallbacks = true;
+  let inspectionError = null;
+  let inspection;
+  try {
+    await document._readyForRendering();
+    styleSystem.setEnvironment({
+      viewportWidth: width,
+      viewportHeight: height,
+      scrollbarStyle,
+    });
+    await document._readyForRendering();
+    const serialized = serializeToScene(renderRoot, {
+      viewportWidth: width,
+      viewportHeight: height,
+      viewport: { width, height, deviceScale, _requestedLeft: 0, _requestedTop: 0 },
+    });
+    const { paintArtifact } = await createRecord({
+      width,
+      height,
+      nodes: serialized.nodes,
+      generatedBoxRows: serialized.generatedBoxRows,
+      imageSources: serialized.imageSources,
+    }, {
+      resolveResource,
+      onImageLoadError: brokenImageInLayout,
+    });
+    const elementAtIndex = new Array(serialized.nodes.length).fill(null);
+    for (const [node, index] of serialized.indexOf) if (index !== null) elementAtIndex[index] = node;
+    inspection = Object.freeze({ paintArtifact, elementAtIndex: Object.freeze(elementAtIndex) });
+  } catch (error) {
+    inspectionError = error;
+  }
+  let restorationError = null;
+  try {
+    styleSystem.setEnvironment(previousEnvironment);
+    await document._readyForRendering();
+  } catch (error) {
+    restorationError = error;
+  } finally {
+    document._suppressAuthoredCallbacks = previousCallbackSuppression;
+  }
+  if (inspectionError && restorationError) {
+    throw new AggregateError(
+      [inspectionError, restorationError],
+      "Paint inspection and environment restoration failed",
+    );
+  }
+  if (inspectionError) throw inspectionError;
+  if (restorationError) throw restorationError;
+  return inspection;
+}
+
 export async function inspectPreparedInput(
   preparedInput,
   request = {},
@@ -898,22 +979,15 @@ export async function inspectPreparedInput(
       scrollbarStyle = "overlay",
     } = request;
     assertScrollbarStyle(scrollbarStyle, "inspection request");
-    if (!["observed", "analytical-layout"].includes(mode)) {
-      throw new RangeError(
-        `Unsupported inspection mode ${JSON.stringify(mode)}`,
-      );
-    }
+    const modeIndex = sharedDomCore.status("output_inspection_check", OUTPUT_CODE.INSPECTION_CHECK_MODE, NaN, NaN, NaN,
+      ...sharedDomCore.valueListInput([mode]));
     const width = Number(viewport.width);
     const height = Number(viewport.height);
     const deviceScale = Number(viewport.deviceScale ?? 1);
-    if (!(width > 0) || !(height > 0) || !(deviceScale > 0)) {
-      throw new RangeError(
-        "inspection viewport width, height, and deviceScale must be positive",
-      );
-    }
+    sharedDomCore.status("output_inspection_check", OUTPUT_CODE.INSPECTION_CHECK_VIEWPORT, width, height, deviceScale, ...sharedDomCore.valueListInput([]));
     const document = preparedInput.document;
 
-    if (mode === "analytical-layout") {
+    if (modeIndex === OUTPUT_CODE.INSPECTION_ANALYTICAL_LAYOUT) {
       const layout = await inspectDocumentLayout(
         document.documentElement,
         { width, height, deviceScale },
@@ -981,16 +1055,23 @@ export async function inspectPreparedInput(
   });
 }
 
-function inspectionRectangle(logicalRectangle, deviceScale) {
-  return Object.freeze({
-    logical: Object.freeze({ ...logicalRectangle }),
-    devicePixels: Object.freeze({
-      x: logicalRectangle.x * deviceScale,
-      y: logicalRectangle.y * deviceScale,
-      width: logicalRectangle.width * deviceScale,
-      height: logicalRectangle.height * deviceScale,
-    }),
+// Inspection rectangles of logical rectangles: each with its device-pixel
+// rectangle (output_inspection_scale), in order.
+function inspectionRectangles(logicalRectangles, deviceScale) {
+  const numbers = new Float64Array(logicalRectangles.length * 4);
+  logicalRectangles.forEach((rectangle, index) => {
+    numbers.set([rectangle.x, rectangle.y, rectangle.width, rectangle.height], index * 4);
   });
+  const devicePixels = devicePixelNumbers(numbers, deviceScale);
+  return logicalRectangles.map((rectangle, index) => Object.freeze({
+    logical: Object.freeze({ ...rectangle }),
+    devicePixels: Object.freeze({
+      x: devicePixels[index * 4],
+      y: devicePixels[index * 4 + 1],
+      width: devicePixels[index * 4 + 2],
+      height: devicePixels[index * 4 + 3],
+    }),
+  }));
 }
 
 export async function inspectAnimationPreparedInput(
@@ -1007,29 +1088,14 @@ export async function inspectAnimationPreparedInput(
       scrollbarStyle = "overlay",
     } = inspectionRequest;
     assertScrollbarStyle(scrollbarStyle, "inspection request");
-    if (
-      !Number.isFinite(width) || width <= 0 || !Number.isFinite(height) ||
-      height <= 0
-    ) {
-      throw new RangeError("width and height must be positive numbers");
-    }
-    if (!Number.isFinite(deviceScale) || deviceScale <= 0) {
-      throw new RangeError("deviceScale must be a positive number");
-    }
-    if (
-      renderMode !== "standard-dynamic-range" &&
-      renderMode !== "high-dynamic-range"
-    ) {
-      throw new RangeError(
-        `Unsupported render mode ${JSON.stringify(renderMode)}`,
-      );
-    }
+    const highDynamicRange = sharedDomCore.status("output_inspection_check", OUTPUT_CODE.INSPECTION_CHECK_ANIMATION,
+      numberOrNaN(width), numberOrNaN(height), numberOrNaN(deviceScale),
+      ...sharedDomCore.valueListInput([renderMode])) === OUTPUT_CODE.INSPECTION_HIGH_DYNAMIC_RANGE;
     if (!preparedInput.document.documentElement) {
       throw new Error("The preprocessor did not populate a document element");
     }
 
     await preparedInput.document._readyForRendering();
-    const highDynamicRange = renderMode === "high-dynamic-range";
     const surface = createRenderSurface(
       preparedInput.document.documentElement,
       {
@@ -1058,19 +1124,19 @@ export async function inspectAnimationPreparedInput(
         layoutBoxes,
         paintArtifact,
       } = frame.inspection;
-      const parentIndices = new Array(sceneNodes.length).fill(null);
-      sceneNodes.forEach((sceneNode, sceneIndex) => {
-        for (const childIndex of sceneNode.children ?? []) {
-          parentIndices[childIndex] = sceneIndex;
-        }
-      });
-      const nodeIdentifier = (sceneIndex) => `scene-node-${sceneIndex}`;
+      const facts = inspectionNodes(sceneNodes, (sceneIndex) => elementAtIndex[sceneIndex], () => null);
+      const identifiers = new Map();
+      const nodeIdentifier = (sceneIndex) => {
+        if (!identifiers.has(sceneIndex)) identifiers.set(sceneIndex, inspectionIdentifier(sceneIndex));
+        return identifiers.get(sceneIndex);
+      };
       const nodes = sceneNodes.map((sceneNode, sceneIndex) => {
         const sourceNode = elementAtIndex[sceneIndex];
+        const { parentIndex, sourceKind: kind } = facts[sceneIndex];
         let source;
-        if (sourceNode?.nodeType === 1) {
+        if (kind === "element") {
           source = {
-            kind: "element",
+            kind,
             localName: sourceNode.localName,
             namespace: sourceNode.namespaceURI,
             ...(sourceNode.id === "" ? {} : { id: sourceNode.id }),
@@ -1078,48 +1144,50 @@ export async function inspectAnimationPreparedInput(
               ? { text: sceneNode.text }
               : {}),
           };
-        } else if (sourceNode?.nodeType === 3) {
-          source = { kind: "text", text: sourceNode.data };
+        } else if (kind === "text") {
+          source = { kind, text: sourceNode.data };
         } else {
-          source = {
-            kind: sceneIndex === 0 ? "viewport" : "generated",
-            display: sceneNode.display,
-          };
+          source = { kind, display: sceneNode.display };
         }
         return Object.freeze({
           identifier: nodeIdentifier(sceneIndex),
           sceneIndex,
-          parentIdentifier: parentIndices[sceneIndex] === null
-            ? null
-            : nodeIdentifier(parentIndices[sceneIndex]),
+          parentIdentifier: parentIndex === null ? null : nodeIdentifier(parentIndex),
           childIdentifiers: Object.freeze(
             (sceneNode.children ?? []).map(nodeIdentifier),
           ),
           source: Object.freeze(source),
         });
       });
-      const layoutRectangles = layoutBoxes.map((box, sceneIndex) =>
+      const layoutRectangleValues = inspectionRectangles(
+        layoutBoxes.map((box) => ({ x: box.x, y: box.y, width: box.w, height: box.h })),
+        deviceScale,
+      );
+      const layoutRectangles = layoutBoxes.map((_, sceneIndex) =>
         Object.freeze({
           nodeIdentifier: nodeIdentifier(sceneIndex),
           rectangleKind: "border-box",
-          rectangle: inspectionRectangle({
-            x: box.x,
-            y: box.y,
-            width: box.w,
-            height: box.h,
-          }, deviceScale),
+          rectangle: layoutRectangleValues[sceneIndex],
         })
       );
-      const paintOperations = paintArtifact.operations.map((operation) =>
+      const operationRectangles = inspectionRectangles(
+        paintArtifact.operations.map((operation) => operation.logicalRectangle),
+        deviceScale,
+      );
+      const clipRectangles = inspectionRectangles(
+        paintArtifact.operations.flatMap((operation) =>
+          operation.clipEntries.map((entry) => ({ x: entry.x, y: entry.y, width: entry.width, height: entry.height }))
+        ),
+        deviceScale,
+      );
+      let clipIndex = 0;
+      const paintOperations = paintArtifact.operations.map((operation, operationPosition) =>
         Object.freeze({
           operationIndex: operation.operationIndex,
           commandIndex: operation.commandIndex,
           operationKind: operation.kind,
           nodeIdentifier: nodeIdentifier(operation.nodeIndex),
-          rectangle: inspectionRectangle(
-            operation.logicalRectangle,
-            deviceScale,
-          ),
+          rectangle: operationRectangles[operationPosition],
           ...(operation.text === undefined ? {} : {
             text: operation.text,
             fontSize: operation.fontSize,
@@ -1134,12 +1202,7 @@ export async function inspectAnimationPreparedInput(
             entries: Object.freeze(
               operation.clipEntries.map((entry) =>
                 Object.freeze({
-                  rectangle: inspectionRectangle({
-                    x: entry.x,
-                    y: entry.y,
-                    width: entry.width,
-                    height: entry.height,
-                  }, deviceScale),
+                  rectangle: clipRectangles[clipIndex++],
                   radii: Object.freeze([...entry.radii]),
                   affine: entry.affine,
                   pathMask: entry.pathMask,
@@ -1157,10 +1220,14 @@ export async function inspectAnimationPreparedInput(
           ),
         })
       );
-      const textChunks = paintOperations.filter((operation) =>
-        operation.operationKind === "text" ||
-        operation.operationKind === "text-shadow"
+      sharedDomCore.status("output_inspection_text_operations",
+        ...sharedDomCore.valueListInput(paintOperations.map((operation) => operation.operationKind)));
+      const textOperation = sharedDomCore.refreshBytes().slice(
+        sharedDomCore.exports.abi_output_pointer(),
+        sharedDomCore.exports.abi_output_pointer() + paintOperations.length,
       );
+      const textChunks = paintOperations.filter((_, operationPosition) =>
+        textOperation[operationPosition] === OUTPUT_CODE.INSPECTION_TEXT_OPERATION);
       const compositingGroups = paintArtifact.compositingGroups.map((group) =>
         Object.freeze({
           identifier: group.identifier,

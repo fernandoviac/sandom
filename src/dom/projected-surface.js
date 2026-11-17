@@ -18,6 +18,7 @@
 // The document's UV convention is v = 0 at the top edge, which is what a
 // GPU texture sampled with flipY = true gives a three.js PlaneGeometry.
 
+import { sharedDomCore } from "../dom-wasm/core.js";
 import { caretRectangle } from "./geometry.js";
 
 // `onTexture(texture, frame)` runs once for each new GPU texture: `texture`
@@ -57,34 +58,37 @@ export function createTexturePresenter({ device, onTexture }) {
   });
 }
 
+// The content box of `element` in CSS pixels, before CSS transforms: the
+// document's viewport. A transform scales the box on screen, and the
+// projection maps the transformed box onto this size. `caller` names the API
+// in the error for an element without a size.
+export function layoutBoxSize(element, caller) {
+  const style = element.ownerDocument.defaultView.getComputedStyle(element);
+  const width = parseFloat(style.width);
+  const height = parseFloat(style.height);
+  if (!(width > 0) || !(height > 0)) {
+    throw new Error(`${caller}: the canvas's layout box is ${style.width} x ${style.height}; give it a size in the page`);
+  }
+  return { width, height };
+}
+
 // The projection for a flat host: the document fills `host`'s client box,
 // scaled to `width` x `height` document CSS pixels. A point outside the box
 // misses. Its `unproject` is the inverse, for the `unproject` argument of
 // bindProjectedInput: a document point as a client point, or null outside
 // the document.
 export function projectOntoRectangle(host, { width, height }) {
-  if (!(width > 0) || !(height > 0)) {
-    throw new TypeError(
-      `projectOntoRectangle: width and height must be positive; got ${width} x ${height}`,
-    );
-  }
-  const project = (event) => {
+  sharedDomCore.statusRaw("input_projection_check", ...sharedDomCore.valueListInput([
+    Number(width), Number(height), String(width), String(height),
+  ]));
+  const exports = sharedDomCore.exports;
+  const projected = (direction, x, y) => {
     const bounds = host.getBoundingClientRect();
-    if (bounds.width === 0 || bounds.height === 0) return null;
-    const x = (event.clientX - bounds.left) * width / bounds.width;
-    const y = (event.clientY - bounds.top) * height / bounds.height;
-    if (x < 0 || y < 0 || x > width || y > height) return null;
-    return { x, y };
+    if (exports.input_project(direction, bounds.left, bounds.top, bounds.width, bounds.height, x, y, width, height) === 0) return null;
+    return { x: exports.input_projected(false), y: exports.input_projected(true) };
   };
-  project.unproject = ({ x, y }) => {
-    const bounds = host.getBoundingClientRect();
-    if (bounds.width === 0 || bounds.height === 0) return null;
-    if (x < 0 || y < 0 || x > width || y > height) return null;
-    return {
-      x: bounds.left + x * bounds.width / width,
-      y: bounds.top + y * bounds.height / height,
-    };
-  };
+  const project = (event) => projected(false, event.clientX, event.clientY);
+  project.unproject = ({ x, y }) => projected(true, x, y);
   return project;
 }
 
@@ -113,52 +117,63 @@ const keyOptions = (event) => ({
   repeat: event.repeat,
 });
 
-// The engine's command-modifier policy: meta, or ctrl without alt. AltGr
-// arrives as ctrl+alt and types characters.
-const commandModifier = (event) =>
-  event.metaKey || (event.ctrlKey && !event.altKey);
-
-// Command chords the document performs itself, or that must not act on the
-// hidden input sink (undo, redo). Every other command chord (reload, new
-// tab, address bar, developer tools, zoom) stays with the browser; the
-// document still receives its keydown.
-const DOCUMENT_COMMAND_KEYS = new Set([
-  "a", "z", "y", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home",
-  "End", "Backspace", "Delete", "Enter", "Tab",
-]);
-
-// Copy, cut and paste chords keep their browser default: the browser then
-// fires `copy`, `cut` and `paste` on the focused input sink, where the
-// clipboard is readable and writable without a permission prompt.
-const CLIPBOARD_KEYS = new Set(["c", "x", "v"]);
-
-// Keys that belong to an in-progress text composition or to a virtual
-// keyboard: the text arrives through composition or beforeinput instead.
-const TEXT_SOURCE_KEYS = new Set(["Process", "Unidentified", "Dead"]);
-
-// beforeinput types a virtual keyboard or the browser's own menus produce
-// without a preceding keydown the sink forwarded.
-const TEXT_INSERTION_TYPES = new Set([
-  "insertText", "insertReplacementText",
-]);
-const KEY_EQUIVALENT_TYPES = new Map([
-  ["deleteContentBackward", "Backspace"],
-  ["deleteContentForward", "Delete"],
-  ["insertLineBreak", "Enter"],
-  ["insertParagraph", "Enter"],
-]);
-
-const TEXT_INPUT_TYPES = new Set([
-  "", "text", "search", "url", "tel", "email", "password", "number",
-]);
+// The key routes of input_key_route and the beforeinput actions of
+// input_before_input: the command chords, clipboard chords, composition
+// keys and beforeinput types are tables of core/dom/input-projection.watpart.
+const KEY_DROP = 0;
+const KEY_DELIVER_PREVENTING_DEFAULT = 2;
+const BEFORE_INPUT_INSERT = 1;
+const BEFORE_INPUT_KEYS = [undefined, undefined, "Backspace", "Delete", "Enter"];
 
 const documentOf = (root) => root.nodeType === 9 ? root : root.ownerDocument;
 
+// Whether an element takes a text composition (input_text_control).
 function isTextControl(element) {
-  if (!element || element.disabled || element.readOnly) return false;
-  if (element.localName === "textarea") return true;
-  return element.localName === "input" &&
-    TEXT_INPUT_TYPES.has(String(element.type ?? "").toLowerCase());
+  return sharedDomCore.status("input_text_control", ...sharedDomCore.valueListInput([
+    element ? 1 : 0,
+    element?.disabled ? 1 : 0,
+    element?.readOnly ? 1 : 0,
+    element ? String(element.localName) : "",
+    element ? String(element.type ?? "") : "",
+  ])) === 1;
+}
+
+// The document side of an input binding: everything the page side needs
+// from one document. bindProjectedInput serves a document of this realm
+// through this port; src/dom/worker-input.js serves a document of a worker
+// through one with the same operations.
+//   deliver(method, ...arguments_)  an input record, as backend[method](root, ...arguments_)
+//   setPreferences(preferences)     the host's colour scheme, motion and forced colours
+//   cursorAt(x, y)                  the cursor at a document point, or null
+//   copy(), cut()                   the selected text for the clipboard, or null
+//   textControlFocused()            whether the focused element takes a composition
+//   caret()                         null without a focused text control, else
+//                                   { control, point }: point is the caret in
+//                                   document CSS pixels, or null where the
+//                                   presented frame does not draw it
+//   onFrame(callback)               callback after each presented frame; returns the stop function
+//   dispatchInputRecords(records, hooks)
+export function localDocumentPort(backend, root) {
+  return Object.freeze({
+    deliver: (method, ...arguments_) => backend[method](root, ...arguments_),
+    setPreferences: (preferences) => backend.setPreferences(preferences),
+    cursorAt: (x, y) => backend.resolveCursor(root, x, y),
+    copy: () => backend.copy(root),
+    cut: () => backend.cut(root),
+    textControlFocused: () => isTextControl(documentOf(root).activeElement),
+    caret() {
+      const control = documentOf(root).activeElement;
+      if (!isTextControl(control)) return null;
+      const frame = root._renderSurface?.presentedFrame ?? null;
+      if (frame === null) return { control, point: null };
+      const offset = control._domCore.status("input_control_caret_offset", control._coreHandle);
+      const deviceScale = frame.viewport.deviceScale;
+      const caret = caretRectangle(frame, control, offset, { deviceScale });
+      return { control, point: caret === null ? null : { x: caret.x / deviceScale, y: caret.y / deviceScale } };
+    },
+    onFrame: (callback) => root._renderSurface?.onFrame(callback) ?? null,
+    dispatchInputRecords: (records, hooks) => backend.dispatchInputRecords(root, records, hooks),
+  });
 }
 
 // A visually hidden textarea is the keyboard's real focus while a document
@@ -235,19 +250,27 @@ function createInputSink(host, label) {
 //
 // `onInput()` runs, without arguments, after every record the binding
 // delivers.
-export function bindProjectedInput({
+//
+// `browserContextMenu: false` keeps the browser's own context menu off the
+// host and the input sink, for a document whose text fields show
+// Sandom's context menu (`backend.setContextMenu`, src/dom/field-menu.js).
+// The page side of an input binding, for one default target `{ backend,
+// root, port }` (a document of another realm has no backend; its port
+// carries its records). bindProjectedInput and bindWorkerInput call it.
+export function bindDocumentInput({
   host,
-  backend,
-  root,
+  target: defaultTarget,
   project,
   unproject = null,
   claimPointerDown = () => false,
   claimWheel = () => false,
+  releaseWheelAtBoundary = false,
   claimKey = () => false,
   cursor = () => null,
   onInput = () => {},
   label = "Sandom document input",
   touchAction = "none",
+  browserContextMenu = true,
 }) {
   if (typeof host?.addEventListener !== "function") {
     throw new TypeError("bindProjectedInput: host must be an EventTarget");
@@ -263,16 +286,20 @@ export function bindProjectedInput({
   if (unproject !== null && typeof unproject !== "function") {
     throw new TypeError("bindProjectedInput: unproject must be a function or null");
   }
-  if (typeof backend?.pointerDown !== "function" || !root) {
-    throw new TypeError(
-      "bindProjectedInput: backend must be an input backend (createSandomDOM) and root its document node",
-    );
-  }
-  const defaultTarget = Object.freeze({ backend, root });
-  const targetOf = (point) =>
-    point.root === undefined || point.root === root
-      ? defaultTarget
-      : { backend: point.backend ?? backend, root: point.root };
+  const localTargets = new WeakMap();
+  const targetOf = (point) => {
+    if (point.root === undefined || point.root === defaultTarget.root) return defaultTarget;
+    const routedBackend = point.backend ?? defaultTarget.backend;
+    if (routedBackend === null) {
+      throw new Error("bindDocumentInput: project routed a point to another document, which a worker document's binding cannot reach");
+    }
+    let target = localTargets.get(point.root);
+    if (target === undefined || target.backend !== routedBackend) {
+      target = Object.freeze({ backend: routedBackend, root: point.root, port: localDocumentPort(routedBackend, point.root) });
+      localTargets.set(point.root, target);
+    }
+    return target;
+  };
   const sameTarget = (left, right) => left?.root === right?.root;
 
   if (touchAction !== null) host.style.touchAction = touchAction;
@@ -287,12 +314,26 @@ export function bindProjectedInput({
   // A claimed keydown's text must not reach the document through the
   // sink's beforeinput: the host owns that key.
   let claimedKeyDown = false;
+  // The document with system focus: the keyboard target while the sink has
+  // browser focus, else none. A field that loses it commits its edit and
+  // stops matching :focus, as a page does when its window loses focus.
+  let systemFocusTarget = null;
+  const giveSystemFocus = (target) => {
+    if (sameTarget(systemFocusTarget, target)) return;
+    const previous = systemFocusTarget;
+    systemFocusTarget = target;
+    previous?.port.deliver("systemFocus", false);
+    target?.port.deliver("systemFocus", true);
+    delivered();
+  };
+  // The document starts without system focus until the sink takes focus.
+  defaultTarget.port.deliver("systemFocus", false);
   // The text control whose caret the sink sits at, or null while the sink
   // sits at the host's corner.
   let sinkCaretControl = null;
   // The render surface whose presented frames move the sink with the
   // caret, and the call that stops listening to it.
-  let caretSurface = null;
+  let caretPort = null;
   let stopCaretFrames = null;
 
   const placeSinkAtHostCorner = () => {
@@ -314,20 +355,13 @@ export function bindProjectedInput({
       placeSinkAtHostCorner();
       return;
     }
-    const control = documentOf(target.root).activeElement;
-    const frame = target.root._renderSurface?.presentedFrame ?? null;
-    const start = control.selectionStart ?? control.value.length;
-    const end = control.selectionEnd ?? start;
-    const offset = control.selectionDirection === "backward" ? start : end;
-    const deviceScale = frame?.viewport.deviceScale ?? 1;
-    const caret = frame === null
-      ? null
-      : caretRectangle(frame, control, offset, { deviceScale });
-    if (caret === null) {
+    const caret = target.port.caret();
+    const control = caret?.control ?? null;
+    if (caret === null || caret.point === null) {
       if (sinkCaretControl !== control) placeSinkAtHostCorner();
       return;
     }
-    const point = unproject({ x: caret.x / deviceScale, y: caret.y / deviceScale }, target);
+    const point = unproject(caret.point, target);
     if (point === null) {
       placeSinkAtHostCorner();
       return;
@@ -340,13 +374,13 @@ export function bindProjectedInput({
   // While the sink has the browser's focus, every frame the keyboard's
   // document presents can move or scroll its caret; the sink follows.
   const followCaretFrames = (focused = sink.getRootNode().activeElement === sink) => {
-    const surface = unproject !== null && keyboardTarget !== null && focused
-      ? keyboardTarget.root._renderSurface ?? null
+    const port = unproject !== null && keyboardTarget !== null && focused
+      ? keyboardTarget.port
       : null;
-    if (surface === caretSurface) return;
+    if (port === caretPort) return;
     stopCaretFrames?.();
-    caretSurface = surface;
-    stopCaretFrames = surface?.onFrame(placeSink) ?? null;
+    caretPort = port;
+    stopCaretFrames = port?.onFrame(placeSink) ?? null;
   };
 
   // Any record can move or scroll the caret; a sink without `unproject`
@@ -360,7 +394,7 @@ export function bindProjectedInput({
     host.style.cursor = cursor(point, event) ??
       (point === null
         ? "default"
-        : target.backend.resolveCursor(target.root, point.x, point.y) ??
+        : target.port.cursorAt(point.x, point.y) ??
           "default");
   };
 
@@ -370,7 +404,7 @@ export function bindProjectedInput({
   // document presents, the host's cursor is resolved again at the last
   // pointer position, as a browser updates its cursor after a scroll.
   let hoverEvent = null;
-  let hoverSurface = null;
+  let hoverPort = null;
   let stopHoverFrames = null;
   const resolveRestingCursor = () => {
     if (hoverTarget === null || hoverEvent === null || captured !== null || claimedPointer !== null) return;
@@ -381,11 +415,11 @@ export function bindProjectedInput({
     applyCursor(point, hoverEvent, hoverTarget);
   };
   const followHoverFrames = () => {
-    const surface = hoverTarget?.root._renderSurface ?? null;
-    if (surface === hoverSurface) return;
+    const port = hoverTarget?.port ?? null;
+    if (port === hoverPort) return;
     stopHoverFrames?.();
-    hoverSurface = surface;
-    stopHoverFrames = surface?.onFrame(resolveRestingCursor) ?? null;
+    hoverPort = port;
+    stopHoverFrames = port?.onFrame(resolveRestingCursor) ?? null;
   };
 
   const leaveHover = () => {
@@ -394,7 +428,7 @@ export function bindProjectedInput({
     hoverTarget = null;
     hoverEvent = null;
     followHoverFrames();
-    previous.backend.pointerLeave(previous.root, hoverPointer ?? 1);
+    previous.port.deliver("pointerLeave", hoverPointer ?? 1);
     delivered();
   };
 
@@ -403,6 +437,8 @@ export function bindProjectedInput({
     placeSink();
     if (sink.getRootNode().activeElement !== sink) {
       sink.focus({ preventScroll: true });
+    } else {
+      giveSystemFocus(target);
     }
     followCaretFrames();
   };
@@ -442,7 +478,7 @@ export function bindProjectedInput({
     captured = { pointerId: event.pointerId, target };
     host.setPointerCapture?.(event.pointerId);
     focusSink(target);
-    target.backend.pointerDown(target.root, point.x, point.y, pointerOptions(event));
+    target.port.deliver("pointerDown", point.x, point.y, pointerOptions(event));
     applyCursor(point, event, target);
     delivered();
   };
@@ -455,7 +491,10 @@ export function bindProjectedInput({
     if (captured?.pointerId === event.pointerId) {
       const point = project(event, { target: captured.target });
       if (point === null) return;
-      captured.target.backend.pointerMove(captured.target.root, point.x, point.y, pointerOptions(event));
+      // The resting cursor resolves at the pointer's last place, so a
+      // release away from the press place shows the cursor there.
+      hoverEvent = event;
+      captured.target.port.deliver("pointerMove", point.x, point.y, pointerOptions(event));
       applyCursor(point, event, captured.target);
       delivered();
       return;
@@ -471,7 +510,7 @@ export function bindProjectedInput({
     hoverPointer = event.pointerId;
     hoverEvent = event;
     followHoverFrames();
-    target.backend.pointerMove(target.root, point.x, point.y, pointerOptions(event));
+    target.port.deliver("pointerMove", point.x, point.y, pointerOptions(event));
     applyCursor(point, event, target);
     delivered();
   };
@@ -495,7 +534,7 @@ export function bindProjectedInput({
     const target = release(event);
     if (target === null) return;
     const point = project(event, { target }) ?? { x: -1, y: -1 };
-    target.backend.pointerUp(target.root, point.x, point.y, pointerOptions(event));
+    target.port.deliver("pointerUp", point.x, point.y, pointerOptions(event));
     if (point.x >= 0) applyCursor(point, event, target);
     delivered();
   };
@@ -503,8 +542,20 @@ export function bindProjectedInput({
   const onPointerCancel = (event) => {
     const target = release(event);
     if (target === null) return;
-    target.backend.pointerCancel(target.root, event.pointerId);
+    target.port.deliver("pointerCancel", event.pointerId);
     delivered();
+  };
+
+  const cancelGestures = () => {
+    claimedPointer = null;
+    if (captured !== null) {
+      const { pointerId } = captured;
+      const target = release({ pointerId });
+      target.port.deliver("pointerCancel", pointerId);
+      delivered();
+    }
+    leaveHover();
+    applyCursor(null, null, null);
   };
 
   const onPointerLeave = () => {
@@ -516,29 +567,54 @@ export function bindProjectedInput({
   const onWheel = (event) => {
     const point = project(event, { target: null });
     if (point === null || claimWheel(point, event)) return;
-    event.preventDefault();
     const target = targetOf(point);
-    target.backend.wheel(
-      target.root,
-      point.x,
-      point.y,
-      event.deltaX,
-      event.deltaY,
-      event.deltaMode,
-      modifierOptions(event),
-    );
+    if (releaseWheelAtBoundary) {
+      let scrolled = false;
+      target.port.dispatchInputRecords([{
+        kind: "wheel",
+        x: point.x,
+        y: point.y,
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        deltaMode: event.deltaMode,
+        ...modifierOptions(event),
+      }], {
+        afterRecord(_record, _index, _target, changed) {
+          scrolled = changed;
+        },
+      });
+      if (scrolled) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    } else {
+      event.preventDefault();
+      target.port.deliver(
+        "wheel",
+        point.x,
+        point.y,
+        event.deltaX,
+        event.deltaY,
+        event.deltaMode,
+        modifierOptions(event),
+      );
+    }
     delivered();
   };
 
   // Keyboard users reach the document by tabbing onto the sink.
   const onSinkFocus = () => {
+    claimedKeyDown = false;
     keyboardTarget ??= defaultTarget;
+    giveSystemFocus(keyboardTarget);
     sink.value = "";
     placeSink();
     followCaretFrames(true);
   };
 
   const onSinkBlur = () => {
+    giveSystemFocus(null);
+    claimedKeyDown = false;
     composing = false;
     sink.value = "";
     followCaretFrames(false);
@@ -552,31 +628,27 @@ export function bindProjectedInput({
       return;
     }
     if (direction === "keydown") claimedKeyDown = false;
-    if (composing || event.isComposing || TEXT_SOURCE_KEYS.has(event.key)) return;
-    const command = commandModifier(event);
-    if (command && CLIPBOARD_KEYS.has(event.key.toLowerCase())) {
-      // Deliver the keydown to the document, keep the browser default so
-      // the clipboard event follows on the sink.
-      target.backend[direction](target.root, event.key, keyOptions(event));
-      delivered();
-      return;
-    }
-    if (!command || DOCUMENT_COMMAND_KEYS.has(event.key) ||
-        DOCUMENT_COMMAND_KEYS.has(event.key.toLowerCase())) {
-      event.preventDefault();
-    }
-    target.backend[direction](target.root, event.key, keyOptions(event));
+    const route = sharedDomCore.status("input_key_route", ...sharedDomCore.valueListInput([
+      event.key, composing || event.isComposing ? 1 : 0, event.metaKey ? 1 : 0, event.ctrlKey ? 1 : 0, event.altKey ? 1 : 0,
+    ]));
+    if (route === KEY_DROP) return;
+    // A clipboard chord keeps its browser default so the clipboard event
+    // follows on the sink.
+    if (route === KEY_DELIVER_PREVENTING_DEFAULT) event.preventDefault();
+    target.port.deliver(direction, event.key, keyOptions(event));
     delivered();
   };
 
   const onKeyDown = (event) => forwardKey(event, "keydown");
-  const onKeyUp = (event) => forwardKey(event, "keyup");
+  const onKeyUp = (event) => {
+    claimedKeyDown = false;
+    forwardKey(event, "keyup");
+  };
 
   const compositionTarget = () => {
     const target = keyboardTarget;
     if (target === null) return null;
-    const document = documentOf(target.root);
-    return isTextControl(document.activeElement) ? target : null;
+    return target.port.textControlFocused() ? target : null;
   };
 
   const onCompositionStart = (event) => {
@@ -586,13 +658,13 @@ export function bindProjectedInput({
     // non-editable element.
     if (target === null) return;
     composing = true;
-    target.backend.compositionStart(target.root, event.data ?? "", modifierOptions(event));
+    target.port.deliver("compositionStart", event.data ?? "", modifierOptions(event));
     delivered();
   };
 
   const onCompositionUpdate = (event) => {
     if (!composing) return;
-    keyboardTarget.backend.compositionUpdate(keyboardTarget.root, event.data ?? "", modifierOptions(event));
+    keyboardTarget.port.deliver("compositionUpdate", event.data ?? "", modifierOptions(event));
     delivered();
   };
 
@@ -600,7 +672,7 @@ export function bindProjectedInput({
     sink.value = "";
     if (!composing) return;
     composing = false;
-    keyboardTarget.backend.compositionEnd(keyboardTarget.root, event.data ?? "", modifierOptions(event));
+    keyboardTarget.port.deliver("compositionEnd", event.data ?? "", modifierOptions(event));
     delivered();
   };
 
@@ -613,30 +685,25 @@ export function bindProjectedInput({
     if (claimedKeyDown) return;
     const target = keyboardTarget;
     if (target === null) return;
-    if (TEXT_INSERTION_TYPES.has(event.inputType)) {
-      target.backend.insertText(target.root, event.data ?? "", { inputType: event.inputType });
+    const action = sharedDomCore.status("input_before_input", ...sharedDomCore.valueListInput([event.inputType, String(event.inputType)]));
+    if (action === BEFORE_INPUT_INSERT) {
+      target.port.deliver("insertText", event.data ?? "", { inputType: event.inputType });
       delivered();
       return;
     }
-    const key = KEY_EQUIVALENT_TYPES.get(event.inputType);
+    const key = BEFORE_INPUT_KEYS[action];
     if (key !== undefined) {
-      target.backend.keydown(target.root, key, {});
-      target.backend.keyup(target.root, key, {});
+      target.port.deliver("keydown", key, {});
+      target.port.deliver("keyup", key, {});
       delivered();
-      return;
     }
-    // Paste and cut arrive as clipboard events, which already ran.
-    if (event.inputType === "insertFromPaste" || event.inputType === "deleteByCut") return;
-    throw new Error(
-      `bindProjectedInput: the Sandom document has no action for beforeinput "${event.inputType}"`,
-    );
   };
 
   const onCopy = (event) => {
     event.preventDefault();
     const target = keyboardTarget;
     if (target === null) return;
-    const text = target.backend.copy(target.root);
+    const text = target.port.copy();
     if (text !== null) event.clipboardData.setData("text/plain", text);
     delivered();
   };
@@ -645,7 +712,7 @@ export function bindProjectedInput({
     event.preventDefault();
     const target = keyboardTarget;
     if (target === null) return;
-    const text = target.backend.cut(target.root);
+    const text = target.port.cut();
     if (text !== null) event.clipboardData.setData("text/plain", text);
     delivered();
   };
@@ -654,17 +721,22 @@ export function bindProjectedInput({
     event.preventDefault();
     const target = keyboardTarget;
     if (target === null) return;
-    target.backend.paste(target.root, event.clipboardData.getData("text/plain"));
+    target.port.deliver("paste", event.clipboardData.getData("text/plain"));
     delivered();
+  };
+  const onContextMenu = (event) => {
+    if (!browserContextMenu) event.preventDefault();
   };
 
   const hostListeners = [
     ["pointerdown", onPointerDown],
     ["pointermove", onPointerMove],
+    ["contextmenu", onContextMenu],
     ["pointerup", onPointerUp],
     ["pointercancel", onPointerCancel],
+    ["lostpointercapture", onPointerCancel],
     ["pointerleave", onPointerLeave],
-    ["wheel", onWheel, { passive: false }],
+    ["wheel", onWheel, { passive: false, capture: releaseWheelAtBoundary }],
   ];
   const sinkListeners = [
     ["focus", onSinkFocus],
@@ -678,12 +750,45 @@ export function bindProjectedInput({
     ["copy", onCopy],
     ["cut", onCut],
     ["paste", onPaste],
+    ["contextmenu", onContextMenu],
   ];
+  const hostWindow = host.ownerDocument.defaultView;
+  const windowListeners = [
+    ["pointerup", onPointerUp],
+    ["pointercancel", onPointerCancel],
+    ["blur", cancelGestures],
+  ];
+  for (const [type, listener] of windowListeners) {
+    hostWindow?.addEventListener(type, listener);
+  }
   for (const [type, listener, options] of hostListeners) {
     host.addEventListener(type, listener, options);
   }
   for (const [type, listener] of sinkListeners) {
     sink.addEventListener(type, listener);
+  }
+  // The browser's preferences are the document's, as its focus is: the
+  // colour scheme, reduced motion and forced colours follow the host
+  // window's media queries now and on each change. A host page without
+  // matchMedia (no browser window) leaves the document's preferences.
+  const preferenceQueries = hostWindow?.matchMedia
+    ? {
+      dark: hostWindow.matchMedia("(prefers-color-scheme: dark)"),
+      reduce: hostWindow.matchMedia("(prefers-reduced-motion: reduce)"),
+      forced: hostWindow.matchMedia("(forced-colors: active)"),
+    }
+    : null;
+  const followPreferences = () => {
+    const dark = preferenceQueries.dark.matches;
+    defaultTarget.port.setPreferences({
+      colorScheme: dark ? "dark" : "light",
+      reducedMotion: preferenceQueries.reduce.matches ? "reduce" : "no-preference",
+      forcedColors: preferenceQueries.forced.matches ? (dark ? "dark" : "light") : "none",
+    });
+  };
+  if (preferenceQueries) {
+    followPreferences();
+    for (const query of Object.values(preferenceQueries)) query.addEventListener("change", followPreferences);
   }
 
   return Object.freeze({
@@ -708,14 +813,29 @@ export function bindProjectedInput({
       for (const [type, listener] of sinkListeners) {
         sink.removeEventListener(type, listener);
       }
-      leaveHover();
-      if (captured !== null) {
-        captured.target.backend.pointerCancel(captured.target.root, captured.pointerId);
-        captured = null;
+      for (const [type, listener] of windowListeners) {
+        hostWindow?.removeEventListener(type, listener);
       }
+      if (preferenceQueries) {
+        for (const query of Object.values(preferenceQueries)) query.removeEventListener("change", followPreferences);
+      }
+      cancelGestures();
       sink.remove();
       keyboardTarget = null;
       followCaretFrames(false);
     },
   });
+}
+
+// Binds the host element's input to a Sandom document of this realm: see
+// the hooks above bindDocumentInput. `backend` is the createSandomDOM result
+// that built `root`, the document node or element whose document takes the
+// input.
+export function bindProjectedInput({ backend, root, ...options }) {
+  if (typeof backend?.pointerDown !== "function" || !root) {
+    throw new TypeError(
+      "bindProjectedInput: backend must be an input backend (createSandomDOM) and root its document node",
+    );
+  }
+  return bindDocumentInput({ ...options, target: Object.freeze({ backend, root, port: localDocumentPort(backend, root) }) });
 }

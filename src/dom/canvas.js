@@ -1,8 +1,9 @@
 import { REFERENCE_WHITE_LUMINANCE } from "../color.js";
-import { loadColorKernel } from "../wasm/color-kernel.js";
+import { srgb8Pixels } from "../wasm/color-source.js";
 import { canvasFrameSource } from "./canvas-gpu-binding.js";
 import { isGpuThreadDevice } from "./webgpu-facade.js";
 import { getDefaultGpu } from "../gpu-thread.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 
 // A realm that cannot host a GPU thread (a browser main thread, a page that
 // is not cross-origin isolated) renders with its native WebGPU, so its
@@ -12,26 +13,17 @@ function isNativeGpuDevice(device) {
     device instanceof globalThis.GPUDevice;
 }
 
-const {
-  convertLinearRgbToXyz,
-  convertXyzToLinearRgb,
-  decodeSrgbTransfer,
-  encodeSrgbTransfer,
-} = loadColorKernel();
-
 const MAXIMUM_READBACKS = 4;
+// The codes that this file passes to WAT, by the names of their WAT globals.
+const RESOURCE_TYPE_CANVAS = layoutConstant("RESOURCE_TYPE_CANVAS");
+const RESOURCE_PENDING = layoutConstant("RESOURCE_PENDING");
+const RESOURCE_READY = layoutConstant("RESOURCE_READY");
+const RESOURCE_FAILED = layoutConstant("RESOURCE_FAILED");
+const CANVAS_BITMAP_WIDTH = layoutConstant("CANVAS_BITMAP_WIDTH");
+const CANVAS_BITMAP_HEIGHT = layoutConstant("CANVAS_BITMAP_HEIGHT");
 
 function align(value, alignment) {
   return Math.ceil(value / alignment) * alignment;
-}
-
-function float16ToNumber(bits) {
-  const sign = bits >> 15 ? -1 : 1;
-  const exponent = (bits >> 10) & 0x1F;
-  const fraction = bits & 0x3FF;
-  if (exponent === 0) return sign * fraction * 2 ** -24;
-  if (exponent === 0x1F) return fraction === 0 ? sign * Infinity : NaN;
-  return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
 }
 
 function colorEncodingFor(colorSpace) {
@@ -97,9 +89,9 @@ export class SandomGPUCanvasContext {
   constructor(canvas) {
     this.canvas = canvas;
     const core = canvas._domCore;
-    this._resourceHandle = core.resourceRegister(2, `canvas:${canvas._coreHandle}`);
+    this._resourceHandle = core.resourceRegister(RESOURCE_TYPE_CANVAS, `canvas:${canvas._coreHandle}`);
     core.resourceBind(canvas._coreHandle, this._resourceHandle);
-    core.resourceUpdate(this._resourceHandle, 0, canvas.width, canvas.height);
+    core.resourceUpdate(this._resourceHandle, RESOURCE_PENDING, canvas.width, canvas.height);
     this._configuration = null;
     this._currentFrame = null;
     this._presentedFrame = null;
@@ -125,10 +117,10 @@ export class SandomGPUCanvasContext {
       sourceIdentifier: core.resourceId(this._resourceHandle),
       resourceHandle: this._resourceHandle,
       get width() {
-        return core.canvasResourceDimension(canvas._canvasContext._resourceHandle, 0);
+        return core.canvasResourceDimension(canvas._canvasContext._resourceHandle, CANVAS_BITMAP_WIDTH);
       },
       get height() {
-        return core.canvasResourceDimension(canvas._canvasContext._resourceHandle, 1);
+        return core.canvasResourceDimension(canvas._canvasContext._resourceHandle, CANVAS_BITMAP_HEIGHT);
       },
       get revision() {
         return core.resourceContentGeneration(canvas._canvasContext._resourceHandle);
@@ -185,7 +177,7 @@ export class SandomGPUCanvasContext {
     this._retireFrames(false);
     this._publishedDescriptor = null;
     this._publishedPresentationSequence = 0;
-    this._updateResource(0, true);
+    this._updateResource(RESOURCE_PENDING, true);
     this._configuration = Object.freeze({
       device,
       format,
@@ -205,7 +197,7 @@ export class SandomGPUCanvasContext {
           information?.message ?? "unknown reason"
         }`,
       );
-      this._updateResource(2, false, 1);
+      this._updateResource(RESOURCE_FAILED, false, 1);
       this.canvas._notifyCanvasPaint();
     });
     this.canvas._notifyCanvasPaint();
@@ -306,7 +298,7 @@ export class SandomGPUCanvasContext {
     };
     frame.finish = () => this._finishRetiredFrame(frame);
     this._currentFrame = frame;
-    this._updateResource(1, true);
+    this._updateResource(RESOURCE_READY, true);
     frame.bitmapRevision = this.paintSource.revision;
     this.canvas._notifyCanvasPaint();
     return texture;
@@ -329,8 +321,8 @@ export class SandomGPUCanvasContext {
     return canvasFrameSource(this._currentFrame);
   }
 
-  get [Symbol.toStringTag]() {
-    return "GPUCanvasContext";
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "GPUCanvasContext", configurable: true });
   }
 
   resetBitmap(sizeChanged = true) {
@@ -530,47 +522,7 @@ export class SandomGPUCanvasContext {
   _descriptorForWebgl(descriptor) {
     const cached = this._webglDescriptorCache.get(descriptor);
     if (cached) return cached;
-    const output = new Uint8Array(descriptor.width * descriptor.height * 4);
-    const source = descriptor.pixels;
-    const sourceSample = (index) =>
-      descriptor.sampleType === "float16"
-        ? float16ToNumber(source[index])
-        : source[index] / 255;
-    for (
-      let pixelIndex = 0;
-      pixelIndex < descriptor.width * descriptor.height;
-      pixelIndex++
-    ) {
-      const sourceOffset = pixelIndex * 4;
-      const alpha = descriptor.alphaMode === "opaque"
-        ? 1
-        : sourceSample(sourceOffset + 3);
-      const encoded = [
-        sourceSample(sourceOffset),
-        sourceSample(sourceOffset + 1),
-        sourceSample(sourceOffset + 2),
-      ];
-      if (descriptor.alphaMode === "premultiplied" && alpha > 0) {
-        encoded[0] /= alpha;
-        encoded[1] /= alpha;
-        encoded[2] /= alpha;
-      }
-      const linear = encoded.map(decodeSrgbTransfer);
-      const xyz = convertLinearRgbToXyz(
-        descriptor.colorEncoding.primaries,
-        linear,
-      );
-      const srgb = convertXyzToLinearRgb("srgb", xyz);
-      const outputOffset = pixelIndex * 4;
-      for (let channel = 0; channel < 3; channel++) {
-        output[outputOffset + channel] = Math.round(
-          Math.min(1, Math.max(0, encodeSrgbTransfer(srgb[channel]))) * 255,
-        );
-      }
-      output[outputOffset + 3] = Math.round(
-        Math.min(1, Math.max(0, alpha)) * 255,
-      );
-    }
+    const output = srgb8Pixels(descriptor);
     const flattened = Object.freeze({
       width: descriptor.width,
       height: descriptor.height,
@@ -701,7 +653,7 @@ export class SandomGPUCanvasContext {
           }
         }
         try {
-          if (!this._shutdown) this._updateResource(2, false, 1);
+          if (!this._shutdown) this._updateResource(RESOURCE_FAILED, false, 1);
           this.canvas._notifyCanvasPaint();
         } catch {
           // Reporting must not replace the readback's original failure.
@@ -743,9 +695,9 @@ export class SandomGPUCanvasContext {
   }
 }
 export function canvasBitmapWidth(element) {
-  return element._domCore.canvasBitmapDimension(element._coreHandle, 0);
+  return element._domCore.canvasBitmapDimension(element._coreHandle, CANVAS_BITMAP_WIDTH);
 }
 
 export function canvasBitmapHeight(element) {
-  return element._domCore.canvasBitmapDimension(element._coreHandle, 1);
+  return element._domCore.canvasBitmapDimension(element._coreHandle, CANVAS_BITMAP_HEIGHT);
 }

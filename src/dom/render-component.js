@@ -9,18 +9,33 @@ import {
   normalizeComponentEnvironmentOptions,
 } from "./component-environment.js";
 import { closeComponentCode, enterComponentCode } from "./component-code.js";
+import { createEvent, dispatchEvent } from "./events.js";
 import { createSandomDOM } from "./sandom-dom.js";
 import { documentClockFromOptions } from "./document-clock.js";
+import { documentScripts } from "./scripts.js";
 import { normalizeInputBatch } from "./interaction.js";
 import { createPreparedDocument } from "./prepared-document.js";
 import { SandomViewport } from "./viewport.js";
 import { buildAccessibilitySnapshot } from "./accessibility.js";
 import { prepareNativeWebgl2Host } from "../native-webgl2-adapter.js";
-import { createSceneRenderer } from "../scene-renderer.js";
+import { openSceneRenderer } from "../scene-renderer.js";
+import { prepareDefaultGpuThread } from "../gpu-thread.js";
 import { validateClosedRecord } from "../closed-record.js";
 import { validateSandomHost } from "../host/contract.js";
 import { eraseEventListenersAndHandlers } from "./event-handlers.js";
 import { hostNow } from "../host-clock.js";
+import { createRetainedInstance } from "./retained-transitions.js";
+import {
+  captureDocumentMetrics,
+  captureDocumentPaint,
+  copyRasterArtifact,
+  captureDocumentRaster,
+  captureDocumentStructure,
+  inspectDocumentWorld,
+  loadDocumentMetrics,
+  readRasterArtifact,
+} from "./document-observation.js";
+import { compareObservations } from "./artifact-comparison.js";
 
 function positiveDimension(value, name) {
   const number = Number(value);
@@ -257,7 +272,9 @@ export async function renderComponent(
     "component-session",
   );
   const previousGlobalDescriptors = snapshotAmbientGlobalDescriptors();
-  const abortController = new AbortController();
+  // Each mount has its own signal: a reset aborts the signal of the mount
+  // that it replaces, and disposal aborts the current one.
+  let abortController = new AbortController();
   let preparedDocument = null;
   let surface = null;
   let mountDispose = null;
@@ -268,13 +285,14 @@ export async function renderComponent(
   let interactionRevision = 0;
   let presentationRevision = 0;
   let accessibilityRevision = 0;
-  let nextNodeIdentifier = 1;
-  const nodeIdentifiers = new WeakMap();
   const publishedFrames = new WeakMap();
   let precedingAccessibilitySnapshot = null;
   let ownershipReleased = false;
 
   try {
+    // A browser worker's GPU thread boots asynchronously; the renderer and
+    // the component's canvases then share its device from their first use.
+    await recordSpan("GPU thread start", () => prepareDefaultGpuThread());
     preparedDocument = await recordSpan(
       "document creation",
       () =>
@@ -350,21 +368,15 @@ export async function renderComponent(
       // session.render({ pixels: true }).
       presentFrame,
       createPersistentRenderer: (rendererOptions) =>
-        (document._sandomSceneRendererRuntime?.createSceneRenderer ??
-          createSceneRenderer)({
+        (document._sandomSceneRendererRuntime?.openSceneRenderer ??
+          openSceneRenderer)({
           ...rendererOptions,
           graphicsDevice: document._preferredCanvasDevice ?? undefined,
         }),
     });
     surface.stop();
-    const identifyNode = (node) => {
-      let identifier = nodeIdentifiers.get(node);
-      if (!identifier) {
-        identifier = `node-${nextNodeIdentifier++}`;
-        nodeIdentifiers.set(node, identifier);
-      }
-      return identifier;
-    };
+    // The core's durable node identifier (core/dom/node-identity.watpart).
+    const identifyNode = (node) => node._domCore.nodeIdentifier(node._coreHandle);
     // Lazily published inspection fields (frame-incrementality): the
     // accessibility snapshot, interactive text geometry, and control-state
     // diff are inspection surfaces consumers read on demand, not per
@@ -494,36 +506,42 @@ export async function renderComponent(
       await preparedDocument.ready();
     });
 
-    let mountResult;
-    await recordSpan("component mount", async () => {
-      mountResult = await enterComponentCode(document, mount, undefined, [
-        Object.freeze({
-          window: globalThis,
-          document,
-          container,
-          signal: abortController.signal,
-        }),
-      ]);
-    });
-    if (
-      mountResult && typeof mountResult === "object" &&
-      typeof mountResult.dispose === "function"
-    ) {
-      mountDispose = mountResult.dispose;
-    }
-    const validatedMountResult = validateMountResult(mountResult);
-    mountDispose = validatedMountResult.dispose;
+    // Mounts the component into the empty container and waits for its
+    // readiness. A reset mounts again; `optionReady` belongs to the first
+    // mount only.
+    const mountComponent = async (mountReady) => {
+      let mountResult;
+      await recordSpan("component mount", async () => {
+        mountResult = await enterComponentCode(document, mount, undefined, [
+          Object.freeze({
+            window: globalThis,
+            document,
+            container,
+            signal: abortController.signal,
+          }),
+        ]);
+      });
+      if (
+        mountResult && typeof mountResult === "object" &&
+        typeof mountResult.dispose === "function"
+      ) {
+        mountDispose = mountResult.dispose;
+      }
+      const validatedMountResult = validateMountResult(mountResult);
+      mountDispose = validatedMountResult.dispose;
 
-    await recordSpan("explicit readiness", async () => {
-      await Promise.all(
-        [optionReady, validatedMountResult.ready].filter((ready) => ready),
+      await recordSpan("explicit readiness", async () => {
+        await Promise.all(
+          [mountReady, validatedMountResult.ready].filter((ready) => ready),
+        );
+      });
+      await recordSpan(
+        "document resource readiness",
+        () => preparedDocument.ready(),
       );
-    });
-    await recordSpan(
-      "document resource readiness",
-      () => preparedDocument.ready(),
-    );
-    if (backgroundException !== null) throw thrownBackgroundException();
+      if (backgroundException !== null) throw thrownBackgroundException();
+    };
+    await mountComponent(optionReady);
 
     let disposeRequested = false;
     let disposalPromise = null;
@@ -543,14 +561,87 @@ export async function renderComponent(
       return result;
     };
 
+    // The retained instance (docs/design/component-rendering.md#retained-transitions):
+    // each transition calls the caller's applicator on the mounted component,
+    // and each reset disposes the mount and mounts the component again.
+    const mountedInstance = Object.freeze({ window: globalThis, document, container });
+    // The structure and metrics records that the session owns until
+    // disposal; projections name nodes by the core's durable identifier.
+    const identify = (node) => node._domCore.nodeIdentifier(node._coreHandle);
+    const projections = new Set();
+    const owned = (record) => {
+      projections.add(record);
+      return record;
+    };
+    const onRelease = (record) => projections.delete(record);
+    // The render surfaces of raster projections at environments where the
+    // live surface does not render, by environment key, until disposal.
+    const projectionSurfaces = new Map();
+    // A projection of the live document, with the live loop stopped so no
+    // frame renders while the capture reads the document.
+    const captureProjection = async (kind, { root, layer, environment, placement }) => {
+      if (kind === "raster") {
+        return await captureDocumentRaster(document, { root, layer, environment, placement, surfaces: projectionSurfaces, identify });
+      }
+      if (kind === "structure") {
+        return owned(captureDocumentStructure(document, {
+          root,
+          instance: "component",
+          revision: retained.revision.ordinal,
+          environment,
+          onRelease,
+        }));
+      }
+      if (kind === "paint") return await captureDocumentPaint(document, { root, environment, identify });
+      const world = await inspectDocumentWorld(document.documentElement, environment, { identify });
+      return owned(await captureDocumentMetrics(document, {
+        selectedNodes: [root ?? document.documentElement],
+        world: {
+          ...world,
+          key: `${identify(document.documentElement)}:${environment.width}x${environment.height}`,
+          environment: { width: environment.width, height: environment.height },
+        },
+        sizingSource: "caller",
+        identify,
+        onRelease,
+      }));
+    };
+    const retained = createRetainedInstance({
+      core: document._domCore,
+      runOperation,
+      apply: (applicator, context) =>
+        enterComponentCode(document, applicator, undefined, [mountedInstance, context]),
+      async replace() {
+        abortController.abort();
+        const previousDispose = mountDispose;
+        mountDispose = null;
+        if (previousDispose) await previousDispose();
+        container.replaceChildren();
+        abortController = new AbortController();
+        await mountComponent(undefined);
+      },
+      // A step renders no frame: the live loop waits until the step ends.
+      stepStarted: () => surface.stop(),
+      stepEnded() {
+        if (!disposeRequested && document.visibilityState === "visible") surface.start();
+      },
+      async capture(kind, request) {
+        surface.stop();
+        await surface.whenIdle();
+        try {
+          return await captureProjection(kind, request);
+        } finally {
+          if (!disposeRequested && document.visibilityState === "visible") surface.start();
+        }
+      },
+    });
+
     const renderCurrentSurface = async ({ pixels = false } = {}) => {
       surface.stop();
       await surface.whenIdle();
-      // Input handlers schedule follow-up work on zero-delay tasks (Radix
-      // moves focus from a timer); one task turn lets it land so the frame
-      // after a dispatch reflects it. A full raster's device awaits used to
-      // provide that turn by accident; a retained delivery has none.
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Publish after the document tasks already queued by input and due
+      // timers. A host timer turn does not order the document's task queue.
+      await documentScripts(document).queueTask(() => {});
       try {
         const render = () => surface.renderNow({ pixels });
         const frame = firstFrameRecorded
@@ -572,6 +663,7 @@ export async function renderComponent(
     };
 
     const dispatchRecords = async (records, ready) => {
+      await documentScripts(document).queueTask(() => {});
       if (!currentFrame) await renderCurrentSurface();
       // The changed-control-state baseline is control state BEFORE this
       // dispatch's input applies. Resolving the current frame's lazy
@@ -713,8 +805,8 @@ export async function renderComponent(
           );
           enterComponentCode(document, () => {
             componentEnvironment.viewportDidResize();
-            globalThis.dispatchEvent(new Event("resize"));
-            globalThis.visualViewport.dispatchEvent(new Event("resize"));
+            dispatchEvent(globalThis, createEvent("resize"));
+            dispatchEvent(globalThis.visualViewport, createEvent("resize"));
           }, undefined, []);
           return await renderCurrentSurface();
         });
@@ -801,6 +893,84 @@ export async function renderComponent(
           ...componentEnvironment.observations,
         ]);
       },
+      // The published revision of the retained instance: its handle, its
+      // ordinal, the resets, and the transitions since the last reset or
+      // the mount.
+      get revision() {
+        return retained.revision;
+      },
+      // Names what a projection observes: the document (no selector), the
+      // subtree of the one node that `selector` matches in the component's
+      // document, or with { layer } the compositing layer at that paint
+      // group index (a raster only).
+      select(selector) {
+        if (selector === undefined) return retained.select(null);
+        if (typeof selector === "object" && selector !== null) return retained.selectLayer(selector.layer);
+        const nodes = document.querySelectorAll(String(selector));
+        if (nodes.length !== 1) {
+          throw new RangeError(`A selection requires a selector that matches one node; ${selector} matches ${nodes.length}.`);
+        }
+        return retained.select(nodes[0]);
+      },
+      // Names how to raster a selection: { environment, rectangle,
+      // backdrop, offset } (createRetainedInstance's place()). Returns
+      // { handle, release() }.
+      place(selection, options) {
+        return retained.place(selection, options);
+      },
+      // Requests the "structure", "metrics", "paint", or "raster"
+      // projection of a published revision: { kind, selection, environment }
+      // or { kind: "raster", placement }. Returns its handle at once; the
+      // request runs after the transitions queued before it, and completion
+      // arrives through onCaptured({ artifact, provenance }) or
+      // onFailed(error). Structure and metrics records belong to the
+      // session until disposal or release().
+      project(revision, request, callbacks) {
+        return retained.project(revision, request, callbacks);
+      },
+      // Reads a raster artifact back, optionally into a shared destination
+      // buffer at the artifact's offset.
+      readback(artifact, destination = null) {
+        return readRasterArtifact(artifact, destination);
+      },
+      // Copies a raster artifact's GPU texture into a shared `texture` at
+      // the artifact's offset, with no readback.
+      copyRaster(artifact, texture) {
+        return copyRasterArtifact(artifact, texture);
+      },
+      // Compares two captured projections of `kind` (compareObservations)
+      // and delivers { kind, changes, left, right } through onCompared, or
+      // the incompatibility through onFailed. It applies no transition.
+      compare(left, right, { kind } = {}, { onCompared, onFailed } = {}) {
+        Promise.resolve().then(() => compareObservations(left, right, kind)).then(onCompared, onFailed);
+      },
+      // Loads the bytes of a metrics record (its bytes()) into this
+      // session's core, as { artifact, provenance } that compare() takes.
+      // The session releases the record at disposal.
+      loadMetrics(bytes) {
+        const loaded = loadDocumentMetrics(document, bytes, { onRelease });
+        owned(loaded.artifact);
+        return loaded;
+      },
+      // Queues one transition of the retained instance and returns its
+      // handle at once. `applicator(instance, context)` mutates the mounted
+      // component ({ window, document, container }) synchronously, or calls
+      // `context.deferSettlement()` and then `settle()` or `fail(error)`.
+      // The transition renders nothing; completion arrives through
+      // `onPublished(revision)` or `onFailed(error)`.
+      transition(applicator, options) {
+        return retained.transition(applicator, options);
+      },
+      // Queues a reset: the mount is disposed and the component mounts
+      // again into the same document. Completion arrives through
+      // `onReady(revision)` or `onFailed(error)`.
+      reset(options) {
+        return retained.reset(options);
+      },
+      // Throws unless `revisionHandle` names the published revision.
+      requireCurrentRevision(revisionHandle) {
+        retained.requireCurrentRevision(revisionHandle);
+      },
       get lifecycle() {
         return Object.freeze([...lifecycleSpans]);
       },
@@ -835,8 +1005,15 @@ export async function renderComponent(
         }
         disposalRestoreAmbientGlobals = restoreAmbientGlobals;
         disposeRequested = true;
+        // Every queued and running step ends as cancelled before the
+        // operation chain drains, so a step that waits for its settlement
+        // does not hold the disposal.
+        retained.dispose();
         disposalPromise = (async () => {
           await operationChain;
+          for (const projection of [...projections]) projection.release();
+          for (const surface of projectionSurfaces.values()) await surface.shutdown();
+          projectionSurfaces.clear();
           const cleanupErrors = [];
           const disposeStartedAt = hostNow();
           abortController.abort();
@@ -872,11 +1049,6 @@ export async function renderComponent(
             } catch (error) {
               collectCleanupError(cleanupErrors, error);
             }
-          }
-          try {
-            await preparedDocument.document._shutdownCanvasContexts();
-          } catch (error) {
-            collectCleanupError(cleanupErrors, error);
           }
           try {
             await preparedDocument.release();
@@ -944,13 +1116,6 @@ export async function renderComponent(
         surface.stop();
         await surface.whenIdle();
         await surface.shutdown();
-      } catch (error) {
-        collectCleanupError(cleanupErrors, error);
-      }
-    }
-    if (preparedDocument) {
-      try {
-        await preparedDocument.document._shutdownCanvasContexts();
       } catch (error) {
         collectCleanupError(cleanupErrors, error);
       }

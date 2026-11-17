@@ -40,17 +40,23 @@ import {
   SDShadowRoot,
   SDSVGElement,
   SDTextNode,
+  SDTreeWalker,
 } from "./node.js";
+import { DOMImplementation } from "./element-mutations.js";
 import { unsignedLongAttributeValue } from "./images.js";
 import { createDOMParserClass } from "./dom-parser.generated.js";
 import { parseHTMLDocument } from "./html.js";
-import { parseXMLDocument } from "./xml.js";
-import { SDAbstractRange, SDRange, SDSelection } from "./selection.js";
+import { parseXMLDocument, XMLSerializer } from "./xml.js";
+import { SDAbstractRange, SDRange, SDSelection, SDStaticRange } from "./selection.js";
+import { cssNamespaceFor, Highlight, HighlightRegistry } from "./highlights.js";
+import { FontFace } from "./font-face-set.js";
 import { CanvasGradient } from "./canvas-2d-gradient.js";
 import { SandomGPUCanvasContext } from "./canvas.js";
 import { gpuFacadeInterfaces } from "./webgpu-facade.js";
 import { CanvasRenderingContext2D, ImageData, Path2D } from "./canvas-2d.js";
 import { HTMLCollection, HTMLFormControlsCollection, HTMLOptionsCollection, NodeList, RadioNodeList } from "./form-dom.js";
+import { ValidityState } from "./constraint-validation.js";
+import { FormData, FormDataEvent } from "./form-data.js";
 import { DOMTokenList, NamedNodeMap } from "./node-collections.js";
 import { CanvasPattern } from "./canvas-2d-pattern.js";
 import { createImageBitmap, ImageBitmap } from "./canvas-image-bitmap.js";
@@ -62,34 +68,36 @@ import {
 } from "./custom-elements.js";
 import {
   addEventListener as addComponentEventListener,
-  dispatchEvent as dispatchComponentEvent,
+  createEventUsing,
+  dispatchEvent as dispatchUserAgentEvent,
+  dispatchEventFromScript as dispatchComponentEvent,
+  eventInterfaces,
+  isHostEvent,
   removeEventListener as removeComponentEventListener,
   registerEventTargetWrapper,
-  SDAnimationEvent,
-  SDAnimationPlaybackEvent,
+  sandomEventForHostEvent,
+  SDErrorEvent,
   SDEventTarget,
-  SDClipboardEvent,
-  SDDataTransfer,
-  SDFocusEvent,
-  SDKeyboardEvent,
-  SDMouseEvent,
-  SDPointerEvent,
-  SDSubmitEvent,
-  SDToggleEvent,
-  SDTransitionEvent,
 } from "./events.js";
+import { SDFileList } from "./file-list.js";
+import { SDDataTransfer, SDDataTransferItem, SDDataTransferItemList } from "./data-transfer.js";
 import {
-  CSS,
+  CSSConditionRule,
+  CSSCounterStyleRule,
   CSSFontFaceRule,
   CSSFontFeatureValuesRule,
   CSSGroupingRule,
   CSSKeyframeRule,
   CSSKeyframesRule,
+  CSSLayerBlockRule,
+  CSSLayerStatementRule,
   CSSMediaRule,
+  CSSNestedDeclarations,
   CSSRule,
   CSSStyleRule,
   CSSStyleSheet,
   CSSSupportsRule,
+  CSSContainerRule,
   SDStyleDeclaration as CSSStyleDeclaration,
 } from "./stylesheet.js";
 import { MediaQueryList } from "./media-query-list.js";
@@ -101,6 +109,7 @@ import {
   DocumentIntersectionObserver,
   DocumentResizeObserver,
 } from "./rendering-observers.js";
+import { DOMRect, DOMRectReadOnly } from "./geometry-interfaces.js";
 import {
   createImplicitComponentEnvironment,
   HashChangeEvent,
@@ -121,18 +130,22 @@ import {
   recordComponentTask,
 } from "./component-code.js";
 import { Animation, CSSAnimation, CSSTransition } from "./animation.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+
+const SCROLL_ACCEPTED_LEFT = layoutConstant("SCROLL_ACCEPTED_LEFT");
+const SCROLL_ACCEPTED_TOP = layoutConstant("SCROLL_ACCEPTED_TOP");
 
 // WebIDL "length" of the interface objects whose Sandom class takes
 // internal constructor arguments: the number of required arguments of the
 // interface's constructor, 0 for an interface without a constructor
 // (Web IDL, "interface object", and the pinned Chrome).
 const INTERFACE_OBJECT_LENGTHS = Object.freeze({
-  Animation: 0, CSSAnimation: 0, CSSTransition: 0, CSSFontFaceRule: 0, CSSGroupingRule: 0,
-  CSSRule: 0, CSSStyleDeclaration: 0, CSSStyleRule: 0, CanvasPattern: 0,
+  Animation: 0, CSSAnimation: 0, CSSTransition: 0, CSSConditionRule: 0, CSSFontFaceRule: 0, CSSGroupingRule: 0,
+  CSSKeyframeRule: 0, CSSNestedDeclarations: 0, CSSRule: 0, CSSStyleDeclaration: 0, CSSStyleRule: 0, CanvasPattern: 0,
   CanvasRenderingContext2D: 0, CustomStateSet: 0, Element: 0, ElementInternals: 0,
   GPUCanvasContext: 0, HTMLElement: 0, History: 0, ImageBitmap: 0, ImageData: 2,
   Location: 0, MediaQueryList: 0, MutationRecord: 0, Navigator: 0, Node: 0,
-  PointerEvent: 1, SVGElement: 0, Screen: 0, ScreenOrientation: 0, Selection: 0, Text: 0,
+  SVGElement: 0, Screen: 0, ScreenOrientation: 0, Selection: 0, Text: 0,
   CharacterData: 0, HTMLAnchorElement: 0,
 });
 
@@ -147,7 +160,7 @@ const animationFrameOwnerFinalizer = new FinalizationRegistry(
 // `new ErrorEvent("error")` is not cancelable, and reports nothing.
 function reportsException(event) {
   if (!event.cancelable) return false;
-  if (event.type === "error") return typeof ErrorEvent === "function" && event instanceof ErrorEvent;
+  if (event.type === "error") return event instanceof SDErrorEvent;
   return event.type === "unhandledrejection";
 }
 
@@ -323,12 +336,33 @@ function legacyImageFactory(document) {
       );
     }
     const image = document.createElement("img");
-    if (width !== undefined) image.setAttribute("width", unsignedLongAttributeValue(width));
-    if (height !== undefined) image.setAttribute("height", unsignedLongAttributeValue(height));
+    if (width !== undefined) image.setAttribute("width", unsignedLongAttributeValue(image._domCore, width));
+    if (height !== undefined) image.setAttribute("height", unsignedLongAttributeValue(image._domCore, height));
     return image;
   }
   Object.defineProperty(Image, "prototype", { value: SDHTMLImageElement.prototype, writable: false });
   return Image;
+}
+
+// HTML's legacy factory function Option(text, value, defaultSelected,
+// selected) of HTMLOptionElement.
+function legacyOptionFactory(document) {
+  function Option(text = "", value = undefined, defaultSelected = false, selected = false) {
+    if (new.target === undefined) {
+      throw new TypeError(
+        "Failed to construct 'Option': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+      );
+    }
+    const option = document.createElement("option");
+    const data = String(text);
+    if (data !== "") option.appendChild(document.createTextNode(data));
+    if (value !== undefined) option.setAttribute("value", String(value));
+    if (defaultSelected) option.setAttribute("selected", "");
+    if (selected) option.selected = true;
+    return option;
+  }
+  Object.defineProperty(Option, "prototype", { value: SDHTMLOptionElement.prototype, writable: false });
+  return Option;
 }
 
 // The interface object and engine instances share the interface prototype.
@@ -341,6 +375,11 @@ function documentInterfaceConstructor(name, engineConstructor, convertArguments 
     },
   }[name];
   Object.defineProperty(constructor, "prototype", { value: engineConstructor.prototype, writable: false });
+  // Web IDL puts constants and static operations on the interface object.
+  for (const key of Reflect.ownKeys(engineConstructor)) {
+    if (key === "length" || key === "name" || key === "prototype") continue;
+    Object.defineProperty(constructor, key, Object.getOwnPropertyDescriptor(engineConstructor, key));
+  }
   return constructor;
 }
 
@@ -359,6 +398,19 @@ export function installComponentGlobals(
       "The component environment target does not match the selected realm",
     );
   }
+  // A browser window's document and window are fixed: its own page owns
+  // them. A document's scripts need a realm that can take them, such as a
+  // dedicated worker's (src/dom/browser-render-worker.js).
+  for (const name of ["document", "window"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(target, name);
+    if (descriptor !== undefined && !descriptor.configurable) {
+      throw new DOMException(
+        `The realm that runs this document's scripts has a fixed ${name}, as a browser window has: ` +
+          "run the document in a dedicated worker, whose global takes the document's bindings.",
+        "NotSupportedError",
+      );
+    }
+  }
   const constructors = {
     ...additionalElementInterfaces,
     ...gpuFacadeInterfaces,
@@ -371,20 +423,18 @@ export function installComponentGlobals(
     CDATASection: documentInterfaceConstructor("CDATASection", SDCDATASection),
     ProcessingInstruction: documentInterfaceConstructor("ProcessingInstruction", SDProcessingInstruction),
     DocumentType: documentInterfaceConstructor("DocumentType", SDDocumentType),
+    DOMImplementation,
+    XMLSerializer,
     EventTarget: SDEventTarget,
     DOMTokenList,
     Node: SDNode,
     Element: SDElement,
     HTMLElement: SDHTMLElement,
     SVGElement: SDSVGElement,
-    ClipboardEvent: SDClipboardEvent,
+    ...eventInterfaces,
     DataTransfer: SDDataTransfer,
-    FocusEvent: SDFocusEvent,
-    KeyboardEvent: SDKeyboardEvent,
-    MouseEvent: SDMouseEvent,
-    PointerEvent: SDPointerEvent,
-    SubmitEvent: SDSubmitEvent,
-    ToggleEvent: SDToggleEvent,
+    DataTransferItemList: SDDataTransferItemList,
+    DataTransferItem: SDDataTransferItem,
     HTMLButtonElement: SDHTMLButtonElement,
     HTMLCanvasElement: SDHTMLCanvasElement,
     GPUCanvasContext: SandomGPUCanvasContext,
@@ -398,6 +448,12 @@ export function installComponentGlobals(
     OffscreenCanvasRenderingContext2D,
     HTMLTemplateElement: SDHTMLTemplateElement,
     HTMLInputElement: SDHTMLInputElement,
+    FormData,
+    FormDataEvent,
+    // The host's File and Blob: the values of a form's file entries.
+    File: globalThis.File,
+    Blob: globalThis.Blob,
+    FileList: SDFileList,
     HTMLFormElement: SDHTMLFormElement,
     HTMLOptionElement: SDHTMLOptionElement,
     HTMLSelectElement: SDHTMLSelectElement,
@@ -418,19 +474,26 @@ export function installComponentGlobals(
     HTMLFormControlsCollection,
     HTMLOptionsCollection,
     RadioNodeList,
+    ValidityState,
     HTMLScriptElement: SDHTMLScriptElement,
     HTMLIFrameElement: SDHTMLIFrameElement,
     HTMLImageElement: SDHTMLImageElement,
     HTMLSourceElement: SDHTMLSourceElement,
     Image: legacyImageFactory(document),
+    Option: legacyOptionFactory(document),
     Document: documentInterfaceConstructor("Document", SDDocument, () => [{ core: document._domCore, xmlDocument: true }]),
     Range: documentInterfaceConstructor("Range", SDRange, () => [document]),
+    TreeWalker: documentInterfaceConstructor("TreeWalker", SDTreeWalker),
     Selection: SDSelection,
+    StaticRange: SDStaticRange,
+    Highlight,
+    HighlightRegistry,
+    FontFace,
     DocumentFragment: documentInterfaceConstructor("DocumentFragment", SDDocumentFragment, () => [document]),
     ShadowRoot: SDShadowRoot,
     Text: SDTextNode,
     DOMParser: createDOMParserClass({
-      createDocument: () => new SDDocument({ core: document._domCore }),
+      createDocument: () => new SDDocument({ core: document._domCore, browsingContext: false }),
       parseHTMLDocument,
       parseXMLDocument,
     }),
@@ -455,12 +518,18 @@ export function installComponentGlobals(
     CSSRule,
     CSSStyleRule,
     CSSGroupingRule,
+    CSSConditionRule,
     CSSMediaRule,
     CSSSupportsRule,
+    CSSContainerRule,
     CSSFontFaceRule,
     CSSFontFeatureValuesRule,
+    CSSCounterStyleRule,
     CSSKeyframesRule,
     CSSKeyframeRule,
+    CSSNestedDeclarations,
+    CSSLayerBlockRule,
+    CSSLayerStatementRule,
     CSSStyleDeclaration,
     MediaQueryList,
     MutationRecord,
@@ -474,10 +543,12 @@ export function installComponentGlobals(
     Animation,
     CSSAnimation,
     CSSTransition,
-    AnimationEvent: SDAnimationEvent,
-    AnimationPlaybackEvent: SDAnimationPlaybackEvent,
-    TransitionEvent: SDTransitionEvent,
   };
+  // These interface objects are the window's own classes; each prototype
+  // has its own class string, the interface's name (Web IDL §3.7.3).
+  for (const name of ["DOMParser", "CustomElementRegistry", "CSSStyleSheet"]) {
+    Object.defineProperty(constructors[name].prototype, Symbol.toStringTag, { value: name, configurable: true });
+  }
   constructors.NodeFilter = Object.freeze({
     FILTER_ACCEPT: 1,
     FILTER_REJECT: 2,
@@ -513,12 +584,18 @@ export function installComponentGlobals(
       },
     }.createImageBitmap,
   });
+  for (const [name, value] of [["DOMRectReadOnly", DOMRectReadOnly], ["DOMRect", DOMRect]]) {
+    Object.defineProperty(target, name, { configurable: true, writable: true, value });
+  }
   Object.defineProperty(target, "MutationObserver", {
     configurable: true,
     writable: true,
     value: class MutationObserver extends DocumentMutationObserver {
       constructor(callback) {
         super(document, callback);
+      }
+      static {
+        Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "MutationObserver", configurable: true });
       }
     },
   });
@@ -529,6 +606,9 @@ export function installComponentGlobals(
       constructor(callback) {
         super(document, callback);
       }
+      static {
+        Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "ResizeObserver", configurable: true });
+      }
     },
   });
   Object.defineProperty(target, "IntersectionObserver", {
@@ -537,6 +617,9 @@ export function installComponentGlobals(
     value: class IntersectionObserver extends DocumentIntersectionObserver {
       constructor(callback, options = undefined) {
         super(document, callback, options);
+      }
+      static {
+        Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "IntersectionObserver", configurable: true });
       }
     },
   });
@@ -552,7 +635,7 @@ export function installComponentGlobals(
   // live here. Native registrations decide whether a callback remains pending.
   const animationFrameCallbacks = new Map();
   const mediaQueryLists = new Set();
-  const visualViewport = new EventTarget();
+  const visualViewport = new SDEventTarget();
   Object.defineProperties(visualViewport, {
     width: {
       enumerable: true,
@@ -572,11 +655,11 @@ export function installComponentGlobals(
     offsetTop: { enumerable: true, value: 0 },
     pageLeft: {
       enumerable: true,
-      get: () => viewportScrollOffset(document, 2),
+      get: () => viewportScrollOffset(document, SCROLL_ACCEPTED_LEFT),
     },
     pageTop: {
       enumerable: true,
-      get: () => viewportScrollOffset(document, 3),
+      get: () => viewportScrollOffset(document, SCROLL_ACCEPTED_TOP),
     },
     scale: { enumerable: true, value: 1 },
   });
@@ -764,19 +847,19 @@ export function installComponentGlobals(
     },
     pageXOffset: {
       configurable: true,
-      get: () => viewportScrollOffset(document, 2),
+      get: () => viewportScrollOffset(document, SCROLL_ACCEPTED_LEFT),
     },
     pageYOffset: {
       configurable: true,
-      get: () => viewportScrollOffset(document, 3),
+      get: () => viewportScrollOffset(document, SCROLL_ACCEPTED_TOP),
     },
     scrollX: {
       configurable: true,
-      get: () => viewportScrollOffset(document, 2),
+      get: () => viewportScrollOffset(document, SCROLL_ACCEPTED_LEFT),
     },
     scrollY: {
       configurable: true,
-      get: () => viewportScrollOffset(document, 3),
+      get: () => viewportScrollOffset(document, SCROLL_ACCEPTED_TOP),
     },
   });
   // window.scroll, scrollTo and scrollBy (CSSOM View) scroll the viewport:
@@ -813,31 +896,54 @@ export function installComponentGlobals(
           "default",
           false,
         );
-        return document._componentRenderSurface?.viewport.deviceScale ??
-          componentEnvironment.viewport.deviceScale ?? 1;
+        return document._componentRenderSurface?.viewport.density ??
+          componentEnvironment.viewport.density ?? componentEnvironment.viewport.deviceScale ?? 1;
       },
     });
   }
   document._reevaluateMediaQueryLists = () => {
     for (const list of mediaQueryLists) list._reevaluate();
   };
+  // The window's single-valued semantics (requestAnimationFrame, the
+  // viewport) bind to the first live surface over the document, whether
+  // that surface was created before the window or after it
+  // (DOMRenderSurface's constructor).
+  if (!document._componentRenderSurface) {
+    const surface = [...(document._liveRenderSurfaces ?? [])].find((candidate) => !candidate._shutdown);
+    if (surface !== undefined) {
+      document._componentRenderSurface = surface;
+      document._documentTimers?.driverChanged();
+    }
+  }
   registerEventTargetWrapper(target);
-  // (type, callback, optional options): length 2.
-  target.addEventListener = (type, callback, options = undefined) =>
-    addComponentEventListener(target, type, callback, options);
-  target.removeEventListener = (type, callback, options = undefined) =>
-    removeComponentEventListener(target, type, callback, options);
+  // The window's EventTarget operations are Web IDL operations (Web IDL
+  // §3.7.4): they act on their `this`, an EventTarget; a nullish `this` is
+  // the realm's global object, this window, and any other object throws a
+  // TypeError (SDEventTarget's receiver check). Their lengths are those of
+  // EventTarget's: 2, 2 and 1.
+  const eventTargetOperations = SDEventTarget.prototype;
+  target.addEventListener = {
+    addEventListener(_type, _callback, _options = undefined) {
+      return Reflect.apply(eventTargetOperations.addEventListener, this ?? target, arguments);
+    },
+  }.addEventListener;
+  target.removeEventListener = {
+    removeEventListener(_type, _callback, _options = undefined) {
+      return Reflect.apply(eventTargetOperations.removeEventListener, this ?? target, arguments);
+    },
+  }.removeEventListener;
   // Deno reports an uncaught exception, an unhandled rejection and
   // reportError() by dispatching a cancelable `error` or
-  // `unhandledrejection` event on the global, which is this window. The
-  // page's listeners hear it first (HTML "report an exception"). When
-  // component code of this document raised it (src/dom/component-code.js)
-  // and the listeners leave it uncanceled, it belongs to the document: it is
+  // `unhandledrejection` event of its own on the global, which is this
+  // window. The page hears the Sandom event of the runtime's event
+  // (sandomEventForHostEvent), and the runtime its cancelation. The page's
+  // listeners hear it first (HTML "report an exception"). When component
+  // code of this document raised it (src/dom/component-code.js) and the
+  // listeners leave it uncanceled, it belongs to the document: it is
   // canceled, so that the runtime keeps running, and its error goes to the
   // document's exception sink (renderComponent's reportException). An
   // exception of host code stays the runtime's.
-  target.dispatchEvent = (event) => {
-    const result = dispatchComponentEvent(target, event);
+  const settleWindowEvent = (event, result) => {
     if (!reportsException(event) || componentCodeDocument() !== document) return result;
     if (!event.defaultPrevented && document._reportException) {
       event.preventDefault();
@@ -847,22 +953,35 @@ export function installComponentGlobals(
     }
     return !event.defaultPrevented;
   };
+  // An event dispatched at another EventTarget is that target's.
+  target.dispatchEvent = {
+    dispatchEvent(event) {
+      const eventTarget = this ?? target;
+      if (eventTarget !== target) return Reflect.apply(eventTargetOperations.dispatchEvent, eventTarget, arguments);
+      if (arguments.length < 1) throw new TypeError("dispatchEvent requires an event");
+      if (!isHostEvent(event)) return settleWindowEvent(event, dispatchComponentEvent(target, event));
+      const windowEvent = sandomEventForHostEvent(event);
+      const result = settleWindowEvent(windowEvent, dispatchUserAgentEvent(target, windowEvent));
+      if (windowEvent.defaultPrevented) event.preventDefault();
+      return result;
+    },
+  }.dispatchEvent;
   // The window's time interfaces and timers on the document's clock.
   installPageClock(target, document, Object.keys(constructors));
   // A timer that component code sets runs component code. The runtime
   // reports the throw of a timer callback after the callback returns, outside
   // the component's code, so the callback reports its own throw at this
-  // window, as the runtime does. An exception that nothing cancels there,
-  // such as one after disposal restores the realm's own dispatchEvent, goes
-  // back to the runtime. A timer of host code stays the host's.
+  // window as a trusted error event, as the user agent does. An exception
+  // that nothing cancels there, or one after the component code closed,
+  // goes back to the runtime. A timer of host code stays the host's.
   const reportTimerException = (error) => {
-    if (!document._reportException) throw error;
-    const event = new ErrorEvent("error", {
+    if (!document._reportException || componentCodeClosed(document)) throw error;
+    const event = createEventUsing(SDErrorEvent, "error", {
       cancelable: true,
       error,
       message: error instanceof Error ? error.message : String(error),
     });
-    if (target.dispatchEvent(event)) throw error;
+    if (settleWindowEvent(event, dispatchUserAgentEvent(target, event))) throw error;
   };
   function runComponentTimer(callback, argumentsList) {
     try {
@@ -1045,6 +1164,9 @@ export function installComponentGlobals(
           throw error;
         }
       }
+      static {
+        Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "WebSocket", configurable: true });
+      }
     }
     Object.defineProperty(target, "WebSocket", {
       configurable: true,
@@ -1102,10 +1224,20 @@ export function installComponentGlobals(
   target.customElements = document.customElements;
   target.getComputedStyle = (element, pseudoElement = null) =>
     document.getComputedStyle(element, pseudoElement);
-  target.CSS = CSS;
+  target.CSS = cssNamespaceFor(document);
   installWindowEventHandlers(target);
   target.window = target;
   if (target.self !== target) target.self = target;
+  // window.frames is the window itself (HTML "frames", [Replaceable]); a
+  // realm whose global already has one keeps it.
+  if (!("frames" in target)) {
+    Object.defineProperty(target, "frames", {
+      configurable: true,
+      enumerable: true,
+      get: () => target,
+      set: (value) => Object.defineProperty(target, "frames", { value, writable: true, enumerable: true, configurable: true }),
+    });
+  }
   if (
     target.globalThis !== target &&
     Object.getOwnPropertyDescriptor(target, "globalThis")?.configurable !==

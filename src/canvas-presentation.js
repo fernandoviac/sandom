@@ -1,11 +1,18 @@
 // The canvas presentation binding (docs/specifications/gpu-command-stream.md).
-// Renderer-core (src/wasm/gpu-presentation.watpart) selects the
+// Renderer-core (core/engine/gpu-presentation.watpart) selects the
 // presentation shader mode, the color matrix, the pipeline, and each
 // frame's pass. This module configures the canvas, imports the working and
 // canvas textures, and executes the records on the presenter's device.
+//
+// The presenter sizes the canvas to each presented texture. With a
+// GPU-thread device (src/gpu-thread.js), as a browser worker's renderer has,
+// it takes the OffscreenCanvas: it transfers it to the GPU thread, which
+// presents from that device, and sizes it there. The host does not use the
+// canvas afterwards.
 import { createGpuBinding } from "./gpu-binding.js";
 import { composeShaderBytes } from "./shaders/compose.js";
 import { instantiateRendererCore } from "./wasm/renderer-core-binary.js";
+import { adoptGpuThreadCanvas, flushGpuThread, gpuThreadResource, sizeGpuThreadCanvas } from "./dom/webgpu-facade.js";
 
 const TEXTURE_FORMATS = Object.freeze({
   rgba8unorm: 0,
@@ -13,6 +20,12 @@ const TEXTURE_FORMATS = Object.freeze({
   bgra8unorm: 7,
 });
 let presentationCore;
+// The host's canvas types and WebGPU, taken when the module loads:
+// renderComponent() replaces these globals in its realm, and a host presents
+// onto its own canvas, such as one that a page transferred to the worker.
+const HostHTMLCanvasElement = globalThis.HTMLCanvasElement;
+const HostOffscreenCanvas = globalThis.OffscreenCanvas;
+const hostGpu = globalThis.navigator?.gpu;
 
 export function createCanvasPresenter({
   canvas,
@@ -22,10 +35,10 @@ export function createCanvasPresenter({
   colorSpace = extended ? "display-p3" : "srgb",
   alphaMode = renderMode === "high-dynamic-range" ? "opaque" : "premultiplied",
 }) {
-  const isHTMLCanvas = typeof HTMLCanvasElement !== "undefined" &&
-    canvas instanceof HTMLCanvasElement;
-  const isOffscreenCanvas = typeof OffscreenCanvas !== "undefined" &&
-    canvas instanceof OffscreenCanvas;
+  const isHTMLCanvas = HostHTMLCanvasElement !== undefined &&
+    canvas instanceof HostHTMLCanvasElement;
+  const isOffscreenCanvas = HostOffscreenCanvas !== undefined &&
+    canvas instanceof HostOffscreenCanvas;
   if (!isHTMLCanvas && !isOffscreenCanvas) {
     throw new TypeError(
       "createCanvasPresenter: canvas must be an HTMLCanvasElement or OffscreenCanvas",
@@ -44,8 +57,14 @@ export function createCanvasPresenter({
       "createCanvasPresenter: high-dynamic-range rendering requires an extended rgba16float canvas",
     );
   }
+  const threadDevice = gpuThreadResource(device) !== null;
+  if (threadDevice && !isOffscreenCanvas) {
+    throw new TypeError(
+      "createCanvasPresenter: a GPU-thread device presents onto an OffscreenCanvas, which the presenter transfers to the GPU thread; give it one, such as from transferControlToOffscreen()",
+    );
+  }
 
-  const context = canvas.getContext("webgpu");
+  const context = threadDevice ? adoptGpuThreadCanvas(device, canvas) : canvas.getContext("webgpu");
   if (!context) {
     throw new Error(
       "createCanvasPresenter: the browser did not provide a WebGPU canvas",
@@ -53,7 +72,7 @@ export function createCanvasPresenter({
   }
   const format = extended
     ? "rgba16float"
-    : navigator.gpu.getPreferredCanvasFormat();
+    : hostGpu.getPreferredCanvasFormat();
   const formatIndex = TEXTURE_FORMATS[format];
   if (formatIndex === undefined) {
     throw new Error(
@@ -86,6 +105,9 @@ export function createCanvasPresenter({
   );
   gpu.execute();
   let destroyed = false;
+  // The canvas's size, on the GPU thread for an adopted canvas.
+  let canvasWidth = 0;
+  let canvasHeight = 0;
 
   return Object.freeze({
     format,
@@ -95,6 +117,16 @@ export function createCanvasPresenter({
       if (!textureImage?.texture) {
         throw new TypeError("canvas presenter requires a GPU texture image");
       }
+      const { width, height } = textureImage.texture;
+      if (width !== canvasWidth || height !== canvasHeight) {
+        if (threadDevice) sizeGpuThreadCanvas(context, width, height);
+        else {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        canvasWidth = width;
+        canvasHeight = height;
+      }
       gpu.beginFrame();
       core.gpu_presentation_present(
         state,
@@ -102,6 +134,9 @@ export function createCanvasPresenter({
         gpu.importResource(context.getCurrentTexture()),
       );
       gpu.execute();
+      // The submit waits in the GPU thread's queue until a request carries
+      // it; no request follows a presentation.
+      if (threadDevice) flushGpuThread(device);
     },
     destroy() {
       if (destroyed) return;

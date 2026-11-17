@@ -1,40 +1,24 @@
 // Exact outline coverage of the text in a display list, and the envelope
-// of coverage Sandom may draw around it (plans/text/PLAN-text-ink-approval.md);
+// of coverage Sandom may draw around it (design/parity-methodology.md, "Text truth checks");
 // the same for SVG fills (plans/PLAN-svg-source-truth.md).
 //
-// The coverage comes from src/wasm/text-ink-reference.wat. For text it
+// The coverage comes from core/build/text-ink-reference.wat. For text it
 // shares only the HarfBuzz outline decode with the renderer
 // (src/shaping.js); it never reads the MSDF atlas, the glyph fields, or
 // the GPU, so a defect in the renderer's glyph path is visible against it.
 // For SVG fills the module parses the path data itself.
 //
 // Glyphs sit where the display list places them: the text command's
-// baseline and each glyph's position, unrounded, in the renderer's f32
-// arithmetic, under the command's affine when it carries one (SVG text,
-// CSS transforms).
+// baseline and each glyph's position and ink height above the baseline
+// (its HarfBuzz y offset), unrounded, in the renderer's f32 arithmetic,
+// under the command's affine when it carries one (SVG text, CSS
+// transforms).
 
 import { instantiate } from "../wasm/text-ink-reference-binary.js";
+import * as textInkReferenceBinary from "../wasm/text-ink-reference-binary.js";
+import * as textInkCheckBinary from "../wasm/text-ink-check-binary.js";
+import { moduleLayoutConstants } from "../wasm/layout-table.js";
 import { createGlyphOutlineSource } from "../shaping.js";
-
-const STATUS_MESSAGES = new Map([
-  [-1, "an outline holds an unknown verb"],
-  [-2, "the reference module could not grow its memory"],
-  [-3, "a pixel row crosses more than 4096 outline segments"],
-  [-4, "a pixel row needs more than 65536 sub-band breaks"],
-  [-5, "the raster is not 1 to 16384 pixels on each side"],
-  [-6, "the chord tolerance is not a positive finite number of pixels"],
-  [-7, "a curve needs more than 65536 chords at the chord tolerance"],
-  [-8, "a glyph has more than 16384 corner vertices"],
-  [-10, "a sample line crosses more than 16384 segments or bands"],
-  [-11, "the envelope radii are not finite and non-negative, the corner cosine is outside [-1, 1], or the sample line count is outside 1 to 4096"],
-  [-15, "the fill rule is not 0 (nonzero) or 1 (evenodd)"],
-]);
-
-// The path commands the module reads, in either case.
-const SVG_PATH_COMMANDS = "M, L, H, V, C, S, Q, T, A and Z";
-
-// Fill rules as the module numbers them.
-const SVG_FILL_RULES = new Map([["nonzero", 0], ["evenodd", 1]]);
 
 // The reference outline is the true curve: chords stay within 1/256 of a
 // device pixel of it, so a pixel's coverage differs from the curve's by at
@@ -43,66 +27,139 @@ const SVG_FILL_RULES = new Map([["nonzero", 0], ["evenodd", 1]]);
 // tolerance (Inter at 32 px, density 2).
 export const REFERENCE_CHORD_TOLERANCE_PIXELS = 1 / 256;
 
-const SYNTHETIC_OBLIQUE_SKEW = 0.25;
+const checkConstant = moduleLayoutConstants(textInkCheckBinary, "text ink check");
+// The edge, corner vertex and source layer records of the reference
+// module (text-ink-reference-body.watpart), by WAT name.
+const referenceConstant = moduleLayoutConstants(textInkReferenceBinary, "text ink reference");
+const EDGE = Object.freeze(Object.fromEntries(["X0", "Y0", "X1", "Y1", "PART", "RADIUS"]
+  .map((name) => [name, referenceConstant(`EDGE_${name}`)])));
+const VERTEX = Object.freeze(Object.fromEntries(["X", "Y", "REACH", "OUTER"]
+  .map((name) => [name, referenceConstant(`VERTEX_${name}`)])));
+const LAYER = Object.freeze(Object.fromEntries(["SIZE", "LOWER", "UPPER", "ALPHA"]
+  .map((name) => [name, referenceConstant(`LAYER_${name}`)])));
 
-const f32 = Math.fround;
+// Status tables of `status_template`.
+export const STATUS_TABLE = Object.freeze({
+  reference: checkConstant("STATUS_TABLE_REFERENCE"),
+  advance: checkConstant("STATUS_TABLE_ADVANCE"),
+  paint: checkConstant("STATUS_TABLE_PAINT"),
+});
+export const STATUS_ALLOCATION_FAILED = checkConstant("STATUS_ALLOCATION_FAILED");
+export const UNMAPPED_GLYPH_TEMPLATE = checkConstant("UNMAPPED_GLYPH_TEMPLATE");
+const TEMPLATE_PATHS_NOT_ARRAY = checkConstant("TEMPLATE_PATHS_NOT_ARRAY");
 
-function statusError(status, context, subject = "text ink reference") {
-  const message = STATUS_MESSAGES.get(status) ?? `unknown status ${status}`;
-  return new Error(`${subject}: ${message} (${context})`);
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const ERROR_CLASSES = [Error, TypeError, RangeError];
+
+// The glyph placement, the text ink verdict, and the argument checks and
+// messages of the references (core/engine/text-ink-check.wat).
+export function createTextInkCheck() {
+  return textInkCheckBinary.instantiate({}).exports;
 }
 
-function beginRaster(exports, width, height, subject) {
+// The error of message template `template` with the arguments as text.
+export function checkError(check, template, ...argumentTexts) {
+  const encoded = argumentTexts.map((text) => encoder.encode(String(text)));
+  const input = check.message_input(4 + encoded.reduce((sum, bytes) => sum + 4 + bytes.length, 0));
+  if (input === 0) throw new Error(`text ink check: the module could not grow its memory for message ${template}`);
+  const view = new DataView(check.memory.buffer);
+  view.setUint32(input, encoded.length, true);
+  let at = input + 4;
+  for (const bytes of encoded) {
+    view.setUint32(at, bytes.length, true);
+    new Uint8Array(check.memory.buffer, at + 4, bytes.length).set(bytes);
+    at += 4 + bytes.length;
+  }
+  const length = check.message(template);
+  if (length < 0) throw new Error(`text ink check: the module could not grow its memory for message ${template}`);
+  const text = decoder.decode(new Uint8Array(check.memory.buffer, check.message_output(), length));
+  return new ERROR_CLASSES[check.message_kind(template)](text);
+}
+
+// Throws the error of a nonzero check result.
+export function throwCheck(check, template, ...argumentTexts) {
+  if (template !== 0) throw checkError(check, template, ...argumentTexts);
+}
+
+export function statusError(check, table, status, context, subject) {
+  return checkError(check, check.status_template(table, status), subject, context);
+}
+
+// Writes keyword texts one after another at keyword_input; returns their
+// byte lengths.
+export function writeKeywords(check, ...keywords) {
+  let at = check.keyword_input();
+  return keywords.map((keyword) => {
+    const bytes = encoder.encode(typeof keyword === "string" ? keyword : "").subarray(0, 128);
+    new Uint8Array(check.memory.buffer, at, bytes.length).set(bytes);
+    at += bytes.length;
+    return bytes.length;
+  });
+}
+
+function beginRaster(exports, check, width, height, subject) {
   const began = exports.reference_begin(width, height);
-  if (began !== 0) throw statusError(began, `raster ${width}x${height}`, subject);
+  if (began !== 0) throw statusError(check, STATUS_TABLE.reference, began, `raster ${width}x${height}`, subject);
 }
 
-function configureEnvelope(exports, mechanisms, subject) {
+function configureEnvelope(exports, check, mechanisms, subject) {
   const {
     lineRadius, curveRadius, curvatureK, curvatureCap, cornerInner, cornerOuter, cornerTurnDegrees, subRows, foldCosine,
   } = mechanisms;
-  if (!(cornerTurnDegrees >= 0 && cornerTurnDegrees <= 180)) {
-    throw new RangeError(`${subject}: cornerTurnDegrees must be in [0, 180], got ${cornerTurnDegrees}`);
-  }
+  throwCheck(check, check.corner_turn_check(Number(cornerTurnDegrees)), subject, "", cornerTurnDegrees);
   const configured = exports.envelope_configure(
     lineRadius, curveRadius, curvatureK, curvatureCap, cornerInner, cornerOuter,
     Math.cos(cornerTurnDegrees * Math.PI / 180), subRows, foldCosine,
   );
-  if (configured !== 0) throw statusError(configured, JSON.stringify(mechanisms), subject);
-}
-
-// The key of a glyph's distance field in the renderer's atlas, as
-// src/wasm/glyph-atlas.watpart computes it from the text
-// command's CSS font size: the size class, its field size
-// (atlas_glyph_msdf_size) and its minimum texel in font units
-// (atlas_glyph_minimum_shape_units_per_texel).
-const MSDF_RANGE = 6;
-const TEXT_FIELD_REACH_PX = 0.95;
-function glyphFieldKey(cssFontSize, unitsPerEm) {
-  const sizeClass = Math.ceil(4 * Math.log2(Math.max(cssFontSize, 1)));
-  return {
-    msdfSize: Math.round(Math.min(256, Math.max(48, 2 ** Math.floor((sizeClass + 3) / 4) + 2 * MSDF_RANGE))),
-    minimumUnitsPerTexel: TEXT_FIELD_REACH_PX / (0.5 * MSDF_RANGE) * unitsPerEm / 2 ** ((sizeClass - 1) / 4),
-  };
+  if (configured !== 0) throw statusError(check, STATUS_TABLE.reference, configured, JSON.stringify(mechanisms), subject);
 }
 
 function raster(exports, base, width, height) {
   return new Float32Array(exports.memory.buffer, base, width * height).slice();
 }
 
-// The command affine [a, b, c, d, e, f] (translation in CSS px) after a
-// device-space placement [a, b, c, d, e, f]: a point p maps to
-// command(placement(p)).
-function composeAffine([a, b, c, d, e, f], deviceScale, [pa, pb, pc, pd, pe, pf]) {
-  return [
-    a * pa + c * pb, b * pa + d * pb,
-    a * pc + c * pd, b * pc + d * pd,
-    a * pe + c * pf + f32(e * deviceScale), b * pe + d * pf + f32(f * deviceScale),
-  ];
+// The transform that places a glyph and the key of its distance field in
+// the renderer's atlas (`glyph_placement`).
+function glyphPlacement(check, command, deviceScale, upem, glyphIndex) {
+  const { x: textX, y: textY, baseline } = command.geometry;
+  const transform = command.transform ?? [0, 0, 0, 0, 0, 0];
+  check.glyph_placement(
+    command.fontSize, deviceScale, upem, command.fontStyle === "italic" && command.font.style !== "italic" ? 1 : 0,
+    textX, textY, baseline, command.glyphPositions[glyphIndex], command.glyphInkY[glyphIndex],
+    command.transform === null ? 0 : 1, ...transform,
+  );
+  const output = new Float64Array(check.memory.buffer, check.output_base(), 8);
+  return {
+    transform: [...output.subarray(0, 6)],
+    fieldKey: { msdfSize: output[6], minimumUnitsPerTexel: output[7] },
+  };
+}
+
+/**
+ * The key of the distance field of a text command's glyphs in the
+ * renderer's atlas at `deviceScale` (`glyph_placement`): the field size and
+ * the minimum font units per field texel. It does not depend on the glyph.
+ */
+export function textCommandFieldKey(command, deviceScale, upem) {
+  return glyphPlacement(createTextInkCheck(), command, deviceScale, upem, 0).fieldKey;
+}
+
+// The variation coordinates of a text command's glyph outlines, in CSS
+// terms: the base pairs `coordinates` of the face, 'opsz' at the command's
+// optical size unless font-optical-sizing is none, then each pair of its
+// font-variation-settings, which replaces the value of the axis it names
+// (CSS Fonts 4, "Font Feature and Variation Resolution").
+export function textCommandVariations(command, coordinates) {
+  const axes = new Map(coordinates);
+  if (command.opticalSizing !== "none") axes.set("opsz", command.opticalSize);
+  for (const [tag, value] of command.variationSettings) axes.set(tag, value);
+  return [...axes];
 }
 
 export function createTextInkReference() {
   const exports = instantiate({}).exports;
+  const check = createTextInkCheck();
   const outlineSources = new Map();
   const outlines = new Map();
 
@@ -141,40 +198,24 @@ export function createTextInkReference() {
     }
     for (const command of commands) {
       const label = `text command ${command.commandIndex} "${command.text}"`;
-      if (command.textShadow) {
-        throw new Error(`text ink reference: ${label} is a text shadow; the reference has no shadow model`);
-      }
-      if (command.font === null) {
-        throw new Error(`text ink reference: ${label} names no registered font`);
-      }
+      throwCheck(check, check.text_command_check(command.textShadow ? 1 : 0, command.font === null ? 1 : 0),
+        "text ink reference", label);
       const fontBytes = resolveFontBytes(command.font);
       if (!(fontBytes instanceof Uint8Array)) {
         throw new TypeError(`text ink reference: resolveFontBytes returned no bytes for ${label} (${JSON.stringify(command.font)})`);
       }
-      const variations = [
+      const variations = textCommandVariations(command, [
         ["wght", command.fontWeight],
-        ["opsz", command.fontSize],
         ["slnt", command.font.slant],
         ["wdth", command.font.stretch],
-      ];
-      const syntheticOblique = command.fontStyle === "italic" && command.font.style !== "italic";
-      const { x: textX, y: textY, baseline } = command.geometry;
-      const baselineY = f32(f32(f32(textY * deviceScale)) + f32(baseline * deviceScale));
-      const deviceTextX = f32(textX * deviceScale);
+      ]);
       for (let glyphIndex = 0; glyphIndex < command.glyphIds.length; glyphIndex++) {
         const glyphId = command.glyphIds[glyphIndex];
         if (glyphId === 0xFFFF) continue;
         const { verbs, upem } = await outlineFor(fontBytes, variations, glyphId);
         if (verbs.length === 0) continue;
-        const scale = command.fontSize * deviceScale / upem;
-        // Font units are y-up; the raster is y-down. A synthetic oblique
-        // skews about the baseline: x gains 0.25 of the height above it.
-        const placement = [
-          scale, 0, syntheticOblique ? SYNTHETIC_OBLIQUE_SKEW * scale : 0, -scale,
-          f32(deviceTextX + f32(command.glyphPositions[glyphIndex] * deviceScale)), baselineY,
-        ];
-        const transform = command.transform === null ? placement : composeAffine(command.transform, deviceScale, placement);
-        yield { label: `${label}, glyph ${glyphId}`, verbs, transform, fieldKey: glyphFieldKey(command.fontSize, upem) };
+        const { transform, fieldKey } = glyphPlacement(check, command, deviceScale, upem, glyphIndex);
+        yield { label: `${label}, glyph ${glyphId}`, verbs, transform, fieldKey };
       }
     }
   }
@@ -188,12 +229,16 @@ export function createTextInkReference() {
 
   function copyVerbs(glyph) {
     const pointer = exports.reference_verb_buffer(glyph.verbs.length);
-    if (pointer === 0) throw statusError(-2, glyph.label);
+    if (pointer === 0) throw inkStatusError(STATUS_ALLOCATION_FAILED, glyph.label);
     new Uint8Array(exports.memory.buffer, pointer, glyph.verbs.length).set(glyph.verbs);
   }
 
+  function inkStatusError(status, context) {
+    return statusError(check, STATUS_TABLE.reference, status, context, "text ink reference");
+  }
+
   function begin(width, height) {
-    beginRaster(exports, width, height, "text ink reference");
+    beginRaster(exports, check, width, height, "text ink reference");
   }
 
   /**
@@ -219,7 +264,7 @@ export function createTextInkReference() {
     for await (const glyph of placedGlyphs(textCommands(displayList, commandIndices), deviceScale, resolveFontBytes)) {
       copyVerbs(glyph);
       const added = exports.reference_add_glyph(glyph.verbs.length, ...glyph.transform, chordTolerance);
-      if (added < 0) throw statusError(added, glyph.label);
+      if (added < 0) throw inkStatusError(added, glyph.label);
     }
     return { width, height, coverage: raster(exports, exports.raster_base(), width, height) };
   }
@@ -240,12 +285,12 @@ export function createTextInkReference() {
     chordTolerance = REFERENCE_CHORD_TOLERANCE_PIXELS,
   }) {
     begin(width, height);
-    configureEnvelope(exports, mechanisms, "text ink reference");
+    configureEnvelope(exports, check, mechanisms, "text ink reference");
     for await (const glyph of placedGlyphs(textCommands(displayList, commandIndices), deviceScale, resolveFontBytes)) {
       copyVerbs(glyph);
       const added = exports.envelope_add_glyph(glyph.verbs.length, ...glyph.transform, chordTolerance,
         glyph.fieldKey.msdfSize, glyph.fieldKey.minimumUnitsPerTexel);
-      if (added < 0) throw statusError(added, glyph.label);
+      if (added < 0) throw inkStatusError(added, glyph.label);
     }
     return {
       width,
@@ -267,26 +312,21 @@ export function createTextInkReference() {
   return Object.freeze({ render, envelope, dispose });
 }
 
-// Stroke parameters as the module numbers them.
-const SVG_LINECAPS = new Map([["butt", 0], ["round", 1], ["square", 2]]);
-const SVG_LINEJOINS = new Map([["miter", 0], ["round", 1], ["bevel", 2]]);
-const SVG_MAX_DASHES = 256;
-
 /**
  * The outline parts of a stroke, as the module numbers them on each outline
  * edge (plans/PLAN-svg-source-truth.md, slice 2), with the outline part
  * class the stress report names and the mechanism whose band they carry.
  */
 export const SVG_STROKE_PARTS = Object.freeze(new Map([
-  [1, Object.freeze({ name: "side", part: "side", mechanism: "sandomEdge" })],
-  [2, Object.freeze({ name: "curve side", part: "curve", mechanism: "sandomCurvature" })],
-  [3, Object.freeze({ name: "butt end", part: "cap", mechanism: "sandomEdge" })],
-  [4, Object.freeze({ name: "round cap", part: "cap", mechanism: "sandomCurvature" })],
-  [5, Object.freeze({ name: "square cap", part: "cap", mechanism: "sandomEdge" })],
-  [6, Object.freeze({ name: "round join", part: "join", mechanism: "sandomCurvature" })],
-  [7, Object.freeze({ name: "bevel edge", part: "join", mechanism: "sandomEdge" })],
-  [8, Object.freeze({ name: "miter edge", part: "join", mechanism: "sandomEdge" })],
-]));
+  ["SIDE", { name: "side", part: "side", mechanism: "sandomEdge" }],
+  ["CURVE_SIDE", { name: "curve side", part: "curve", mechanism: "sandomCurvature" }],
+  ["BUTT_END", { name: "butt end", part: "cap", mechanism: "sandomEdge" }],
+  ["ROUND_CAP", { name: "round cap", part: "cap", mechanism: "sandomCurvature" }],
+  ["SQUARE_CAP", { name: "square cap", part: "cap", mechanism: "sandomEdge" }],
+  ["ROUND_JOIN", { name: "round join", part: "join", mechanism: "sandomCurvature" }],
+  ["BEVEL_EDGE", { name: "bevel edge", part: "join", mechanism: "sandomEdge" }],
+  ["MITER_EDGE", { name: "miter edge", part: "join", mechanism: "sandomEdge" }],
+].map(([part, record]) => [referenceConstant(`SVG_PART_${part}`), Object.freeze(record)])));
 
 /**
  * Exact coverage of SVG fills and strokes, and the envelope around it
@@ -305,68 +345,45 @@ export const SVG_STROKE_PARTS = Object.freeze(new Map([
  * is flattened, and after a stroke is constructed in user units. An
  * optional label names the path in errors. Paths composite in order with
  * source-over coverage.
+ *
+ * A path may instead be a glyph, `{ glyph: { verbs, fieldKey }, transform,
+ * label }`: a glyph outline's verbs (glyphOutline() of src/shaping.js, font
+ * units, y-up) with the transform from font units to raster pixels, and
+ * for an envelope the key of its distance field (`msdfSize`,
+ * `minimumUnitsPerTexel`, as the text reference's glyph placement gives
+ * it). It takes the glyph coverage and the glyph envelope of the text
+ * reference, field ridge included, so SVG text fills composite with SVG
+ * paths in one raster.
  */
 export function createSvgReference() {
   const exports = instantiate({}).exports;
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
+  const check = createTextInkCheck();
   const subject = "SVG reference";
 
   function pathError(status, bytes, label) {
     const offset = exports.path_error_offset();
-    const byte = exports.path_error_byte();
-    const found = byte < 0
-      ? "the end of the path data"
-      : byte > 0x20 && byte < 0x7F ? `"${String.fromCharCode(byte)}"` : `byte 0x${byte.toString(16).padStart(2, "0")}`;
-    const near = JSON.stringify(decoder.decode(bytes.subarray(Math.max(0, offset - 16), offset + 16)));
-    if (status === -12) {
-      return new Error(
-        `${subject}: ${label} uses the path command ${found} at byte ${offset} (near ${near}), which the reference does not read; ` +
-          `it reads ${SVG_PATH_COMMANDS}, absolute or relative: rewrite that segment with these commands`,
-      );
-    }
-    if (status === -13) {
-      return new Error(
-        `${subject}: ${label} has malformed path data at byte ${offset}, at ${found} (near ${near}); ` +
-          "give each command the arguments it takes, as SVG path grammar numbers and arc flags",
-      );
-    }
-    if (status === -14) {
-      return new Error(`${subject}: ${label} path data begins with ${found}, not a moveto; begin it with M or m`);
-    }
-    if (status === -16) {
-      return new Error(
-        `${subject}: ${label} strokes a curve with a cusp, where the stroke's normal is undefined; ` +
-          "split the curve at the cusp into two segments",
-      );
-    }
-    if (status === -18) {
-      return new Error(`${subject}: ${label} needs more than 1400 points in one stroke region or 1000000 dash steps; shorten the dash pattern relative to the path`);
-    }
-    if (status === -19) {
-      return new Error(`${subject}: ${label} strokes more than 512 subpaths; split it into several paths`);
-    }
-    return statusError(status, label, subject);
+    check.svg_path_error_window(offset);
+    const [start, end] = new Uint32Array(check.memory.buffer, check.output_base(), 2);
+    const near = JSON.stringify(decoder.decode(bytes.subarray(start, end)));
+    return checkError(check, check.svg_path_error(status, exports.path_error_byte(), offset), subject, label, near);
   }
 
   function strokeArguments(stroke, label) {
     const { width, linecap = "butt", linejoin = "miter", miterlimit = 4, dasharray = [], dashoffset = 0 } = stroke;
-    if (!(Number.isFinite(width) && width > 0)) {
-      throw new TypeError(`${subject}: ${label} has the stroke width ${width}; give a positive finite user length (a zero width paints no stroke: omit the stroke)`);
-    }
-    const cap = SVG_LINECAPS.get(linecap);
-    if (cap === undefined) throw new TypeError(`${subject}: ${label} has the linecap ${JSON.stringify(linecap)}; give butt, round, or square`);
-    const join = SVG_LINEJOINS.get(linejoin);
-    if (join === undefined) {
-      throw new TypeError(`${subject}: ${label} has the linejoin ${JSON.stringify(linejoin)}; the reference constructs miter, round, and bevel joins`);
-    }
-    if (!(Number.isFinite(miterlimit) && miterlimit >= 0)) {
-      throw new TypeError(`${subject}: ${label} has the miter limit ${miterlimit}; give a non-negative finite number`);
-    }
-    if (!Array.isArray(dasharray) || dasharray.length > SVG_MAX_DASHES || !dasharray.every((value) => Number.isFinite(value) && value >= 0)) {
-      throw new TypeError(`${subject}: ${label} has the dash array ${JSON.stringify(dasharray)}; give at most ${SVG_MAX_DASHES} non-negative finite user lengths`);
-    }
-    if (!Number.isFinite(dashoffset)) throw new TypeError(`${subject}: ${label} has the dash offset ${dashoffset}; give a finite user length`);
+    const [capLength, joinLength] = writeKeywords(check, linecap, linejoin);
+    const dashes = Array.isArray(dasharray) && dasharray.length <= 256 ? dasharray : [];
+    new Float64Array(check.memory.buffer, check.dash_input(), dashes.length)
+      .set(dashes.map((value) => typeof value === "number" ? value : NaN));
+    throwCheck(
+      check,
+      check.svg_stroke_check(
+        typeof width === "number" ? width : NaN, capLength, joinLength, typeof miterlimit === "number" ? miterlimit : NaN,
+        Array.isArray(dasharray) ? 1 : 0, Array.isArray(dasharray) ? dasharray.length : 0,
+        typeof dashoffset === "number" ? dashoffset : NaN,
+      ),
+      subject, label, width, JSON.stringify(linecap), JSON.stringify(linejoin), miterlimit, JSON.stringify(dasharray), dashoffset,
+    );
+    const [cap, join] = new Int32Array(check.memory.buffer, check.output_base(), 2);
     new Float64Array(exports.memory.buffer, exports.stroke_dash_buffer(), dasharray.length).set(dasharray);
     return [width, cap, join, miterlimit, dasharray.length, dashoffset];
   }
@@ -378,12 +395,12 @@ export function createSvgReference() {
     const edgeBase = exports.edge_base(), edgeStride = exports.edge_stride();
     for (let index = 0; index < exports.edge_count(); index++) {
       const at = edgeBase + index * edgeStride;
-      const part = view.getInt32(at + 36, true);
+      const part = view.getInt32(at + EDGE.PART, true);
       if (part === 0) continue;
       edges.push({
-        x0: view.getFloat64(at, true), y0: view.getFloat64(at + 8, true),
-        x1: view.getFloat64(at + 16, true), y1: view.getFloat64(at + 24, true),
-        part, radius: view.getFloat64(at + 40, true),
+        x0: view.getFloat64(at + EDGE.X0, true), y0: view.getFloat64(at + EDGE.Y0, true),
+        x1: view.getFloat64(at + EDGE.X1, true), y1: view.getFloat64(at + EDGE.Y1, true),
+        part, radius: view.getFloat64(at + EDGE.RADIUS, true),
       });
     }
     const vertices = [];
@@ -391,32 +408,57 @@ export function createSvgReference() {
     for (let index = 0; index < exports.vertex_count(); index++) {
       const at = vertexBase + index * vertexStride;
       vertices.push({
-        x: view.getFloat64(at, true), y: view.getFloat64(at + 8, true),
-        reach: view.getFloat64(at + 48, true), outer: view.getInt32(at + 56, true) === 1,
+        x: view.getFloat64(at + VERTEX.X, true), y: view.getFloat64(at + VERTEX.Y, true),
+        reach: view.getFloat64(at + VERTEX.REACH, true), outer: view.getInt32(at + VERTEX.OUTER, true) === 1,
       });
     }
     return { label, edges, vertices };
   }
 
+  function addGlyph(path, label, chordTolerance, envelope) {
+    const { transform, glyph } = path;
+    const values = Array.isArray(transform) && transform.length === 6 ? transform : [];
+    if (values.length !== 6 || !values.every(Number.isFinite) || !(glyph.verbs instanceof Uint8Array) ||
+      (envelope && !(Number.isFinite(glyph.fieldKey?.msdfSize) && Number.isFinite(glyph.fieldKey?.minimumUnitsPerTexel)))) {
+      throw new TypeError(`${subject}: the glyph ${label} needs a transform of six finite numbers, its verbs and, for an envelope, its field key`);
+    }
+    const pointer = exports.reference_verb_buffer(glyph.verbs.length);
+    if (pointer === 0) throw statusError(check, STATUS_TABLE.reference, STATUS_ALLOCATION_FAILED, label, subject);
+    new Uint8Array(exports.memory.buffer, pointer, glyph.verbs.length).set(glyph.verbs);
+    const added = envelope
+      ? exports.envelope_add_glyph(glyph.verbs.length, ...transform, chordTolerance, glyph.fieldKey.msdfSize, glyph.fieldKey.minimumUnitsPerTexel)
+      : exports.reference_add_glyph(glyph.verbs.length, ...transform, chordTolerance);
+    if (added < 0) throw statusError(check, STATUS_TABLE.reference, added, label, subject);
+  }
+
   function addPaths(paths, chordTolerance, envelope) {
-    if (!Array.isArray(paths)) throw new TypeError(`${subject}: paths must be an array of { d, transform, fillRule } or { d, transform, stroke }`);
+    throwCheck(check, Array.isArray(paths) ? 0 : TEMPLATE_PATHS_NOT_ARRAY, subject);
     const outlines = [];
     paths.forEach((path, index) => {
       const label = path.label ?? `path ${index}`;
-      if (typeof path.d !== "string") throw new TypeError(`${subject}: ${label} has no path data string`);
+      if (path.glyph !== undefined) {
+        addGlyph(path, label, chordTolerance, envelope);
+        if (envelope) outlines.push(strokeOutline(label));
+        return;
+      }
       const { transform } = path;
-      if (!Array.isArray(transform) || transform.length !== 6 || !transform.every(Number.isFinite)) {
-        throw new TypeError(`${subject}: ${label} needs a transform of six finite numbers [a, b, c, d, e, f], got ${JSON.stringify(transform)}`);
-      }
-      if ((path.stroke === undefined) === (path.fillRule === undefined)) {
-        throw new TypeError(`${subject}: ${label} needs exactly one of fillRule (a fill) and stroke (a stroke)`);
-      }
+      const values = Array.isArray(transform) && transform.length === 6
+        ? transform.map((value) => typeof value === "number" ? value : NaN)
+        : [NaN, NaN, NaN, NaN, NaN, NaN];
+      throwCheck(
+        check,
+        check.svg_path_check(
+          typeof path.d === "string" ? 1 : 0, Array.isArray(transform) ? 1 : 0, Array.isArray(transform) ? transform.length : 0,
+          ...values, path.stroke !== undefined ? 1 : 0, path.fillRule !== undefined ? 1 : 0,
+        ),
+        subject, label, JSON.stringify(transform),
+      );
       const bytes = encoder.encode(path.d);
       let added;
       if (path.stroke !== undefined) {
         const stroke = strokeArguments(path.stroke, label);
         const pointer = exports.reference_verb_buffer(bytes.length);
-        if (pointer === 0) throw statusError(-2, label, subject);
+        if (pointer === 0) throw statusError(check, STATUS_TABLE.reference, STATUS_ALLOCATION_FAILED, label, subject);
         new Uint8Array(exports.memory.buffer, pointer, bytes.length).set(bytes);
         added = (envelope ? exports.envelope_add_stroke : exports.reference_add_stroke)(
           bytes.length, ...transform, chordTolerance, ...stroke,
@@ -424,12 +466,11 @@ export function createSvgReference() {
         if (added < 0) throw pathError(added, bytes, label);
         if (envelope) outlines.push(strokeOutline(label));
       } else {
-        const rule = SVG_FILL_RULES.get(path.fillRule);
-        if (rule === undefined) {
-          throw new TypeError(`${subject}: ${label} has the fill rule ${JSON.stringify(path.fillRule)}; give "nonzero" or "evenodd"`);
-        }
+        const [ruleLength] = writeKeywords(check, path.fillRule);
+        const rule = check.svg_fill_rule(ruleLength);
+        throwCheck(check, rule < 0 ? -rule : 0, subject, label, JSON.stringify(path.fillRule));
         const pointer = exports.reference_verb_buffer(bytes.length);
-        if (pointer === 0) throw statusError(-2, label, subject);
+        if (pointer === 0) throw statusError(check, STATUS_TABLE.reference, STATUS_ALLOCATION_FAILED, label, subject);
         new Uint8Array(exports.memory.buffer, pointer, bytes.length).set(bytes);
         added = (envelope ? exports.envelope_add_path : exports.reference_add_path)(bytes.length, ...transform, chordTolerance, rule);
         if (added < 0) throw pathError(added, bytes, label);
@@ -450,7 +491,7 @@ export function createSvgReference() {
    * @returns {{width: number, height: number, coverage: Float32Array}}
    */
   function render({ width, height, paths, chordTolerance = REFERENCE_CHORD_TOLERANCE_PIXELS }) {
-    beginRaster(exports, width, height, subject);
+    beginRaster(exports, check, width, height, subject);
     addPaths(paths, chordTolerance, false);
     return { width, height, coverage: raster(exports, exports.raster_base(), width, height) };
   }
@@ -468,8 +509,8 @@ export function createSvgReference() {
    *   chords (2)
    */
   function envelope({ width, height, paths, mechanisms, chordTolerance = REFERENCE_CHORD_TOLERANCE_PIXELS }) {
-    beginRaster(exports, width, height, subject);
-    configureEnvelope(exports, mechanisms, subject);
+    beginRaster(exports, check, width, height, subject);
+    configureEnvelope(exports, check, mechanisms, subject);
     const outlines = addPaths(paths, chordTolerance, true);
     return {
       width,
@@ -486,7 +527,7 @@ export function createSvgReference() {
    * transform.
    */
   function bounds({ d, transform, label = "path", stroke = undefined, chordTolerance = REFERENCE_CHORD_TOLERANCE_PIXELS }) {
-    beginRaster(exports, 1, 1, subject);
+    beginRaster(exports, check, 1, 1, subject);
     addPaths([stroke === undefined ? { d, transform, fillRule: "nonzero", label } : { d, transform, stroke, label }], chordTolerance, false);
     const values = new Float64Array(exports.memory.buffer, exports.outline_bounds(), 4);
     return [values[0], values[1], values[2] - values[0], values[3] - values[1]];
@@ -494,10 +535,6 @@ export function createSvgReference() {
 
   return Object.freeze({ render, envelope, bounds, exports });
 }
-
-// Gradient kinds and spread methods as paint_gradient numbers them.
-const GRADIENT_KINDS = new Map([["linear", 1], ["radial", 2]]);
-const GRADIENT_SPREADS = new Map([["pad", 0], ["reflect", 1], ["repeat", 2]]);
 
 /** Judge program operations (paint_judge). */
 export const PAINT_OPERATIONS = Object.freeze({ layer: 1, open: 2, close: 3 });
@@ -517,31 +554,28 @@ export const PAINT_VERDICTS = Object.freeze({
  */
 export function createSvgPaintReference() {
   const exports = instantiate({}).exports;
+  const check = createTextInkCheck();
   const subject = "SVG paint reference";
 
   function checked(status, what) {
-    if (status < 0) {
-      if (status === -20) throw new Error(`${subject}: ${what} has a singular radial gradient transform`);
-      throw statusError(status, what, subject);
-    }
+    if (status < 0) throw statusError(check, STATUS_TABLE.paint, status, what, subject);
     return status;
   }
 
   function alloc(bytes, what) {
     const pointer = exports.paint_alloc(bytes);
-    if (pointer === 0) throw statusError(-2, what, subject);
+    if (pointer === 0) throw statusError(check, STATUS_TABLE.paint, STATUS_ALLOCATION_FAILED, what, subject);
     return pointer;
   }
 
   /** A zeroed plane over `rect`, filled from `data` (Float32Array) when given. */
   function plane(rect, data = null) {
     const { x, y, width, height } = rect;
-    if (![x, y, width, height].every(Number.isInteger) || width < 1 || height < 1) {
-      throw new RangeError(`${subject}: a plane needs an integer rectangle of at least one pixel, got ${JSON.stringify(rect)}`);
-    }
+    const number = (value) => typeof value === "number" ? value : NaN;
+    throwCheck(check, check.svg_plane_check(number(x), number(y), number(width), number(height)), subject, "", JSON.stringify(rect));
     const pointer = alloc(width * height * 4, `a ${width}x${height} plane`);
     if (data !== null) {
-      if (data.length !== width * height) throw new RangeError(`${subject}: plane data holds ${data.length} values for ${width}x${height}`);
+      throwCheck(check, check.svg_plane_data_check(data.length, width, height), subject, "", data.length, width, height);
       new Float32Array(exports.memory.buffer, pointer, data.length).set(data);
     }
     return { x, y, width, height, pointer };
@@ -563,12 +597,12 @@ export function createSvgPaintReference() {
    * coverage bounds (`{ lo, hi }` planes on `rect`) and paint alphas.
    */
   function sourceAlpha(layers, rect) {
-    const table = alloc(layers.length * 16, "the source layer table");
+    const table = alloc(layers.length * LAYER.SIZE, "the source layer table");
     const view = new DataView(exports.memory.buffer);
     layers.forEach(({ lo, hi, alpha }, index) => {
-      view.setInt32(table + index * 16, lo.pointer, true);
-      view.setInt32(table + index * 16 + 4, hi.pointer, true);
-      view.setFloat64(table + index * 16 + 8, alpha, true);
+      view.setInt32(table + index * LAYER.SIZE + LAYER.LOWER, lo.pointer, true);
+      view.setInt32(table + index * LAYER.SIZE + LAYER.UPPER, hi.pointer, true);
+      view.setFloat64(table + index * LAYER.SIZE + LAYER.ALPHA, alpha, true);
     });
     const lo = plane(rect), hi = plane(rect);
     exports.paint_source_alpha(table, layers.length, rect.width * rect.height, lo.pointer, hi.pointer);
@@ -629,7 +663,7 @@ export function createSvgPaintReference() {
 
   function boxGaussianDistance(sigmaX, sigmaY, boxFactor) {
     const distance = exports.paint_box_gaussian_distance(sigmaX, sigmaY, boxFactor);
-    if (distance < 0) throw statusError(-2, "the box and Gaussian kernels", subject);
+    if (distance < 0) throw statusError(check, STATUS_TABLE.paint, STATUS_ALLOCATION_FAILED, "the box and Gaussian kernels", subject);
     return distance;
   }
 
@@ -642,10 +676,13 @@ export function createSvgPaintReference() {
    * address of 12 f32 per pixel.
    */
   function gradient({ kind, spread, stops, matrix, label }, width, height) {
-    const kindNumber = GRADIENT_KINDS.get(kind), spreadNumber = GRADIENT_SPREADS.get(spread);
-    if (kindNumber === undefined || spreadNumber === undefined || stops.length < 1 || matrix.length !== 6 || !matrix.every(Number.isFinite)) {
-      throw new TypeError(`${subject}: ${label} is not a linear or radial gradient with pad, reflect or repeat, stops and a finite matrix`);
-    }
+    const [kindLength, spreadLength] = writeKeywords(check, kind, spread);
+    const matrixValues = Array.isArray(matrix) && matrix.length === 6
+      ? matrix.map((value) => typeof value === "number" ? value : NaN)
+      : [NaN, NaN, NaN, NaN, NaN, NaN];
+    throwCheck(check, check.svg_gradient_check(kindLength, spreadLength, stops?.length ?? NaN, matrix?.length ?? NaN, ...matrixValues),
+      subject, label);
+    const [kindNumber, spreadNumber] = new Int32Array(check.memory.buffer, check.output_base(), 2);
     const table = alloc(stops.length * 32, "the gradient stops");
     const values = new Float64Array(exports.memory.buffer, table, stops.length * 4);
     stops.forEach(({ offset, rgb }, index) => values.set([offset, ...rgb], index * 4));

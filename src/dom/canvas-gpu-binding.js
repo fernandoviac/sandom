@@ -10,18 +10,51 @@ import { createGpuBinding } from '../gpu-binding.js';
 import { canvasUnpremultiplyTable } from '../canvas-unpremultiply.js';
 import { composeShaderBytes, shaderLibraryFor } from '../shaders/compose.js';
 import { GlyphResourceManager } from '../glyph-resource-manager.js';
-import { imageUploadRepresentation, sourceConversionPlan } from '../image-data.js';
-import { loadColorKernel } from '../wasm/color-kernel.js';
-import { canvasGamutRows } from './canvas-2d-color-space.js';
+import { imageUploadRepresentation } from '../image-data.js';
+import { imageConversionUniform } from '../image-conversion.js';
 import { gpuThreadQueueDevice, setGpuThreadExternalImageCopy } from './webgpu-facade.js';
+import { layoutConstant, moduleLayoutConstants } from '../wasm/layout-table.js';
+import * as canvas2dBinary from '../wasm/canvas-2d-binary.js';
+
+const CANVAS_COPY_KIND = Object.freeze(Object.fromEntries(['FRAME', 'BITMAP', 'IMAGE_DATA']
+  .map((name) => [name, layoutConstant(`CANVAS_COPY_KIND_${name}`)])));
+const CANVAS_COPY_STATUS = Object.freeze(Object.fromEntries(['TAINTED', 'OUTSIDE', 'EMPTY']
+  .map((name) => [name, layoutConstant(`CANVAS_COPY_STATUS_${name}`)])));
+const CANVAS_FORMAT_RGBA8UNORM = layoutConstant('CANVAS_FORMAT_RGBA8UNORM');
+const CANVAS_FORMAT_RGBA16FLOAT = layoutConstant('CANVAS_FORMAT_RGBA16FLOAT');
+// The Canvas flush, copy and readback records (gpu-canvas-flush, -copy and
+// -readback watparts), keyed by their name without the CANVAS_ prefix.
+const CANVAS = Object.freeze(Object.fromEntries([
+  'FLUSH_SIZE', 'FLUSH_TARGET', 'FLUSH_WIDTH', 'FLUSH_HEIGHT', 'FLUSH_OPAQUE', 'FLUSH_FORMAT', 'FLUSH_CLEAR',
+  'FLUSH_LIST_COUNT', 'FLUSH_LISTS', 'FLUSH_OBSERVE', 'FLUSH_STATUS', 'FLUSH_JOB_LOG', 'FLUSH_JOB_LOG_LENGTH',
+  'LIST_SIZE', 'LIST_SPANS', 'LIST_SOURCES', 'LIST_SOURCE_COUNT', 'LIST_PAYLOADS', 'LIST_PAYLOAD_COUNT',
+  'LIST_GLYPH_RUNS', 'LIST_GLYPH_RUN_COUNT', 'LIST_GLYPHS', 'LIST_FORMAT', 'LIST_WIDTH', 'LIST_HEIGHT',
+  'LIST_OPAQUE', 'LIST_PERSISTENT', 'LIST_KEPT_TEXTURE', 'LIST_COMPOSITED', 'LIST_TEXTURE',
+  'SPAN_SIZE', 'SPAN_POINTER', 'SPAN_LENGTH',
+  'SOURCE_SIZE', 'SOURCE_KIND', 'SOURCE_VALUE', 'SOURCE_KIND_TEXTURE', 'SOURCE_KIND_LIST',
+  'PAYLOAD_SIZE', 'PAYLOAD_BYTES', 'PAYLOAD_LENGTH', 'PAYLOAD_WIDTH', 'PAYLOAD_HEIGHT', 'PAYLOAD_FORMAT',
+  'GLYPH_RUN_SIZE', 'GLYPH_RUN_COMMAND', 'GLYPH_RUN_ATLAS', 'GLYPH_RUN_FIRST', 'GLYPH_RUN_UNITS_PER_EM',
+  'GLYPH_SIZE', 'GLYPH_PRESENT', 'GLYPH_WIDTH', 'GLYPH_HEIGHT', 'GLYPH_U', 'GLYPH_V', 'GLYPH_U_WIDTH',
+  'GLYPH_V_HEIGHT', 'GLYPH_BOX_X_MINIMUM', 'GLYPH_BOX_Y_MINIMUM', 'GLYPH_BOX_X_MAXIMUM', 'GLYPH_BOX_Y_MAXIMUM',
+  'JOB_LOG_LIST', 'JOB_LOG_WIDTH', 'JOB_LOG_HEIGHT', 'JOB_LOG_MULTISAMPLED', 'JOB_LOG_COUNT', 'JOB_LOG_COMMANDS',
+  'COPY_SIZE', 'COPY_SOURCE', 'COPY_TARGET', 'COPY_FORMAT', 'COPY_WIDTH', 'COPY_HEIGHT', 'COPY_SOURCE_X',
+  'COPY_SOURCE_Y', 'COPY_TARGET_X', 'COPY_TARGET_Y', 'COPY_FLIP', 'COPY_SOURCE_KIND', 'COPY_SOURCE_SPACE',
+  'COPY_TARGET_SPACE', 'COPY_SOURCE_OPAQUE', 'COPY_TARGET_PREMULTIPLIED', 'COPY_TARGET_USAGE', 'COPY_UPLOAD',
+  'COPY_UPLOAD_LENGTH', 'COPY_UPLOAD_FORMAT', 'COPY_IMAGE_WIDTH', 'COPY_IMAGE_HEIGHT', 'COPY_ORIGIN_CLEAN',
+  'COPY_DEPTH', 'READBACK_BYTES',
+  'IMAGE_INPUT_SIZE', 'IMAGE_INPUT_WIDTH', 'IMAGE_INPUT_HEIGHT', 'IMAGE_INPUT_FORMAT', 'IMAGE_INPUT_SAMPLE_KIND',
+  'IMAGE_INPUT_UPLOAD', 'IMAGE_INPUT_UPLOAD_LENGTH', 'IMAGE_INPUT_ROW_BYTES', 'IMAGE_INPUT_UNIFORM', 'IMAGE_UNIFORM_SIZE',
+  'ENCODE_SIZE', 'ENCODE_PIXELS', 'ENCODE_LENGTH', 'ENCODE_BIT_DEPTH', 'ENCODE_CHANNELS',
+].map((name) => [name, layoutConstant(`CANVAS_${name}`)])));
 
 const formats = ['rgba8unorm', 'rgba16float', 'rgba16uint', 'rgba32float',
   'r8unorm', 'r8uint', 'depth24plus-stencil8', 'bgra8unorm', 'rgba8unorm-srgb', 'bgra8unorm-srgb'];
 const bindings = new WeakMap();
 let canvasCore;
 
-// The record size of src/wasm/canvas-2d.wat.
-export const COMMAND_SIZE = 128;
+// The record size of a Canvas 2D command (canvas-2d-core.watpart).
+const canvasConstant = moduleLayoutConstants(canvas2dBinary, 'canvas 2d');
+export const COMMAND_SIZE = canvasConstant('COMMAND_SIZE');
 // The bitmap format of each Canvas 2D colorType.
 export const BITMAP_FORMAT = 'rgba8unorm';
 export const BITMAP_FORMATS = Object.freeze({ unorm8: BITMAP_FORMAT, float16: 'rgba16float' });
@@ -35,11 +68,27 @@ export function bytesPerPixel(format) {
 
 function bitmapFormat(format) {
   bytesPerPixel(format);
-  return format === 'rgba16float' ? 1 : 0;
+  return format === 'rgba16float' ? CANVAS_FORMAT_RGBA16FLOAT : CANVAS_FORMAT_RGBA8UNORM;
 }
 
 function executionCore() {
   return canvasCore ??= instantiateRendererCore().exports;
+}
+
+const CANVAS_SPACES = new Map([['srgb', 0], ['display-p3', 1]]);
+
+// The matrix, by rows, from linear `source` to linear `destination`, both
+// canvas color spaces (canvas_gamut_rows: Skia's matrix through XYZ D50).
+export function canvasGamutRows(source, destination) {
+  const from = CANVAS_SPACES.get(source);
+  const to = CANVAS_SPACES.get(destination);
+  if (from === undefined || to === undefined) {
+    throw new Error(`Canvas 2D color space conversion from ${source} to ${destination}: expected "srgb" or "display-p3"`);
+  }
+  const core = executionCore();
+  if (core.canvas_gamut_rows(from, to) !== 1) throw new Error('canvas_gamut_rows failed');
+  const entries = new Float64Array(core.memory.buffer, core.abi_output_pointer(), 9);
+  return [0, 3, 6].map((start) => Array.from(entries.subarray(start, start + 3)));
 }
 
 function bindingFor(device) {
@@ -103,34 +152,7 @@ export function copyBitmapTexture(device, texture, width, height) {
 
 // ------------------------------------------------------ decoded images
 
-const { linearRgbToWorkingMatrix } = loadColorKernel();
 const imageTextures = new WeakMap();
-
-// The source-convert uniforms that bring `descriptor` into a bitmap of
-// `colorSpace`: the standard plan (sRGB-encoded output, premultiplied in
-// float) with its matrix replaced by the one into the bitmap's primaries.
-function conversionUniforms(descriptor, colorSpace) {
-  const plan = sourceConversionPlan(descriptor, 'standard');
-  const uniforms = new Float32Array(20);
-  uniforms.set(plan.matrix, 0);
-  const primaries = descriptor.colorEncoding.primaries;
-  if (primaries !== colorSpace) {
-    const rows = primaries === 'srgb' || primaries === 'display-p3'
-      ? canvasGamutRows(primaries, colorSpace)
-      : linearRgbToWorkingMatrix(primaries, colorSpace);
-    for (let row = 0; row < 3; row++) {
-      for (let column = 0; column < 3; column++) uniforms[row * 4 + column] = rows[row][column];
-    }
-  }
-  uniforms[12] = plan.transferId;
-  uniforms[13] = plan.gammaExponent;
-  uniforms[14] = plan.linearScale;
-  uniforms[15] = plan.encodeSrgbOutput;
-  uniforms[16] = plan.alphaSourceMode;
-  uniforms[17] = plan.sourceScale;
-  uniforms[18] = descriptor.sampleType === 'float16' && descriptor.canvasToneMapping === 'standard' ? 1 : 0;
-  return uniforms;
-}
 
 // The bitmap of a renderer image entry { width, height, descriptor } on
 // `device` in `colorSpace`. The renderer's single decode uploads once per
@@ -151,15 +173,26 @@ export function decodedImageTexture(device, image, colorSpace = 'srgb') {
   const { descriptor, width, height } = image;
   const upload = imageUploadRepresentation(descriptor);
   const bytes = new Uint8Array(upload.data.buffer, upload.data.byteOffset, upload.data.byteLength);
-  const uniforms = conversionUniforms(descriptor, colorSpace);
+  // The standard uniform (sRGB-encoded output, premultiplied in float)
+  // with the matrix into the bitmap's primaries.
+  const uniforms = imageConversionUniform(descriptor, 'standard', colorSpace);
   const { core, gpu, imageState } = bindingFor(device);
   gpu.beginFrame();
-  const input = gpu.input(112 + bytes.length);
-  const words = new Uint32Array(core.memory.buffer, input.byteOffset, 8);
-  words.set([width, height, formats.indexOf(upload.format), upload.sampleKind === 'uint' ? 1 : 0,
-    input.byteOffset + 112, bytes.length, upload.bytesPerRow, input.byteOffset + 32]);
-  new Float32Array(core.memory.buffer, input.byteOffset + 32, 20).set(uniforms);
-  new Uint8Array(core.memory.buffer, input.byteOffset + 112, bytes.length).set(bytes);
+  const uniformAt = CANVAS.IMAGE_INPUT_SIZE;
+  const uploadAt = uniformAt + CANVAS.IMAGE_UNIFORM_SIZE;
+  const input = gpu.input(uploadAt + bytes.length);
+  const view = new DataView(core.memory.buffer, input.byteOffset, CANVAS.IMAGE_INPUT_SIZE);
+  view.setUint32(CANVAS.IMAGE_INPUT_WIDTH, width, true);
+  view.setUint32(CANVAS.IMAGE_INPUT_HEIGHT, height, true);
+  view.setUint32(CANVAS.IMAGE_INPUT_FORMAT, formats.indexOf(upload.format), true);
+  view.setUint32(CANVAS.IMAGE_INPUT_SAMPLE_KIND, upload.sampleKind === 'uint' ? 1 : 0, true);
+  view.setUint32(CANVAS.IMAGE_INPUT_UPLOAD, input.byteOffset + uploadAt, true);
+  view.setUint32(CANVAS.IMAGE_INPUT_UPLOAD_LENGTH, bytes.length, true);
+  view.setUint32(CANVAS.IMAGE_INPUT_ROW_BYTES, upload.bytesPerRow, true);
+  view.setUint32(CANVAS.IMAGE_INPUT_UNIFORM, input.byteOffset + uniformAt, true);
+  new Float32Array(core.memory.buffer, input.byteOffset + uniformAt, CANVAS.IMAGE_UNIFORM_SIZE / Float32Array.BYTES_PER_ELEMENT)
+    .set(uniforms);
+  new Uint8Array(core.memory.buffer, input.byteOffset + uploadAt, bytes.length).set(bytes);
   const handle = core.gpu_canvas_image_convert(imageState, input.byteOffset);
   gpu.execute();
   texture = gpu.resource(handle);
@@ -195,7 +228,10 @@ function textureOnDevice(device, source) {
 // Canvas has a CPU-only manager, so a synchronous flush never waits for a
 // GPU generation callback on the script thread.
 let canvasGlyphManager = null;
-const GLYPH_RUN = 12;
+// The glyph run command of canvas-2d-glyphs.watpart, by WAT name.
+const GLYPH_RUN = Object.freeze(Object.fromEntries(["KIND", "FIRST", "MAXIMUM_SCALE", "COUNT", "FONT", "FONT_SIZE"]
+  .map((name) => [name, canvasConstant(`GLYPH_RUN_${name}`)])));
+const COMMAND_KIND = canvasConstant("COMMAND_KIND");
 
 // The glyph runs of each list, with the atlas glyph records that
 // renderer-core places as instances. Returns { runs: Map(list -> run
@@ -206,11 +242,13 @@ function prepareGlyphs(lists, device) {
   const requestIndices = new Map();
   for (const list of lists) {
     const view = new DataView(list.bytes.buffer, list.bytes.byteOffset, list.bytes.byteLength);
-    const floats = new Float32Array(list.geometry.buffer, list.geometry.byteOffset, list.geometry.byteLength / 4);
+    const floats = new Float32Array(list.geometry.buffer, list.geometry.byteOffset,
+      list.geometry.byteLength / Float32Array.BYTES_PER_ELEMENT);
     for (let offset = 0; offset < list.bytes.length; offset += COMMAND_SIZE) {
-      if (view.getUint32(offset, true) !== GLYPH_RUN) continue;
-      const font = list.fonts[view.getUint32(offset + 68, true)];
-      const devicePixelSize = view.getFloat32(offset + 72, true) * view.getFloat32(offset + 56, true);
+      if (view.getUint32(offset + COMMAND_KIND, true) !== GLYPH_RUN.KIND) continue;
+      const font = list.fonts[view.getUint32(offset + GLYPH_RUN.FONT, true)];
+      const devicePixelSize = view.getFloat32(offset + GLYPH_RUN.FONT_SIZE, true) *
+        view.getFloat32(offset + GLYPH_RUN.MAXIMUM_SCALE, true);
       let bySize = requestIndices.get(font);
       if (bySize === undefined) {
         bySize = new Map();
@@ -226,8 +264,8 @@ function prepareGlyphs(lists, device) {
           devicePixelSize,
         });
       }
-      const first = view.getUint32(offset + 4, true);
-      const count = view.getUint32(offset + 64, true);
+      const first = view.getUint32(offset + GLYPH_RUN.FIRST, true);
+      const count = view.getUint32(offset + GLYPH_RUN.COUNT, true);
       const glyphs = [];
       for (let glyph = 0; glyph < count; glyph++) {
         const id = floats[(first + glyph * 2 + 1) * 2];
@@ -270,7 +308,6 @@ export function observeCommandLists(observer) {
   commandListObserver = observer;
 }
 
-const LIST_SIZE = 160;
 const align = (value) => (value + 7) & ~7;
 
 // Draws `list` into `target` ({ texture, width, height, opaque,
@@ -305,117 +342,129 @@ export function rasterizeCommands(device, target, list, clear) {
   let input = 0;
   try {
     gpu.beginFrame();
-    let length = 48 + entries.length * LIST_SIZE;
+    let length = CANVAS.FLUSH_SIZE + entries.length * CANVAS.LIST_SIZE;
     for (const entry of entries) {
       const { list: commands } = entry;
       entry.runs = glyphs?.runs.get(commands) ?? [];
       const glyphCount = entry.runs.reduce((sum, run) => sum + run.infos.length, 0);
       length += align(commands.bytes.length) + align(commands.geometry.length) + align(commands.clips.length) +
         align(commands.masks.length) + align(commands.maskGeometry.length) + align(commands.paints.length) +
-        align(commands.sources.length * 8) + align(commands.payloads.length * 20) +
+        align(commands.sources.length * CANVAS.SOURCE_SIZE) + align(commands.payloads.length * CANVAS.PAYLOAD_SIZE) +
         commands.payloads.reduce((sum, payload) => sum + align(payload.bytes.byteLength), 0) +
-        entry.runs.length * 24 + glyphCount * 96;
+        entry.runs.length * CANVAS.GLYPH_RUN_SIZE + glyphCount * CANVAS.GLYPH_SIZE;
     }
-    input = core.abi_allocate(length);
+    // A retained block: the finally below frees it. A transient abi_allocate
+    // block would also be freed at the next DOM core operation.
+    input = core.abi_malloc(length);
+    if (input === 0) throw new Error(`renderer-core could not allocate ${length} bytes of Canvas input`);
     const memory = new Uint8Array(core.memory.buffer);
     const view = new DataView(core.memory.buffer);
     memory.fill(0, input, input + length);
-    let cursor = input + 48 + entries.length * LIST_SIZE;
+    let cursor = input + CANVAS.FLUSH_SIZE + entries.length * CANVAS.LIST_SIZE;
     const place = (bytes) => {
       const at = cursor;
       memory.set(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength), at);
       cursor += align(bytes.byteLength);
       return [at, bytes.byteLength];
     };
-    view.setUint32(input, gpu.importResource(target.texture), true);
-    view.setUint32(input + 4, target.width, true);
-    view.setUint32(input + 8, target.height, true);
-    view.setUint32(input + 12, target.opaque ? 1 : 0, true);
-    view.setUint32(input + 16, bitmapFormat(target.texture.format), true);
-    view.setUint32(input + 20, clear ? 1 : 0, true);
-    view.setUint32(input + 24, entries.length, true);
-    view.setUint32(input + 28, input + 48, true);
-    view.setUint32(input + 32, commandListObserver === null ? 0 : 1, true);
+    view.setUint32(input + CANVAS.FLUSH_TARGET, gpu.importResource(target.texture), true);
+    view.setUint32(input + CANVAS.FLUSH_WIDTH, target.width, true);
+    view.setUint32(input + CANVAS.FLUSH_HEIGHT, target.height, true);
+    view.setUint32(input + CANVAS.FLUSH_OPAQUE, target.opaque ? 1 : 0, true);
+    view.setUint32(input + CANVAS.FLUSH_FORMAT, bitmapFormat(target.texture.format), true);
+    view.setUint32(input + CANVAS.FLUSH_CLEAR, clear ? 1 : 0, true);
+    view.setUint32(input + CANVAS.FLUSH_LIST_COUNT, entries.length, true);
+    view.setUint32(input + CANVAS.FLUSH_LISTS, input + CANVAS.FLUSH_SIZE, true);
+    view.setUint32(input + CANVAS.FLUSH_OBSERVE, commandListObserver === null ? 0 : 1, true);
     entries.forEach((entry, index) => {
-      const at = input + 48 + index * LIST_SIZE;
+      const at = input + CANVAS.FLUSH_SIZE + index * CANVAS.LIST_SIZE;
       const { list: commands, source } = entry;
       const spans = [commands.bytes, commands.geometry, commands.clips, commands.masks, commands.maskGeometry, commands.paints];
       spans.forEach((bytes, span) => {
         const [pointer, byteLength] = place(bytes);
-        view.setUint32(at + span * 8, pointer, true);
-        view.setUint32(at + span * 8 + 4, byteLength, true);
+        const spanRecord = at + CANVAS.LIST_SPANS + span * CANVAS.SPAN_SIZE;
+        view.setUint32(spanRecord + CANVAS.SPAN_POINTER, pointer, true);
+        view.setUint32(spanRecord + CANVAS.SPAN_LENGTH, byteLength, true);
       });
       const sources = cursor;
       commands.sources.forEach((value, slot) => {
-        const record = sources + slot * 8;
+        const record = sources + slot * CANVAS.SOURCE_SIZE;
         if (value?.kind === 'commands') {
-          view.setUint32(record, 2, true);
-          view.setUint32(record + 4, listIndices.get(value), true);
+          view.setUint32(record + CANVAS.SOURCE_KIND, CANVAS.SOURCE_KIND_LIST, true);
+          view.setUint32(record + CANVAS.SOURCE_VALUE, listIndices.get(value), true);
         } else if (entry.textures[slot] !== null) {
-          view.setUint32(record, 1, true);
-          view.setUint32(record + 4, gpu.importResource(entry.textures[slot]), true);
+          view.setUint32(record + CANVAS.SOURCE_KIND, CANVAS.SOURCE_KIND_TEXTURE, true);
+          view.setUint32(record + CANVAS.SOURCE_VALUE, gpu.importResource(entry.textures[slot]), true);
         }
       });
-      cursor += align(commands.sources.length * 8);
-      view.setUint32(at + 48, sources, true);
-      view.setUint32(at + 52, commands.sources.length, true);
+      cursor += align(commands.sources.length * CANVAS.SOURCE_SIZE);
+      view.setUint32(at + CANVAS.LIST_SOURCES, sources, true);
+      view.setUint32(at + CANVAS.LIST_SOURCE_COUNT, commands.sources.length, true);
       const payloads = cursor;
-      cursor += align(commands.payloads.length * 20);
+      cursor += align(commands.payloads.length * CANVAS.PAYLOAD_SIZE);
       commands.payloads.forEach((payload, slot) => {
-        const record = payloads + slot * 20;
+        const record = payloads + slot * CANVAS.PAYLOAD_SIZE;
         const [pointer, byteLength] = place(payload.bytes);
-        view.setUint32(record, pointer, true);
-        view.setUint32(record + 4, byteLength, true);
-        view.setUint32(record + 8, payload.width, true);
-        view.setUint32(record + 12, payload.height, true);
-        view.setUint32(record + 16, bitmapFormat(payload.format), true);
+        view.setUint32(record + CANVAS.PAYLOAD_BYTES, pointer, true);
+        view.setUint32(record + CANVAS.PAYLOAD_LENGTH, byteLength, true);
+        view.setUint32(record + CANVAS.PAYLOAD_WIDTH, payload.width, true);
+        view.setUint32(record + CANVAS.PAYLOAD_HEIGHT, payload.height, true);
+        view.setUint32(record + CANVAS.PAYLOAD_FORMAT, bitmapFormat(payload.format), true);
       });
-      view.setUint32(at + 56, payloads, true);
-      view.setUint32(at + 60, commands.payloads.length, true);
+      view.setUint32(at + CANVAS.LIST_PAYLOADS, payloads, true);
+      view.setUint32(at + CANVAS.LIST_PAYLOAD_COUNT, commands.payloads.length, true);
       const runs = cursor;
-      cursor += entry.runs.length * 24;
+      cursor += entry.runs.length * CANVAS.GLYPH_RUN_SIZE;
       const infos = cursor;
       let glyph = 0;
       entry.runs.forEach((run, slot) => {
-        const record = runs + slot * 24;
-        view.setUint32(record, run.command, true);
-        view.setUint32(record + 4, gpu.importResource(run.atlas), true);
-        view.setUint32(record + 8, glyph, true);
-        view.setFloat64(record + 16, run.upem, true);
+        const record = runs + slot * CANVAS.GLYPH_RUN_SIZE;
+        view.setUint32(record + CANVAS.GLYPH_RUN_COMMAND, run.command, true);
+        view.setUint32(record + CANVAS.GLYPH_RUN_ATLAS, gpu.importResource(run.atlas), true);
+        view.setUint32(record + CANVAS.GLYPH_RUN_FIRST, glyph, true);
+        view.setFloat64(record + CANVAS.GLYPH_RUN_UNITS_PER_EM, run.upem, true);
         for (const information of run.infos) {
-          const info = infos + glyph * 96;
+          const info = infos + glyph * CANVAS.GLYPH_SIZE;
           glyph++;
           if (!information) continue;
           const { metrics } = information;
-          view.setUint32(info, 1, true);
-          [information.w, information.h, information.u, information.v, information.uW, information.vH,
-            metrics.bboxXMin, metrics.bboxYMin, metrics.bboxXMax, metrics.bboxYMax]
-            .forEach((value, field) => view.setFloat64(info + 8 + field * 8, value, true));
+          view.setUint32(info + CANVAS.GLYPH_PRESENT, 1, true);
+          view.setFloat64(info + CANVAS.GLYPH_WIDTH, information.w, true);
+          view.setFloat64(info + CANVAS.GLYPH_HEIGHT, information.h, true);
+          view.setFloat64(info + CANVAS.GLYPH_U, information.u, true);
+          view.setFloat64(info + CANVAS.GLYPH_V, information.v, true);
+          view.setFloat64(info + CANVAS.GLYPH_U_WIDTH, information.uW, true);
+          view.setFloat64(info + CANVAS.GLYPH_V_HEIGHT, information.vH, true);
+          view.setFloat64(info + CANVAS.GLYPH_BOX_X_MINIMUM, metrics.bboxXMin, true);
+          view.setFloat64(info + CANVAS.GLYPH_BOX_Y_MINIMUM, metrics.bboxYMin, true);
+          view.setFloat64(info + CANVAS.GLYPH_BOX_X_MAXIMUM, metrics.bboxXMax, true);
+          view.setFloat64(info + CANVAS.GLYPH_BOX_Y_MAXIMUM, metrics.bboxYMax, true);
         }
       });
-      cursor += glyph * 96;
-      view.setUint32(at + 64, runs, true);
-      view.setUint32(at + 68, entry.runs.length, true);
-      view.setUint32(at + 72, infos, true);
-      view.setUint32(at + 76, bitmapFormat(entry.format), true);
+      cursor += glyph * CANVAS.GLYPH_SIZE;
+      view.setUint32(at + CANVAS.LIST_GLYPH_RUNS, runs, true);
+      view.setUint32(at + CANVAS.LIST_GLYPH_RUN_COUNT, entry.runs.length, true);
+      view.setUint32(at + CANVAS.LIST_GLYPHS, infos, true);
+      view.setUint32(at + CANVAS.LIST_FORMAT, bitmapFormat(entry.format), true);
       if (source !== null) {
-        view.setUint32(at + 80, source.width, true);
-        view.setUint32(at + 84, source.height, true);
-        view.setUint32(at + 88, source.opaque ? 1 : 0, true);
-        view.setUint32(at + 92, source.persistent ? 1 : 0, true);
-        view.setUint32(at + 96, entry.kept === null ? 0 : gpu.importResource(entry.kept), true);
+        view.setUint32(at + CANVAS.LIST_WIDTH, source.width, true);
+        view.setUint32(at + CANVAS.LIST_HEIGHT, source.height, true);
+        view.setUint32(at + CANVAS.LIST_OPAQUE, source.opaque ? 1 : 0, true);
+        view.setUint32(at + CANVAS.LIST_PERSISTENT, source.persistent ? 1 : 0, true);
+        view.setUint32(at + CANVAS.LIST_KEPT_TEXTURE, entry.kept === null ? 0 : gpu.importResource(entry.kept), true);
       }
     });
     core.gpu_canvas_rasterize(rasterState, blurState, colorState, frames, input);
     gpu.execute();
     const result = new DataView(core.memory.buffer);
-    if (result.getUint32(input + 36, true) !== 0) {
+    if (result.getUint32(input + CANVAS.FLUSH_STATUS, true) !== 0) {
       throw new RangeError('Canvas 2D blur: an image lacks its one-pixel transparent border');
     }
     entries.forEach((entry, index) => {
       if (entry.source?.persistent && entry.kept === null) {
         entry.source.textures ??= new Map();
-        entry.source.textures.set(device, gpu.resource(result.getUint32(input + 48 + index * LIST_SIZE + 132, true)));
+        const list = input + CANVAS.FLUSH_SIZE + index * CANVAS.LIST_SIZE;
+        entry.source.textures.set(device, gpu.resource(result.getUint32(list + CANVAS.LIST_TEXTURE, true)));
       }
     });
     if (commandListObserver !== null) observeJobs(core, input, entries);
@@ -427,27 +476,27 @@ export function rasterizeCommands(device, target, list, clear) {
 
 function observeJobs(core, input, entries) {
   const view = new DataView(core.memory.buffer);
-  const log = view.getUint32(input + 40, true);
-  const end = log + view.getUint32(input + 44, true);
+  const log = view.getUint32(input + CANVAS.FLUSH_JOB_LOG, true);
+  const end = log + view.getUint32(input + CANVAS.FLUSH_JOB_LOG_LENGTH, true);
   for (let at = log; at < end;) {
-    const index = view.getUint32(at, true);
-    const count = view.getUint32(at + 16, true);
-    const composited = view.getUint32(input + 48 + index * LIST_SIZE + 100, true);
+    const index = view.getUint32(at + CANVAS.JOB_LOG_LIST, true);
+    const count = view.getUint32(at + CANVAS.JOB_LOG_COUNT, true);
+    const composited = view.getUint32(input + CANVAS.FLUSH_SIZE + index * CANVAS.LIST_SIZE + CANVAS.LIST_COMPOSITED, true);
     const bytes = new Uint8Array(count * COMMAND_SIZE);
     for (let position = 0; position < count; position++) {
-      const command = view.getUint32(at + 20 + position * 4, true);
+      const command = view.getUint32(at + CANVAS.JOB_LOG_COMMANDS + position * Uint32Array.BYTES_PER_ELEMENT, true);
       bytes.set(new Uint8Array(core.memory.buffer, composited + command * COMMAND_SIZE, COMMAND_SIZE), position * COMMAND_SIZE);
     }
     const { list } = entries[index];
     commandListObserver({
-      width: view.getUint32(at + 4, true),
-      height: view.getUint32(at + 8, true),
-      multisampled: view.getUint32(at + 12, true) !== 0,
+      width: view.getUint32(at + CANVAS.JOB_LOG_WIDTH, true),
+      height: view.getUint32(at + CANVAS.JOB_LOG_HEIGHT, true),
+      multisampled: view.getUint32(at + CANVAS.JOB_LOG_MULTISAMPLED, true) !== 0,
       bytes,
       geometry: list.geometry.slice(),
       fonts: list.fonts,
     });
-    at += 20 + count * 4;
+    at += CANVAS.JOB_LOG_COMMANDS + count * 4;
   }
 }
 
@@ -480,19 +529,26 @@ function copyInput(device, description, upload = null) {
   const { core, gpu } = bindingFor(device);
   const format = formats.indexOf(description.format);
   if (format < 0) throw new DOMException(`GPUQueue.copyExternalImageToTexture: texture format ${description.format} is unsupported`, 'NotSupportedError');
-  const input = gpu.input(96 + (upload?.bytes.byteLength ?? 0));
-  new Uint32Array(core.memory.buffer, input.byteOffset, 24).set([
-    0, 0, format, description.width, description.height, description.sourceX, description.sourceY,
-    description.targetX, description.targetY, description.flipY ? 1 : 0,
-    description.sourceKind, description.sourceColorSpace === 'display-p3' ? 1 : 0,
-    description.targetColorSpace === 'display-p3' ? 1 : 0, description.opaque ? 1 : 0,
-    description.premultiplied ? 1 : 0, description.targetUsage ?? 0,
-    upload === null ? 0 : input.byteOffset + 96, upload?.bytes.byteLength ?? 0,
-    upload === null ? 0 : bitmapFormat(upload.format), description.imageWidth ?? 0, description.imageHeight ?? 0,
-    description.originClean === false ? 0 : 1, description.depth ?? 1, 0,
-  ]);
+  const input = gpu.input(CANVAS.COPY_SIZE + (upload?.bytes.byteLength ?? 0));
+  const fields = [
+    ['COPY_SOURCE', 0], ['COPY_TARGET', 0], ['COPY_FORMAT', format], ['COPY_WIDTH', description.width],
+    ['COPY_HEIGHT', description.height], ['COPY_SOURCE_X', description.sourceX], ['COPY_SOURCE_Y', description.sourceY],
+    ['COPY_TARGET_X', description.targetX], ['COPY_TARGET_Y', description.targetY], ['COPY_FLIP', description.flipY ? 1 : 0],
+    ['COPY_SOURCE_KIND', description.sourceKind],
+    ['COPY_SOURCE_SPACE', description.sourceColorSpace === 'display-p3' ? 1 : 0],
+    ['COPY_TARGET_SPACE', description.targetColorSpace === 'display-p3' ? 1 : 0],
+    ['COPY_SOURCE_OPAQUE', description.opaque ? 1 : 0], ['COPY_TARGET_PREMULTIPLIED', description.premultiplied ? 1 : 0],
+    ['COPY_TARGET_USAGE', description.targetUsage ?? 0],
+    ['COPY_UPLOAD', upload === null ? 0 : input.byteOffset + CANVAS.COPY_SIZE],
+    ['COPY_UPLOAD_LENGTH', upload?.bytes.byteLength ?? 0],
+    ['COPY_UPLOAD_FORMAT', upload === null ? 0 : bitmapFormat(upload.format)],
+    ['COPY_IMAGE_WIDTH', description.imageWidth ?? 0], ['COPY_IMAGE_HEIGHT', description.imageHeight ?? 0],
+    ['COPY_ORIGIN_CLEAN', description.originClean === false ? 0 : 1], ['COPY_DEPTH', description.depth ?? 1],
+  ];
+  new Uint8Array(core.memory.buffer, input.byteOffset, CANVAS.COPY_SIZE).fill(0);
+  for (const [field, value] of fields) input.setUint32(CANVAS[field], value, true);
   if (upload !== null) {
-    new Uint8Array(core.memory.buffer, input.byteOffset + 96, upload.bytes.byteLength)
+    new Uint8Array(core.memory.buffer, input.byteOffset + CANVAS.COPY_SIZE, upload.bytes.byteLength)
       .set(new Uint8Array(upload.bytes.buffer, upload.bytes.byteOffset, upload.bytes.byteLength));
   }
   return { core, gpu, input };
@@ -504,9 +560,8 @@ export function copyCanvasTexture(device, source, target, description, upload = 
   const { core, gpu, state } = bindingFor(device);
   gpu.beginFrame();
   const { input } = copyInput(device, { ...description, targetUsage: target?.usage }, upload);
-  const words = new Uint32Array(core.memory.buffer, input.byteOffset, 2);
-  words[0] = source === null ? 0 : gpu.importResource(source);
-  words[1] = target === null ? 0 : gpu.importResource(target);
+  input.setUint32(CANVAS.COPY_SOURCE, source === null ? 0 : gpu.importResource(source), true);
+  input.setUint32(CANVAS.COPY_TARGET, target === null ? 0 : gpu.importResource(target), true);
   const handle = core.gpu_canvas_copy(state, input.byteOffset);
   gpu.execute();
   return gpu.resource(handle);
@@ -522,7 +577,7 @@ export function canvasFrameSource(frame) {
     device,
     texture: copyCanvasTexture(device, frame.texture, null, {
       format, width, height, sourceX: 0, sourceY: 0, targetX: 0, targetY: 0,
-      flipY: false, sourceKind: 0, sourceColorSpace: frame.colorSpace,
+      flipY: false, sourceKind: CANVAS_COPY_KIND.FRAME, sourceColorSpace: frame.colorSpace,
       targetColorSpace: 'srgb', opaque, premultiplied: true,
     }),
     width,
@@ -573,11 +628,11 @@ function extent3D(value) {
   return [integer(value.width, 0), integer(value.height, 1), integer(value.depthOrArrayLayers, 1)];
 }
 
-const COPY_ERRORS = [
-  null,
-  ['The external image is tainted by cross-origin data.', 'SecurityError'],
-  ['Copy rect is out of bounds of external image', 'OperationError'],
-];
+// The DOMException of each failed gpu_canvas_copy_check status.
+const COPY_ERRORS = new Map([
+  [CANVAS_COPY_STATUS.TAINTED, ['The external image is tainted by cross-origin data.', 'SecurityError']],
+  [CANVAS_COPY_STATUS.OUTSIDE, ['Copy rect is out of bounds of external image', 'OperationError']],
+]);
 
 // GPUQueue.copyExternalImageToTexture() with a Sandom source, as Chrome
 // copies a canvas source with Dawn's CopyTextureForBrowser. Renderer-core
@@ -601,7 +656,7 @@ function copyExternalImage(device, sourceInfo, destination, copySize) {
   const description = {
     format: texture.format, width, height, sourceX: origin[0], sourceY: origin[1],
     targetX: destinationOrigin[0], targetY: destinationOrigin[1], flipY: Boolean(sourceInfo.flipY),
-    sourceKind: straight ? 2 : 1,
+    sourceKind: straight ? CANVAS_COPY_KIND.IMAGE_DATA : CANVAS_COPY_KIND.BITMAP,
     sourceColorSpace: (straight ? image.colorSpace : image.source.colorSpace) ?? 'srgb',
     targetColorSpace: destination.colorSpace ?? 'srgb', opaque: false,
     premultiplied: Boolean(destination.premultipliedAlpha),
@@ -609,8 +664,9 @@ function copyExternalImage(device, sourceInfo, destination, copySize) {
   };
   const { core, input } = copyInput(device, description);
   const status = core.gpu_canvas_copy_check(input.byteOffset);
-  if (status === 1 || status === 2) throw new DOMException(`${member}: ${COPY_ERRORS[status][0]}`, COPY_ERRORS[status][1]);
-  if (status === 3) return true;
+  const error = COPY_ERRORS.get(status);
+  if (error) throw new DOMException(`${member}: ${error[0]}`, error[1]);
+  if (status === CANVAS_COPY_STATUS.EMPTY) return true;
   if (straight) {
     copyCanvasTexture(device, null, texture, description, { bytes: image.bytes, format: image.format });
     return true;
@@ -659,9 +715,10 @@ function readTextureRegion(device, texture, width, height, format, x, y, targetF
 // Bytes belong to the binding and are valid during reply. A consumer that
 // retains them copies its addressed span before returning from reply.
 export function readCanvasTexture(device, texture, width, height, format, operation) {
-  readTextureRegion(device, texture, width, height, format, 0, 0, format === 'rgba16float' ? 1 : 0, {
+  readTextureRegion(device, texture, width, height, format, 0, 0,
+    format === 'rgba16float' ? CANVAS_FORMAT_RGBA16FLOAT : CANVAS_FORMAT_RGBA8UNORM, {
     reply({ core, readbackState }, formatIndex) {
-      const pointer = new DataView(core.memory.buffer).getUint32(readbackState + 12, true);
+      const pointer = new DataView(core.memory.buffer).getUint32(readbackState + CANVAS.READBACK_BYTES, true);
       operation.reply(new Uint8Array(core.memory.buffer, pointer, width * height * (formatIndex === 1 ? 8 : 4)));
     },
     throw(error) { operation.throw(error); },
@@ -683,7 +740,7 @@ export function readBitmapTexture(device, texture, width, height) {
 }
 
 export function readCanvasImageData(device, texture, region, sourceColorSpace, opaque, imageData, operation) {
-  const format = imageData.pixelFormat === 'rgba-float16' ? 1 : 0;
+  const format = imageData.pixelFormat === 'rgba-float16' ? CANVAS_FORMAT_RGBA16FLOAT : CANVAS_FORMAT_RGBA8UNORM;
   readTextureRegion(device, texture, region[4], region[5], texture.format, region[2], region[3], format, {
     reply({ core, readbackState }) {
       try {
@@ -705,17 +762,19 @@ export function readCanvasImageData(device, texture, region, sourceColorSpace, o
 }
 
 export function readCanvasEncodingPixels(device, texture, width, height, jpeg, opaque, operation) {
-  readTextureRegion(device, texture, width, height, texture.format, 0, 0, 0, {
+  readTextureRegion(device, texture, width, height, texture.format, 0, 0, CANVAS_FORMAT_RGBA8UNORM, {
     reply({ core, readbackState }) {
       let samples;
       try {
         const pointer = core.gpu_canvas_encode_pixels(readbackState, jpeg ? 1 : 0, opaque ? 1 : 0);
-        const descriptor = new Uint32Array(core.memory.buffer, pointer, 4);
-        const bitDepth = descriptor[2];
+        const descriptor = new DataView(core.memory.buffer, pointer, CANVAS.ENCODE_SIZE);
+        const pixelsAt = descriptor.getUint32(CANVAS.ENCODE_PIXELS, true);
+        const length = descriptor.getUint32(CANVAS.ENCODE_LENGTH, true);
+        const bitDepth = descriptor.getUint32(CANVAS.ENCODE_BIT_DEPTH, true);
         const pixels = bitDepth === 16
-          ? new Uint16Array(core.memory.buffer, descriptor[0], descriptor[1] / 2)
-          : new Uint8Array(core.memory.buffer, descriptor[0], descriptor[1]);
-        samples = { pixels, bitDepth, channelLayout: descriptor[3] === 3 ? 'rgb' : 'rgba' };
+          ? new Uint16Array(core.memory.buffer, pixelsAt, length / Uint16Array.BYTES_PER_ELEMENT)
+          : new Uint8Array(core.memory.buffer, pixelsAt, length);
+        samples = { pixels, bitDepth, channelLayout: descriptor.getUint32(CANVAS.ENCODE_CHANNELS, true) === 3 ? 'rgb' : 'rgba' };
       } catch (error) {
         operation.throw(error);
         return;

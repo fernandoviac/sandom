@@ -23,7 +23,7 @@ import {
   CMD_RECT_OFFSET_RADIUS_BOTTOM_LEFT_X, CMD_RECT_OFFSET_RADIUS_BOTTOM_LEFT_Y,
   CMD_RECT_OFFSET_XFORM,
   CMD_RECT_FLAG_FILL, CMD_RECT_FLAG_BORDER, CMD_RECT_FLAG_GRADIENT, CMD_RECT_FLAG_TRANSFORM,
-  CMD_RECT_GRADIENT_EXT_SIZE, CMD_RECT_GRADIENT_OFFSET_KIND,
+  CMD_RECT_GRADIENT_OFFSET_KIND,
   CMD_RECT_GRADIENT_OFFSET_STOP_COUNT, CMD_RECT_GRADIENT_OFFSET_STOP_OFFSET,
   CMD_RECT_GRADIENT_OFFSET_GEOM,
   CMD_PUSH_CLIP, CMD_PUSH_CLIP_HEADER_SIZE, CMD_PUSH_CLIP_OFFSET_FLAGS,
@@ -47,13 +47,22 @@ import {
   CMD_PUSH_BACKDROP_FILTER_OFFSET_SEGMENTS, cmdPushBackdropFilterSize,
   cmdPushBackdropFilterOwnShapeOffset,
   CMD_POP_BACKDROP_FILTER, CMD_POP_BACKDROP_FILTER_SIZE,
+  cmdRectGradientOffset, cmdRectSize,
 } from './layout.js';
+import { layoutConstant } from './layout-table.js';
 
+const CMD_HEADER_FLAGS = layoutConstant('CMD_HEADER_FLAGS');
+const CMD_HEADER_WORD = layoutConstant('CMD_HEADER_WORD');
+const CLIP_ENTRY_OFFSET_SCROLL_REF = layoutConstant('CLIP_ENTRY_OFFSET_SCROLL_REF');
+const FILTER_PAYLOAD = Object.freeze(Object.fromEntries(['BLUR_SIGMA_X', 'BLUR_SIGMA_Y', 'SHADOW_DX', 'SHADOW_DY',
+  'SHADOW_SIGMA_X', 'SHADOW_COLOR', 'SHADOW_SIGMA_Y'].map((name) => [name, layoutConstant(`CMD_FILTER_${name}`)])));
+
+const F32 = Float32Array.BYTES_PER_ELEMENT;
+
+// A color as four f32 components: r, g, b, a.
 function writeColor(view, offset, color) {
-  view.setFloat32(offset, color.r ?? 0, true);
-  view.setFloat32(offset + 4, color.g ?? 0, true);
-  view.setFloat32(offset + 8, color.b ?? 0, true);
-  view.setFloat32(offset + 12, color.a ?? 0, true);
+  [color.r, color.g, color.b, color.a].forEach((component, index) =>
+    view.setFloat32(offset + index * F32, component ?? 0, true));
 }
 
 // rect: { x, y, w, h, flags?,
@@ -87,9 +96,10 @@ export function writeRect(view, offset, rect) {
     (rect.flags ?? (CMD_RECT_FLAG_FILL | CMD_RECT_FLAG_BORDER))
       | (hasTransform ? CMD_RECT_FLAG_TRANSFORM : 0)
       | (hasGradient ? CMD_RECT_FLAG_GRADIENT : 0));
-  // border styles (P7): packed 4-bit-per-side u16 (top | right<<4 |
-  // bottom<<8 | left<<12), BORDER_STYLE_* values; 0 = all solid.
-  view.setUint16(offset + 0x02, rect.borderStyles ?? 0, true);
+  // border styles (P7): the header word holds them, packed 4 bits per side
+  // (top | right<<4 | bottom<<8 | left<<12), BORDER_STYLE_* values; 0 = all
+  // solid.
+  view.setUint16(offset + CMD_HEADER_WORD, rect.borderStyles ?? 0, true);
   view.setFloat32(offset + CMD_RECT_OFFSET_X, rect.x, true);
   view.setFloat32(offset + CMD_RECT_OFFSET_Y, rect.y, true);
   view.setFloat32(offset + CMD_RECT_OFFSET_W, rect.w, true);
@@ -121,21 +131,21 @@ export function writeRect(view, offset, rect) {
   }
   if (hasTransform) {
     for (let i = 0; i < 6; i++) {
-      view.setFloat32(offset + CMD_RECT_OFFSET_XFORM + i * 4, rect.transform[i], true);
+      view.setFloat32(offset + CMD_RECT_OFFSET_XFORM + i * F32, rect.transform[i], true);
     }
   }
   if (hasGradient) {
-    const gradExtOffset = offset + CMD_RECT_OFFSET_XFORM + (hasTransform ? 24 : 0);
+    const gradExtOffset = offset + cmdRectGradientOffset(hasTransform);
     const g = rect.gradient;
     view.setUint8(gradExtOffset + CMD_RECT_GRADIENT_OFFSET_KIND, g.kind ?? 0);
     view.setUint8(gradExtOffset + CMD_RECT_GRADIENT_OFFSET_STOP_COUNT, g.stopCount ?? 0);
     view.setUint32(gradExtOffset + CMD_RECT_GRADIENT_OFFSET_STOP_OFFSET, g.stopOffset ?? 0, true);
     const geom = g.geom ?? [0, 0, 0, 0];
     for (let i = 0; i < 4; i++) {
-      view.setFloat32(gradExtOffset + CMD_RECT_GRADIENT_OFFSET_GEOM + i * 4, geom[i] ?? 0, true);
+      view.setFloat32(gradExtOffset + CMD_RECT_GRADIENT_OFFSET_GEOM + i * F32, geom[i] ?? 0, true);
     }
   }
-  return CMD_RECT_SIZE + (hasTransform ? 24 : 0) + (hasGradient ? CMD_RECT_GRADIENT_EXT_SIZE : 0);
+  return cmdRectSize(hasTransform, hasGradient);
 }
 
 // clip (oriented-clip redesign — a push carries the COMPLETE clip state,
@@ -172,22 +182,22 @@ function writeClipEntry(view, entryOffset, entry) {
   const uniform = { rx: entry.radius ?? 0, ry: entry.radius ?? 0 };
   for (let corner = 0; corner < 4; corner++) {
     const cornerRadii = entry.radii ? (entry.radii[CLIP_ENTRY_CORNERS[corner]] ?? { rx: 0, ry: 0 }) : uniform;
-    view.setFloat32(entryOffset + CLIP_ENTRY_OFFSET_RADII + corner * 8, cornerRadii.rx ?? 0, true);
-    view.setFloat32(entryOffset + CLIP_ENTRY_OFFSET_RADII + corner * 8 + 4, cornerRadii.ry ?? 0, true);
+    // Each corner is an (rx, ry) pair of f32.
+    view.setFloat32(entryOffset + CLIP_ENTRY_OFFSET_RADII + corner * 2 * F32, cornerRadii.rx ?? 0, true);
+    view.setFloat32(entryOffset + CLIP_ENTRY_OFFSET_RADII + (corner * 2 + 1) * F32, cornerRadii.ry ?? 0, true);
   }
   for (let component = 0; component < 6; component++) {
-    view.setFloat32(entryOffset + CLIP_ENTRY_OFFSET_AFFINE + component * 4,
+    view.setFloat32(entryOffset + CLIP_ENTRY_OFFSET_AFFINE + component * F32,
       hasAffine ? entry.affine[component] : 0, true);
   }
-  view.setUint32(entryOffset + 0x4C, 0, true);
+  view.setUint32(entryOffset + CLIP_ENTRY_OFFSET_SCROLL_REF, 0, true);
 }
 
 export function writePushClip(view, offset, clip) {
   const entries = clip.entries ?? [clip];
   view.setUint8(offset, CMD_PUSH_CLIP);
   view.setUint8(offset + CMD_PUSH_CLIP_OFFSET_FLAGS, 0);
-  view.setUint8(offset + CMD_PUSH_CLIP_OFFSET_COUNT, entries.length);
-  view.setUint8(offset + 0x03, 0);
+  view.setUint16(offset + CMD_PUSH_CLIP_OFFSET_COUNT, entries.length, true);
   for (let i = 0; i < entries.length; i++) {
     writeClipEntry(view, offset + CMD_PUSH_CLIP_HEADER_SIZE + i * CLIP_ENTRY_SIZE, entries[i]);
   }
@@ -196,8 +206,8 @@ export function writePushClip(view, offset, clip) {
 
 export function writePopClip(view, offset) {
   view.setUint8(offset, CMD_POP_CLIP);
-  view.setUint8(offset + 1, 0);
-  view.setUint16(offset + 2, 0, true);
+  view.setUint8(offset + CMD_HEADER_FLAGS, 0);
+  view.setUint16(offset + CMD_HEADER_WORD, 0, true);
   return CMD_POP_CLIP_SIZE;
 }
 
@@ -223,24 +233,21 @@ function writeFilterSegments(view, segmentsBase, segments) {
     if (segment.kind === 'matrix') {
       view.setUint8(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_KIND, CMD_PUSH_OPACITY_SEGMENT_KIND_MATRIX);
       for (let j = 0; j < 20; j++) {
-        view.setFloat32(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD + j * 4, segment.matrix[j], true);
+        view.setFloat32(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD + j * F32, segment.matrix[j], true);
       }
     } else if (segment.kind === 'blur') {
       view.setUint8(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_KIND, CMD_PUSH_OPACITY_SEGMENT_KIND_BLUR);
-      view.setFloat32(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD, segment.sigma, true);
-      view.setFloat32(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD + 4, segment.sigma, true);
+      const payloadOffset = segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD;
+      view.setFloat32(payloadOffset + FILTER_PAYLOAD.BLUR_SIGMA_X, segment.sigma, true);
+      view.setFloat32(payloadOffset + FILTER_PAYLOAD.BLUR_SIGMA_Y, segment.sigma, true);
     } else if (segment.kind === 'drop-shadow') {
       view.setUint8(segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_KIND, CMD_PUSH_OPACITY_SEGMENT_KIND_DROP_SHADOW);
       const payloadOffset = segBase + CMD_PUSH_OPACITY_SEGMENT_OFFSET_PAYLOAD;
-      view.setFloat32(payloadOffset + 0, segment.dx, true);
-      view.setFloat32(payloadOffset + 4, segment.dy, true);
-      view.setFloat32(payloadOffset + 8, segment.sigma, true);
-      const c = segment.color;
-      view.setFloat32(payloadOffset + 12, c.r, true);
-      view.setFloat32(payloadOffset + 16, c.g, true);
-      view.setFloat32(payloadOffset + 20, c.b, true);
-      view.setFloat32(payloadOffset + 24, c.a, true);
-      view.setFloat32(payloadOffset + 28, segment.sigma, true);
+      view.setFloat32(payloadOffset + FILTER_PAYLOAD.SHADOW_DX, segment.dx, true);
+      view.setFloat32(payloadOffset + FILTER_PAYLOAD.SHADOW_DY, segment.dy, true);
+      view.setFloat32(payloadOffset + FILTER_PAYLOAD.SHADOW_SIGMA_X, segment.sigma, true);
+      writeColor(view, payloadOffset + FILTER_PAYLOAD.SHADOW_COLOR, segment.color);
+      view.setFloat32(payloadOffset + FILTER_PAYLOAD.SHADOW_SIGMA_Y, segment.sigma, true);
     } else {
       throw new Error(`writeFilterSegments: unknown filter segment kind "${segment.kind}"`);
     }
@@ -260,8 +267,8 @@ export function writePushOpacity(view, offset, op) {
 
 export function writePopOpacity(view, offset) {
   view.setUint8(offset, CMD_POP_OPACITY);
-  view.setUint8(offset + 1, 0);
-  view.setUint16(offset + 2, 0, true);
+  view.setUint8(offset + CMD_HEADER_FLAGS, 0);
+  view.setUint16(offset + CMD_HEADER_WORD, 0, true);
   return CMD_POP_OPACITY_SIZE;
 }
 
@@ -278,7 +285,7 @@ export function writePopOpacity(view, offset) {
 export function writePushBackdropFilter(view, offset, op) {
   const segments = op?.filterSegments ?? [];
   view.setUint8(offset, CMD_PUSH_BACKDROP_FILTER);
-  view.setUint8(offset + 1, 0);
+  view.setUint8(offset + CMD_HEADER_FLAGS, 0);
   view.setUint16(offset + CMD_PUSH_BACKDROP_FILTER_OFFSET_SEGMENT_COUNT, segments.length, true);
   writeFilterSegments(view, offset + CMD_PUSH_BACKDROP_FILTER_OFFSET_SEGMENTS, segments);
   const ownShapeOffset = offset + cmdPushBackdropFilterOwnShapeOffset(segments.length);
@@ -288,7 +295,7 @@ export function writePushBackdropFilter(view, offset, op) {
 
 export function writePopBackdropFilter(view, offset) {
   view.setUint8(offset, CMD_POP_BACKDROP_FILTER);
-  view.setUint8(offset + 1, 0);
-  view.setUint16(offset + 2, 0, true);
+  view.setUint8(offset + CMD_HEADER_FLAGS, 0);
+  view.setUint16(offset + CMD_HEADER_WORD, 0, true);
   return CMD_POP_BACKDROP_FILTER_SIZE;
 }

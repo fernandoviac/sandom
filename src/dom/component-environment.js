@@ -1,5 +1,7 @@
 import { getDefaultGpu } from "../gpu-thread.js";
 import { isGpuThreadCapability } from "./webgpu-facade.js";
+import { createEvent, createEventUsing, dispatchEvent, SDEvent, SDEventTarget } from "./events.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 
 const environmentState = new WeakMap();
 const locationEnvironment = new WeakMap();
@@ -11,7 +13,6 @@ const constructorToken = Symbol("component platform constructor");
 
 const environmentOptionNames = new Set([
   "navigation",
-  "language",
   "languages",
   "online",
   "hardwareConcurrency",
@@ -32,15 +33,15 @@ const orientationTypes = new Set([
   "portrait-secondary",
 ]);
 
-const scrollRestorationValues = new Set(["auto", "manual"]);
-const landscapePrimaryOrientation = Object.freeze({
-  type: "landscape-primary",
-  angle: 0,
-});
-const portraitPrimaryOrientation = Object.freeze({
-  type: "portrait-primary",
-  angle: 0,
-});
+// The orientations of an unconfigured screen (screen_orientation), and the
+// screen fields by SCREEN_FIELD_* code (screen_default).
+const derivedOrientations = Object.freeze([
+  Object.freeze({ type: "landscape-primary", angle: 0 }),
+  Object.freeze({ type: "portrait-primary", angle: 0 }),
+]);
+const screenFields = ["width", "height", "availWidth", "availHeight", "colorDepth", "pixelDepth"];
+const HISTORY_GO_RELOAD = layoutConstant("HISTORY_GO_RELOAD");
+const HISTORY_GO_NONE = layoutConstant("HISTORY_GO_NONE");
 
 function integerCapability(value, name, minimum) {
   const number = Number(value);
@@ -174,7 +175,7 @@ export function normalizeComponentEnvironmentOptions(value, target = globalThis)
       throw new TypeError(`environment.${name} must be a function`);
     }
   }
-  for (const name of ["language", "userAgent", "platform"]) {
+  for (const name of ["userAgent", "platform"]) {
     if (value[name] !== undefined && (typeof value[name] !== "string" || value[name].length === 0)) {
       throw new TypeError(`environment.${name} must be a nonempty string`);
     }
@@ -198,11 +199,9 @@ export function normalizeComponentEnvironmentOptions(value, target = globalThis)
   ) {
     throw new TypeError("environment.gpu must be a GPU-thread facade or null; supply native devices through a GPU-thread provider module");
   }
-  const language = value.language ?? value.languages?.[0] ?? "en";
-  const languages = Object.freeze([...(value.languages ?? [language])]);
-  if (languages[0] !== language) {
-    throw new TypeError("environment.language must equal the first environment.languages value");
-  }
+  // navigator.language is the first of navigator.languages, as in Chrome.
+  const languages = Object.freeze([...(value.languages ?? ["en"])]);
+  const language = languages[0];
   const sources = Object.freeze(Object.fromEntries(
     [...environmentOptionNames].map((name) => [
       name,
@@ -262,9 +261,9 @@ function currentHref(environment) {
 }
 
 function updateDocumentURL(environment) {
-  const href = currentHref(environment);
-  environment.document.URL = href;
-  environment.document.documentURI = href;
+  const { document } = environment;
+  const core = document._domCore;
+  core.status("document_set_url", document._coreHandle, ...core.input(currentHref(environment)));
 }
 
 function cloneState(environment, value) {
@@ -303,7 +302,7 @@ function sameDocumentExceptHash(left, right) {
 const popStateEventState = new WeakMap();
 const hashChangeEventState = new WeakMap();
 
-export class PopStateEvent extends Event {
+export class PopStateEvent extends SDEvent {
   constructor(type, init = {}) {
     super(type, init);
     popStateEventState.set(this, init.state ?? null);
@@ -312,8 +311,10 @@ export class PopStateEvent extends Event {
     return popStateEventState.get(this);
   }
 }
+Object.defineProperty(PopStateEvent.prototype, "state", { enumerable: true });
+Object.defineProperty(PopStateEvent.prototype, Symbol.toStringTag, { configurable: true, value: "PopStateEvent" });
 
-export class HashChangeEvent extends Event {
+export class HashChangeEvent extends SDEvent {
   constructor(type, init = {}) {
     super(type, init);
     hashChangeEventState.set(this, Object.freeze({
@@ -328,54 +329,84 @@ export class HashChangeEvent extends Event {
     return hashChangeEventState.get(this)?.newURL ?? "";
   }
 }
+for (const name of ["oldURL", "newURL"]) Object.defineProperty(HashChangeEvent.prototype, name, { enumerable: true });
+Object.defineProperty(HashChangeEvent.prototype, Symbol.toStringTag, { configurable: true, value: "HashChangeEvent" });
 
+// The hashchange and popstate events of a navigation that the user agent
+// fires at the window (HTML "update document for history step
+// application"): trusted.
 function dispatchHashChange(environment, oldURL, newURL) {
-  environment.target.dispatchEvent(new HashChangeEvent("hashchange", {
-    oldURL,
-    newURL,
-  }));
+  dispatchEvent(environment.target, createEventUsing(HashChangeEvent, "hashchange", { oldURL, newURL }));
 }
 
 function dispatchPopState(environment, state) {
-  environment.target.dispatchEvent(new PopStateEvent("popstate", { state }));
+  dispatchEvent(environment.target, createEventUsing(PopStateEvent, "popstate", { state }));
+}
+
+// The session history: the core keeps the entry count and the current
+// entry (session-history.watpart); the host keeps each entry's URL and
+// state at its index.
+function historyCall(environment, exportName, ...parameters) {
+  const document = environment.document;
+  return document._domCore.status(exportName, document._coreHandle, ...parameters);
 }
 
 function replaceHistoryEntry(environment, url, state) {
   const internal = stateFor(environment);
-  internal.entries[internal.entryIndex] = { url: new URL(url.href), state };
+  internal.entries[historyCall(environment, "history_index")] = { url: new URL(url.href), state };
   internal.currentURL = new URL(url.href);
   updateDocumentURL(environment);
 }
 
 function pushHistoryEntry(environment, url, state) {
   const internal = stateFor(environment);
-  internal.entries.splice(internal.entryIndex + 1);
+  internal.entries.length = historyCall(environment, "history_push");
   internal.entries.push({ url: new URL(url.href), state });
-  internal.entryIndex = internal.entries.length - 1;
   internal.currentURL = new URL(url.href);
   updateDocumentURL(environment);
 }
 
-function requestNavigation(environment, kind, requestedURL) {
-  const internal = assertActive(environment, "Location", kind);
+// One navigation (HTML "navigate"): `kind` is its history handling
+// ("assign" pushes an entry, "replace" replaces the current one, "reload"
+// keeps it); `target` is "_self" for the document's own navigable, else
+// the name of the new navigable that a form submission targets; `body` is
+// the Blob of a POST request with its `contentType`. `owner` and
+// `propertyName` name the API in the environment's observations. A GET
+// navigation whose URL has a fragment and equals the document's URL
+// except for fragments navigates to the fragment; any other navigation of
+// the document goes to the navigation handler, and one to the current URL
+// replaces the current entry.
+function requestNavigation(environment, kind, requestedURL, {
+  owner = "Location",
+  propertyName = kind,
+  method = "GET",
+  target = "_self",
+  body = null,
+  contentType = null,
+} = {}) {
+  const internal = assertActive(environment, owner, propertyName);
   const oldURL = internal.currentURL.href;
   const nextURL = new URL(requestedURL, oldURL);
+  const self = target === "_self";
   // A javascript: URL evaluates in the document realm instead of
   // navigating (HTML, "evaluate a javascript: URL").
-  if (nextURL.protocol === "javascript:") {
+  if (self && nextURL.protocol === "javascript:") {
     environment.document._scriptProcessing?.queueJavaScriptURL(nextURL.href);
     return;
   }
-  if (kind !== "reload" && nextURL.href === oldURL) return;
-  if (kind !== "reload" && sameDocumentExceptHash(internal.currentURL, nextURL)) {
+  // A POST request has a document resource: it does not navigate to a
+  // fragment.
+  if (self && kind !== "reload" && method === "GET" && nextURL.href.includes("#") &&
+    sameDocumentExceptHash(internal.currentURL, nextURL)) {
     if (kind === "replace") replaceHistoryEntry(environment, nextURL, null);
     else pushHistoryEntry(environment, nextURL, null);
-    dispatchHashChange(environment, oldURL, nextURL.href);
-    environment.observe("Location", kind, "default", false);
+    if (nextURL.href !== oldURL) dispatchHashChange(environment, oldURL, nextURL.href);
+    environment.observe(owner, propertyName, "default", false);
     return;
   }
+  if (self && kind === "assign" && nextURL.href === oldURL) kind = "replace";
   if (!environment.navigation) {
-    environment.observe("Location", kind, "default", true, {
+    environment.observe(owner, propertyName, "default", true, {
       requestedURL: nextURL.href,
       missingHandler: "environment.navigation",
     });
@@ -388,22 +419,32 @@ function requestNavigation(environment, kind, requestedURL) {
     kind,
     currentURL: oldURL,
     requestedURL: nextURL.href,
+    method,
+    target,
+    body,
+    contentType,
   });
   let accepted;
   try {
     accepted = environment.navigation(request);
   } catch (error) {
-    environment.observe("Location", kind, "caller", true, {
+    environment.observe(owner, propertyName, "caller", true, {
       requestedURL: nextURL.href,
       missingHandler: null,
     });
     throw error;
   }
+  // Another navigable's document is the host's: this document keeps its
+  // URL and history.
+  if (!self) {
+    environment.observe(owner, propertyName, "caller", false);
+    return;
+  }
   if (
     typeof accepted !== "string" &&
     !(accepted instanceof URL)
   ) {
-    environment.observe("Location", kind, "caller", true, {
+    environment.observe(owner, propertyName, "caller", true, {
       requestedURL: nextURL.href,
       missingHandler: null,
     });
@@ -415,7 +456,7 @@ function requestNavigation(environment, kind, requestedURL) {
   try {
     finalURL = new URL(accepted, oldURL);
   } catch (error) {
-    environment.observe("Location", kind, "caller", true, {
+    environment.observe(owner, propertyName, "caller", true, {
       requestedURL: nextURL.href,
       missingHandler: null,
     });
@@ -423,14 +464,29 @@ function requestNavigation(environment, kind, requestedURL) {
       cause: error,
     });
   }
-  if (kind !== "reload") {
-    if (kind === "replace") replaceHistoryEntry(environment, finalURL, null);
-    else pushHistoryEntry(environment, finalURL, null);
-    if (sameDocumentExceptHash(new URL(oldURL), finalURL) && oldURL !== finalURL.href) {
-      dispatchHashChange(environment, oldURL, finalURL.href);
-    }
+  if (kind === "replace") replaceHistoryEntry(environment, finalURL, null);
+  else if (kind !== "reload") pushHistoryEntry(environment, finalURL, null);
+  environment.observe(owner, propertyName, "caller", false);
+}
+
+// The navigation of a form submission's planned navigation task
+// (form-data.js): `request` holds the history handling `kind`, the `url`,
+// the `method`, the `target`, and for POST the `body` and its
+// `contentType`. A document without a component environment has no
+// navigation handler.
+export function navigateForForm(document, { kind, url, method, target, body, contentType }) {
+  const environment = document._componentEnvironment;
+  if (!environment) {
+    throw new DOMException(`Navigation to ${url} requires environment.navigation`, "NotSupportedError");
   }
-  environment.observe("Location", kind, "caller", false);
+  requestNavigation(environment, kind, url, {
+    owner: "HTMLFormElement",
+    propertyName: "submit",
+    method,
+    target,
+    body,
+    contentType,
+  });
 }
 
 class ComponentDOMStringList {
@@ -445,6 +501,9 @@ class ComponentDOMStringList {
   }
   [Symbol.iterator]() {
     return [][Symbol.iterator]();
+  }
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "DOMStringList", configurable: true });
   }
 }
 
@@ -532,13 +591,13 @@ export class History {
     const environment = historyEnvironment.get(this);
     const internal = assertActive(environment, "History", "length");
     environment.observe("History", "length", "default", false);
-    return internal.entries.length;
+    return historyCall(environment, "history_length");
   }
   get state() {
     const environment = historyEnvironment.get(this);
     const internal = assertActive(environment, "History", "state");
     environment.observe("History", "state", "default", false);
-    return internal.entries[internal.entryIndex].state;
+    return internal.entries[historyCall(environment, "history_index")].state;
   }
   get scrollRestoration() {
     const environment = historyEnvironment.get(this);
@@ -546,13 +605,13 @@ export class History {
     environment.observe("History", "scrollRestoration", "default", false);
     return internal.scrollRestoration;
   }
+  // An invalid value is ignored (Web IDL enumeration attribute), as in
+  // Chrome.
   set scrollRestoration(value) {
     const environment = historyEnvironment.get(this);
     const internal = assertActive(environment, "History", "scrollRestoration");
     const normalized = String(value);
-    if (!scrollRestorationValues.has(normalized)) {
-      throw new TypeError(`Unknown scrollRestoration value ${JSON.stringify(normalized)}`);
-    }
+    if (normalized !== "auto" && normalized !== "manual") return;
     internal.scrollRestoration = normalized;
     environment.observe("History", "scrollRestoration", "default", false);
   }
@@ -617,19 +676,16 @@ export class History {
   go(delta = 0) {
     const environment = historyEnvironment.get(this);
     const internal = assertActive(environment, "History", "go");
-    const number = Number(delta);
-    const normalized = Number.isFinite(number) ? Math.trunc(number) : 0;
-    if (normalized === 0) {
+    const index = historyCall(environment, "history_go", Number(delta));
+    if (index === HISTORY_GO_RELOAD) {
       requestNavigation(environment, "reload", internal.currentURL);
       return;
     }
-    const nextIndex = internal.entryIndex + normalized;
-    if (nextIndex < 0 || nextIndex >= internal.entries.length) return;
+    if (index === HISTORY_GO_NONE) return;
     const oldURL = internal.currentURL.href;
-    internal.entryIndex = nextIndex;
-    internal.currentURL = new URL(internal.entries[nextIndex].url.href);
+    const currentEntry = internal.entries[index];
+    internal.currentURL = new URL(currentEntry.url.href);
     updateDocumentURL(environment);
-    const currentEntry = internal.entries[nextIndex];
     dispatchPopState(environment, currentEntry.state);
     if (new URL(oldURL).hash !== internal.currentURL.hash) {
       dispatchHashChange(environment, oldURL, internal.currentURL.href);
@@ -663,7 +719,7 @@ export class Navigator {
     return readNavigator(this, "platform", "platform");
   }
   get language() {
-    return readNavigator(this, "language", "language");
+    return readNavigator(this, "language", "languages")[0];
   }
   get languages() {
     return readNavigator(this, "languages", "languages");
@@ -693,26 +749,25 @@ export class Navigator {
 function screenValue(environment, name) {
   const configured = environment.options.screen;
   if (configured) return configured[name];
-  if (name === "width" || name === "availWidth") {
-    return environment.viewport.width;
-  }
-  if (name === "height" || name === "availHeight") {
-    return environment.viewport.height;
-  }
-  return 24;
+  return environment.document._domCore.status(
+    "screen_default",
+    screenFields.indexOf(name),
+    environment.viewport.width,
+    environment.viewport.height,
+  );
 }
 
 function derivedOrientation(environment) {
   const configured = environment.options.screen;
   if (configured?.orientation) return configured.orientation;
-  const width = configured?.width ?? environment.viewport.width;
-  const height = configured?.height ?? environment.viewport.height;
-  return width >= height
-    ? landscapePrimaryOrientation
-    : portraitPrimaryOrientation;
+  return derivedOrientations[environment.document._domCore.status(
+    "screen_orientation",
+    configured?.width ?? environment.viewport.width,
+    configured?.height ?? environment.viewport.height,
+  )];
 }
 
-export class ScreenOrientation extends EventTarget {
+export class ScreenOrientation extends SDEventTarget {
   constructor(token, environment) {
     if (token !== constructorToken) throw new TypeError("Illegal constructor");
     super();
@@ -922,7 +977,7 @@ export function createComponentEnvironment({
       }
       if (nextType !== internal.orientationType) {
         internal.orientationType = nextType;
-        environment.screenObject.orientation.dispatchEvent(new Event("change"));
+        dispatchEvent(environment.screenObject.orientation, createEvent("change"));
       }
     },
     dispose() {
@@ -930,18 +985,19 @@ export function createComponentEnvironment({
       internal.disposed = true;
       if (document._componentEnvironment === environment) {
         document._componentEnvironment = null;
+        setDocumentLanguage(document, "");
       }
     },
   };
   const internal = {
     currentURL: new URL(initialURL),
     entries: [{ url: new URL(initialURL), state: null }],
-    entryIndex: 0,
     scrollRestoration: "auto",
     disposed: false,
     orientationType: null,
   };
   environmentState.set(environment, internal);
+  historyCall(environment, "history_start");
   environment.locationObject = new Location(constructorToken, environment);
   environment.historyObject = new History(constructorToken, environment);
   environment.navigatorObject = new Navigator(constructorToken, environment);
@@ -953,11 +1009,22 @@ export function createComponentEnvironment({
     ? null
     : derivedOrientation(environment).type;
   document._componentEnvironment = environment;
+  setDocumentLanguage(document, options.languages[0]);
   updateDocumentURL(environment);
   return Object.freeze(environment);
 }
 
-export function createImplicitComponentEnvironment(target, document) {
+// The language that a date or time input without a lang follows: the
+// environment's first language, else en (core/dom/input-date-fields.watpart).
+function setDocumentLanguage(document, language) {
+  document._domCore.status("document_date_language_set", document._coreHandle, ...document._domCore.input(language));
+}
+
+export function createImplicitComponentEnvironment(
+  target,
+  document,
+  options = normalizeComponentEnvironmentOptions(undefined, target),
+) {
   const viewport = {};
   Object.defineProperties(viewport, {
     width: {
@@ -984,6 +1051,6 @@ export function createImplicitComponentEnvironment(target, document) {
     url: document.URL ?? "about:blank",
     viewport: fallbackViewport,
     target,
-    options: normalizeComponentEnvironmentOptions(undefined, target),
+    options,
   });
 }

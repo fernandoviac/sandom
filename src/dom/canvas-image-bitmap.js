@@ -5,7 +5,7 @@
 // An ImageBitmap holds the image of its source as a Canvas 2D source
 // (src/dom/canvas-2d.js, resolveImageSource): the source's own image when
 // the bitmap takes it whole, else the command list that draws its crop,
-// resize or flip (derivedImageSource). Nothing is drawn or read when the
+// resize or flip (imageBitmapGeometry). Nothing is drawn or read when the
 // bitmap is made: a canvas that draws the bitmap rasterizes its image on
 // its own device. An image Blob decodes through the renderer's codec, the
 // decoder of every image of the document.
@@ -13,13 +13,16 @@
 // The arguments, the options and the errors follow Chrome (measured on the
 // pinned Chrome 151, test/canvas/canvas_2d_image_parity_test.js).
 import {
+  BITMAP,
+  bitmapOptionsCheck,
   BROKEN_IMAGE,
-  derivedImageSource,
   discardSource,
+  imageBitmapGeometry,
   imageDataSource,
   isImageDataObject,
   releaseSource,
   registerImageBitmapState,
+  RESIZE_QUALITIES,
   resolveImageSource,
   retainSource,
 } from "./canvas-2d.js";
@@ -58,11 +61,8 @@ export class ImageBitmap {
     this.#image = null;
   }
 
-  get [Symbol.toStringTag]() {
-    return "ImageBitmap";
-  }
-
   static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "ImageBitmap", configurable: true });
     bitmapImage = (value) => #image in value ? value.#image : undefined;
   }
 }
@@ -87,7 +87,6 @@ export function createImageBitmapOf(image) {
 const ORIENTATIONS = ["from-image", "flipY", "none"];
 const PREMULTIPLY = ["none", "premultiply", "default"];
 const COLOR_SPACE_CONVERSIONS = ["none", "default"];
-const RESIZE_QUALITIES = ["pixelated", "low", "medium", "high"];
 
 function enumOption(options, name, values, type, fallback) {
   const value = options[name];
@@ -153,55 +152,37 @@ function isBlob(value) {
   return typeof Blob === "function" && value instanceof Blob;
 }
 
-// The bitmap's size and its crop of a `width` x `height` source (Blink
-// ImageBitmap::ParseOptions): a crop rect with a negative side extends the
-// other way; a resize of one side scales the other in proportion, rounded
-// up in single precision.
-function bitmapGeometry(width, height, crop, options) {
-  const rect = crop ?? [0, 0, width, height];
-  const cropWidth = rect[2];
-  const cropHeight = rect[3];
-  const f32 = Math.fround;
-  let outputWidth = cropWidth;
-  let outputHeight = cropHeight;
-  if (options.resizeWidth !== undefined && options.resizeHeight !== undefined) {
-    outputWidth = options.resizeWidth;
-    outputHeight = options.resizeHeight;
-  } else if (options.resizeWidth !== undefined) {
-    outputWidth = options.resizeWidth;
-    outputHeight = Math.ceil(f32(f32(f32(options.resizeWidth) / cropWidth) * cropHeight));
-  } else if (options.resizeHeight !== undefined) {
-    outputHeight = options.resizeHeight;
-    outputWidth = Math.ceil(f32(f32(f32(options.resizeHeight) / cropHeight) * cropWidth));
-  }
-  return { crop: rect, width: outputWidth, height: outputHeight };
-}
+// The errors of the canvas core's BITMAP_ failures.
+const BITMAP_FAILURES = Object.freeze({
+  [BITMAP.CROP_WIDTH_ZERO]: ["RangeError", "The crop rect width is 0."],
+  [BITMAP.CROP_HEIGHT_ZERO]: ["RangeError", "The crop rect height is 0."],
+  [BITMAP.RESIZE_ZERO]: ["InvalidStateError", "The resize width dimension is equal to 0."],
+  [BITMAP.SOURCE_WIDTH_ZERO]: ["InvalidStateError", "The image source's width is 0."],
+  [BITMAP.SOURCE_HEIGHT_ZERO]: ["InvalidStateError", "The image source's height is 0."],
+  [BITMAP.NO_NATURAL_SIZE]: [
+    "InvalidStateError",
+    "The image element contains an SVG image without natural dimensions, and no resize options are specified.",
+  ],
+});
 
-// The ImageBitmap of a resolved `image` with `crop` and `options`; the
-// bitmap takes `image.source` whole when nothing changes it.
+// The ImageBitmap of a resolved `image` with `crop` and `options`: the
+// source whole, or the recording of its crop, resize or flip
+// (imageBitmapGeometry); { failure } for a BITMAP_ failure.
 function bitmapOf(image, crop, options) {
-  const geometry = bitmapGeometry(image.width, image.height, crop, options);
-  const [sx, sy, sw, sh] = geometry.crop;
-  const whole = sx === 0 && sy === 0 && sw === image.width && sh === image.height &&
-    geometry.width === image.width && geometry.height === image.height && options.imageOrientation !== "flipY";
-  if (whole) return createImageBitmapOf(image);
-  const source = derivedImageSource(
-    image,
-    geometry.crop,
-    geometry.width,
-    geometry.height,
-    options.imageOrientation === "flipY",
-    options.resizeQuality,
-  );
+  const geometry = imageBitmapGeometry(image, crop, options);
+  if (geometry.result === BITMAP.WHOLE) return { bitmap: createImageBitmapOf(image) };
+  if (geometry.result !== BITMAP.DERIVED) return { failure: BITMAP_FAILURES[geometry.result] };
   discardSource(image.source);
-  return createImageBitmapOf({
-    source,
-    width: geometry.width,
-    height: geometry.height,
-    opaque: false,
-    originClean: image.originClean,
-    naturalDimensions: true,
-  });
+  return {
+    bitmap: createImageBitmapOf({
+      source: geometry.source,
+      width: geometry.width,
+      height: geometry.height,
+      opaque: false,
+      originClean: image.originClean,
+      naturalDimensions: true,
+    }),
+  };
 }
 
 // The decoded image of an image Blob: a raster image only (Chrome does not
@@ -264,18 +245,19 @@ export function createImageBitmap(document, argumentCount, image, ...rest) {
     if (resolved && resolved !== BROKEN_IMAGE) discardSource(resolved.source);
     return rejection(name, `${MEMBER}: ${message}`);
   };
-  if (crop !== null) {
-    if (crop[2] === 0 || crop[3] === 0) return fail("RangeError", `The crop rect ${crop[2] === 0 ? "width" : "height"} is 0.`);
-    // A crop rect with a negative side extends the other way.
-    if (crop[2] < 0) crop = [crop[0] + crop[2], crop[1], -crop[2], crop[3]];
-    if (crop[3] < 0) crop = [crop[0], crop[1] + crop[3], crop[2], -crop[3]];
-  }
-  if (options.resizeWidth === 0) return fail("InvalidStateError", "The resize width dimension is equal to 0.");
-  // Chrome names the width for a zero height as well.
-  if (options.resizeHeight === 0) return fail("InvalidStateError", "The resize width dimension is equal to 0.");
+  const checked = bitmapOptionsCheck(crop, options);
+  if (checked !== null) return fail(...BITMAP_FAILURES[checked]);
+  // A failure of the bitmap's geometry rejects; its source is discarded.
+  const settle = (image) => {
+    const made = bitmapOf(image, crop, options);
+    if (made.failure === undefined) return made.bitmap;
+    discardSource(image.source);
+    const [name, message] = made.failure;
+    throw new DOMException(`${MEMBER}: ${message}`, name);
+  };
   let pending;
   if (blob) {
-    pending = blobImage(document, image).then((decoded) => bitmapOf(decoded, crop, options));
+    pending = blobImage(document, image).then(settle);
   } else {
     if (imageData) {
       if (image.data.buffer.detached) return fail("InvalidStateError", "The source data has been detached.");
@@ -290,22 +272,11 @@ export function createImageBitmap(document, argumentCount, image, ...rest) {
     }
     if (resolved === BROKEN_IMAGE) return fail("InvalidStateError", "The HTMLImageElement provided is in the 'broken' state.");
     if (resolved === null) return fail("InvalidStateError", "The image source is not usable.");
-    if (resolved.width === 0 || resolved.height === 0) {
-      return fail("InvalidStateError", `The image source's ${resolved.width === 0 ? "width" : "height"} is 0.`);
-    }
-    if (!resolved.naturalDimensions && (options.resizeWidth === undefined || options.resizeHeight === undefined)) {
-      return fail(
-        "InvalidStateError",
-        "The image element contains an SVG image without natural dimensions, and no resize options are specified.",
-      );
-    }
-    let bitmap;
     try {
-      bitmap = bitmapOf(resolved, crop, options);
+      pending = Promise.resolve(settle(resolved));
     } catch (error) {
       return Promise.reject(error);
     }
-    pending = Promise.resolve(bitmap);
   }
   // The promise settles in a task of the document, as Chrome settles it
   // after the work it posts.

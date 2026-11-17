@@ -8,14 +8,11 @@
 // owner of a control is the DOM core's (`input_control_form`); the list of
 // options of a select is the DOM core's (`input_control_options`).
 import { createTokenList } from "./node-collections.js";
+import { decodeDomString } from "../dom-wasm/dom-string-transport.js";
+import { formTargets, nodeMember } from "./node-members.js";
 
 const HTML_NS = "http://www.w3.org/1999/xhtml";
 const INDEX = /^(0|[1-9][0-9]*)$/;
-const LISTED = "button,fieldset,input,object,output,select,textarea";
-const LISTED_NAMES = new Set(LISTED.split(","));
-const LABELABLE = "button,input,meter,output,progress,select,textarea";
-const LABELABLE_NAMES = new Set(LABELABLE.split(","));
-const ASCII_UPPER = /[A-Z]+/g;
 
 const states = new WeakMap();
 const caches = new WeakMap();
@@ -28,34 +25,12 @@ function cached(element, key, create) {
   return value;
 }
 
-function asciiLowercase(value) {
-  return value.replace(ASCII_UPPER, (letters) => letters.toLowerCase());
-}
-
 function isHTML(element) {
   return element.namespaceURI === HTML_NS;
 }
 
 function formOwnerHandle(element) {
   return element._domCore.handle("input_control_form", element._coreHandle);
-}
-
-// A string as the content of a quoted CSS string.
-function cssString(value) {
-  return value.replace(/[\\"]/g, "\\$&").replace(/\n/g, "\\a ").replace(/\r/g, "\\d ")
-    .replace(/\f/g, "\\c ").replace(/\0/g, "\uFFFD");
-}
-
-function query(root, selector) {
-  return root._domCore.selectorQueryAll(root._coreHandle, selector);
-}
-
-// The elements of `root` (root excluded) whose id is `name`, or, for an HTML
-// element, whose name attribute is `name`, in tree order.
-function namedCandidates(root, name, selector = "") {
-  const value = cssString(name);
-  return query(root, `${selector}[id="${value}"],${selector}[name="${value}"]`).filter((element) =>
-    element.getAttribute("id") === name || isHTML(element) && element.getAttribute("name") === name);
 }
 
 function matchesName(element, name) {
@@ -178,14 +153,14 @@ export class HTMLCollection {
   [Symbol.iterator]() {
     return stateOf(this).items()[Symbol.iterator]();
   }
-  get [Symbol.toStringTag]() {
-    return "HTMLCollection";
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "HTMLCollection", configurable: true });
   }
 }
 
 export class HTMLFormControlsCollection extends HTMLCollection {
-  get [Symbol.toStringTag]() {
-    return "HTMLFormControlsCollection";
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "HTMLFormControlsCollection", configurable: true });
   }
 }
 
@@ -196,8 +171,31 @@ export class HTMLOptionsCollection extends HTMLCollection {
   set selectedIndex(value) {
     stateOf(this).select.selectedIndex = value;
   }
-  get [Symbol.toStringTag]() {
-    return "HTMLOptionsCollection";
+  // HTML: add(element, before) inserts an option or optgroup into the
+  // select before the node `before` names, or before the before-th option
+  // when it is a number, or at the end.
+  add(element, before = null) {
+    const { select } = stateOf(this);
+    if (!(element instanceof Object) || !isHTML(element) || !["option", "optgroup"].includes(element.localName)) {
+      throw new TypeError("Failed to execute 'add': the element is not an option or an optgroup");
+    }
+    if (element.contains(select)) {
+      throw new DOMException("Failed to execute 'add': the element is an ancestor of the select", "HierarchyRequestError");
+    }
+    let reference = null;
+    if (before !== null && typeof before === "object") {
+      if (!select.contains(before) || before === select) {
+        throw new DOMException("Failed to execute 'add': the reference element is not in the select", "NotFoundError");
+      }
+      if (before === element) return;
+      reference = before;
+    } else if (before !== null) {
+      reference = this.item(Number(before) | 0);
+    }
+    (reference === null ? select : reference.parentNode).insertBefore(element, reference);
+  }
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "HTMLOptionsCollection", configurable: true });
   }
 }
 
@@ -229,8 +227,8 @@ export class NodeList {
   [Symbol.iterator]() {
     return stateOf(this).items()[Symbol.iterator]();
   }
-  get [Symbol.toStringTag]() {
-    return "NodeList";
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "NodeList", configurable: true });
   }
 }
 
@@ -256,8 +254,8 @@ export class RadioNodeList extends NodeList {
       }
     }
   }
-  get [Symbol.toStringTag]() {
-    return "RadioNodeList";
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "RadioNodeList", configurable: true });
   }
 }
 
@@ -273,17 +271,15 @@ function htmlCollection(prototype, items, extra = {}) {
 }
 
 // The listed elements whose form owner is the form, in tree order, without
-// image buttons (HTML form.elements).
-function formListedElements(form, root = form.getRootNode()) {
-  const handle = form._coreHandle;
-  return query(root, LISTED).filter((element) =>
-    isHTML(element) && formOwnerHandle(element) === handle &&
-    !(element.localName === "input" && element.type === "image"));
+// image buttons (HTML form.elements; form_controls).
+function formListedElements(form) {
+  return form._domCore.outputNodes(form._domCore.status("form_controls", form._coreHandle));
 }
 
-function isFormControl(form, element) {
-  return LISTED_NAMES.has(element.localName) && isHTML(element) &&
-    formOwnerHandle(element) === form._coreHandle && !(element.localName === "input" && element.type === "image");
+// The form's controls with the id or name `name` (form_named_controls).
+function formNamedControls(form, name) {
+  const core = form._domCore;
+  return core.outputNodes(core.status("form_named_controls", form._coreHandle, ...core.input(name)));
 }
 
 // A live RadioNodeList over `items()`, the same object for each read of
@@ -296,48 +292,187 @@ function formElements(form) {
   return cached(form, "elements", () => {
     const items = () => formListedElements(form);
     const named = (name) => {
-      if (name === "") return null;
-      const matches = namedCandidates(form.getRootNode(), name).filter((element) => isFormControl(form, element));
+      const matches = formNamedControls(form, name);
       if (matches.length === 0) return null;
       if (matches.length === 1) return matches[0];
-      return radioNodeList(form, `controls ${name}`, () => items().filter((element) => matchesName(element, name)));
+      return radioNodeList(form, `controls ${name}`, () => formNamedControls(form, name));
     };
     return liveCollection(HTMLFormControlsCollection.prototype, { items, named });
   });
 }
 
-// The img elements whose form owner is the form: an img has its nearest
-// ancestor form.
-function formImages(form, name) {
-  return namedCandidates(form.getRootNode(), name, "img").filter((image) =>
-    isHTML(image) && image.parentElement?.closest("form") === form);
+// HTMLFormElement is a legacy platform object (Web IDL) with an indexed
+// getter, its controls, and a named getter (HTML "the form element",
+// form_named_item), with [LegacyOverrideBuiltIns] and
+// [LegacyUnenumerableNamedProperties]: a named property comes before each
+// property of the prototype chain. The wrapper of a form element is a
+// proxy around the element object; the traps are Web IDL's
+// [[GetOwnProperty]], [[DefineOwnProperty]], [[Delete]],
+// [[PreventExtensions]] and [[OwnPropertyKeys]] of such an object.
+//
+// A property whose name starts with "_" is a Sandom internal of the node
+// (design/constraint-validation.md, "Form named properties"): a named
+// property does not shadow it when the element has it, and a script can
+// always set or define it.
+const FORM_NAMED_CANDIDATES = 0;
+const FORM_NAMED_GETTER = 1;
+const FORM_NAMED_SUPPORTED = 2;
+const ARRAY_INDEX_END = 4294967295;
+
+let formPrototype = null;
+// Each form element object's wrapper; each wrapper's element object is in
+// formTargets (node-members.js).
+const formWrappers = new WeakMap();
+
+function isArrayIndex(property) {
+  return INDEX.test(property) && Number(property) < ARRAY_INDEX_END;
 }
 
-// Whether an element of `root` has the id or name `name`: one core walk
-// with no result list, so a miss (the usual read of an absent property,
-// also by Sandom's own code while it makes the form's wrapper) runs no
-// selector query.
-function hasNamedDescendant(root, name) {
-  const core = root._domCore;
-  return core.handle("node_collection_named", root._coreHandle, ...core.input("*"), 0, ...core.input(name)) !== 0n;
+function isInternal(property) {
+  return property.charCodeAt(0) === 95;
 }
 
-// HTML's named property of a form: its controls by id or name, else its
-// images by id or name; a RadioNodeList when several match.
-function formNamedProperty(form, name) {
-  if (name === "" || !hasNamedDescendant(form.getRootNode(), name)) return undefined;
-  const control = formElements(form).namedItem(name);
-  if (control !== null) return control;
-  const images = formImages(form, name);
-  if (images.length === 0) return undefined;
-  if (images.length === 1) return images[0];
-  return radioNodeList(form, `images ${name}`, () => formImages(form, name));
+// The elements of form element `element` for `name` by `mode`
+// (form_named_item).
+function formNamedItems(element, name, mode) {
+  const core = element._domCore;
+  const count = core.status("form_named_item", element._coreHandle, ...core.input(name), mode);
+  return count === 0 ? [] : core.outputNodes(count);
 }
 
-// Indexed and named properties of a form or a select element, without a
-// proxy around the element itself: an object between the class prototype
-// and its parent answers the properties that no own property and no
-// prototype has. The receiver is the element.
+// The supported property indices of a form: its controls (form_controls).
+function formIndexed(element, property) {
+  const core = element._domCore;
+  return core.outputNodes(core.status("form_controls", element._coreHandle))[Number(property)];
+}
+
+// Web IDL "named property visibility" without the supported property name
+// check: the object has no own property of the name, and the name is not
+// a Sandom internal that the element has.
+function namedVisible(element, property) {
+  return !Object.hasOwn(element, property) && !(isInternal(property) && property in element);
+}
+
+// The value of a visible named property of the form: one element, or a
+// RadioNodeList of the candidates; undefined for none. Several controls
+// give the RadioNodeList of form.elements for the name, as in Chrome.
+function formNamed(form, element, property) {
+  if (!namedVisible(element, property)) return undefined;
+  const items = formNamedItems(element, property, FORM_NAMED_GETTER);
+  if (items.length === 0) return undefined;
+  if (items.length === 1) return items[0];
+  if (element._domCore.nodeString("node_local_name", items[0]._coreHandle) !== "img") {
+    return radioNodeList(form, `controls ${property}`, () => formNamedControls(form, property));
+  }
+  return radioNodeList(form, `images ${property}`, () => formNamedItems(element, property, FORM_NAMED_CANDIDATES));
+}
+
+function isSupportedName(element, property) {
+  const core = element._domCore;
+  return core.status("form_named_item", element._coreHandle, ...core.input(property), FORM_NAMED_SUPPORTED) !== 0;
+}
+
+// The supported property names of a form (form_supported_property_names):
+// each name as its byte length (u32) and its bytes.
+function formSupportedNames(element) {
+  const core = element._domCore;
+  const count = core.status("form_supported_property_names", element._coreHandle);
+  const pointer = core.exports.abi_output_pointer();
+  const length = core.exports.abi_output_length();
+  const bytes = new Uint8Array(core.refreshBytes().buffer, pointer, length).slice();
+  const view = new DataView(bytes.buffer);
+  const names = [];
+  for (let index = 0, at = 0; index < count; index += 1) {
+    const size = view.getUint32(at, true);
+    names.push(decodeDomString(bytes.subarray(at + 4, at + 4 + size)));
+    at += 4 + size;
+  }
+  return names;
+}
+
+const formTraps = {
+  get(element, property, receiver) {
+    if (typeof property === "string") {
+      const value = isArrayIndex(property)
+        ? formIndexed(element, property)
+        : formNamed(formWrappers.get(element), element, property);
+      if (value !== undefined) return value;
+    }
+    return Reflect.get(element, property, receiver);
+  },
+  has(element, property) {
+    if (typeof property === "string") {
+      const value = isArrayIndex(property)
+        ? formIndexed(element, property)
+        : formNamed(formWrappers.get(element), element, property);
+      if (value !== undefined) return true;
+    }
+    return Reflect.has(element, property);
+  },
+  getOwnPropertyDescriptor(element, property) {
+    if (typeof property === "string") {
+      if (isArrayIndex(property)) {
+        const value = formIndexed(element, property);
+        if (value !== undefined) return { value, writable: false, enumerable: true, configurable: true };
+      } else {
+        const value = formNamed(formWrappers.get(element), element, property);
+        if (value !== undefined) return { value, writable: false, enumerable: false, configurable: true };
+      }
+    }
+    return Reflect.getOwnPropertyDescriptor(element, property);
+  },
+  // A Sandom internal that the element does not have yet becomes its own
+  // data property, without the named property check of [[Set]].
+  set(element, property, value, receiver) {
+    if (typeof property === "string" && isInternal(property) && !(property in element) &&
+      receiver === formWrappers.get(element)) {
+      return Reflect.defineProperty(element, property, { value, writable: true, enumerable: true, configurable: true });
+    }
+    return Reflect.set(element, property, value, receiver);
+  },
+  defineProperty(element, property, descriptor) {
+    if (typeof property === "string") {
+      if (isArrayIndex(property)) return false;
+      if (!isInternal(property) && isSupportedName(element, property)) return false;
+    }
+    return Reflect.defineProperty(element, property, descriptor);
+  },
+  deleteProperty(element, property) {
+    if (typeof property === "string") {
+      if (isArrayIndex(property)) return formIndexed(element, property) === undefined;
+      if (namedVisible(element, property) && isSupportedName(element, property)) return false;
+    }
+    return Reflect.deleteProperty(element, property);
+  },
+  preventExtensions() {
+    return false;
+  },
+  ownKeys(element) {
+    const core = element._domCore;
+    const count = core.status("form_controls", element._coreHandle);
+    const keys = new Set(Array.from({ length: count }, (_, index) => String(index)));
+    for (const name of formSupportedNames(element)) {
+      if (namedVisible(element, name)) keys.add(name);
+    }
+    for (const key of Reflect.ownKeys(element)) keys.add(key);
+    return [...keys];
+  },
+};
+
+// The wrapper of element object `element`: a form wrapper proxy for an
+// HTML form element, else the object.
+export function elementWrapper(element) {
+  if (Object.getPrototypeOf(element) !== formPrototype) return element;
+  const form = new Proxy(element, formTraps);
+  formWrappers.set(element, form);
+  formTargets.set(form, element);
+  return form;
+}
+
+// Indexed properties of a select element, without a proxy around the
+// element itself: an object between the class prototype and its parent
+// answers the properties that no own property and no prototype has. The
+// receiver is the element.
 function installElementProperties(prototype, lookup) {
   const parent = Object.getPrototypeOf(prototype);
   const target = Object.create(parent);
@@ -351,70 +486,40 @@ function installElementProperties(prototype, lookup) {
   }));
 }
 
+// A reflected attribute; a form's controls can shadow the attribute
+// methods of the form (node-members.js).
 function reflectString(name) {
   return {
     get() {
-      return this.getAttribute(name) ?? "";
+      return nodeMember(this, "getAttribute").call(this, name) ?? "";
     },
     set(value) {
-      this.setAttribute(name, String(value));
+      nodeMember(this, "setAttribute").call(this, name, String(value));
     },
     configurable: true,
   };
 }
+
+// The autocomplete IDL attribute of input, select and textarea: the
+// element's IDL-exposed autofill value (HTML "autofill processing model",
+// core/dom/autofill.watpart); setting it sets the content attribute.
+const autocomplete = {
+  get() {
+    return this._domCore.string("element_autofill_value", this._coreHandle);
+  },
+  set(value) {
+    this.setAttribute("autocomplete", String(value));
+  },
+  configurable: true,
+};
 
 function reflectBoolean(name) {
   return {
     get() {
-      return this.hasAttribute(name);
+      return nodeMember(this, "hasAttribute").call(this, name);
     },
     set(value) {
-      this.toggleAttribute(name, Boolean(value));
-    },
-    configurable: true,
-  };
-}
-
-// An enumerated attribute: the keyword in ASCII lower case, else the
-// invalid-value default, else (no attribute) the missing-value default.
-function reflectEnumerated(name, keywords, missing, invalid = missing) {
-  return {
-    get() {
-      const value = this.getAttribute(name);
-      if (value === null) return missing;
-      const keyword = asciiLowercase(value);
-      return keywords.includes(keyword) ? keyword : invalid;
-    },
-    set(value) {
-      this.setAttribute(name, String(value));
-    },
-    configurable: true,
-  };
-}
-
-// HTML's rules for parsing non-negative integers; null for an error.
-function parseNonNegative(value) {
-  const match = /^[\t\n\f\r ]*([+-]?)([0-9]+)/.exec(value);
-  if (!match) return null;
-  const number = Number(match[2]);
-  if (match[1] === "-" && number !== 0) return null;
-  return number > 2147483647 ? null : number;
-}
-
-// An unsigned long attribute; `positive` limits it to values above zero.
-export function reflectUnsigned(name, fallback, positive = false) {
-  return {
-    get() {
-      const value = this.getAttribute(name);
-      const number = value === null ? null : parseNonNegative(value);
-      if (number === null || positive && number === 0) return fallback;
-      return number;
-    },
-    set(value) {
-      let number = Number(value);
-      number = Number.isFinite(number) ? ((Math.trunc(number) % 2 ** 32) + 2 ** 32) % 2 ** 32 : 0;
-      if (number > 2147483647 || positive && number === 0) number = fallback;
-      this.setAttribute(name, String(number));
+      nodeMember(this, "toggleAttribute").call(this, name, Boolean(value));
     },
     configurable: true,
   };
@@ -434,35 +539,33 @@ function reflectTokenList(attribute) {
   };
 }
 
-function isLabelable(element) {
-  return isHTML(element) && LABELABLE_NAMES.has(element.localName) &&
-    !(element.localName === "input" && element.type === "hidden");
-}
-
-// The labeled control of a label: the element its for attribute names in
-// its tree when that is labelable, else (no for attribute) its first
-// labelable descendant.
+// The labeled control of a label (label_control).
 function labelControl(label) {
-  const target = label.getAttribute("for");
-  if (target !== null) {
-    if (target === "") return null;
-    const root = label.getRootNode();
-    const element = root.getAttribute?.("id") === target
-      ? root
-      : label._domCore.elementById(root._coreHandle, target);
-    return element !== null && isLabelable(element) ? element : null;
-  }
-  return query(label, LABELABLE).find(isLabelable) ?? null;
+  return label._domCore.nodeHandle("label_control", label._coreHandle);
 }
 
-// The labels of a labelable element: the label elements of its tree whose
-// labeled control it is, in tree order. Null for a hidden input.
+// The labels of a labelable element, in tree order (element_labels). Null
+// for a hidden input.
 const labels = {
   get() {
-    if (this.localName === "input" && this.type === "hidden") return null;
+    const core = this._domCore;
+    if (core.status("element_labels", this._coreHandle) < 0) return null;
     return cached(this, "labels", () => liveCollection(NodeList.prototype, {
-      items: () => query(this.getRootNode(), "label").filter((label) => isHTML(label) && labelControl(label) === this),
+      items: () => core.outputNodes(core.status("element_labels", this._coreHandle)),
     }));
+  },
+  configurable: true,
+};
+
+// The labels NodeList of labelable element `element`.
+export function elementLabels(element) {
+  return labels.get.call(element);
+}
+
+// The suggestions source element of an input (input_control_list), or null.
+const list = {
+  get() {
+    return this._domCore.nodeHandle("input_control_list", this._coreHandle);
   },
   configurable: true,
 };
@@ -471,15 +574,17 @@ const labels = {
 // the default mode.
 const outputOverrides = new WeakMap();
 
-// The list of options of a select. The core packs their handles; they are
-// copied before wrapper construction can enter the core again.
+// The reset algorithm of an output element: its text becomes its default
+// value, and its default value override goes away.
+export function resetOutput(output) {
+  const value = outputOverrides.get(output) ?? output.textContent;
+  outputOverrides.delete(output);
+  output.textContent = value;
+}
+
+// The list of options of a select (input_control_options).
 function selectOptions(select) {
-  const core = select._domCore;
-  const count = core.status("input_control_options", select._coreHandle);
-  if (count <= 0) return [];
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * 8);
-  const handles = Array.from({ length: count }, (_, index) => view.getBigUint64(index * 8, true));
-  return handles.map((handle) => core.wrapperFor(handle));
+  return select._domCore.outputNodes(select._domCore.status("input_control_options", select._coreHandle));
 }
 
 export function installFormDomBindings({
@@ -511,36 +616,21 @@ export function installFormDomBindings({
       },
       configurable: true,
     },
-    action: {
-      get() {
-        const value = this.getAttribute("action");
-        const document = this.ownerDocument;
-        if (value === null || value === "") return document.URL;
-        return URL.parse(value, document.baseURI)?.href ?? value;
-      },
-      set(value) {
-        this.setAttribute("action", String(value));
-      },
-      configurable: true,
-    },
-    method: reflectEnumerated("method", ["get", "post", "dialog"], "get"),
-    enctype: reflectEnumerated("enctype", ["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"], "application/x-www-form-urlencoded"),
-    encoding: reflectEnumerated("enctype", ["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"], "application/x-www-form-urlencoded"),
-    autocomplete: reflectEnumerated("autocomplete", ["on", "off"], "on"),
     target: reflectString("target"),
     acceptCharset: reflectString("accept-charset"),
     rel: reflectString("rel"),
-    relList: reflectTokenList("rel"),
     noValidate: reflectBoolean("novalidate"),
   });
-  installElementProperties(SDHTMLFormElement.prototype, (form, property) =>
-    INDEX.test(property) ? formElements(form).item(Number(property)) ?? undefined : formNamedProperty(form, property));
+  formPrototype = SDHTMLFormElement.prototype;
 
   Object.defineProperty(SDHTMLInputElement.prototype, "labels", labels);
+  Object.defineProperty(SDHTMLInputElement.prototype, "list", list);
   Object.defineProperty(SDHTMLInputElement.prototype, "placeholder", reflectString("placeholder"));
+  Object.defineProperty(SDHTMLInputElement.prototype, "autocomplete", autocomplete);
+  Object.defineProperty(SDHTMLSelectElement.prototype, "autocomplete", autocomplete);
+  Object.defineProperty(SDHTMLTextAreaElement.prototype, "autocomplete", autocomplete);
 
   Object.defineProperties(SDHTMLButtonElement.prototype, {
-    type: reflectEnumerated("type", ["submit", "reset", "button"], "submit"),
     value: reflectString("value"),
     labels,
   });
@@ -575,6 +665,13 @@ export function installFormDomBindings({
       writable: true,
       configurable: true,
     },
+    add: {
+      value: function add(element, before = null) {
+        options(this).add(element, before);
+      },
+      writable: true,
+      configurable: true,
+    },
     namedItem: {
       value(name) {
         return options(this).namedItem(name);
@@ -592,7 +689,6 @@ export function installFormDomBindings({
       configurable: true,
     },
     multiple: reflectBoolean("multiple"),
-    size: reflectUnsigned("size", 0),
     labels,
   });
   installElementProperties(SDHTMLSelectElement.prototype, (select, property) =>
@@ -611,8 +707,6 @@ export function installFormDomBindings({
       },
       configurable: true,
     },
-    rows: reflectUnsigned("rows", 2, true),
-    cols: reflectUnsigned("cols", 20, true),
     placeholder: reflectString("placeholder"),
     labels,
   });
@@ -665,8 +759,8 @@ export function installFormDomBindings({
     disabled: reflectBoolean("disabled"),
     elements: {
       get() {
-        return cached(this, "elements", () =>
-          htmlCollection(HTMLCollection.prototype, () => query(this, LISTED).filter(isHTML)));
+        return cached(this, "elements", () => htmlCollection(HTMLCollection.prototype,
+          () => this._domCore.outputNodes(this._domCore.status("fieldset_elements", this._coreHandle))));
       },
       configurable: true,
     },

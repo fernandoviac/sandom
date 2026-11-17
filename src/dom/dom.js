@@ -1,8 +1,4 @@
 export { createSandomRuntime } from "../scene-renderer.js";
-export {
-  defineSandomInteractiveRenderer,
-  SandomInteractiveRendererElement,
-} from "./interactive-renderer-element.js";
 export { createDocumentSession, DocumentSession } from "./document-session.js";
 export { createRenderSurface } from "./render-surface.js";
 export { renderComponent } from "./render-component.js";
@@ -120,6 +116,7 @@ export async function inspectHTML(source, {
       width: viewportW,
       height: viewportH,
       nodes: serialized.nodes,
+      generatedBoxRows: serialized.generatedBoxRows,
       imageSources: serialized.imageSources,
     });
     layoutRecord = Object.freeze({
@@ -222,7 +219,7 @@ function unsuppliedFontDiagnostics(document, domNodes) {
       code: "font-face-unsupplied",
       severity: "error",
       recoverable: false,
-      message: unsuppliedFontFaceMessage(family, element),
+      message: unsuppliedFontFaceMessage(document._domCore, family, element),
       fontFamily: family,
       nodeIndex: nodeIndices.get(element),
     }));

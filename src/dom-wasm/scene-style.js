@@ -16,6 +16,12 @@ import {
   LAYOUT_NODE_OFFSET_SVG_STROKE_PATH_INDEX,
   LAYOUT_NODE_OFFSET_SVG_STROKE_WIDTH,
 } from "../wasm/layout.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+
+const ROW_STYLE_MATRIX = layoutConstant("ROW_STYLE_MATRIX");
+const ROW_STYLE_WORLD_MATRIX = layoutConstant("ROW_STYLE_WORLD_MATRIX");
+const ROW_STYLE_DIAGNOSTIC_MATRIX = layoutConstant("ROW_STYLE_DIAGNOSTIC_MATRIX");
+const SVG_KIND_PATH_REF = layoutConstant("SVG_KIND_PATH_REF");
 
 // The style generation each serialized node list was taken at. A
 // DOM-backed node carries no style, so a renderer given only the nodes
@@ -71,37 +77,39 @@ export function readSceneRowStyle(
   );
   const view = new DataView(core.refreshBytes().buffer);
   const output = core.exports.abi_output_pointer();
+  const F32 = Float32Array.BYTES_PER_ELEMENT;
   const number = (offset) => view.getFloat32(record + offset, true);
+  // An RGBA color as four f32 values.
   const color = (offset) => ({
     r: number(offset),
-    g: number(offset + 4),
-    b: number(offset + 8),
-    a: number(offset + 12),
+    g: number(offset + F32),
+    b: number(offset + 2 * F32),
+    a: number(offset + 3 * F32),
   });
   const style = {
     matrix: Array.from(
       { length: 6 },
-      (_, index) => view.getFloat32(output + index * 4, true),
+      (_, index) => view.getFloat32(output + ROW_STYLE_MATRIX + index * Float32Array.BYTES_PER_ELEMENT, true),
     ),
     diagnosticMatrix: Array.from(
       { length: 6 },
-      (_, index) => view.getFloat64(output + 48 + index * 8, true),
+      (_, index) => view.getFloat64(output + ROW_STYLE_DIAGNOSTIC_MATRIX + index * Float64Array.BYTES_PER_ELEMENT, true),
     ),
     worldMatrix: Array.from(
       { length: 6 },
-      (_, index) => view.getFloat32(output + 24 + index * 4, true),
+      (_, index) => view.getFloat32(output + ROW_STYLE_WORLD_MATRIX + index * Float32Array.BYTES_PER_ELEMENT, true),
     ),
     border: Object.fromEntries(
       sides.map((
         side,
         index,
-      ) => [side, number(LAYOUT_NODE_OFFSET_BORDER_TOP + index * 4)]),
+      ) => [side, number(LAYOUT_NODE_OFFSET_BORDER_TOP + index * F32)]),
     ),
     borderColors: Object.fromEntries(
       sides.map((
         side,
         index,
-      ) => [side, color(LAYOUT_NODE_OFFSET_BORDER_COLOR_TOP + index * 16)]),
+      ) => [side, color(LAYOUT_NODE_OFFSET_BORDER_COLOR_TOP + index * 4 * F32)]),
     ),
     borderStyles: Object.fromEntries(sides.map((side, index) => {
       const value = view.getUint8(
@@ -148,8 +156,10 @@ export function readSceneRowStyle(
         "bevel",
       ][view.getUint8(record + LAYOUT_NODE_OFFSET_SVG_LINE_JOIN)],
     };
-    if (kind === 4) {
-      style.svg.path = core.svgPathDefinition(fillIndex);
+    // 65535 is the core's "no path" index (engine-svg.watpart): a shape
+    // without a fill path has no definition to read.
+    if (kind === SVG_KIND_PATH_REF) {
+      if (fillIndex !== 65535) style.svg.path = core.svgPathDefinition(fillIndex);
       style.svg.bounds = core.sceneSvgPathBounds(
         publication.handle,
         node._corePublicationIndex,

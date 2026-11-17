@@ -4,8 +4,8 @@
 // package and its library set. They are part of the program, as its
 // JavaScript modules are, and they are not document resources: a document
 // resource always goes through the host resource session. This module reads
-// only locators below the Sandom package root, the root of the libraries it
-// is installed beside, or the font set, and refuses every other locator, so
+// only locators below the Sandom package root, the root of each library
+// that it loads, or the font set, and refuses every other locator, so
 // it cannot serve as a document resource provider.
 //
 // Deno, Node, and Bun expose the package files through `node:fs`; a browser
@@ -13,6 +13,8 @@
 // Chrome logs a console error for the failed request that no catch can
 // suppress, so the attempt is gated on the runtime advertising node
 // compatibility.
+
+import { FONT_SET } from "./font-set.js";
 
 const runtimeProvidesNodeModules = globalThis.Deno !== undefined ||
   globalThis.process?.versions !== undefined;
@@ -30,12 +32,27 @@ if (runtimeProvidesNodeModules) {
 // Bun). False in a browser.
 export const hasFileSystem = nodeFileSystemPromises !== null;
 
-// The libraries root is where the sibling libraries resolve: two levels
-// above the colour module, which is `<root>/sandom-color/dist/color.wasm`
-// in a checkout or a published set and `node_modules/@sandom/color/dist/`
-// in an installed package. The npm build projects both specifiers below.
-const COLOR_WASM = "@sandom/color/color.wasm";
-const FONT_SET_LOCATION = "https://cdn.urania-libs.com/set/4ac082ad6cf25238/sandom-fonts/";
+// A library root is two levels above a library module: the set root in a
+// checkout or a published set (`<root>/sandom-color/dist/color.wasm`), and
+// the scope directory that holds the package in an installed package
+// (`node_modules/@sandom/color/dist/color.wasm`). An install can put each
+// package in its own directory: an isolated layout
+// (`node_modules/.store/@sandom/color@0.3.0-…/node_modules/@sandom/`) gives
+// each library a different scope directory. Thus each library module that
+// Sandom loads gives one root. The npm build projects each specifier below.
+const LIBRARY_MODULES = Object.freeze([
+  "@sandom/color/color.wasm",
+  "@sandom/gain-map/gain-map.wasm",
+  "@sandom/png/png-codec.wasm",
+  "@sandom/image-codecs/jpeg.wasm",
+  "@sandom/image-codecs/webp.wasm",
+]);
+const FONT_SET_LOCATION = "https://cdn.urania-libs.com/set/2621941e2c701e45/sandom-fonts/";
+// The font set's location as src/system-fonts.js resolves it: the
+// import-map target of FONT_SET_LOCATION, else the published set of the pin
+// (a realm without an import map, such as a dedicated worker).
+const mappedFontSet = import.meta.resolve(FONT_SET_LOCATION);
+const fontSetRoot = mappedFontSet === FONT_SET_LOCATION ? FONT_SET.url : mappedFontSet;
 // The module URL goes through a variable on purpose. Vite's asset transform
 // rewrites the literal form `new URL("../", import.meta.url)` at serve time
 // into the directory's file-system path (no trailing slash), while the asset
@@ -43,9 +60,8 @@ const FONT_SET_LOCATION = "https://cdn.urania-libs.com/set/4ac082ad6cf25238/sand
 // outside the root.
 const moduleURL = import.meta.url;
 const packageRoot = new URL("../", moduleURL).href;
-const librariesRoot = new URL("../../", import.meta.resolve(COLOR_WASM)).href;
-const fontSetRoot = import.meta.resolve(FONT_SET_LOCATION);
-const programRoots = Object.freeze([...new Set([packageRoot, librariesRoot, fontSetRoot])]);
+const libraryRoots = LIBRARY_MODULES.map((specifier) => new URL("../../", import.meta.resolve(specifier)).href);
+const programRoots = Object.freeze([...new Set([packageRoot, ...libraryRoots, fontSetRoot])]);
 
 function toUint8Array(buffer) {
   return buffer instanceof Uint8Array && buffer.constructor === Uint8Array

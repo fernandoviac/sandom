@@ -6,6 +6,14 @@ import { createGpuBinding } from '../gpu-binding.js';
 import { instantiateRendererCore } from '../wasm/renderer-core-binary.js';
 import { MAX_CONTOURS, MSDF_ATLAS_POPULATION_WGSL, MSDF_COMPUTE_WGSL } from './shader.js';
 import { getDefaultGpu } from '../gpu-thread.js';
+import { layoutConstant } from '../wasm/layout-table.js';
+
+// The request rows of gpu-msdf.watpart, by WAT name.
+const MSDF_REQUEST = Object.freeze(Object.fromEntries(
+  ['SIZE', 'GEOMETRY', 'LENGTH', 'X', 'Y', 'WIDTH', 'HEIGHT', 'PIXELS']
+    .map((name) => [name, layoutConstant(`MSDF_REQUEST_${name}`)])));
+const MSDF_ERROR = Object.freeze(Object.fromEntries(['CODE', 'GLYPH', 'OBSERVED', 'LIMIT']
+  .map((name) => [name, layoutConstant(`MSDF_ERROR_${name}`)])));
 
 export class WebGpuMsdfError extends Error {
   constructor(code, message, details = {}) {
@@ -34,7 +42,8 @@ export async function createWebGpuMsdfGenerator(options = {}) {
   const encoder = new TextEncoder();
   const sources = [MSDF_COMPUTE_WGSL, MSDF_ATLAS_POPULATION_WGSL].map((source) => {
     const bytes = encoder.encode(source);
-    const pointer = core.abi_allocate(bytes.length);
+    // A retained block, freed after the create records execute.
+    const pointer = core.abi_malloc(bytes.length);
     if (!pointer) throw new Error(`renderer-core could not allocate ${bytes.length} bytes of MSDF WGSL`);
     new Uint8Array(core.memory.buffer, pointer, bytes.length).set(bytes);
     return { pointer, length: bytes.length };
@@ -48,12 +57,12 @@ export async function createWebGpuMsdfGenerator(options = {}) {
   const pipelineCreationMilliseconds = hostNow() - startedAt;
   let closed = false;
   function throwNativeError() {
-    const view = new DataView(core.memory.buffer, state, 32);
-    const code = view.getUint32(16, true);
+    const view = new DataView(core.memory.buffer, state, MSDF_ERROR.LIMIT + Uint32Array.BYTES_PER_ELEMENT);
+    const code = view.getUint32(MSDF_ERROR.CODE, true);
     if (!code) return;
-    const glyphIndex = view.getUint32(20, true);
-    const observed = view.getUint32(24, true);
-    const limit = view.getUint32(28, true);
+    const glyphIndex = view.getUint32(MSDF_ERROR.GLYPH, true);
+    const observed = view.getUint32(MSDF_ERROR.OBSERVED, true);
+    const limit = view.getUint32(MSDF_ERROR.LIMIT, true);
     const codes = ['malformed-buffer', 'unknown-format-version', 'contour-cap-exceeded', 'batch-too-large', 'malformed-atlas-target', 'device-lost'];
     throw new WebGpuMsdfError(codes[code - 1], `glyph ${glyphIndex}: observed ${observed}, required limit ${limit}; provide geometry and a target within the declared format and device limits`, { glyphIndex, observed, limit });
   }
@@ -78,17 +87,18 @@ export async function createWebGpuMsdfGenerator(options = {}) {
         readbackMilliseconds: 0, totalMilliseconds: 0, batchCount: 0 };
       try {
         binding.beginFrame();
-        const length = preparedBuffers.reduce((sum, bytes) => sum + bytes.byteLength, preparedBuffers.length * 32);
+        const length = preparedBuffers.reduce((sum, bytes) => sum + bytes.byteLength, preparedBuffers.length * MSDF_REQUEST.SIZE);
         const input = binding.input(length);
         const inputPointer = input.byteOffset;
-        let pointer = inputPointer + preparedBuffers.length * 32;
+        let pointer = inputPointer + preparedBuffers.length * MSDF_REQUEST.SIZE;
         const memory = new Uint8Array(core.memory.buffer);
         for (let index = 0; index < preparedBuffers.length; index++) {
           const bytes = preparedBuffers[index];
-          input.setUint32(index * 32, pointer, true);
-          input.setUint32(index * 32 + 4, bytes.length, true);
-          input.setUint32(index * 32 + 8, directAtlas?.placements[index].x ?? 0, true);
-          input.setUint32(index * 32 + 12, directAtlas?.placements[index].y ?? 0, true);
+          const row = index * MSDF_REQUEST.SIZE;
+          input.setUint32(row + MSDF_REQUEST.GEOMETRY, pointer, true);
+          input.setUint32(row + MSDF_REQUEST.LENGTH, bytes.length, true);
+          input.setUint32(row + MSDF_REQUEST.X, directAtlas?.placements[index].x ?? 0, true);
+          input.setUint32(row + MSDF_REQUEST.Y, directAtlas?.placements[index].y ?? 0, true);
           memory.set(bytes, pointer);
           pointer += bytes.length;
         }
@@ -116,10 +126,10 @@ export async function createWebGpuMsdfGenerator(options = {}) {
         const readStart = hostNow();
         const view = new DataView(core.memory.buffer);
         const results = preparedBuffers.map((_, index) => {
-          const row = inputPointer + index * 32;
-          const width = view.getUint32(row + 16, true);
-          const height = view.getUint32(row + 20, true);
-          const pixels = view.getUint32(row + 24, true);
+          const row = inputPointer + index * MSDF_REQUEST.SIZE;
+          const width = view.getUint32(row + MSDF_REQUEST.WIDTH, true);
+          const height = view.getUint32(row + MSDF_REQUEST.HEIGHT, true);
+          const pixels = view.getUint32(row + MSDF_REQUEST.PIXELS, true);
           return { width, height, pixels: pixels ? new Uint8Array(core.memory.buffer, pixels, width * height * 3).slice() : null };
         });
         timings.readbackMilliseconds += hostNow() - readStart;

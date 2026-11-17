@@ -1,23 +1,25 @@
-import { instantiate } from "../wasm/motion-capture-binary.js";
+import * as motionCaptureBinary from "../wasm/motion-capture-binary.js";
+import { moduleLayoutConstants } from "../wasm/layout-table.js";
 
-// The failure message of the last failed call (frame_sequence_error_message).
-function failureMessage(exports) {
-  const length = exports.frame_sequence_error_message();
-  const pointer = exports.frame_sequence_error_text();
-  return new TextDecoder().decode(new Uint8Array(exports.memory.buffer, pointer, length));
+const { instantiate } = motionCaptureBinary;
+const motionCaptureConstant = moduleLayoutConstants(motionCaptureBinary, "motion capture");
+const CREATE = motionCaptureConstant("FRAME_SEQUENCE_CONTEXT_CREATE");
+const ADD_FRAME = motionCaptureConstant("FRAME_SEQUENCE_CONTEXT_ADD_FRAME");
+const FINISH = motionCaptureConstant("FRAME_SEQUENCE_CONTEXT_FINISH");
+const numberOrNaN = (value) => typeof value === "number" ? value : NaN;
+
+function messageText(exports, length) {
+  return new TextDecoder().decode(new Uint8Array(exports.memory.buffer, exports.frame_sequence_error_text(), length));
 }
 
-function call(exports, operation, message) {
+// Throws the RangeError of a nonzero check result (its message length).
+function check(exports, length) {
+  if (length !== 0) throw new RangeError(messageText(exports, length));
+}
+
+function call(exports, operation, context) {
   if (operation()) return;
-  throw new Error(`${message}: ${failureMessage(exports)}`);
-}
-function integerInRange(value, minimum, maximum, name) {
-  if (!Number.isInteger(value) || value < minimum || value > maximum) {
-    throw new RangeError(
-      `${name} must be an integer from ${minimum} through ${maximum}`,
-    );
-  }
-  return value;
+  throw new Error(messageText(exports, exports.frame_sequence_failure_message(context)));
 }
 
 function frameBytes(pixels) {
@@ -38,11 +40,7 @@ function copyRectangles(exports, rectangles) {
   if (!Array.isArray(rectangles)) {
     throw new TypeError("candidateRectangles must be an array");
   }
-  if (rectangles.length > exports.frame_sequence_rectangle_capacity()) {
-    throw new RangeError(
-      "candidateRectangles exceeds the WebAssembly capacity",
-    );
-  }
+  check(exports, exports.frame_sequence_rectangle_count_check(rectangles.length));
   const view = new DataView(exports.memory.buffer);
   const base = exports.frame_sequence_rectangle_address();
   for (let index = 0; index < rectangles.length; index++) {
@@ -61,8 +59,9 @@ function copyRectangles(exports, rectangles) {
         `candidateRectangles[${index}] must have numeric x, y, width, and height`,
       );
     }
+    // Each rectangle is x, y, width and height as f64 values.
     for (let field = 0; field < values.length; field++) {
-      view.setFloat64(base + index * 32 + field * 8, values[field], true);
+      view.setFloat64(base + (index * values.length + field) * Float64Array.BYTES_PER_ELEMENT, values[field], true);
     }
   }
   return rectangles.length;
@@ -74,32 +73,18 @@ export function createGifRecorder({
   loopCount = 0,
   alphaThreshold = 0,
 }) {
-  const frameWidth = integerInRange(width, 1, 65535, "width");
-  const frameHeight = integerInRange(height, 1, 65535, "height");
-  const loops = integerInRange(loopCount, 0, 65535, "loopCount");
-  const threshold = integerInRange(alphaThreshold, 0, 255, "alphaThreshold");
-  const expectedByteLength = frameWidth * frameHeight * 4;
   const instance = instantiate({});
   const exports = instance.exports;
-  call(
-    exports,
-    () =>
-      exports.frame_sequence_create(frameWidth, frameHeight, loops, threshold),
-    "Cannot create GIF recorder",
-  );
+  check(exports, exports.frame_sequence_option_check(
+    numberOrNaN(width), numberOrNaN(height), numberOrNaN(loopCount), numberOrNaN(alphaThreshold),
+  ));
+  call(exports, () => exports.frame_sequence_create(width, height, loopCount, alphaThreshold), CREATE);
 
   return Object.freeze({
     addFrame({ pixels, durationMilliseconds, candidateRectangles } = {}) {
       const bytes = frameBytes(pixels);
-      const format = pixels instanceof Float32Array ? 1 : 0;
-      const expectedInputLength = format === 1
-        ? expectedByteLength * Float32Array.BYTES_PER_ELEMENT
-        : expectedByteLength;
-      if (bytes.byteLength !== expectedInputLength) {
-        throw new RangeError(
-          `pixels must contain exactly ${expectedByteLength} RGBA samples`,
-        );
-      }
+      const floatSamples = pixels instanceof Float32Array;
+      check(exports, exports.frame_sequence_samples_check(floatSamples, bytes.byteLength));
       new Uint8Array(
         exports.memory.buffer,
         exports.frame_sequence_input_address(),
@@ -110,21 +95,17 @@ export function createGifRecorder({
         exports,
         () =>
           exports.frame_sequence_add_frame(
-            format,
+            floatSamples,
             bytes.byteLength,
             durationMilliseconds,
             rectangleCount,
           ),
-        "Cannot encode GIF frame",
+        ADD_FRAME,
       );
     },
 
     finish() {
-      call(
-        exports,
-        () => exports.frame_sequence_finish(),
-        "Cannot finish GIF recorder",
-      );
+      call(exports, () => exports.frame_sequence_finish(), FINISH);
       return new Uint8Array(
         exports.memory.buffer,
         exports.frame_sequence_output_address(),

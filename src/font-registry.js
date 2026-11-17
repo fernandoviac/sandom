@@ -2,6 +2,41 @@ import { decodeFontCoverage } from "./font-coverage.js";
 
 import { createDocumentResourceLoader } from "./dom/document-resources.js";
 import { sharedDomCore } from "./dom-wasm/core.js";
+import { layoutConstant } from "./wasm/layout-table.js";
+
+const FONT_HOST_FAMILY_RECORD = Object.freeze(Object.fromEntries(
+  ["IDENTITY_LENGTH", "CSS_LENGTH", "FALLBACK_LENGTH", "HEADER_SIZE"]
+    .map((name) => [name, layoutConstant(`FONT_HOST_FAMILY_RECORD_${name}`)]),
+));
+const FONT_MESSAGE_UNKNOWN_FAMILY = layoutConstant("FONT_MESSAGE_UNKNOWN_FAMILY");
+const FONT_MESSAGE_SYSTEM_FAMILY_UNUSABLE = layoutConstant("FONT_MESSAGE_SYSTEM_FAMILY_UNUSABLE");
+const FONT_MESSAGE_NO_SYSTEM_PROVIDER = layoutConstant("FONT_MESSAGE_NO_SYSTEM_PROVIDER");
+const FONT_MESSAGE_UNDECLARED_FACE = layoutConstant("FONT_MESSAGE_UNDECLARED_FACE");
+const FONT_MESSAGE_NO_METRICS_FACE = layoutConstant("FONT_MESSAGE_NO_METRICS_FACE");
+const FONT_MESSAGE_FALLBACK_WITHOUT_FACE = layoutConstant("FONT_MESSAGE_FALLBACK_WITHOUT_FACE");
+const FONT_MESSAGE_FALLBACK_LOAD_FAILED = layoutConstant("FONT_MESSAGE_FALLBACK_LOAD_FAILED");
+const FONT_MESSAGE_EMPTY_FAMILY = layoutConstant("FONT_MESSAGE_EMPTY_FAMILY");
+const FONT_FAMILY_VARIABLE = layoutConstant("FONT_FAMILY_VARIABLE");
+const FONT_REMOVED_NONE = layoutConstant("FONT_REMOVED_NONE");
+const FONT_REMOVED_FAMILY = layoutConstant("FONT_REMOVED_FAMILY");
+const FONT_KEY_GENERIC = layoutConstant("FONT_KEY_GENERIC");
+const FONT_REQUEST_DONE = layoutConstant("FONT_REQUEST_DONE");
+const FONT_REQUEST_SYSTEM_FAMILY = layoutConstant("FONT_REQUEST_SYSTEM_FAMILY");
+const FONT_REQUEST_GENERIC_FAMILY = layoutConstant("FONT_REQUEST_GENERIC_FAMILY");
+// The face rows of font-hosted-faces.watpart and the style descriptor of
+// font-runtime-faces.watpart, by WAT name.
+const FONT_FACE_ROW = Object.freeze(Object.fromEntries(["SIZE", "FACE", "INDEX", "RESOURCE"]
+  .map((name) => [name, layoutConstant(`FONT_FACE_ROW_${name}`)])));
+const FONT_STYLE_DESCRIPTOR = Object.freeze(Object.fromEntries(["SIZE", "MINIMUM", "MAXIMUM", "AUTO"]
+  .map((name) => [name, layoutConstant(`FONT_STYLE_DESCRIPTOR_${name}`)])));
+// The runtime face descriptor of font-input.watpart and the face instance
+// of font-runtime-faces.watpart.
+const FONT_RUNTIME_DESCRIPTOR = Object.freeze(Object.fromEntries([
+  "WEIGHT_MINIMUM", "WEIGHT_MAXIMUM", "STRETCH_MINIMUM", "STRETCH_MAXIMUM", "WEIGHT_AUTO", "STRETCH_AUTO",
+  "INITIAL_WEIGHT", "INITIAL_STRETCH", "NAME",
+].map((name) => [name, layoutConstant(`FONT_RUNTIME_DESCRIPTOR_${name}`)])));
+const FONT_INSTANCE = Object.freeze(Object.fromEntries(["SIZE", "WEIGHT", "WIDTH", "SLANT", "ITALIC"]
+  .map((name) => [name, layoutConstant(`FONT_INSTANCE_${name}`)])));
 
 const fontCatalogFinalizer = new FinalizationRegistry((lifetime) => {
   lifetime.unsubscribe?.();
@@ -83,11 +118,11 @@ function defaultSlope(core, style) {
 // text.
 export function fontFaceStyleDescriptor(text, core = sharedDomCore) {
   if (core.status("font_face_style_descriptor", ...core.input(String(text ?? ""))) === 0) return null;
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 24);
+  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_STYLE_DESCRIPTOR.SIZE);
   return {
-    slopeMinimum: view.getFloat64(0, true),
-    slopeMaximum: view.getFloat64(8, true),
-    slopeAuto: view.getInt32(16, true) !== 0,
+    slopeMinimum: view.getFloat64(FONT_STYLE_DESCRIPTOR.MINIMUM, true),
+    slopeMaximum: view.getFloat64(FONT_STYLE_DESCRIPTOR.MAXIMUM, true),
+    slopeAuto: view.getInt32(FONT_STYLE_DESCRIPTOR.AUTO, true) !== 0,
   };
 }
 
@@ -114,7 +149,7 @@ function createFallbackFamilies(fallbackFamilies) {
   const faces = coverage.families.map((family) => {
     const entry = Object.hasOwn(fallbackFamilies.faces, family) ? fallbackFamilies.faces[family] : undefined;
     if (typeof entry?.url !== "string" || typeof entry?.load !== "function") {
-      throw new Error(registryMessage(sharedDomCore, 5, 0, family));
+      throw new Error(registryMessage(sharedDomCore, FONT_MESSAGE_FALLBACK_WITHOUT_FACE, 0, family));
     }
     return entry;
   });
@@ -147,7 +182,7 @@ function createFallbackFamilies(fallbackFamilies) {
           };
         }).catch((cause) => {
           Object.assign(resource, { state: "failed", error: cause });
-          throw new Error(registryMessage(sharedDomCore, 6, Number(weight), name, String(style), url,
+          throw new Error(registryMessage(sharedDomCore, FONT_MESSAGE_FALLBACK_LOAD_FAILED, Number(weight), name, String(style), url,
             String(cause?.message ?? cause)), { cause });
         });
         loads.set(key, resource);
@@ -267,9 +302,11 @@ function createRegistry({
     if (hostSources === null) return;
     const count = recordHostSources();
     if (count < 0) return;
-    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * 16);
-    const released = Array.from({ length: count }, (_, row) =>
-      [report.getUint32(row * 16, true), report.getBigInt64(row * 16 + 8, true)]);
+    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * FONT_FACE_ROW.SIZE);
+    const released = Array.from({ length: count }, (_, row) => [
+      report.getUint32(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.FACE, true),
+      report.getBigInt64(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.RESOURCE, true),
+    ]);
     for (const [faceID, resourceHandle] of released) {
       faceIDs.delete(facesByID.get(faceID));
       facesByID.delete(faceID);
@@ -381,17 +418,17 @@ function createRegistry({
     );
     const pointer = core.exports.abi_output_pointer();
     const bytes = core.refreshBytes();
-    const descriptor = new DataView(bytes.buffer, pointer, 56);
+    const descriptor = new DataView(bytes.buffer, pointer, FONT_RUNTIME_DESCRIPTOR.NAME);
     return {
-      name: new TextDecoder().decode(bytes.subarray(pointer + 56, pointer + core.exports.abi_output_length())),
-      weightMinimum: descriptor.getFloat64(0, true),
-      weightMaximum: descriptor.getFloat64(8, true),
-      stretchMinimum: descriptor.getFloat64(16, true),
-      stretchMaximum: descriptor.getFloat64(24, true),
-      weightAuto: descriptor.getUint32(32, true) !== 0,
-      stretchAuto: descriptor.getUint32(36, true) !== 0,
-      initialWeight: descriptor.getFloat64(40, true),
-      initialStretch: descriptor.getFloat64(48, true),
+      name: new TextDecoder().decode(bytes.subarray(pointer + FONT_RUNTIME_DESCRIPTOR.NAME, pointer + core.exports.abi_output_length())),
+      weightMinimum: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.WEIGHT_MINIMUM, true),
+      weightMaximum: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.WEIGHT_MAXIMUM, true),
+      stretchMinimum: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.STRETCH_MINIMUM, true),
+      stretchMaximum: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.STRETCH_MAXIMUM, true),
+      weightAuto: descriptor.getUint32(FONT_RUNTIME_DESCRIPTOR.WEIGHT_AUTO, true) !== 0,
+      stretchAuto: descriptor.getUint32(FONT_RUNTIME_DESCRIPTOR.STRETCH_AUTO, true) !== 0,
+      initialWeight: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.INITIAL_WEIGHT, true),
+      initialStretch: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.INITIAL_STRETCH, true),
       style: String(style),
       unicodeRange,
     };
@@ -430,10 +467,10 @@ function createRegistry({
     }
     const outputPointer = core.exports.abi_output_pointer();
     const output = core.refreshBytes().slice(outputPointer, outputPointer + core.exports.abi_output_length());
-    const report = new DataView(output.buffer, output.byteOffset, 16);
-    const index = report.getInt32(4, true);
-    const resourceHandle = report.getBigInt64(8, true);
-    const key = new TextDecoder().decode(output.subarray(16));
+    const report = new DataView(output.buffer, output.byteOffset, FONT_FACE_ROW.SIZE);
+    const index = report.getInt32(FONT_FACE_ROW.INDEX, true);
+    const resourceHandle = report.getBigInt64(FONT_FACE_ROW.RESOURCE, true);
+    const key = new TextDecoder().decode(output.subarray(FONT_FACE_ROW.SIZE));
     const existing = facesByID.get(faceID);
     const registered = existing ?? face;
     if (!existing) ownerBinding.references++;
@@ -471,7 +508,7 @@ function createRegistry({
   function loadDeclaredFace(faceID) {
     const face = facesByID.get(faceID);
     if (typeof face?.load !== "function") {
-      throw new Error(registryMessage(core, 3, Number(faceID)));
+      throw new Error(registryMessage(core, FONT_MESSAGE_UNDECLARED_FACE, Number(faceID)));
     }
     return face.load();
   }
@@ -480,14 +517,14 @@ function createRegistry({
     const ownerBinding = runtimeOwnerTokens.get(owner);
     const removed = core.status("font_runtime_face_remove", fontCatalogHandle,
       ...core.input(familyKey), ownerBinding?.token ?? 0);
-    if (removed === 0) return;
+    if (removed === FONT_REMOVED_NONE) return;
     const faceID = new DataView(core.refreshBytes().buffer,
       core.exports.abi_output_pointer(), 4).getUint32(0, true);
     const face = facesByID.get(faceID);
     const resourceHandle = resources.get(faceID);
     const specification = runtimeFontFamilies.get(familyKey);
     specification.faces.splice(specification.faces.indexOf(face), 1);
-    if (removed === 2) runtimeFontFamilies.delete(familyKey);
+    if (removed === FONT_REMOVED_FAMILY) runtimeFontFamilies.delete(familyKey);
     faceIDs.delete(face);
     facesByID.delete(faceID);
     keptFaceRecords.delete(faceID);
@@ -505,7 +542,7 @@ function createRegistry({
     { weight = 400, stretch = "auto", style = "normal", host = null } = {},
   ) {
     const name = normalizedFamilyName(cssFamily, false, core);
-    if (!name) throw new TypeError(registryMessage(core, 7, 0));
+    if (!name) throw new TypeError(registryMessage(core, FONT_MESSAGE_EMPTY_FAMILY, 0));
     let bytes;
     let finalURL = null;
     if (source instanceof Uint8Array) {
@@ -566,7 +603,7 @@ function createRegistry({
 
   function familySpec(familyKey) {
     const specification = lookupFamily(familyKey);
-    if (specification === null) throw new Error(registryMessage(core, 0, 0, String(familyKey)));
+    if (specification === null) throw new Error(registryMessage(core, FONT_MESSAGE_UNKNOWN_FAMILY, 0, String(familyKey)));
     return specification;
   }
 
@@ -579,7 +616,7 @@ function createRegistry({
       runtimeFontFamilies.get(localKey) ?? hostedFontFamilies.get(localKey) ?? genericFontFamilies.get(localKey);
     const kind = core.status("font_family_key_value", ...core.input(String(familyKey)));
     const value = core.outputString() ?? "";
-    let specification = kind === 1 ? undefined : registered(familyKey);
+    let specification = kind === FONT_KEY_GENERIC ? undefined : registered(familyKey);
     if (!specification) {
       const [localKey] = stackKeys(value).keys;
       if (localKey !== undefined) specification = registered(localKey);
@@ -633,10 +670,12 @@ function createRegistry({
     core.throwIfError(true);
     const bytes = core.refreshBytes();
     const pointer = core.exports.abi_output_pointer();
-    const lengths = new DataView(bytes.buffer, pointer, 12);
+    const lengths = new DataView(bytes.buffer, pointer, FONT_HOST_FAMILY_RECORD.HEADER_SIZE);
     const decoder = new TextDecoder();
-    let cursor = pointer + 12;
-    const [identity, cssFamily, fallback] = [0, 4, 8].map((offset) => {
+    let cursor = pointer + FONT_HOST_FAMILY_RECORD.HEADER_SIZE;
+    const [identity, cssFamily, fallback] = [
+      FONT_HOST_FAMILY_RECORD.IDENTITY_LENGTH, FONT_HOST_FAMILY_RECORD.CSS_LENGTH, FONT_HOST_FAMILY_RECORD.FALLBACK_LENGTH,
+    ].map((offset) => {
       const start = cursor;
       cursor += lengths.getUint32(offset, true);
       return decoder.decode(bytes.subarray(start, cursor));
@@ -697,11 +736,11 @@ function createRegistry({
   function runFamilySession(session) {
     for (;;) {
       const request = core.status("font_answer_next", session);
-      if (request === 0) return;
+      if (request === FONT_REQUEST_DONE) return;
       const name = core.outputString() ?? "";
       const token = core.status("font_answer_token", session);
-      if (request === 1 || request === 2) {
-        const record = request === 1
+      if (request === FONT_REQUEST_SYSTEM_FAMILY || request === FONT_REQUEST_GENERIC_FAMILY) {
+        const record = request === FONT_REQUEST_SYSTEM_FAMILY
           ? systemFamilyRecord(name)
           : genericFamilyRecord(name);
         const specification = record?.specification;
@@ -714,8 +753,8 @@ function createRegistry({
           Number.isFinite(specification?.zeroAdvanceRatio) ? specification.zeroAdvanceRatio : NaN,
         );
         const key = core.outputString() ?? "";
-        if (request === 1 && record !== null) adoptHostedFamily(key, record.specification);
-        if (request === 2) adoptGenericFamily(key, name, specification ?? null);
+        if (request === FONT_REQUEST_SYSTEM_FAMILY && record !== null) adoptHostedFamily(key, record.specification);
+        if (request === FONT_REQUEST_GENERIC_FAMILY) adoptGenericFamily(key, name, specification ?? null);
       } else {
         const face = metricsFace(name);
         core.status(
@@ -810,7 +849,7 @@ function createRegistry({
   function importHostFontSource(familyKey, weight, style) {
     const specification = hostedFontFamilies.get(familyKey) ?? genericFontFamilies.get(familyKey);
     if (!specification?.resolveFace) {
-      throw new Error(registryMessage(core, 2, 0, String(familyKey)));
+      throw new Error(registryMessage(core, FONT_MESSAGE_NO_SYSTEM_PROVIDER, 0, String(familyKey)));
     }
     const face = hostFontFace(specification, Number(weight), style);
     return face;
@@ -827,7 +866,7 @@ function createRegistry({
     if (!face) {
       const resolved = specification.resolveFace(requestedWeight, hostStyle);
       if (!resolved || !(resolved.bytes instanceof Uint8Array)) {
-        throw new Error(registryMessage(core, 1, 0, String(specification.cssFamily)));
+        throw new Error(registryMessage(core, FONT_MESSAGE_SYSTEM_FAMILY_UNUSABLE, 0, String(specification.cssFamily)));
       }
       face = {
         bytes: resolved.bytes, faceIndex: Number(resolved.faceIndex ?? 0),
@@ -845,9 +884,9 @@ function createRegistry({
         requestedWeight, styleCode,
         ...core.byteInput(face.bytes), face.faceIndex,
       );
-      const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 16);
-      const index = report.getInt32(4, true);
-      const resource = report.getBigInt64(8, true);
+      const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_FACE_ROW.SIZE);
+      const index = report.getInt32(FONT_FACE_ROW.INDEX, true);
+      const resource = report.getBigInt64(FONT_FACE_ROW.RESOURCE, true);
       faceIDs.set(face, faceID);
       facesByID.set(faceID, face);
       const record = { family: key, weight: requestedWeight, stretch: 100, document: 0n };
@@ -864,11 +903,11 @@ function createRegistry({
   // faces) in the renderer's scope.
   function registerKeptFaces() {
     const count = core.status("font_catalog_faces_register", fontCatalogHandle, engineSourceTransport.ensureScope());
-    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * 16);
+    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * FONT_FACE_ROW.SIZE);
     const rows = Array.from({ length: count }, (_, row) => ({
-      faceID: report.getInt32(row * 16, true),
-      index: report.getInt32(row * 16 + 4, true),
-      resourceHandle: report.getBigInt64(row * 16 + 8, true),
+      faceID: report.getInt32(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.FACE, true),
+      index: report.getInt32(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.INDEX, true),
+      resourceHandle: report.getBigInt64(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.RESOURCE, true),
     }));
     for (const { faceID, index, resourceHandle } of rows) {
       engineSourceTransport.recordFaceInstance(index, {
@@ -917,19 +956,19 @@ function createRegistry({
       Number(weight), Number(stretch), Number(slope),
     );
     if (faceID === 0) return null;
-    const instance = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 32);
+    const instance = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_INSTANCE.SIZE);
     const face = facesByID.get(faceID);
     return {
       bytes: face.bytes,
       faceIndex: Number(face.faceIndex ?? 0),
-      italicFace: instance.getInt32(24, true) !== 0,
+      italicFace: instance.getInt32(FONT_INSTANCE.ITALIC, true) !== 0,
       version: face.version,
       finalURL: face.finalURL,
       catalogID: faceID,
       resourceHandle: resources.get(faceID),
-      variationWeight: instance.getFloat64(0, true),
-      variationWidth: instance.getFloat64(8, true),
-      variationSlant: instance.getFloat64(16, true),
+      variationWeight: instance.getFloat64(FONT_INSTANCE.WEIGHT, true),
+      variationWidth: instance.getFloat64(FONT_INSTANCE.WIDTH, true),
+      variationSlant: instance.getFloat64(FONT_INSTANCE.SLANT, true),
     };
   }
 
@@ -948,7 +987,7 @@ function createRegistry({
     return (core.status(
       "font_catalog_family_flags", fontCatalogHandle,
       ...core.input(familyKeys.get(specification)),
-    ) & 1) !== 0;
+    ) & FONT_FAMILY_VARIABLE) !== 0;
   }
 
   // CSS Values and Units, "ch": when it is impossible or impractical to
@@ -992,7 +1031,7 @@ function createRegistry({
       return faceFor(key, 400, "normal");
     } catch (cause) {
       const family = lookupFamily(key)?.cssFamily ?? key;
-      throw new Error(registryMessage(core, 4, 0, String(family), String(cause?.message ?? cause)), { cause });
+      throw new Error(registryMessage(core, FONT_MESSAGE_NO_METRICS_FACE, 0, String(family), String(cause?.message ?? cause)), { cause });
     }
   }
 
@@ -1027,12 +1066,12 @@ function createRegistry({
       engineSourceTransport = transport;
       if (keptFaceRecords.size !== 0) registerKeptFaces();
     },
-    prepareNativeFontPublication(root) {
+    prepareNativeFontPublication(root, computedRead = false) {
       refreshHostAnswers();
       if (engineSourceTransport === null) return;
       registry.bindDocument(root.nodeType === 9 ? root : root.ownerDocument);
       defaultFamilyKey ??= fontStackKeysForCssValue(DEFAULT_FONT_FAMILY)[0];
-      engineSourceTransport.prepare(root, defaultFamilyKey, importHostFontSource);
+      engineSourceTransport.prepare(root, defaultFamilyKey, importHostFontSource, computedRead);
     },
     replayEngineSources() {
       if (keptFaceRecords.size !== 0) registerKeptFaces();

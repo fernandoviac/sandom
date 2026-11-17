@@ -1,23 +1,31 @@
 import { prepareImageSceneInput } from "./dom-wasm/direct-scene-input.js";
+import {
+  ImageJoinInfoSize,
+  ImageRequestSize,
+  readImageJoinInfo,
+  readImageRequest,
+} from "./dom-wasm/record-readers.generated.js";
+import { layoutConstant } from "./wasm/layout-table.js";
 import { SandomHostError } from "./host/contract.js";
 
 const decoder = new TextDecoder();
-const properties = ["src", "canvas", "background-image", "mask-image", "border-image-source", "broken-image-icon"];
-const IMAGE_JOIN_RECORD_BYTES = 40;
-const IMAGE_REQUEST_RECORD_BYTES = 56;
+const PROPERTY = Object.fromEntries(["SRC", "CANVAS", "BACKGROUND", "MASK", "BORDER", "ICON", "COUNT"]
+  .map((name) => [name, layoutConstant(`IMAGE_PROPERTY_${name}`)]));
+const IMAGE_INDEX_NONE = layoutConstant("IMAGE_INDEX_NONE");
+const IMAGE_KIND_ENCODED = layoutConstant("IMAGE_KIND_ENCODED");
+const IMAGE_KIND_CANVAS = layoutConstant("IMAGE_KIND_CANVAS");
+const IMAGE_KIND_ICON = layoutConstant("IMAGE_KIND_ICON");
+const IMAGE_KINDS = new Set([IMAGE_KIND_ENCODED, IMAGE_KIND_CANVAS, IMAGE_KIND_ICON]);
 
-function imageRecordBytes(view, offset, end, usage) {
-  const size = usage ? IMAGE_REQUEST_RECORD_BYTES : IMAGE_JOIN_RECORD_BYTES;
-  if (end - offset < size) throw new Error(`Image request has ${end - offset} bytes; requires ${size}`);
-  const kind = view.getUint32(offset + 4, true);
-  if (kind < 1 || kind > 3) throw new Error(`Unknown native image kind ${kind}`);
+function checkImageRecord(record, usage) {
+  if (!IMAGE_KINDS.has(record.kind)) throw new Error(`Unknown native image kind ${record.kind}`);
   if (usage) {
-    const property = view.getUint32(offset + 44, true);
-    const required = view.getUint32(offset + 52, true);
-    if (property >= properties.length) throw new Error(`Unknown native image property ${property}`);
-    if (required !== 0 && required !== kind) throw new Error(`Image kind ${kind} has invalid decode operation ${required}`);
+    if (record.property >= PROPERTY.COUNT) throw new Error(`Unknown native image property ${record.property}`);
+    if (record.requiredDecode !== 0 && record.requiredDecode !== record.kind) {
+      throw new Error(`Image kind ${record.kind} has invalid decode operation ${record.requiredDecode}`);
+    }
   }
-  return size;
+  return record;
 }
 
 // The native registry owns request state, cache joins, indices and reclamation.
@@ -28,26 +36,17 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
   const failures = new Map();
   let nextFailure = 1;
 
-  function readInfo(view, offset) {
-    const pointer = view.getUint32(offset + 8, true);
-    const length = view.getUint32(offset + 12, true);
-    return {
-      identity: view.getUint32(offset, true),
-      kind: view.getUint32(offset + 4, true),
-      source: decoder.decode(new Uint8Array(core.memory.buffer, pointer, length)),
-      resourceIdentifier: view.getUint32(offset + 16, true),
-      imageIndex: view.getUint32(offset + 20, true),
-      failure: view.getUint32(offset + 24, true),
-      errorHandle: view.getUint32(offset + 28, true),
-      resourceHandle: view.getBigUint64(offset + 32, true),
-    };
+  function withSource(record) {
+    record.source = decoder.decode(new Uint8Array(core.memory.buffer, record.sourcePointer, record.sourceLength));
+    return record;
   }
   function info(identity) {
     core.status("image_join_info", identity);
     const view = new DataView(core.memory.buffer);
     const pointer = core.exports.abi_output_pointer();
-    imageRecordBytes(view, pointer, pointer + core.exports.abi_output_length(), false);
-    return readInfo(view, pointer);
+    const available = core.exports.abi_output_length();
+    if (available < ImageJoinInfoSize) throw new Error(`Image request has ${available} bytes; requires ${ImageJoinInfoSize}`);
+    return withSource(checkImageRecord(readImageJoinInfo(view, pointer), false));
   }
   function requests(nodes) {
     const count = prepareImageSceneInput(core, nodes, ensureScope());
@@ -57,19 +56,17 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
     const output = new Array(count);
     let offset = pointer;
     for (let index = 0; index < count; index++) {
-      const size = imageRecordBytes(view, offset, end, true);
-      output[index] = { ...readInfo(view, offset), node: view.getUint32(offset + 40, true),
-        property: view.getUint32(offset + 44, true), layer: view.getUint32(offset + 48, true),
-        requiredDecode: view.getUint32(offset + 52, true) };
-      offset += size;
+      if (end - offset < ImageRequestSize) throw new Error(`Image request has ${end - offset} bytes; requires ${ImageRequestSize}`);
+      output[index] = withSource(checkImageRecord(readImageRequest(view, offset), true));
+      offset += ImageRequestSize;
     }
     if (offset !== end) throw new Error(`Image request table has ${end - offset} unconsumed bytes`);
     return output;
   }
   function releasePixels() {
     const count = core.status("image_join_released");
-    const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * 4);
-    for (let index = 0; index < count; index++) pixels.delete(view.getUint32(index * 4, true));
+    const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * Uint32Array.BYTES_PER_ELEMENT);
+    for (let index = 0; index < count; index++) pixels.delete(view.getUint32(index * Uint32Array.BYTES_PER_ELEMENT, true));
   }
   function commit(identity, entry) {
     const index = core.status("image_join_commit", identity, entry.width, entry.height,
@@ -99,7 +96,12 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
       if (!resolveResource) throw new SandomHostError("missing-host-capability",
         `Image ${request.source} has no document resource loader to demand it through`,
         { details: { capability: "resource" } });
-      resource = await resolveResource({ requestedURL: request.source, kind: "image" });
+      // The request modifiers of the url() that named the image (CSS
+      // Values 5 §4.1.1) set the fields of its demand.
+      const settings = request.resourceIdentifier
+        ? core.resourceRequest(core.resourceById(request.resourceIdentifier))
+        : {};
+      resource = await resolveResource({ requestedURL: request.source, kind: "image", ...settings });
     } catch (cause) {
       return { broken: { failure: "fetch", error: new Error(
         `Image ${request.source}: resource resolution failed: ${cause.message ?? String(cause)}`, { cause }) } };
@@ -112,7 +114,7 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
     return entry.failure === undefined ? { cacheKey, entry } : { cacheKey, broken: entry };
   }
   function start(request, resolveResource) {
-    if (request.requiredDecode !== 1 || pending.has(request.identity)) return;
+    if (request.requiredDecode !== IMAGE_KIND_ENCODED || pending.has(request.identity)) return;
     // Keep a rejection as an effect outcome until ordered consumption observes it.
     const effect = load(request, resolveResource).then(value => ({ value }), error => ({ error }));
     pending.set(request.identity, effect);
@@ -125,16 +127,16 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
   }
   function copyResolution(output, nodes, request, index) {
     const row = output[request.node] === nodes[request.node] ? { ...nodes[request.node] } : output[request.node];
-    if (request.property === 0 || request.property === 1 || request.property === 5) {
+    if (request.property === PROPERTY.SRC || request.property === PROPERTY.CANVAS || request.property === PROPERTY.ICON) {
       row.imageIndex = index;
-    } else if (request.property === 2 || request.property === 3) {
-      const sourceName = request.property === 2 ? "backgroundImages" : "masks";
-      const targetName = request.property === 2 ? "resolvedBackgroundImages" : "resolvedMasks";
+    } else if (request.property === PROPERTY.BACKGROUND || request.property === PROPERTY.MASK) {
+      const sourceName = request.property === PROPERTY.BACKGROUND ? "backgroundImages" : "masks";
+      const targetName = request.property === PROPERTY.BACKGROUND ? "resolvedBackgroundImages" : "resolvedMasks";
       if (!Object.hasOwn(row, targetName) || row[targetName] === nodes[request.node][targetName]) {
         row[targetName] = nodes[request.node][sourceName].slice();
       }
       row[targetName][request.layer] = { ...nodes[request.node][sourceName][request.layer], imageIndex: index };
-    } else if (request.property === 4) {
+    } else if (request.property === PROPERTY.BORDER) {
       row.resolvedBorderImage = { ...nodes[request.node].borderImage, imageIndex: index };
     } else {
       throw new Error(`Unknown native image property ${request.property}`);
@@ -144,14 +146,14 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
   function report(request, nodes, onError) {
     const current = info(request.identity);
     if (!current.failure) {
-      if (current.imageIndex === 65535) return undefined;
+      if (current.imageIndex === IMAGE_INDEX_NONE) return undefined;
       if (!pixels.has(current.imageIndex)) throw new Error(`Image request ${request.identity}: native index ${current.imageIndex} has no host pixels`);
       return current.imageIndex;
     }
     const broken = failures.get(current.errorHandle);
     if (!broken) throw new Error(`Image request ${request.identity} has no host error for handle ${current.errorHandle}`);
     if (!onError) throw broken.error;
-    onError({ node: nodes[request.node], property: properties[request.property], requestedURL: request.source,
+    onError({ node: nodes[request.node], property: core.string("image_property_name", request.property), requestedURL: request.source,
       failure: broken.failure, error: broken.error });
     return undefined;
   }
@@ -161,15 +163,15 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
     for (const request of rows) start(request, resolveResource);
     const output = nodes.slice();
     for (const request of rows) {
-      if (request.requiredDecode === 2) {
+      if (request.requiredDecode === IMAGE_KIND_CANVAS) {
         copyResolution(output, nodes, request, canvas(request, sources));
         continue;
       }
-      if (request.requiredDecode === 3) {
+      if (request.requiredDecode === IMAGE_KIND_ICON) {
         if (core.status("image_join_source", request.identity, ...core.input(request.source))) {
           commit(request.identity, await decodeIcon());
         }
-      } else if (request.requiredDecode === 1) {
+      } else if (request.requiredDecode === IMAGE_KIND_ENCODED) {
         const effect = pending.get(request.identity);
         if (effect !== undefined) {
           const outcome = await effect;
@@ -180,7 +182,7 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
             core.status("image_join_source", request.identity, ...core.input(loaded.cacheKey));
           }
           const current = info(request.identity);
-          if (current.imageIndex === 65535 && !current.failure) {
+          if (current.imageIndex === IMAGE_INDEX_NONE && !current.failure) {
             if (loaded.broken) fail(request.identity, loaded.broken);
             else if (loaded.entry) commit(request.identity, loaded.entry);
           }
@@ -193,22 +195,26 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
     }
     return output;
   }
+  // A synchronous layout takes each image as decoded so far: an image the
+  // host has not decoded yet, the broken image icon included, has no index
+  // and the next asynchronous render decodes it. The icon box has a fixed
+  // 16 by 16 size (engine-record.watpart $engineImageFallbackBox), so its
+  // layout needs no pixels.
   function prepareImagesSync(nodes, sources = new Map()) {
     const rows = requests(nodes);
     if (!rows.length) return nodes;
     const output = nodes.slice();
     for (const request of rows) {
-      const index = request.requiredDecode === 2 ? canvas(request, sources)
-        : request.imageIndex === 65535 ? undefined : request.imageIndex;
-      if (request.requiredDecode === 3) throw new Error("The broken image icon requires an asynchronous render before synchronous layout");
+      const index = request.requiredDecode === IMAGE_KIND_CANVAS ? canvas(request, sources)
+        : request.imageIndex === IMAGE_INDEX_NONE ? undefined : request.imageIndex;
       copyResolution(output, nodes, request, index);
     }
     return output;
   }
   function registerDecodedImage(resourceHandle, resource) {
     const source = resource.cacheKey ?? resource.finalURL;
-    const identity = core.status("image_join_open", ensureScope(), core.resourceId(resourceHandle), ...core.input(source), 1);
-    if (info(identity).imageIndex !== 65535) return null;
+    const identity = core.status("image_join_open", ensureScope(), core.resourceId(resourceHandle), ...core.input(source), IMAGE_KIND_ENCODED);
+    if (info(identity).imageIndex !== IMAGE_INDEX_NONE) return null;
     const required = core.status("image_join_source", identity, ...core.input(source));
     if (!required) return null;
     return decodedEntry(resource, source).then(entry => {
@@ -220,7 +226,7 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
   function canvasImageEntry(resource) {
     const source = resource.cacheKey ?? resource.finalURL;
     const index = core.status("image_join_cache", ensureScope(), ...core.input(source));
-    if (index !== 65535) {
+    if (index !== IMAGE_INDEX_NONE) {
       const entry = pixels.get(index);
       if (!entry) throw new Error(`Image ${source}: native index ${index} has no host pixels`);
       return Promise.resolve(entry);

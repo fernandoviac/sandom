@@ -41,21 +41,19 @@ import {
 } from "./runtime-assets.js";
 import { prepareImageProfile, toSrgbRgba8 } from "./image-data.js";
 import { BROKEN_IMAGE_ICON_2X_PNG, BROKEN_IMAGE_ICON_PNG } from "./broken-image-icon.js";
-import { loadColorKernel } from "./wasm/color-kernel.js";
+import { srgb8Pixels } from "./wasm/color-source.js";
 import { createShapingRuntime } from "./shaping.js";
 import { acquireFontByteSource } from "./dom-wasm/font-byte-binding.js";
 import { noResourceHost } from "./host/contract.js";
 import { createDocumentResourceLoader } from "./dom/document-resources.js";
+import { capturePaintRecord } from "./dom/paint-projection.js";
 import {
   createFontRegistry,
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE,
   defaultFontRegistry,
 } from "./font-registry.js";
-import {
-  gridTrackCss,
-  scaleGridTrack,
-} from "./grid-tracks.js";
+import { gridTrackCss } from "./grid-tracks.js";
 import { DomCore, sharedDomCore } from "./dom-wasm/core.js";
 import { prepareAuthoredSceneInput, publishDirectSceneInput, releaseAuthoredSceneInput } from "./dom-wasm/direct-scene-input.js";
 import { readSceneRowStyle, sceneStyleGeneration } from "./dom-wasm/scene-style.js";
@@ -68,7 +66,6 @@ import {
   writeEngineFrameInput,
 } from "./dom-wasm/record-readers.generated.js";
 import {
-  BLEND_MODE_NAMES,
   BOX_OFFSET_CONTENT_H,
   BOX_OFFSET_CONTENT_W,
   BOX_OFFSET_CONTENT_X,
@@ -78,10 +75,6 @@ import {
   BOX_OFFSET_X,
   BOX_OFFSET_Y,
   BOX_SIZE,
-  CLEAR_BOTH,
-  CLEAR_LEFT,
-  CLEAR_NONE,
-  CLEAR_RIGHT,
   CLIP_ENTRY_FLAG_AFFINE,
   CLIP_ENTRY_FLAG_PATH_MASK,
   CLIP_ENTRY_OFFSET_AFFINE,
@@ -93,46 +86,19 @@ import {
   CLIP_ENTRY_OFFSET_Y,
   CLIP_ENTRY_SIZE,
   CMD_BOX_SHADOW,
-  CMD_BOX_SHADOW_FLAG_TRANSFORM,
-  CMD_BOX_SHADOW_OFFSET_FLAGS,
   CMD_BOX_SHADOW_OFFSET_H,
   CMD_BOX_SHADOW_OFFSET_W,
   CMD_BOX_SHADOW_OFFSET_X,
-  CMD_BOX_SHADOW_OFFSET_XFORM,
   CMD_BOX_SHADOW_OFFSET_Y,
   CMD_IMAGE,
-  CMD_IMAGE_FLAG_GLYPH_BITMAP,
-  CMD_IMAGE_FLAG_NO_PIXEL_SNAP,
-  CMD_IMAGE_FLAG_TRANSFORM,
-  CMD_IMAGE_OFFSET_FLAGS,
-  CMD_IMAGE_OFFSET_INDEX,
   CMD_IMAGE_OFFSET_H,
-  CMD_IMAGE_OFFSET_UV_H,
-  CMD_IMAGE_OFFSET_UV_W,
   CMD_IMAGE_OFFSET_W,
   CMD_IMAGE_OFFSET_X,
-  CMD_IMAGE_OFFSET_XFORM,
   CMD_IMAGE_OFFSET_Y,
-  CMD_POP_BACKDROP_FILTER,
-  CMD_POP_BACKGROUND,
-  CMD_POP_BLEND_LAYER,
   CMD_POP_CLIP,
-  CMD_POP_MASK_LAYER,
-  CMD_POP_OPACITY,
-  CMD_PUSH_BACKDROP_FILTER,
-  CMD_PUSH_BACKGROUND,
-  CMD_PUSH_BLEND_LAYER,
-  CMD_PUSH_BLEND_LAYER_OFFSET_MODE,
   CMD_PUSH_CLIP,
   CMD_PUSH_CLIP_HEADER_SIZE,
   CMD_PUSH_CLIP_OFFSET_COUNT,
-  CMD_PUSH_MASK,
-  CMD_PUSH_MASK_LAYER,
-  CMD_PUSH_OPACITY,
-  CMD_PUSH_OPACITY_FLAG_BLEND_MASK,
-  CMD_PUSH_OPACITY_FLAG_BLEND_SHIFT,
-  CMD_PUSH_OPACITY_OFFSET_ALPHA,
-  CMD_PUSH_OPACITY_OFFSET_FLAGS,
   CMD_RECT,
   CMD_RECT_FLAG_BORDER,
   CMD_RECT_FLAG_FILL,
@@ -148,7 +114,6 @@ import {
   CMD_RECT_OFFSET_W,
   CMD_RECT_OFFSET_X,
   CMD_RECT_OFFSET_Y,
-  CMD_RECT_OFFSET_XFORM,
   CMD_SET_NODE,
   CMD_SET_NODE_OFFSET_INDEX,
   CMD_SVG_PATH,
@@ -160,48 +125,34 @@ import {
   CMD_SVG_PATH_OFFSET_X,
   CMD_SVG_PATH_OFFSET_XFORM,
   CMD_SVG_PATH_OFFSET_Y,
-  COLOR_GLYPH_CACHE_INDEX_BASE,
   COLOR_GLYPH_IMAGE_INDEX_BASE,
   COLOR_GLYPH_IMAGE_RESOURCE_COUNT,
   COLOR_GLYPH_PATH_INDEX_BASE,
-  TEXT_STROKE_PATH_INDEX_BASE,
-  BUILTIN_PATH_INDEX_BASE,
-  BUILTIN_PATH_DISCLOSURE_DOWN,
-  BUILTIN_PATH_DISCLOSURE_LEFT,
-  BUILTIN_PATH_DISCLOSURE_RIGHT,
   FONT_UNIT_SUBDIVISION,
   CMD_TEXT,
   CMD_TEXT_FLAG_TEXT_SHADOW,
   CMD_TEXT_FLAG_TRANSFORM,
-  CMD_TEXT_OFFSET_ASCENT,
   CMD_TEXT_OFFSET_BL,
-  CMD_TEXT_OFFSET_DESCENT,
   CMD_TEXT_OFFSET_FLAGS,
   CMD_TEXT_OFFSET_FONT,
   CMD_TEXT_OFFSET_COLOR,
   CMD_TEXT_OFFSET_FSIZE,
   CMD_TEXT_OFFSET_GCOUNT,
   CMD_TEXT_OFFSET_GOFF,
-  CMD_TEXT_OFFSET_LH,
+  CMD_TEXT_OFFSET_OPSZ,
   CMD_TEXT_OFFSET_STYLE,
   CMD_TEXT_OFFSET_UPEM,
+  CMD_TEXT_OFFSET_VARIATIONS,
   CMD_TEXT_OFFSET_WEIGHT,
   CMD_TEXT_OFFSET_X,
   CMD_TEXT_OFFSET_XFORM,
   CMD_TEXT_OFFSET_Y,
   commandByteSize,
-  FLOAT_LEFT,
-  FLOAT_NONE,
-  FLOAT_RIGHT,
   FONT_TABLE_BASE,
   FONT_TABLE_ENTRY_SIZE,
-  FONT_TABLE_OFFSET_ASCENDER,
-  FONT_TABLE_OFFSET_DESCENDER,
-  FONT_TABLE_OFFSET_LINE_GAP,
   FONT_TABLE_OFFSET_UPEM,
   FONT_TABLE_OFFSET_BYTES,
   FONT_TABLE_OFFSET_LENGTH,
-  FONT_TABLE_OFFSET_ITALIC,
   FONT_TABLE_OFFSET_WEIGHT,
   FONT_VARIATION_TABLE_BASE,
   FONT_VARIATION_TABLE_ENTRY_SIZE,
@@ -211,38 +162,24 @@ import {
   GLYPH_REQUEST_HEADER_SIZE,
   GLYPH_REQUEST_ROW_SIZE,
   GLYPH_REQUEST_KIND_PATH,
+  GLYPH_REQUEST_KIND,
+  GLYPH_REQUEST_PATH_INDEX,
+  GLYPH_REQUEST_PATH_SCREEN_SIZE,
+  GLYPH_REQUEST_PATH_COVERAGE,
   glyphRequestRowByteSize,
   GLYPH_OFFSET_CLUSTER_END,
   GLYPH_OFFSET_CLUSTER_START,
   GLYPH_OFFSET_ID,
+  GLYPH_OFFSET_INK_X,
+  GLYPH_OFFSET_INK_Y,
   GLYPH_OFFSET_X_ADVANCE,
   GLYPH_OFFSET_X_OFFSET,
-  GRADIENT_STOP_POOL_BASE,
-  GRADIENT_STOP_POOL_SIZE,
-  HEADER_BASE,
-  HEADER_OFFSET_GENERATION,
   RASTER_PLAN_SCROLLBAR_ROW_SIZE,
   RASTER_RESOURCE_IMAGE,
-  LANGUAGE_TABLE_ENTRY_SIZE,
   LAYOUT_NODE_OFFSET_CHANGED_GEN,
   LAYOUT_NODE_OFFSET_PAINT_GEN,
-  LAYOUT_NODE_OFFSET_FONT_INDEX,
-  LAYOUT_NODE_OFFSET_FONT_SIZE,
-  LAYOUT_NODE_OFFSET_FONT_STACK,
-  FONT_STACK_ENTRY_SIZE,
-  FONT_STACK_OFFSET_PRIMARY,
-  FONT_STACK_OFFSET_SLOTS,
-  FONT_STACK_SLOT_HEADER_SIZE,
-  FONT_STACK_SLOT_SIZE,
-  FONT_STACK_TABLE_BASE,
-  FONT_STACK_UNLOADED,
-  LAYOUT_NODE_OFFSET_LINE_HEIGHT,
-  LAYOUT_NODE_OFFSET_LINE_HEIGHT_TAG,
   LAYOUT_NODE_SIZE,
   LAYOUT_UNIT,
-  LINE_HEIGHT_LENGTH,
-  LINE_HEIGHT_NORMAL,
-  LINE_HEIGHT_NUMBER,
   TEXT_LINE_ENTRY_SIZE,
   TEXT_LINE_OFFSET_AVAIL,
   TEXT_LINE_OFFSET_FIRST_GLYPH,
@@ -251,35 +188,121 @@ import {
   TEXT_LINE_OFFSET_X,
   TEXT_LINE_OFFSET_Y,
   TEXT_RUN_ENTRY_SIZE,
-  TEXT_RUN_OFFSET_GLYPH_COUNT,
-  TEXT_RUN_OFFSET_GLYPH_OFFSET,
   TEXT_RUN_OFFSET_LINE_COUNT,
   TEXT_RUN_OFFSET_LINE_OFFSET,
-  SHAPED_GLYPH_ENTRY_SIZE,
-  SHAPED_GLYPH_OFFSET_CLUSTER_START,
-  SHAPED_GLYPH_OFFSET_FLAGS,
   SHAPED_GLYPH_FONT_INDEX,
   SHAPED_GLYPH_FONT_SYNTHESIZED,
-  SHAPED_GLYPH_OFFSET_FONT,
-  SHAPED_GLYPH_OFFSET_ID,
-  SHAPED_GLYPH_OFFSET_X_ADVANCE,
-  SHAPED_GLYPH_OFFSET_UNSCALED_ADVANCE,
-  TILE_CONFIG_BASE,
-  TILE_CONFIG_OFFSET_COLUMNS,
-  TILE_CONFIG_OFFSET_DEVICE_SCALE,
-  TILE_CONFIG_OFFSET_FRAME_HEIGHT,
-  TILE_CONFIG_OFFSET_FRAME_WIDTH,
-  TILE_CONFIG_OFFSET_ORIGIN_X,
-  TILE_CONFIG_OFFSET_ORIGIN_Y,
-  TILE_CONFIG_OFFSET_ROWS,
-  TILE_CONFIG_OFFSET_TILE_SIZE,
-  TILE_DIRTY_MAP_SIZE,
 } from "./wasm/layout.js";
-import { FONT_COVERAGE_RANGE_SIZE } from "./font-coverage.js";
+import { layoutConstant } from "./wasm/layout-table.js";
+
+const SCENE_LAYER_BACKGROUNDS = layoutConstant("SCENE_LAYER_BACKGROUNDS");
+const SCENE_LAYER_MASKS = layoutConstant("SCENE_LAYER_MASKS");
+const SCENE_LAYER_BORDER_IMAGE = layoutConstant("SCENE_LAYER_BORDER_IMAGE");
+const SCENE_CSS_NEEDS_FONT = layoutConstant("SCENE_CSS_NEEDS_FONT");
+const SCENE_CSS_NEEDS_GRID = layoutConstant("SCENE_CSS_NEEDS_GRID");
+const SCENE_CSS_NEEDS_IMAGE = layoutConstant("SCENE_CSS_NEEDS_IMAGE");
+const SVG_GEOMETRY_CHANGED = layoutConstant("SVG_GEOMETRY_CHANGED");
+const SVG_GEOMETRY_REQUESTS_SHIFT = layoutConstant("SVG_GEOMETRY_REQUESTS_SHIFT");
+const PATH_SOURCE_SVG = layoutConstant("PATH_SOURCE_SVG");
+const PATH_SOURCE_COLOR_GLYPH = layoutConstant("PATH_SOURCE_COLOR_GLYPH");
+const ENGINE_FINISH_FORCE_GENERATION = layoutConstant("ENGINE_FINISH_FORCE_GENERATION");
+const ENGINE_FINISH_SCROLL_ONLY = layoutConstant("ENGINE_FINISH_SCROLL_ONLY");
+const PATH_SOURCE_TEXT_STROKE = layoutConstant("PATH_SOURCE_TEXT_STROKE");
+const RASTER_IMAGE_RECORD = Object.fromEntries(["FLOATS", "WIDTH", "HEIGHT", "KIND"]
+  .map((name) => [name, layoutConstant(`RASTER_IMAGE_RECORD_${name}`)]));
+const FRAME_TILES = Object.fromEntries(["COLUMNS", "ROWS", "MAP"]
+  .map((name) => [name, layoutConstant(`FRAME_TILES_${name}`)]));
+const RASTER_IMAGE_KIND_DECODED = layoutConstant("RASTER_IMAGE_KIND_DECODED");
+const RASTER_IMAGE_KIND_CANVAS = layoutConstant("RASTER_IMAGE_KIND_CANVAS");
+const BROKEN_IMAGE_ICON_WIDTH = layoutConstant("BROKEN_IMAGE_ICON_WIDTH");
+const BROKEN_IMAGE_ICON_HEIGHT = layoutConstant("BROKEN_IMAGE_ICON_HEIGHT");
+const BROKEN_IMAGE_ICON_2X = layoutConstant("BROKEN_IMAGE_ICON_2X");
+const DRAWN_SCAN_TABLE_FULL = layoutConstant("DRAWN_SCAN_TABLE_FULL");
+const ENGINE_FRAME_INPUT_DIRECT = layoutConstant("ENGINE_FRAME_INPUT_DIRECT");
+const ENGINE_RESOLUTION = Object.fromEntries(["FONT", "IMAGE", "LAYERS"]
+  .map((name) => [name, layoutConstant(`ENGINE_RESOLUTION_${name}`)]));
+const IMAGE_INDEX_NONE = layoutConstant("IMAGE_INDEX_NONE");
+const RETAINED_EDIT_SPLICE = layoutConstant("RETAINED_EDIT_SPLICE");
+const RETAINED_EDIT_PATCH = layoutConstant("RETAINED_EDIT_PATCH");
+const RASTER_PLAN_REUSE = Object.fromEntries(["NONE", "TARGET", "SAME"]
+  .map((name) => [name, layoutConstant(`RASTER_PLAN_REUSE_${name}`)]));
+const RASTER_PLAN_HEADER_RECORD_COUNT = layoutConstant("RASTER_PLAN_HEADER_RECORD_COUNT");
+const GLYPH_REQUEST_COUNT = layoutConstant("GLYPH_REQUEST_COUNT");
+const GLYPH_REQUEST_REVISION = layoutConstant("GLYPH_REQUEST_REVISION");
+// The font records of font-registration, font-instance-input and
+// font-requests watparts, by WAT name.
+const layoutConstants = (prefix, names) =>
+  Object.freeze(Object.fromEntries(names.map((name) => [name, layoutConstant(`${prefix}${name}`)])));
+const FONT_REGISTRATION = layoutConstants("FONT_REGISTRATION_",
+  ["SIZE", "FAMILY", "IDENTITY", "FACE_INDEX", "ITALIC", "WEIGHT", "STRETCH", "SLANT"]);
+const FONT_INSTANCE_REPORT = layoutConstants("FONT_INSTANCE_REPORT_", ["SIZE", "WEIGHT", "WIDTH", "SLANT", "FACE_INDEX"]);
+const FONT_GLYPH_REQUEST = layoutConstants("FONT_GLYPH_REQUEST_",
+  ["SIZE", "FACE_INDEX", "WEIGHT", "WIDTH", "SLANT", "OPTICAL_SIZE", "DEVICE_PIXEL_SIZE"]);
+const CANVAS_TEXT_LAYOUT = Object.freeze(Object.fromEntries(["WIDTH", "INK", "ASCENT", "DESCENT", "LINE_GAP",
+  "TYPO_ASCENT", "TYPO_DESCENT", "SIZE", "SYNTHESIZED_SIZE", "GLYPH_COUNT", "GLYPHS"]
+  .map((name) => [name, layoutConstant(`CANVAS_TEXT_LAYOUT_${name}`)])));
+const CANVAS_TEXT_GLYPH = Object.freeze(Object.fromEntries(["SIZE", "ID", "FONT", "OBLIQUE", "RUN_FONT", "X"]
+  .map((name) => [name, layoutConstant(`CANVAS_TEXT_GLYPH_${name}`)])));
+const CANVAS_TEXT_MEASURE_COUNT = layoutConstant("CANVAS_TEXT_MEASURE_COUNT");
+const SHAPE_FEATURE_SIZE = layoutConstant("SHAPE_FEATURE_SIZE");
+const SHAPE_FEATURE_TAG = layoutConstant("SHAPE_FEATURE_TAG");
+const SHAPE_FEATURE_VALUE = layoutConstant("SHAPE_FEATURE_VALUE");
+const VARIATION_CONTROL_COUNT = layoutConstant("VARIATION_CONTROL_COUNT");
+const VARIATION_CONTROL_OPTICAL_SIZING_NONE = layoutConstant("VARIATION_CONTROL_OPTICAL_SIZING_NONE");
+const VARIATION_CONTROL_PAIRS = layoutConstant("VARIATION_CONTROL_PAIRS");
+const VARIATION_PAIR_SIZE = layoutConstant("VARIATION_PAIR_SIZE");
+const VARIATION_PAIR_TAG = layoutConstant("VARIATION_PAIR_TAG");
+const VARIATION_PAIR_VALUE = layoutConstant("VARIATION_PAIR_VALUE");
+const FONT_SOURCE_REQUEST = Object.freeze(Object.fromEntries(["SIZE", "FAMILY_POINTER", "FAMILY_LENGTH", "WEIGHT", "STYLE"]
+  .map((name) => [name, layoutConstant(`FONT_SOURCE_REQUEST_${name}`)])));
+const CLIP_ENTRY_PATH = Object.freeze(Object.fromEntries(["INDEX", "SCALE", "X_MIN", "Y_MIN", "X_MAX", "Y_MAX"]
+  .map((name) => [name, layoutConstant(`CLIP_ENTRY_PATH_${name}`)])));
+const PAGE_FRAGMENT_NODE = layoutConstant("PAGE_FRAGMENT_NODE");
+const PAGE_FRAGMENT_PAGE = layoutConstant("PAGE_FRAGMENT_PAGE");
+const PAGE_FRAGMENT_BOX = layoutConstant("PAGE_FRAGMENT_BOX");
+const FONT_REQUEST_CSS_FAMILY = layoutConstant("FONT_REQUEST_CSS_FAMILY");
+const F32 = Float32Array.BYTES_PER_ELEMENT;
 
 export { LAYOUT_UNIT };
 
-const { convertXyzToLinearRgb, encodeSrgbTransfer } = loadColorKernel();
+// The variation control of a text command's variation key
+// (text_variation_control): whether font-optical-sizing is none, and the
+// font-variation-settings pairs [tag, value].
+function textVariationControl(engine, key) {
+  const control = engine.exports.text_variation_control(key);
+  if (control === 0) return { opticalSizing: "auto", variationSettings: [] };
+  const view = new DataView(engine.memory.buffer);
+  const count = view.getUint32(control + VARIATION_CONTROL_COUNT, true);
+  return {
+    opticalSizing: view.getUint32(control + VARIATION_CONTROL_OPTICAL_SIZING_NONE, true) === 0 ? "auto" : "none",
+    variationSettings: Array.from({ length: count }, (_, index) => {
+      const pair = control + VARIATION_CONTROL_PAIRS + index * VARIATION_PAIR_SIZE;
+      const tag = view.getUint32(pair + VARIATION_PAIR_TAG, true);
+      return [String.fromCharCode(tag >>> 24, (tag >>> 16) & 0xFF, (tag >>> 8) & 0xFF, tag & 0xFF),
+        view.getFloat32(pair + VARIATION_PAIR_VALUE, true)];
+    }),
+  };
+}
+
+// The canvases a scene paints (serialize.js imageSources: a canvas's
+// resource identifier to its context's paint source), each with its
+// content revision as a preparation recorded them.
+function canvasSourceRevisions(imageSources) {
+  return new Map(Array.from(imageSources ?? [], ([id, source]) => [id, { source, revision: source.revision }]));
+}
+
+// Whether a scene paints the canvases of `recorded` (canvasSourceRevisions)
+// with the same content: a serialization builds a new map each frame, and
+// a canvas that kept its content keeps the preparation's rows and commands.
+function canvasSourcesHold(recorded, imageSources) {
+  const size = imageSources?.size ?? 0;
+  if (size !== (recorded?.size ?? 0)) return false;
+  for (const [id, source] of imageSources ?? []) {
+    const entry = recorded.get(id);
+    if (entry === undefined || entry.source !== source || entry.revision !== source.revision) return false;
+  }
+  return true;
+}
 
 export async function createSceneRendererRuntime({
   harfbuzzBytes = null,
@@ -347,6 +370,35 @@ export async function createSceneRendererRuntime({
   const graphicsStateOwner = graphicsDevice === null
     ? {}
     : { webgpuDevice: graphicsDevice };
+  // Adopts a host's GPU device for every surface, presenter and canvas of
+  // this runtime: one device for the realm, which the host owns. Only
+  // before the runtime's first render context: its pipelines, atlases and
+  // textures belong to the device that context started on.
+  function useGraphicsDevice(device) {
+    if (typeof device?.createBuffer !== "function" || typeof device?.queue?.submit !== "function") {
+      throw new TypeError(`useGraphicsDevice takes a GPUDevice; it received ${device}`);
+    }
+    if (graphicsStateOwner.webgpuDevice === device) return;
+    if (graphicsStateOwner.webgpuDevice !== undefined || graphicsStateOwner.webgpu?.size || graphicsStateOwner.webgl2) {
+      throw new Error(
+        "useGraphicsDevice: this Sandom runtime already renders on " +
+          (graphicsStateOwner.webgpuDevice !== undefined ? "another host device" : "a device it requested at its first frame") +
+          "; call useGraphicsDevice once, before the first surface renders",
+      );
+    }
+    graphicsDevice = device;
+    graphicsStateOwner.webgpuDevice = device;
+  }
+  // True once the runtime has its device: a host's (useGraphicsDevice) or the
+  // one its first render context requested.
+  function hasGraphicsDevice() {
+    return graphicsStateOwner.webgpuDevice !== undefined || Boolean(graphicsStateOwner.webgpu?.size) ||
+      Boolean(graphicsStateOwner.webgl2);
+  }
+  // The device the host gave the runtime (useGraphicsDevice), or null.
+  function hostGraphicsDevice() {
+    return graphicsStateOwner.webgpuDevice ?? null;
+  }
   // Engine layout-buffer occupancy. Persistent renderers created through
   // this runtime share ONE engine; a renderer's incremental node diff is
   // only valid while the engine memory still holds THAT renderer's scene.
@@ -386,12 +438,14 @@ export async function createSceneRendererRuntime({
     releaseAuthoredSceneInput(retained.nodes, preservedNodes);
   }
 
+  // Whether a changed row forbids the sparse and patched frames
+  // (engine_direct_needs_global_preparation).
   function needsGlobalPreparation(node) {
-    return node.display === "svg-use" || (node.order ?? 0) !== 0 ||
-      (!usesCoreRecord(node) && (node.display === "grid" ||
-        node.display === "inline-grid" ||
-        node.transform?.kind === "cssTransform" ||
-        node.clipPath !== undefined));
+    const text = (value) => typeof value === "string" ? value : "";
+    return core.status("engine_direct_needs_global_preparation",
+      ...core.input(text(node.display)), Number(node.order ?? 0),
+      ...core.input(text(node.transform?.kind)), node.clipPath !== undefined ? 1 : 0,
+      usesCoreRecord(node) ? 1 : 0) !== 0;
   }
   // Renders through the shared engine are SERIALIZED: renderScenePixels
   // holds live views over the engine's command buffer across awaits, so a
@@ -520,15 +574,15 @@ export async function createSceneRendererRuntime({
 
   function fontIdentityForDocument(fontIndex, document) {
     const pointer = core.status("font_registration_read", fontRegistry.fontCatalogHandle, fontIndex, document);
-    const record = new DataView(core.refreshBytes().buffer, pointer, 80);
+    const record = new DataView(core.refreshBytes().buffer, pointer, FONT_REGISTRATION.SIZE);
     return Object.freeze({
-      family: fontIdentityValues[record.getUint32(24, true)],
-      faceIdentity: fontIdentityValues[record.getUint32(28, true)],
-      faceIndex: record.getUint32(32, true),
-      style: ["normal", "italic"][record.getUint32(36, true)],
-      weight: record.getFloat64(40, true),
-      stretch: record.getFloat64(48, true),
-      slant: record.getFloat64(56, true),
+      family: fontIdentityValues[record.getUint32(FONT_REGISTRATION.FAMILY, true)],
+      faceIdentity: fontIdentityValues[record.getUint32(FONT_REGISTRATION.IDENTITY, true)],
+      faceIndex: record.getUint32(FONT_REGISTRATION.FACE_INDEX, true),
+      style: ["normal", "italic"][record.getUint32(FONT_REGISTRATION.ITALIC, true)],
+      weight: record.getFloat64(FONT_REGISTRATION.WEIGHT, true),
+      stretch: record.getFloat64(FONT_REGISTRATION.STRETCH, true),
+      slant: record.getFloat64(FONT_REGISTRATION.SLANT, true),
     });
   }
 
@@ -565,13 +619,13 @@ export async function createSceneRendererRuntime({
       Number(Boolean(wghtOnAxis)) | (Number(typeof variationWidth === "number") << 1) |
         (Number(typeof variationSlant === "number") << 2),
     ]);
-    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 16);
+    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_INSTANCE_REPORT.SIZE);
     return recordFontInstance(index, {
       family, weight, stretch, faceIdentity, finalURL, resourceHandle,
-      faceIndex: report.getUint32(12, true),
-      registeredWeight: report.getInt32(0, true),
-      registeredWidth: report.getFloat32(4, true),
-      registeredSlant: report.getFloat32(8, true),
+      faceIndex: report.getUint32(FONT_INSTANCE_REPORT.FACE_INDEX, true),
+      registeredWeight: report.getInt32(FONT_INSTANCE_REPORT.WEIGHT, true),
+      registeredWidth: report.getFloat32(FONT_INSTANCE_REPORT.WIDTH, true),
+      registeredSlant: report.getFloat32(FONT_INSTANCE_REPORT.SLANT, true),
     });
   }
 
@@ -641,11 +695,14 @@ export async function createSceneRendererRuntime({
         const glyphIds = new Uint32Array(core.refreshBytes().buffer,
           core.exports.abi_output_pointer(), count).slice();
         core.status("font_requests_glyph_request", plan.handle, group, fontRegistry.fontCatalogHandle);
-        const record = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 48);
+        const record = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_GLYPH_REQUEST.SIZE);
         const glyphRequest = {
-          faceIndex: record.getUint32(0, true), weight: record.getFloat64(8, true),
-          variationWidth: record.getFloat64(16, true), variationSlant: record.getFloat64(24, true),
-          opticalSize: record.getFloat64(32, true), devicePixelSize: record.getFloat64(40, true),
+          faceIndex: record.getUint32(FONT_GLYPH_REQUEST.FACE_INDEX, true),
+          weight: record.getFloat64(FONT_GLYPH_REQUEST.WEIGHT, true),
+          variationWidth: record.getFloat64(FONT_GLYPH_REQUEST.WIDTH, true),
+          variationSlant: record.getFloat64(FONT_GLYPH_REQUEST.SLANT, true),
+          opticalSize: record.getFloat64(FONT_GLYPH_REQUEST.OPTICAL_SIZE, true),
+          devicePixelSize: record.getFloat64(FONT_GLYPH_REQUEST.DEVICE_PIXEL_SIZE, true),
         };
         const fontBytes = registeredFontBytes(fontIndex);
         if (!fontBytes) {
@@ -710,7 +767,7 @@ export async function createSceneRendererRuntime({
     try {
       if (plan.requests.length === 0) return nodes;
       const fonts = plan.requests.map((request) => {
-        const family = request.familyKind === 1
+        const family = request.familyKind === FONT_REQUEST_CSS_FAMILY
           ? fontStackKeysForCssValue(request.family)[0] : request.family;
         return registerFontBytes(family, request.weight, request.stretch,
           fontFileFor(family, request.weight, request.style, request.stretch, request.slope));
@@ -725,11 +782,22 @@ export async function createSceneRendererRuntime({
   // Native image joins own indices and resource lifetimes. The host retains
   // only pixel descriptors, canvas sources and decoder effects.
   const imagePixelsByIndex = new Map();
+  // The renderer's resource engine scope, created on first use by any
+  // resource (an image, a font face, an engine resource) and again after
+  // releaseRenderContexts: each new scope takes the font registry's engine
+  // sources, which the old scope held.
   let resourceEngineScope = 0n;
+  function ensureResourceScope() {
+    if (resourceEngineScope === 0n) {
+      resourceEngineScope = core.resourceEngineCreate();
+      fontRegistry.replayEngineSources();
+    }
+    return resourceEngineScope;
+  }
   const { prepareImages, prepareImagesSync, registerDecodedImage, canvasImageEntry, releasePixels } =
     createImageResourceBinding({
       core,
-      ensureScope: () => resourceEngineScope ||= core.resourceEngineCreate(),
+      ensureScope: ensureResourceScope,
       pixels: imagePixelsByIndex,
       decode: decodeImageEntry,
       decodeIcon: () => brokenImageIconEntry(svgImageDensity),
@@ -737,18 +805,9 @@ export async function createSceneRendererRuntime({
     });
 
   function joinEngineResource(resource, index, variant = 0) {
-    resourceEngineScope ||= core.resourceEngineCreate();
-    core.resourceEngineBind(
-      resourceEngineScope,
-      resource,
-      index,
-      variant,
-    );
-    return core.resourceEngineIndex(
-      resourceEngineScope,
-      core.resourceId(resource),
-      variant,
-    );
+    const scope = ensureResourceScope();
+    core.resourceEngineBind(scope, resource, index, variant);
+    return core.resourceEngineIndex(scope, core.resourceId(resource), variant);
   }
 
   const fontSourceDecoder = new TextDecoder();
@@ -757,9 +816,9 @@ export async function createSceneRendererRuntime({
     release({ resourceHandle }) {
       core.status("font_registration_forget", fontRegistry.fontCatalogHandle, resourceHandle);
     },
-    // The renderer's resource engine scope, created on first use.
+    // The renderer's resource engine scope (ensureResourceScope).
     ensureScope() {
-      return resourceEngineScope ||= core.resourceEngineCreate();
+      return ensureResourceScope();
     },
     // The core registered engine instance `index` of a face whose bytes it
     // keeps (font_hosted_face_supply, font_runtime_face_publish); the
@@ -776,27 +835,23 @@ export async function createSceneRendererRuntime({
         registeredSlant: view.getFloat32(variation + FONT_VARIATION_OFFSET_SLANT, true),
       });
     },
-    prepare(root, defaultFamilyKey, importSource) {
+    prepare(root, defaultFamilyKey, importSource, computedRead) {
       synchronizeFallbackCoverage();
-      if (resourceEngineScope === 0n) {
-        resourceEngineScope = core.resourceEngineCreate();
-        fontRegistry.replayEngineSources();
-      }
       core.status("font_catalog_render_bind", fontRegistry.fontCatalogHandle,
-        resourceEngineScope, root._coreHandle, ...core.input(defaultFamilyKey));
-      const count = core.status("font_catalog_source_requests");
+        ensureResourceScope(), root._coreHandle, ...core.input(defaultFamilyKey));
+      const count = core.status("font_catalog_source_requests", computedRead ? root._coreHandle : 0n);
       if (count === 0) return;
       const base = core.exports.abi_output_pointer();
       const requestView = new DataView(core.memory.buffer);
       const requests = new Array(count);
       for (let index = 0; index < count; index++) {
-        const row = base + index * 16;
-        const pointer = requestView.getUint32(row, true);
-        const length = requestView.getUint32(row + 4, true);
+        const row = base + index * FONT_SOURCE_REQUEST.SIZE;
+        const pointer = requestView.getUint32(row + FONT_SOURCE_REQUEST.FAMILY_POINTER, true);
+        const length = requestView.getUint32(row + FONT_SOURCE_REQUEST.FAMILY_LENGTH, true);
         requests[index] = {
           family: fontSourceDecoder.decode(new Uint8Array(core.memory.buffer, pointer, length)),
-          weight: requestView.getUint32(row + 8, true),
-          style: requestView.getUint32(row + 12, true) === 0 ? "normal" : "italic",
+          weight: requestView.getUint32(row + FONT_SOURCE_REQUEST.WEIGHT, true),
+          style: requestView.getUint32(row + FONT_SOURCE_REQUEST.STYLE, true) === 0 ? "normal" : "italic",
         };
       }
       for (const request of requests) importSource(request.family, request.weight, request.style);
@@ -819,23 +874,12 @@ export async function createSceneRendererRuntime({
       return;
     }
     const { ranges, defaultCount, languages } = fallbackFamilies.coverage;
-    const rangePointer = engine.exports.hb_malloc_for_test(ranges.length);
-    new Uint8Array(engine.memory.buffer, rangePointer, ranges.length).set(ranges);
-    const languagePointer = engine.exports.hb_malloc_for_test(Math.max(1, languages.length) * LANGUAGE_TABLE_ENTRY_SIZE);
-    const languageBytes = new Uint8Array(engine.memory.buffer, languagePointer, languages.length * LANGUAGE_TABLE_ENTRY_SIZE);
-    languageBytes.fill(0);
-    for (const [index, tag] of languages.entries()) {
-      const bytes = new TextEncoder().encode(tag.toLowerCase());
-      if (bytes.length > LANGUAGE_TABLE_ENTRY_SIZE - 1) {
-        throw new RangeError(
-          `The coverage index language tag "${tag}" has ${bytes.length} bytes; the limit is ${LANGUAGE_TABLE_ENTRY_SIZE - 1}`,
-        );
-      }
-      languageBytes[index * LANGUAGE_TABLE_ENTRY_SIZE] = bytes.length;
-      languageBytes.set(bytes, index * LANGUAGE_TABLE_ENTRY_SIZE + 1);
-    }
-    engine.exports.font_coverage_set(
-      rangePointer, ranges.length / FONT_COVERAGE_RANGE_SIZE, defaultCount, languagePointer, languages.length,
+    core.status(
+      "font_coverage_publish",
+      ...(ranges.length === 0 ? [0, 0] : core.byteInput(ranges)),
+      defaultCount,
+      ...core.valueListInput(languages.flatMap((tag) => [tag, tag.toLowerCase()])),
+      languages.length,
     );
   }
   synchronizeFallbackCoverage();
@@ -859,15 +903,12 @@ export async function createSceneRendererRuntime({
     if (fallbackFamilies === null) {
       throw new Error(`The engine requested ${count} fallback faces, and the font registry has no fallbackFamilies`);
     }
-    const requests = Array.from({ length: count }, (_, index) => {
-      const request = engine.exports.font_fallback_request_at(index);
-      return {
-        family: request >>> 16,
-        style: request & 0xFFFF,
-        weight: fontRegistry.fontWeightInCssUnits(request & 0xFF),
-        italic: (request & 0x100) !== 0,
-      };
-    });
+    const requests = Array.from({ length: count }, (_, index) => ({
+      family: engine.exports.font_fallback_request_family(index),
+      style: engine.exports.font_fallback_request_style(index),
+      weight: fontRegistry.fontWeightInCssUnits(engine.exports.font_fallback_request_weight(index)),
+      italic: engine.exports.font_fallback_request_italic(index) === 1,
+    }));
     answers.push(Promise.all(requests.map(({ family, weight, italic }) =>
       fallbackFamilies.load(family, weight, italic ? "italic" : "normal")
     )).then((faces) => registerFallbackFaces(requests, faces)));
@@ -889,11 +930,7 @@ export async function createSceneRendererRuntime({
       fontRegistry.loadDeclaredFace(face).then(() => true, () => false)
     )).then((loaded) => {
       for (const [index, { face, style }] of requests.entries()) {
-        engine.exports.font_range_answer(
-          face,
-          style,
-          loaded[index] ? core.status("font_range_face_index", style, face) : FONT_STACK_UNLOADED,
-        );
+        core.status("font_range_settle", face, style, loaded[index] ? 1 : 0);
       }
     });
   }
@@ -1155,24 +1192,7 @@ export async function createSceneRendererRuntime({
           resolved.colorEncoding.primaries === "xyz-d65" &&
           resolved.colorEncoding.transferFunction === "linear"
         ) {
-          const count = resolved.width * resolved.height;
-          value = new Uint8Array(count * 4);
-          for (let i = 0; i < count; i++) {
-            const rgb = convertXyzToLinearRgb("srgb", [
-              resolved.pixels[i * 4],
-              resolved.pixels[i * 4 + 1],
-              resolved.pixels[i * 4 + 2],
-            ]);
-            for (let channel = 0; channel < 3; channel++) {
-              value[i * 4 + channel] = Math.round(
-                Math.min(1, Math.max(0, encodeSrgbTransfer(rgb[channel]))) *
-                  255,
-              );
-            }
-            value[i * 4 + 3] = Math.round(
-              Math.min(1, Math.max(0, resolved.pixels[i * 4 + 3])) * 255,
-            );
-          }
+          value = srgb8Pixels(resolved);
         } else {
           value = toSrgbRgba8(resolved).pixels;
         }
@@ -1183,24 +1203,11 @@ export async function createSceneRendererRuntime({
   }
 
 
-  // The failure code the core keeps for a broken image (resources.watpart
-  // failure96, read by scene.watpart $sceneSourceFailure): 1 the load
-  // failed; 2 bytes of an image type, or of no type, that do not decode; 3
-  // bytes of a document type (text, XML or JSON), which an object or an
-  // embed shows as a nested browsing context (Blink's
-  // IsSupportedNonImageMimeType); 4 bytes of another type.
+  // The failure code the core keeps for a broken image
+  // (image_failure_code).
   function brokenImageFailureCode(broken) {
-    if (broken.failure === "fetch") return 1;
-    const type = broken.mediaType;
-    if (type === null || type.startsWith("image/")) return 2;
-    if (
-      type.startsWith("text/") || type === "application/xml" ||
-      type === "application/xhtml+xml" || type === "application/json" ||
-      type.endsWith("+xml") || type.endsWith("+json")
-    ) {
-      return 3;
-    }
-    return 4;
+    const type = broken.mediaType ?? null;
+    return core.status("image_failure_code", broken.failure === "fetch" ? 1 : 0, ...core.input(type ?? ""), type === null ? 0 : 1);
   }
 
   // $mediaType is the resource's normalized media type, or null.
@@ -1241,25 +1248,26 @@ export async function createSceneRendererRuntime({
   // shares, so a frame at a scale drawn before selects its raster again
   // without rastering.
   function svgImageEntry(decoded, locator) {
+    const viewport = svgImageViewport(decoded, null);
     return {
-      width: Math.max(1, Math.ceil(decoded.naturalWidth)),
-      height: Math.max(1, Math.ceil(decoded.naturalHeight)),
-      naturalWidth: Math.ceil(decoded.naturalWidth),
-      naturalHeight: Math.ceil(decoded.naturalHeight),
+      width: viewport.width,
+      height: viewport.height,
+      naturalWidth: core.exports.image_svg_natural(decoded.naturalWidth),
+      naturalHeight: core.exports.image_svg_natural(decoded.naturalHeight),
       defaultSized: decoded.defaultSized,
       naturalRatio: decoded.naturalRatio ?? 0,
       svg: Object.freeze({ decoded, locator, density: null, viewport: null, rasters: new Map() }),
     };
   }
 
-  // The viewport of an SVG image's raster in CSS px: its natural size,
-  // rounded up, or for an image without natural dimensions the concrete
-  // object size that the frame draws it at (rounded up).
+  // The viewport of an SVG image's raster in CSS px (image_svg_viewport),
+  // drawn at the concrete object size `concrete` ([width, height] or null).
   function svgImageViewport(decoded, concrete) {
-    const [width, height] = decoded.defaultSized && concrete !== null
-      ? concrete
-      : [decoded.naturalWidth, decoded.naturalHeight];
-    return { width: Math.max(1, Math.ceil(width)), height: Math.max(1, Math.ceil(height)) };
+    const defaultSized = decoded.defaultSized ? 1 : 0;
+    return {
+      width: core.exports.image_svg_viewport(decoded.naturalWidth, defaultSized, concrete?.[0] ?? NaN),
+      height: core.exports.image_svg_viewport(decoded.naturalHeight, defaultSized, concrete?.[1] ?? NaN),
+    };
   }
 
   // The entry of an SVG image with pixels at `density` and `viewport`,
@@ -1273,8 +1281,8 @@ export async function createSceneRendererRuntime({
       raster = rasterizeSvgImage(decoded, locator, density, viewport, svgImageTimings).then((result) => {
         const rastered = registeredImageEntry(
           result,
-          Math.ceil(decoded.naturalWidth),
-          Math.ceil(decoded.naturalHeight),
+          core.exports.image_svg_natural(decoded.naturalWidth),
+          core.exports.image_svg_natural(decoded.naturalHeight),
         );
         rastered.defaultSized = decoded.defaultSized;
         rastered.naturalRatio = decoded.naturalRatio ?? 0;
@@ -1289,73 +1297,81 @@ export async function createSceneRendererRuntime({
     return raster;
   }
 
-  // The concrete object size in CSS px that one CMD_IMAGE draws image
-  // `entry` at: the destination over the share of the image it samples.
-  // A border-image piece (CMD_IMAGE_FLAG_NO_PIXEL_SNAP) scales a slice to
-  // a border width, which does not give the size of the image: for an
-  // image with a natural ratio its concrete size has that ratio (CSS
-  // Backgrounds 3 §6.2 sizes it in the border image area), and the larger
-  // scale of the piece gives the resolution.
-  function drawnConcreteSize(cmdView, off, entry) {
-    const scaleX = cmdView.getFloat32(off + CMD_IMAGE_OFFSET_W, true) /
-      Math.abs(cmdView.getFloat32(off + CMD_IMAGE_OFFSET_UV_W, true));
-    const scaleY = cmdView.getFloat32(off + CMD_IMAGE_OFFSET_H, true) /
-      Math.abs(cmdView.getFloat32(off + CMD_IMAGE_OFFSET_UV_H, true));
-    if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY)) return null;
-    const piece = (cmdView.getUint8(off + CMD_IMAGE_OFFSET_FLAGS) & CMD_IMAGE_FLAG_NO_PIXEL_SNAP) !== 0;
-    if (!piece || !(entry.naturalRatio > 0)) return [scaleX, scaleY];
-    const width = Math.max(scaleX, scaleY * entry.naturalRatio);
-    return [width, width / entry.naturalRatio];
+  // The images and color glyph bitmap slots that the engine's last
+  // emission of `bytesWritten` command bytes draws (frame_drawn_scan), read
+  // before the frame awaits: another engine writer may emit after. The scan
+  // writes into the commands the index of each concrete size of an image
+  // without natural dimensions, so it runs before the frame copies them.
+  // Each image row names the index that its draws name and the base index
+  // whose decode it draws.
+  function drawnImagesAndSlots(bytesWritten) {
+    const imageCount = engine.exports.frame_drawn_scan(bytesWritten);
+    if (imageCount === DRAWN_SCAN_TABLE_FULL) {
+      core.throwIfError();
+      throw new Error("The engine's image draws need more image indices than the image table has free");
+    }
+    if (imageCount < 0) {
+      throw new Error(
+        `The engine's ${bytesWritten} command bytes hold an unknown or truncated command at byte ` +
+          `${engine.exports.frame_drawn_failed_offset()}`,
+      );
+    }
+    const images = new Array(imageCount);
+    for (let row = 0; row < imageCount; row++) {
+      const width = engine.exports.frame_drawn_image_concrete(row, 0);
+      images[row] = {
+        imageIndex: engine.exports.frame_drawn_image(row),
+        baseIndex: engine.exports.frame_drawn_image_base(row),
+        concrete: Number.isNaN(width) ? null : [width, engine.exports.frame_drawn_image_concrete(row, 1)],
+      };
+    }
+    const slots = Array.from(
+      { length: engine.exports.frame_drawn_slot_count() },
+      (_, row) => engine.exports.frame_drawn_slot(row),
+    );
+    return { images, slots };
   }
 
-  // Gives each SVG image that the frame's commands draw (CMD_IMAGE of a
-  // registered image) its raster at `density`, kept or made. An image
-  // without natural dimensions rasters with its viewport at the concrete
-  // object size of the largest draw of the frame: one image index has one
-  // raster in a frame
-  // (plans/images/BUG-default-sized-image-drawn-at-two-shapes-shares-one-raster.md).
-  // Images that the frame does not draw keep their entry: the runtime also
-  // holds the images of other documents. The entry replaces the one at
-  // the same index, as a color glyph bitmap of another size does; the GPU
-  // texture follows the entry. The rasters to make start at once and take
-  // turns (rasterizeSvgImage).
-  async function selectSvgImageRasters(cmdView, bytesWritten, density, svgImageTimings) {
-    const drawn = new Map(); // imageIndex -> { entry, concrete }
-    for (let off = 0; off < bytesWritten; off += commandByteSize(cmdView, off)) {
-      // A command with an empty rectangle draws nothing.
-      if (
-        cmdView.getUint8(off) !== CMD_IMAGE ||
-        (cmdView.getUint8(off + CMD_IMAGE_OFFSET_FLAGS) & CMD_IMAGE_FLAG_GLYPH_BITMAP) !== 0 ||
-        !(cmdView.getFloat32(off + CMD_IMAGE_OFFSET_W, true) > 0) ||
-        !(cmdView.getFloat32(off + CMD_IMAGE_OFFSET_H, true) > 0)
-      ) continue;
-      const imageIndex = cmdView.getUint16(off + CMD_IMAGE_OFFSET_INDEX, true);
-      const entry = imagePixelsByIndex.get(imageIndex);
-      if (entry?.svg === undefined) continue;
-      const image = drawn.get(imageIndex) ?? { entry, concrete: null };
-      drawn.set(imageIndex, image);
-      if (!entry.defaultSized) continue;
-      const concrete = drawnConcreteSize(cmdView, off, entry);
-      if (concrete !== null && (image.concrete === null || concrete[0] * concrete[1] > image.concrete[0] * image.concrete[1])) {
-        image.concrete = concrete;
-      }
-    }
+  // Gives each SVG image index that the frame's commands draw its raster at
+  // `density`, kept or made. An image without natural dimensions rasters
+  // with its viewport at the concrete object size of its draw
+  // (frame_drawn_scan, with the engine's natural ratio, as layout sizes the
+  // image): the scan gives each concrete size its own index, a size variant
+  // of the image's index, and the variant's entry is a raster of the base
+  // index's decode. Images that the frame does not draw keep their entry:
+  // the runtime also holds the images of other documents. The entry
+  // replaces the one at the same index, as a color glyph bitmap of another
+  // size does; the GPU texture follows the entry. The rasters to make start
+  // at once and take turns (rasterizeSvgImage).
+  async function selectSvgImageRasters(drawnImages, density, svgImageTimings) {
     const selections = [];
-    for (const [imageIndex, { entry, concrete }] of drawn) {
-      const viewport = svgImageViewport(entry.svg.decoded, concrete);
+    for (const { imageIndex, baseIndex, concrete } of drawnImages) {
+      const base = imagePixelsByIndex.get(baseIndex);
+      if (base?.svg === undefined) continue;
+      const current = imagePixelsByIndex.get(imageIndex);
+      const viewport = svgImageViewport(base.svg.decoded, base.defaultSized ? concrete : null);
       if (
-        entry.svg.density === density && entry.svg.viewport.width === viewport.width &&
-        entry.svg.viewport.height === viewport.height
+        current?.svg?.decoded === base.svg.decoded && current.svg.density === density &&
+        current.svg.viewport.width === viewport.width && current.svg.viewport.height === viewport.height
       ) continue;
-      selections.push({ imageIndex, entry, selected: svgImageRaster(entry, density, viewport, svgImageTimings) });
+      selections.push({
+        imageIndex,
+        baseIndex,
+        decoded: base.svg.decoded,
+        current,
+        selected: svgImageRaster(base, density, viewport, svgImageTimings),
+      });
     }
     const selected = await Promise.all(
       selections.map((selection) => selection.selected),
     );
-    selections.forEach(({ imageIndex, entry }, index) => {
-      if (imagePixelsByIndex.get(imageIndex) === entry) {
-        imagePixelsByIndex.set(imageIndex, selected[index]);
-      }
+    // An index whose entry changed during the rasters, or whose base no
+    // longer holds the decode (a release), keeps that change.
+    selections.forEach(({ imageIndex, baseIndex, decoded, current }, index) => {
+      if (
+        imagePixelsByIndex.get(imageIndex) === current &&
+        imagePixelsByIndex.get(baseIndex)?.svg?.decoded === decoded
+      ) imagePixelsByIndex.set(imageIndex, selected[index]);
     });
   }
 
@@ -1378,11 +1394,11 @@ export async function createSceneRendererRuntime({
   // texture follows the entry.
   const brokenImageIconEntries = new Map(); // 1 | 2 -> Promise<entry>
   function brokenImageIconEntry(density) {
-    const variant = density >= 2 ? 2 : 1;
+    const variant = core.exports.image_broken_icon_variant(density);
     let entry = brokenImageIconEntries.get(variant);
     if (entry === undefined) {
-      entry = decodeImage(variant === 2 ? BROKEN_IMAGE_ICON_2X_PNG : BROKEN_IMAGE_ICON_PNG)
-        .then((decoded) => registeredImageEntry(decoded, 14, 16));
+      entry = decodeImage(variant === BROKEN_IMAGE_ICON_2X ? BROKEN_IMAGE_ICON_2X_PNG : BROKEN_IMAGE_ICON_PNG)
+        .then((decoded) => registeredImageEntry(decoded, BROKEN_IMAGE_ICON_WIDTH, BROKEN_IMAGE_ICON_HEIGHT));
       brokenImageIconEntries.set(variant, entry);
     }
     return entry;
@@ -1425,7 +1441,7 @@ export async function createSceneRendererRuntime({
         engine.exports.raster_resource_table_release(RASTER_RESOURCE_IMAGE, imageIndex);
         continue;
       }
-      const kind = image.kind === "canvas" ? 1 : 0;
+      const kind = image.kind === "canvas" ? RASTER_IMAGE_KIND_CANVAS : RASTER_IMAGE_KIND_DECODED;
       const count = image.glyphBox ? COLOR_GLYPH_IMAGE_RESOURCE_COUNT : 1;
       const pointer = engine.exports.raster_resource_table_reserve(
         RASTER_RESOURCE_IMAGE,
@@ -1437,13 +1453,15 @@ export async function createSceneRendererRuntime({
           `raster image resource ${imageIndex} (${image.width}×${image.height}) could not be reserved`,
         );
       }
-      const records = new Float32Array(engine.memory.buffer, pointer, count * 3);
-      records.set([image.width, image.height, kind]);
-      if (image.glyphBox) records.set(image.glyphBox, 3);
+      const records = new Float32Array(engine.memory.buffer, pointer, count * RASTER_IMAGE_RECORD.FLOATS);
+      records[RASTER_IMAGE_RECORD.WIDTH] = image.width;
+      records[RASTER_IMAGE_RECORD.HEIGHT] = image.height;
+      records[RASTER_IMAGE_RECORD.KIND] = kind;
+      if (image.glyphBox) records.set(image.glyphBox, RASTER_IMAGE_RECORD.FLOATS);
     }
   }
 
-  // Bitmap glyphs (plans/text/PLAN-color-glyphs.md slice 2): a CMD_IMAGE with
+  // Bitmap glyphs (design/text-rendering.md, "Colour glyphs"): a CMD_IMAGE with
   // CMD_IMAGE_FLAG_GLYPH_BITMAP names the engine's bitmap slot (font,
   // glyph, CSS font size) at COLOR_GLYPH_IMAGE_INDEX_BASE + slot. At the
   // target's device scale the engine's strike chooser picks the strike and
@@ -1453,21 +1471,9 @@ export async function createSceneRendererRuntime({
   // origin is a whole device pixel (sbix) for the raster plan.
   const colorGlyphBitmapBySlot = new Map(); // slot -> { requested, entry }
   const colorGlyphBitmapDecodes = new Map(); // "pointer:length" -> { png, image }
-  async function prepareColorGlyphBitmaps(cmdView, bytesWritten, deviceScale) {
+  async function prepareColorGlyphBitmaps(slots, deviceScale) {
     const slotCount = engine.exports.color_glyph_bitmap_count();
     if (slotCount === 0) return;
-    const slots = new Set();
-    for (let off = 0; off < bytesWritten; off += commandByteSize(cmdView, off)) {
-      if (
-        cmdView.getUint8(off) === CMD_IMAGE &&
-        (cmdView.getUint8(off + CMD_IMAGE_OFFSET_FLAGS) & CMD_IMAGE_FLAG_GLYPH_BITMAP) !== 0
-      ) {
-        const index = cmdView.getUint16(off + CMD_IMAGE_OFFSET_INDEX, true);
-        // Indices from COLOR_GLYPH_CACHE_INDEX_BASE are color glyph cache
-        // slots (src/color-glyph-cache.js).
-        if (index < COLOR_GLYPH_CACHE_INDEX_BASE) slots.add(index - COLOR_GLYPH_IMAGE_INDEX_BASE);
-      }
-    }
     for (const slot of slots) {
       if (slot >= slotCount) {
         throw new Error(
@@ -1525,8 +1531,18 @@ export async function createSceneRendererRuntime({
   }
 
   // Authored paths register in the same native identity space as DOM paths.
-  // Definitions are immutable effects data for the atlas generator.
-  const svgPathDefByIndex = new Map(); // pathIndex -> { pathDef, fillRule, stroke? }
+  // A definition is immutable while its index keeps its generation: the
+  // core releases unused paths and gives a reused index a new generation
+  // (core/dom/path-collection.watpart).
+  const svgPathDefByIndex = new Map(); // pathIndex -> { generation, definition }
+  function svgPathDefinitionCurrent(pathIndex) {
+    const generation = core.exports.svg_path_generation(pathIndex);
+    const cached = svgPathDefByIndex.get(pathIndex);
+    if (cached?.generation === generation) return cached.definition;
+    const definition = { ...core.svgPathDefinition(pathIndex), generation };
+    svgPathDefByIndex.set(pathIndex, { generation, definition });
+    return definition;
+  }
   const sharedSvgPathAtlas = new SvgPathAtlas({
     coverageMode: svgImageRasterMode,
   });
@@ -1543,10 +1559,11 @@ export async function createSceneRendererRuntime({
   });
   engine.exports.color_glyph_cache_enable(1);
 
-  // The outline of a color glyph layer (plans/text/PLAN-color-glyphs.md): the
-  // engine's path slot names a registered font and a glyph; its outline at
-  // the shaping scale becomes a `d` string in font units, y down — the box
-  // the engine measured for the slot's CMD_SVG_PATH dest rect.
+  // The outline of a color glyph layer (design/text-rendering.md, "Colour glyphs"): the
+  // engine's path slot names a registered font and a glyph; the core writes
+  // its outline at the shaping scale as a `d` string in font units, y down
+  // (svg_path_definition) — the box the engine measured for the slot's
+  // CMD_SVG_PATH dest rect.
   const colorGlyphPathDefs = new Map(); // pathIndex -> { key, def }
   // Relative agreement of the engine's layer box with the atlas bounds.
   // Both measure the same f32 outline coordinates; the engine stores its
@@ -1555,48 +1572,12 @@ export async function createSceneRendererRuntime({
   // the 120 box corners of test/text/text_color_glyph_test.js: 0.
   const COLOR_GLYPH_BOX_TOLERANCE = 2 ** -22;
   function colorGlyphPathDef(pathIndex) {
+    const { pathDef, fillRule } = core.svgPathDefinition(pathIndex);
     const slot = pathIndex - COLOR_GLYPH_PATH_INDEX_BASE;
-    const count = engine.exports.color_glyph_path_count();
-    if (slot >= count) {
-      throw new Error(
-        `CMD_SVG_PATH names color glyph path slot ${slot}, but the engine registered ${count}; ` +
-          "the command buffer and the engine disagree",
-      );
-    }
     const key = engine.exports.color_glyph_path_key(slot);
     const cached = colorGlyphPathDefs.get(pathIndex);
     if (cached?.key === key) return cached.def;
-    const pointer = engine.exports.glyph_outline_extract_registered(key >>> 16, key & 0xffff);
-    const length = engine.exports.glyph_outline_length();
-    const view = new DataView(engine.memory.buffer, pointer, length);
-    const scale = 1 / FONT_UNIT_SUBDIVISION;
-    const x = (offset) => view.getFloat32(offset, true) * scale;
-    const y = (offset) => -view.getFloat32(offset, true) * scale;
-    const parts = [];
-    for (let offset = 0; offset < length;) {
-      const verb = view.getUint8(offset);
-      if (verb === 0) {
-        parts.push(`M${x(offset + 1)} ${y(offset + 5)}`);
-        offset += 9;
-      } else if (verb === 1) {
-        parts.push(`L${x(offset + 1)} ${y(offset + 5)}`);
-        offset += 9;
-      } else if (verb === 2) {
-        parts.push(`Q${x(offset + 1)} ${y(offset + 5)} ${x(offset + 9)} ${y(offset + 13)}`);
-        offset += 17;
-      } else if (verb === 3) {
-        parts.push(
-          `C${x(offset + 1)} ${y(offset + 5)} ${x(offset + 9)} ${y(offset + 13)} ${x(offset + 17)} ${y(offset + 21)}`,
-        );
-        offset += 25;
-      } else if (verb === 4) {
-        parts.push("Z");
-        offset += 1;
-      } else {
-        throw new Error(`glyph outline verb ${verb} at byte ${offset} of ${length} is unknown`);
-      }
-    }
-    const def = { pathDef: parts.join(""), fillRule: "nonzero" };
+    const def = { pathDef, fillRule };
     // The command places the atlas entry's bounds on the engine's box: the
     // two measure the same outline, so they agree to the rounding of the
     // engine's f32 box (see COLOR_GLYPH_BOX_TOLERANCE).
@@ -1615,7 +1596,7 @@ export async function createSceneRendererRuntime({
             `[${[0, 1, 2, 3].map((index) => engine.exports.color_glyph_path_box(slot, index)).join(", ")}] ` +
             `and the path atlas bounds [${measured.join(", ")}] differ by more than ${COLOR_GLYPH_BOX_TOLERANCE} ` +
             "relative; the layer would be stretched. The engine's outline box (engine-color-glyph.watpart " +
-            "$cgPathSlot) and the atlas measurement must describe the same outline",
+            "$cgPathSlot) and the atlas measurement must describe the same outline. The outline: " + def.pathDef,
         );
       }
     }
@@ -1623,34 +1604,16 @@ export async function createSceneRendererRuntime({
     return def;
   }
 
-  // The engine's built-in outlines (layout.js BUILTIN_PATH_*): Blink's
-  // disclosure triangles (list_marker_painter.cc) in a 100-unit square. The
-  // command's rectangle is each outline's own box, so only the shape and
-  // its proportions within the box matter. The core lists the same
-  // definitions to native hosts (src/dom-wasm/path-resources.watpart).
-  const BUILTIN_PATH_DEFS = new Map([
-    [BUILTIN_PATH_DISCLOSURE_RIGHT, { pathDef: "M0 0L86 50L0 100Z", fillRule: "nonzero" }],
-    [BUILTIN_PATH_DISCLOSURE_LEFT, { pathDef: "M100 0L14 50L100 100Z", fillRule: "nonzero" }],
-    [BUILTIN_PATH_DISCLOSURE_DOWN, { pathDef: "M0 7L50 93L100 7Z", fillRule: "nonzero" }],
-  ]);
-
-  // The path a CMD_SVG_PATH index names: a host SVG path, a color glyph
-  // outline, a stroked glyph outline of SVG text, or a built-in outline.
+  // The path a CMD_SVG_PATH index names: a host SVG path, or an outline
+  // the core defines (a color glyph outline, a stroked glyph outline of SVG
+  // text, or a built-in outline).
   function pathDefForIndex(pathIndex) {
-    if (pathIndex >= BUILTIN_PATH_INDEX_BASE) {
-      const def = BUILTIN_PATH_DEFS.get(pathIndex);
-      if (!def) throw new Error(`CMD_SVG_PATH names built-in path ${pathIndex}, which the host does not define`);
-      return def;
-    }
-    if (pathIndex >= TEXT_STROKE_PATH_INDEX_BASE) {
-      const { pathDef, fillRule, stroke } = core.svgPathDefinition(pathIndex);
-      return { pathDef, fillRule, stroke };
-    }
-    return pathIndex >= COLOR_GLYPH_PATH_INDEX_BASE
-      ? colorGlyphPathDef(pathIndex)
-      : svgPathDefByIndex.get(pathIndex);
+    const source = engine.exports.path_index_source(pathIndex);
+    if (source === PATH_SOURCE_COLOR_GLYPH) return colorGlyphPathDef(pathIndex);
+    if (source === PATH_SOURCE_SVG) return svgPathDefinitionCurrent(pathIndex);
+    const { pathDef, fillRule, stroke } = core.svgPathDefinition(pathIndex);
+    return { pathDef, fillRule, stroke };
   }
-
 
   function svgPathBboxSync(pathDef, fillRule) {
     return sharedSvgPathAtlas.measurePathBoundsSync(pathDef, fillRule);
@@ -1666,17 +1629,19 @@ export async function createSceneRendererRuntime({
     const requests = [];
     for (let offset = GLYPH_REQUEST_HEADER_SIZE; offset < snapshot.byteLength;) {
       const size = glyphRequestRowByteSize(view, offset);
-      if (view.getUint16(offset + 14, true) === GLYPH_REQUEST_KIND_PATH) {
-        const pathIndex = view.getUint32(offset, true);
+      if (view.getUint16(offset + GLYPH_REQUEST_KIND, true) === GLYPH_REQUEST_KIND_PATH) {
+        const pathIndex = view.getUint32(offset + GLYPH_REQUEST_PATH_INDEX, true);
         // Color glyph and text stroke slots are the engine's; the core
         // writes their definitions from its current slots.
-        const engineSlot = pathIndex >= COLOR_GLYPH_PATH_INDEX_BASE && pathIndex < BUILTIN_PATH_INDEX_BASE;
-        let definition = engineSlot ? null : svgPathDefByIndex.get(pathIndex);
-        if (!definition) {
-          definition = core.svgPathDefinition(pathIndex);
-          if (!engineSlot) svgPathDefByIndex.set(pathIndex, definition);
-        }
-        requests.push({ ...definition, pathIndex, screenSize: view.getFloat64(offset + 4, true) });
+        const source = engine.exports.path_index_source(pathIndex);
+        const engineSlot = source === PATH_SOURCE_COLOR_GLYPH || source === PATH_SOURCE_TEXT_STROKE;
+        const definition = engineSlot ? core.svgPathDefinition(pathIndex) : svgPathDefinitionCurrent(pathIndex);
+        requests.push({
+          ...definition,
+          pathIndex,
+          screenSize: view.getFloat64(offset + GLYPH_REQUEST_PATH_SCREEN_SIZE, true),
+          coverage: view.getUint16(offset + GLYPH_REQUEST_PATH_COVERAGE, true) !== 0,
+        });
       }
       offset += size;
     }
@@ -1699,8 +1664,7 @@ export async function createSceneRendererRuntime({
     for (const publication of svgPathPublications(nodes)) {
       if (core.status("scene_svg_path_prepare", publication.handle) === 0) continue;
       await sharedSvgPathAtlas.ensurePaths(nativePathRequests());
-      core.status("scene_svg_path_complete", publication.handle,
-        sharedSvgPathAtlas.id, Number(sharedSvgPathAtlas.coverageMode));
+      core.status("scene_svg_path_complete", publication.handle, sharedSvgPathAtlas.id);
     }
     return nodes;
   }
@@ -1709,8 +1673,7 @@ export async function createSceneRendererRuntime({
     for (const publication of svgPathPublications(nodes)) {
       if (core.status("scene_svg_path_prepare", publication.handle) === 0) continue;
       sharedSvgPathAtlas.ensurePathsSync(nativePathRequests());
-      core.status("scene_svg_path_complete", publication.handle,
-        sharedSvgPathAtlas.id, Number(sharedSvgPathAtlas.coverageMode));
+      core.status("scene_svg_path_complete", publication.handle, sharedSvgPathAtlas.id);
     }
     return nodes;
   }
@@ -1720,12 +1683,11 @@ export async function createSceneRendererRuntime({
   // an awaited resource load could replace the shared engine's current rows.
   function prepareLayoutSvgGeometry(count, width, height) {
     const preparation = core.status("scene_svg_geometry_prepare", count, width, height);
-    if (preparation >>> 1) {
+    if (preparation >>> SVG_GEOMETRY_REQUESTS_SHIFT) {
       sharedSvgPathAtlas.ensurePathsSync(nativePathRequests());
-      core.status("scene_svg_geometry_complete", count,
-        sharedSvgPathAtlas.id, Number(sharedSvgPathAtlas.coverageMode));
+      core.status("scene_svg_geometry_complete", count, sharedSvgPathAtlas.id);
     }
-    return (preparation & 1) !== 0;
+    return (preparation & SVG_GEOMETRY_CHANGED) !== 0;
   }
 
   // Capture at emission, before user callbacks or asynchronous resource preparation.
@@ -1744,20 +1706,26 @@ export async function createSceneRendererRuntime({
     const requestBytes = engine.exports.glyph_request_table_bytes();
     const requestSnapshot = new Uint8Array(engine.memory.buffer, requestBase, requestBytes).slice();
     const header = new DataView(requestSnapshot.buffer);
-    const requestRowCount = header.getUint32(0, true);
+    const requestRowCount = header.getUint32(GLYPH_REQUEST_COUNT, true);
+    const publishedRevision = header.getUint32(GLYPH_REQUEST_REVISION, true);
     if (requestBytes !== GLYPH_REQUEST_HEADER_SIZE + requestRowCount * GLYPH_REQUEST_ROW_SIZE ||
-      header.getUint32(4, true) !== requestRevision) {
-      throw new Error(`Glyph request publication has ${requestBytes} bytes, ${requestRowCount} rows, and revision ${header.getUint32(4, true)}; expected revision ${requestRevision} and complete 16-byte rows`);
+      publishedRevision !== requestRevision) {
+      throw new Error(`Glyph request publication has ${requestBytes} bytes, ${requestRowCount} rows, and revision ${publishedRevision}; expected revision ${requestRevision} and complete ${GLYPH_REQUEST_ROW_SIZE}-byte rows`);
     }
     return { requestRevision, requestRowCount, requestSnapshot, glyphBuffer,
       engineMemory: engine.memory, publicationOwner: owner, glyphResourceManager, generationBackend, glyphLease: null };
   }
 
 
-  // Native request rows already include draw transforms, clip masks and density.
+  // Native request rows already include draw transforms, clip masks and
+  // density: they are every path entry the frame draws, so the frame begins
+  // here and the atlas may free the entries it leaves unused.
   async function buildSvgPathRenderResources(requestSnapshot) {
     const requests = nativePathRequests(requestSnapshot);
-    if (requests.length) await sharedSvgPathAtlas.ensurePaths(requests);
+    if (requests.length) {
+      sharedSvgPathAtlas.beginFrame();
+      await sharedSvgPathAtlas.ensurePaths(requests);
+    }
     sharedSvgPathAtlas.rebuildAtlas();
     bindPathRasterAtlas(sharedSvgPathAtlas);
     return sharedSvgPathAtlas;
@@ -1793,15 +1761,15 @@ export async function createSceneRendererRuntime({
         if (flags & CMD_SVG_PATH_FLAG_TRANSFORM) {
           const a = cmdView.getFloat32(off + CMD_SVG_PATH_OFFSET_XFORM, true);
           const b = cmdView.getFloat32(
-            off + CMD_SVG_PATH_OFFSET_XFORM + 4,
+            off + CMD_SVG_PATH_OFFSET_XFORM + F32,
             true,
           );
           const c = cmdView.getFloat32(
-            off + CMD_SVG_PATH_OFFSET_XFORM + 8,
+            off + CMD_SVG_PATH_OFFSET_XFORM + 2 * F32,
             true,
           );
           const d = cmdView.getFloat32(
-            off + CMD_SVG_PATH_OFFSET_XFORM + 12,
+            off + CMD_SVG_PATH_OFFSET_XFORM + 3 * F32,
             true,
           );
           scaleX = Math.hypot(a, b);
@@ -1821,20 +1789,20 @@ export async function createSceneRendererRuntime({
           });
         }
       } else if (opcode === CMD_PUSH_CLIP) {
-        const count = cmdView.getUint8(off + CMD_PUSH_CLIP_OFFSET_COUNT);
+        const count = cmdView.getUint16(off + CMD_PUSH_CLIP_OFFSET_COUNT, true);
         for (let index = 0; index < count; index++) {
           const entry = off + CMD_PUSH_CLIP_HEADER_SIZE +
             index * CLIP_ENTRY_SIZE;
           const flags = cmdView.getUint8(entry + CLIP_ENTRY_OFFSET_FLAGS);
           if (!(flags & CLIP_ENTRY_FLAG_PATH_MASK)) continue;
           const payload = entry + CLIP_ENTRY_OFFSET_RADII;
-          const pathIndex = cmdView.getUint32(payload, true);
-          const coordinateScale = cmdView.getFloat32(payload + 4, true) *
+          const pathIndex = cmdView.getUint32(payload + CLIP_ENTRY_PATH.INDEX, true);
+          const coordinateScale = cmdView.getFloat32(payload + CLIP_ENTRY_PATH.SCALE, true) *
             deviceScale;
-          const destW = (cmdView.getFloat32(payload + 16, true) -
-            cmdView.getFloat32(payload + 8, true)) * coordinateScale;
-          const destH = (cmdView.getFloat32(payload + 20, true) -
-            cmdView.getFloat32(payload + 12, true)) * coordinateScale;
+          const destW = (cmdView.getFloat32(payload + CLIP_ENTRY_PATH.X_MAX, true) -
+            cmdView.getFloat32(payload + CLIP_ENTRY_PATH.X_MIN, true)) * coordinateScale;
+          const destH = (cmdView.getFloat32(payload + CLIP_ENTRY_PATH.Y_MAX, true) -
+            cmdView.getFloat32(payload + CLIP_ENTRY_PATH.Y_MIN, true)) * coordinateScale;
           let scaleX = 1;
           let scaleY = 1;
           if (flags & CLIP_ENTRY_FLAG_AFFINE) {
@@ -1843,15 +1811,15 @@ export async function createSceneRendererRuntime({
               true,
             );
             const b = cmdView.getFloat32(
-              entry + CLIP_ENTRY_OFFSET_AFFINE + 4,
+              entry + CLIP_ENTRY_OFFSET_AFFINE + F32,
               true,
             );
             const c = cmdView.getFloat32(
-              entry + CLIP_ENTRY_OFFSET_AFFINE + 8,
+              entry + CLIP_ENTRY_OFFSET_AFFINE + 2 * F32,
               true,
             );
             const d = cmdView.getFloat32(
-              entry + CLIP_ENTRY_OFFSET_AFFINE + 12,
+              entry + CLIP_ENTRY_OFFSET_AFFINE + 3 * F32,
               true,
             );
             scaleX = Math.hypot(a, b);
@@ -1896,26 +1864,6 @@ export async function createSceneRendererRuntime({
     return { entries, ensures: ensureByPathIndex.values() };
   }
 
-  const col = (c) => c || { r: 0, g: 0, b: 0, a: 0 };
-
-  // float / clear DSL values → u8 enums (design/floats.md). Unknown
-  // values throw rather than silently writing 0 — same fail-loud convention
-  // as blendMode.
-  function floatByte(value) {
-    if (value === undefined || value === "none") return FLOAT_NONE;
-    if (value === "left") return FLOAT_LEFT;
-    if (value === "right") return FLOAT_RIGHT;
-    throw new Error(`unknown float: ${value}`);
-  }
-
-  function clearByte(value) {
-    if (value === undefined || value === "none") return CLEAR_NONE;
-    if (value === "left") return CLEAR_LEFT;
-    if (value === "right") return CLEAR_RIGHT;
-    if (value === "both") return CLEAR_BOTH;
-    throw new Error(`unknown clear: ${value}`);
-  }
-
   function usesCoreRecord(node) {
     return node._coreBox !== undefined;
   }
@@ -1948,7 +1896,7 @@ export async function createSceneRendererRuntime({
       count: nodes.length,
       imageCount,
       publication,
-      flags: 1,
+      flags: ENGINE_FRAME_INPUT_DIRECT,
       sceneGeneration,
     });
     let imageCursor = 0;
@@ -1961,7 +1909,7 @@ export async function createSceneRendererRuntime({
       // the image and path joins; a retained zero would shape the first
       // frame against the fallback face.
       if (node.fontIndex !== undefined) {
-        flags |= 1;
+        flags |= ENGINE_RESOLUTION.FONT;
         inputView.setUint32(
           row + EngineFrameResolutionFields.fontIndex,
           node.fontIndex,
@@ -1969,7 +1917,7 @@ export async function createSceneRendererRuntime({
         );
       }
       if (node.imageIndex !== undefined) {
-        flags |= 2;
+        flags |= ENGINE_RESOLUTION.IMAGE;
         inputView.setUint32(
           row + EngineFrameResolutionFields.imageIndex,
           node.imageIndex,
@@ -1982,7 +1930,7 @@ export async function createSceneRendererRuntime({
         ? [node.resolvedBackgroundImages, node.resolvedMasks, node.resolvedBorderImage ? [node.resolvedBorderImage] : null] : [];
       const layerCount = imageLists.reduce((count, layers) => count + (layers?.length ?? 0), 0);
       if (layerCount) {
-        flags |= 16;
+        flags |= ENGINE_RESOLUTION.LAYERS;
         inputView.setUint32(
           row + EngineFrameResolutionFields.backgroundImages,
           imageCursor,
@@ -1996,7 +1944,7 @@ export async function createSceneRendererRuntime({
         for (const layers of imageLists) for (const layer of layers ?? []) {
           inputView.setUint32(
             input.images + imageCursor * 4,
-            layer.imageIndex ?? 0xffff,
+            layer.imageIndex ?? IMAGE_INDEX_NONE,
             true,
           );
           imageCursor++;
@@ -2037,538 +1985,43 @@ export async function createSceneRendererRuntime({
   // More runs than this changed in one sparse write re-prepare the batch
   // more times than a full write prepares it once; the write is refused.
   const SPARSE_TEXT_REPREPARATION_LIMIT = 8;
-  function backgroundLayerList(node) {
-    const layers = node.resolvedBackgroundImages ?? node.backgroundImages;
-    const attachment = node.backgroundAttachment ?? "scroll";
-    if (!layers?.length) {
-      return node.backgroundGradient && attachment !== "scroll"
-        ? [{ gradient: node.backgroundGradient, attachment }]
-        : null;
-    }
-    return node.backgroundGradient
-      ? [...layers, { gradient: node.backgroundGradient, attachment }]
-      : layers;
-  }
-
-  function edgeQuad(spec, fallback) {
-    const v = spec === undefined ? fallback : spec;
-    const a = Array.isArray(v) ? v : [v];
-    if (a.length === 1) return [a[0], a[0], a[0], a[0]];
-    if (a.length === 2) return [a[0], a[1], a[0], a[1]];
-    if (a.length === 3) return [a[0], a[1], a[2], a[1]];
-    return [a[0], a[1], a[2], a[3]];
-  }
-
-
 
   // ---- spec → CSS/HTML (the Chrome side) ----
-  function cssSize(v) {
-    if (v === undefined || v === "auto") return "auto";
-    if (typeof v === "number") return `${v}px`;
-    if (
-      v && typeof v === "object" &&
-      Number.isFinite(v.pixels) && Number.isFinite(v.percentage)
-    ) {
-      const sign = v.percentage < 0 ? "-" : "+";
-      return `calc(${v.pixels}px ${sign} ${Math.abs(v.percentage * 100)}%)`;
-    }
-    return v;
-  }
-  const rgba = (c) =>
-    c && c.a > 0
-      ? `rgba(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${
-        Math.round(c.b * 255)
-      },${c.a})`
-      : "transparent";
-
-  // svg shape children (design/svg-rendering.md): SVG presentation attributes
-  // (cx/r/x/width/fill/...) are NOT CSS properties — applying nodeCss's
-  // ordinary width/height/etc. declarations to a <rect>/<circle> element
-  // would be meaningless (SVG geometry attributes, not boxes). sceneHtml's
-  // renderNode emits real SVG attributes directly instead; nodeCss
-  // contributes nothing for these nodes.
-  // svg-symbol (S6 step 3): a DEFINITION-only node, never itself linked
-  // into any `children` array (only ever reached via a use.href index) —
-  // nodeCss should treat it as a no-op just like every other member here,
-  // since <symbol> gets display:none unconditionally per the UA
-  // stylesheet regardless of any CSS declared on it.
-  // svg-use (S6 steps 2-3): its own x/y/width/height/transform are ALL
-  // real SVG attributes on the <use> element itself (renderNode's own
-  // svg-use branch emits them directly) — applying nodeCss's ordinary
-  // width:/height:/transform: CSS declarations ON TOP would double-apply
-  // sizing/positioning that's already fully expressed via attributes
-  // (found as a real bug: a real Chrome oracle test showed both instances
-  // shifted/resized wrong until this was added).
-  const SVG_SHAPE_DISPLAY_NAMES_CSS = new Set([
-    "svg-rect",
-    "svg-circle",
-    "svg-ellipse",
-    "svg-line",
-    "svg-path",
-    "svg-polygon",
-    "svg-polyline",
-    "svg-group",
-    "svg-symbol",
-    "svg-use",
-  ]);
-
-  // Shared by nodeCss's own filter: and backdrop-filter: declarations — CSS
-  // space-separated function list, list order preserved AS-IS (matches
-  // writeFilterList's own list-order-is-chaining-order convention). amount
-  // is unitless for color-matrix functions (CSS accepts a bare number OR
-  // percentage — this DSL's own `amount` is always the unitless/fraction
-  // form, e.g. 1 not 100%) except hue-rotate (angle, deg — writeFilterList
-  // converts to radians on the WASM side, this oracle-CSS side stays in
-  // degrees since that's what the `deg` unit expects), blur (length, px —
-  // this DSL's own `amount` IS sigma directly, which is also exactly what
-  // CSS's own blur() length argument means, so no conversion needed here),
-  // and drop-shadow (CSS's own `drop-shadow(dx dy sigma color)` shorthand —
-  // NOTE: unlike box-shadow, drop-shadow's blur argument in CSS is ALSO
-  // literally sigma, same "no radius/2 mapping" convention as blur() itself,
-  // confirmed by writeFilterList's own doc comment for the WASM-side
-  // payload).
-  function filterListCss(filters) {
-    return filters.map((f) => {
-      if (f.type === "hue-rotate") return `hue-rotate(${f.amount ?? 0}deg)`;
-      if (f.type === "blur") return `blur(${f.amount ?? 0}px)`;
-      if (f.type === "drop-shadow") {
-        const c = f.color ?? { r: 0, g: 0, b: 0, a: 1 };
-        return `drop-shadow(${f.dx ?? 0}px ${f.dy ?? 0}px ${f.sigma ?? 0}px ${
-          rgba(c)
-        })`;
-      }
-      return `${f.type}(${f.amount ?? 1})`;
-    }).join(" ");
-  }
-
-  // One CSS <gradient> function from this DSL's {kind, repeating, angle,
-  // center, shape, size, stops} shape — shared by background-image and
-  // P11's mask-image, which take the identical gradient object.
-  function cssGradientImage(g) {
-    // A stop's position is its `position` fraction plus its `pixels`
-    // length; a stop with neither is unpositioned.
-    const stopPositionCss = (s) => {
-      if (s.pixels === undefined) {
-        return s.position === undefined ? "" : ` ${s.position * 100}%`;
-      }
-      return s.position ? ` calc(${s.position * 100}% + ${s.pixels}px)` : ` ${s.pixels}px`;
-    };
-    const stopsCss = g.stops.map((s) => `${rgba(s.color)}${stopPositionCss(s)}`).join(", ");
-    const repeatingPrefix = g.repeating ? "repeating-" : "";
-    // css-images-4 <color-interpolation-method>: emitted only when the DSL
-    // names one, so every pre-existing scene keeps its exact CSS text.
-    const hueClause = g.hueMethod && g.hueMethod !== "shorter"
-      ? ` ${g.hueMethod} hue`
-      : "";
-    const interpolationCss = g.interpolationSpace
-      ? ` in ${g.interpolationSpace}${hueClause}`
-      : "";
-    if (g.kind === "linear") {
-      return `${repeatingPrefix}linear-gradient(${
-        g.angle ?? 0
-      }deg${interpolationCss}, ${stopsCss})`;
-    }
-    // css's <position> takes bare length/percent components (no 'x'/'y'
-    // suffix) in x-then-y order — same values this scene DSL's own
-    // `center` field already carries, just needing unit suffixes for a
-    // plain number (matches cssSize's own length-vs-percent convention).
-    const [centerXSpec, centerYSpec] = g.center ?? ["50%", "50%"];
-    const centerCss = `${cssSize(centerXSpec)} ${cssSize(centerYSpec)}`;
-    if (g.kind === "conic") {
-      return `${repeatingPrefix}conic-gradient(from ${
-        g.angle ?? 0
-      }deg at ${centerCss}${interpolationCss}, ${stopsCss})`;
-    }
-    if (g.kind !== "radial") {
-      throw new Error(`cssGradientImage: unknown gradient kind "${g.kind}"`);
-    }
-    const shapeCss = g.shape ?? "ellipse";
-    // css-images-3's <radial-size> grammar: an EXPLICIT circle takes a
-    // single <length> (not a pair) — `circle 60px 60px` is invalid CSS and
-    // Chrome silently drops the whole declaration on a parse failure
-    // (found exactly this way: an explicit-circle demo scene rendered a
-    // real gradient in sandom but a completely BLANK box in Chrome — not
-    // an engine bug, a CSS syntax mistake in this emission code). An
-    // explicit ellipse still takes the rx/ry pair.
-    const sizeCss = Array.isArray(g.size)
-      ? (g.shape === "circle"
-        ? cssSize(g.size[0])
-        : `${cssSize(g.size[0])} ${cssSize(g.size[1] ?? g.size[0])}`)
-      : (g.size ?? "farthest-corner");
-    return `${repeatingPrefix}radial-gradient(${shapeCss} ${sizeCss} at ${centerCss}${interpolationCss}, ${stopsCss})`;
-  }
-
+  // The fields of a scene node that its oracle CSS reads, in the order of
+  // scene_node_css (core/dom/scene-css.watpart); the binding adds the
+  // font and grid texts that other modules resolve. SVG shapes, groups,
+  // symbols and uses carry SVG attributes and get no CSS.
   function nodeCss(n) {
-    if (SVG_SHAPE_DISPLAY_NAMES_CSS.has(n.display)) return "";
-    const d = [];
-    d.push("box-sizing:" + (n.boxSizing === 1 ? "border-box" : "content-box"));
-    // n.bfc is a BFC-establishment-only test knob (Chrome has no "BFC but
-    // don't clip" property, so overflow:hidden is the trigger either way);
-    // n.overflow:'hidden' (Slice P1) is the real, visually-clipping case —
-    // see chrome-oracle.js's matching nodeCss comment for the full reasoning.
-    if (n.bfc) d.push("overflow:hidden");
-    else if (n.overflow !== undefined) d.push(`overflow:${n.overflow}`);
-    // clip-path (P9): real CSS basic-shape syntax for the Chrome-oracle
-    // side, from the same scene fields writeClipPath encodes for the
-    // engine. Value formatting: numbers are px, strings ('50%',
-    // 'closest-side', 'farthest-side') pass through verbatim.
-    if (n.clipPath) {
-      const cp = n.clipPath;
-      const len = (v) => (typeof v === "number" ? `${v}px` : v);
-      if (cp.kind === "inset") {
-        let inset = `inset(${len(cp.top ?? 0)} ${len(cp.right ?? 0)} ${
-          len(cp.bottom ?? 0)
-        } ${len(cp.left ?? 0)}`;
-        const corners = ["topLeft", "topRight", "bottomRight", "bottomLeft"];
-        const cornerRadii = corners.map((corner) => {
-          const v = cp.radii ? (cp.radii[corner] ?? 0) : (cp.radius ?? 0);
-          return typeof v === "object"
-            ? { rx: v.rx ?? 0, ry: v.ry ?? 0 }
-            : { rx: v, ry: v };
-        });
-        if (cornerRadii.some((r) => r.rx > 0 || r.ry > 0)) {
-          const anyElliptical = cornerRadii.some((r) => r.rx !== r.ry);
-          inset += anyElliptical
-            ? ` round ${cornerRadii.map((r) => `${r.rx}px`).join(" ")} / ${
-              cornerRadii.map((r) => `${r.ry}px`).join(" ")
-            }`
-            : ` round ${cornerRadii.map((r) => `${r.rx}px`).join(" ")}`;
-        }
-        d.push(`clip-path:${inset})`);
-      } else if (cp.kind === "circle") {
-        d.push(
-          `clip-path:circle(${len(cp.r ?? "closest-side")} at ${
-            len(cp.cx ?? "50%")
-          } ${len(cp.cy ?? "50%")})`,
-        );
-      } else if (cp.kind === "ellipse") {
-        d.push(
-          `clip-path:ellipse(${len(cp.rx ?? "closest-side")} ${
-            len(cp.ry ?? "closest-side")
-          } at ${len(cp.cx ?? "50%")} ${len(cp.cy ?? "50%")})`,
-        );
-      } else if (cp.kind === "polygon") {
-        const fillRule = cp.fillRule === "evenodd" ? "evenodd, " : "";
-        const points = cp.points.map(([x, y]) => `${len(x)} ${len(y)}`).join(
-          ", ",
-        );
-        d.push(`clip-path:polygon(${fillRule}${points})`);
-      } else if (cp.kind === "path") {
-        const fillRule = cp.fillRule === "evenodd" ? "evenodd, " : "";
-        d.push(`clip-path:path(${fillRule}"${cp.d.replaceAll('"', '\\"')}")`);
-      }
-    }
-    // Text declarations (Slice 6; multi-family since T4). font-family MUST
-    // match the font sandom shapes with (the registry maps the node's
-    // fontFamily key to the same test-assets file both sides use) for the
-    // pixel/box comparison to mean anything; the gallery/pixel-test harness
-    // is responsible for loading the matching @font-face for the Chrome
-    // side (fontFaceCss in test/fixtures/font-registry.js).
-    if (
-      n.display === "text" || n.display === "inline" ||
-      n.display === "inline-block" || n.inlineCtx
-    ) {
-      d.push(
-        `font-family:${
-          fontFamilyCssValue(
-            n.fontFamily ?? fontStackKeysForCssValue(DEFAULT_FONT_FAMILY)[0],
-          )
-        }`,
-      );
-      d.push(`font-size:${n.fontSize ?? DEFAULT_FONT_SIZE}px`);
-      d.push(`font-weight:${fontWeightInCssUnits(n.fontWeight)}`);
-      d.push(`font-style:${n.fontStyle ?? "normal"}`);
-      d.push(`text-align:${n.textAlign ?? "left"}`);
-      d.push(`text-decoration:${n.textDecoration ?? "none"}`);
-      d.push(`text-overflow:${n.textOverflow ?? "clip"}`);
-      if (n.verticalAlign !== undefined) {
-        const verticalAlign = typeof n.verticalAlign === "object"
-          ? `${n.verticalAlign.px}px`
-          : n.verticalAlign;
-        d.push(`vertical-align:${verticalAlign}`);
-      }
-      // Text color defaults to opaque black (CSS initial), NOT transparent —
-      // mirrors writeNode's same special case for NODE_TEXT_COLOR.
-      d.push("color:" + rgba(n.color || { r: 0, g: 0, b: 0, a: 1 }));
-      const lh = n.lineHeight;
-      if (lh === undefined || lh === "normal") d.push("line-height:normal");
-      else if (typeof lh === "number") d.push(`line-height:${lh}`);
-      else if (typeof lh === "object" && typeof lh.px === "number") {
-        d.push(`line-height:${lh.px}px`);
-      }
-    }
-    // An inline-block renders as a <span> (renderNode), whose own display
-    // is inline: it needs the declaration to be an atomic inline.
-    if (n.display === "inline-block") d.push("display:inline-block");
-    if (
-      typeof n.display === "string" &&
-      (n.display === "table" || n.display === "inline-table" ||
-        n.display.startsWith("table-"))
-    ) {
-      d.push(`display:${n.display}`);
-      if (n.tableLayout !== undefined) d.push(`table-layout:${n.tableLayout}`);
-      if (n.borderCollapse !== undefined) {
-        d.push(`border-collapse:${n.borderCollapse}`);
-      }
-      if (n.borderSpacing !== undefined) {
-        const spacing = Array.isArray(n.borderSpacing)
-          ? n.borderSpacing
-          : [n.borderSpacing];
-        d.push(
-          `border-spacing:${spacing.map((value) => `${value}px`).join(" ")}`,
-        );
-      }
-      if (n.captionSide !== undefined) d.push(`caption-side:${n.captionSide}`);
-      if (n.emptyCells !== undefined) d.push(`empty-cells:${n.emptyCells}`);
-    }
-    // Flex container declarations.
-    if (n.display === "flex" || n.display === "inline-flex") {
-      d.push(`display:${n.display}`);
-      if (n.flexDirection) d.push(`flex-direction:${n.flexDirection}`);
-      if (n.justifyContent) d.push(`justify-content:${n.justifyContent}`);
-      if (n.alignItems) d.push(`align-items:${n.alignItems}`);
-      if (n.flexWrap) d.push(`flex-wrap:${n.flexWrap}`);
-      if (n.gap !== undefined) d.push(`gap:${n.gap}px`);
-      if (n.rowGap !== undefined) d.push(`row-gap:${n.rowGap}px`);
-      if (n.columnGap !== undefined) d.push(`column-gap:${n.columnGap}px`);
-    }
-    if (n.display === "grid" || n.display === "inline-grid") {
-      d.push(`display:${n.display}`);
-      d.push(
-        `grid-template-columns:${
-          Array.isArray(n.gridTemplateColumns)
-            ? n.gridTemplateColumns.map(gridTrackCss).join(" ")
-            : n.gridTemplateColumns || "none"
-        }`,
-      );
-      d.push(
-        `grid-template-rows:${
-          Array.isArray(n.gridTemplateRows)
-            ? n.gridTemplateRows.map(gridTrackCss).join(" ")
-            : n.gridTemplateRows || "none"
-        }`,
-      );
-      if (n.gridTemplateAreas !== undefined) {
-        d.push(
-          `grid-template-areas:${
-            n.gridTemplateAreas.map((row) => `"${row}"`).join(" ")
-          }`,
-        );
-      }
-      if (n.gridAutoColumns !== undefined) {
-        d.push(`grid-auto-columns:${gridTrackCss(n.gridAutoColumns)}`);
-      }
-      if (n.gridAutoRows !== undefined) {
-        d.push(`grid-auto-rows:${gridTrackCss(n.gridAutoRows)}`);
-      }
-      if (n.gridAutoFlow !== undefined) {
-        d.push(`grid-auto-flow:${n.gridAutoFlow}`);
-      }
-      if (n.gap !== undefined) d.push(`gap:${cssSize(n.gap)}`);
-      if (n.rowGap !== undefined) d.push(`row-gap:${cssSize(n.rowGap)}`);
-      if (n.columnGap !== undefined) {
-        d.push(`column-gap:${cssSize(n.columnGap)}`);
-      }
-      if (n.alignItems !== undefined) d.push(`align-items:${n.alignItems}`);
-      if (n.justifyItems !== undefined) {
-        d.push(`justify-items:${n.justifyItems}`);
-      }
-      if (n.alignContent !== undefined) {
-        d.push(`align-content:${n.alignContent}`);
-      }
-      if (n.justifyContent !== undefined) {
-        d.push(`justify-content:${n.justifyContent}`);
-      }
-    }
-    // Flex item declarations (only meaningful when parent is flex; harmless else).
-    if (n.flexGrow !== undefined) d.push(`flex-grow:${n.flexGrow}`);
-    if (n.flexShrink !== undefined) d.push(`flex-shrink:${n.flexShrink}`);
-    if (n.flexBasis !== undefined) d.push(`flex-basis:${cssSize(n.flexBasis)}`);
-    if (n.alignSelf !== undefined) d.push(`align-self:${n.alignSelf}`);
-    if (n.order !== undefined) d.push(`order:${n.order}`);
-    if (n.gridRowStart !== undefined) {
-      d.push(`grid-row-start:${n.gridRowStart}`);
-    }
-    if (n.gridRowEnd !== undefined) d.push(`grid-row-end:${n.gridRowEnd}`);
-    if (n.gridColumnStart !== undefined) {
-      d.push(`grid-column-start:${n.gridColumnStart}`);
-    }
-    if (n.gridColumnEnd !== undefined) {
-      d.push(`grid-column-end:${n.gridColumnEnd}`);
-    }
-    if (n.gridArea !== undefined) d.push(`grid-area:${n.gridArea}`);
-    if (n.justifySelf !== undefined) d.push(`justify-self:${n.justifySelf}`);
-    // float / clear (design/floats.md). floatByte/clearByte validate
-    // the same values writeNode accepts, so oracle HTML can never diverge
-    // from what the engine side was given.
-    if (n.float !== undefined) {
-      floatByte(n.float);
-      d.push(`float:${n.float}`);
-    }
-    if (n.clear !== undefined) {
-      clearByte(n.clear);
-      d.push(`clear:${n.clear}`);
-    }
-    d.push("width:" + cssSize(n.width));
-    d.push("height:" + cssSize(n.height));
-    if (n.aspectRatio !== undefined) d.push(`aspect-ratio:${n.aspectRatio}`);
-    if (n.minWidth !== undefined) d.push("min-width:" + cssSize(n.minWidth));
-    if (n.minHeight !== undefined) d.push("min-height:" + cssSize(n.minHeight));
-    if (n.maxWidth !== undefined) d.push("max-width:" + cssSize(n.maxWidth));
-    if (n.maxHeight !== undefined) d.push("max-height:" + cssSize(n.maxHeight));
-    const m = n.margin || {};
-    d.push(
-      "margin-top:" + (n.marginTop === "auto" ? "auto" : `${m.top || 0}px`),
-    );
-    d.push(
-      "margin-bottom:" +
-        (n.marginBottom === "auto" ? "auto" : `${m.bottom || 0}px`),
-    );
-    d.push(
-      "margin-left:" + (n.marginLeft === "auto" ? "auto" : `${m.left || 0}px`),
-    );
-    d.push(
-      "margin-right:" +
-        (n.marginRight === "auto" ? "auto" : `${m.right || 0}px`),
-    );
-    const p = n.padding || {};
-    d.push(
-      `padding:${p.top || 0}px ${p.right || 0}px ${p.bottom || 0}px ${
-        p.left || 0
-      }px`,
-    );
-    const b = n.border;
-    d.push(`border-style:${typeof n.borderStyle === "string" ? n.borderStyle :
-      `${n.borderStyle.top} ${n.borderStyle.right} ${n.borderStyle.bottom} ${n.borderStyle.left}`}`);
-    d.push(
-      `border-width:${b.top || 0}px ${b.right || 0}px ${b.bottom || 0}px ${
-        b.left || 0
-      }px`,
-    );
-    const nodeBorderColors = n.borderColor;
-    d.push(
-      `border-color:${rgba(nodeBorderColors.top)} ${
-        rgba(nodeBorderColors.right)
-      } ${rgba(nodeBorderColors.bottom)} ${rgba(nodeBorderColors.left)}`,
-    );
-    if (n.borderRadius !== undefined) {
-      const nodeRadii = n.borderRadius;
-      const corners = [
-        nodeRadii.topLeft,
-        nodeRadii.topRight,
-        nodeRadii.bottomRight,
-        nodeRadii.bottomLeft,
-      ];
-      // A negative component is the percentage encoding (see cornerRxRy):
-      // emit the CSS percentage form for the oracle.
-      const radiusCss = (component) =>
-        component < 0 ? `${-component}%` : `${component}px`;
-      const xValues = corners.map((c) => radiusCss(c.rx)).join(" ");
-      // P10: only emit the CSS `/` elliptical syntax when a corner is
-      // actually elliptical (rx!==ry) — keeps existing circular-only scenes'
-      // generated CSS unchanged (easier to read/diff).
-      const isElliptical = corners.some((c) => c.rx !== c.ry);
-      d.push(
-        isElliptical
-          ? `border-radius:${xValues} / ${
-            corners.map((c) => radiusCss(c.ry)).join(" ")
-          }`
-          : `border-radius:${xValues}`,
-      );
-    }
-    d.push("background:" + rgba(n.bg));
-    // background-clip / background-origin: emitted whenever set so the
-    // Chrome oracle sees the same value the engine reads (background-clip
-    // was never emitted here before — P10's own tests were pixel asserts,
-    // not oracle comparisons, so the gap never surfaced). Defaults need no
-    // emission: Chrome's initial values (clip border-box, origin
-    // padding-box) match the engine's zeroed-struct behavior.
-    if (n.backgroundClip !== undefined) {
-      d.push(`background-clip:${n.backgroundClip}`);
-    }
-    if (n.backgroundOrigin !== undefined) {
-      d.push(`background-origin:${n.backgroundOrigin}`);
-    }
-    // P4 (gradients): CSS's background-image is INDEPENDENT of background-
-    // color (the `background:` shorthand above only ever set the color, per
-    // rgba(n.bg) — a plain color function, not a gradient-aware one), so
-    // this is a separate declaration, matching real CSS layering.
-    // Only the FUSED case here — once the gradient lowers into the layer
-    // list, nodeCssBackgroundImages emits it as one entry of a single
-    // comma-separated background-image, which is the only way the ordering
-    // between it and the other layers can be expressed at all.
-    if (n.backgroundGradient && !backgroundLayerList(n)) {
-      d.push(`background-image:${cssGradientImage(n.backgroundGradient)}`);
-    }
-    // box-shadow (P3): CSS shorthand order is [inset] offsetX offsetY
-    // [blur] [spread] color — offsetX/offsetY/blur/spread are ALL required
-    // positionally even when 0 (CSS's own grammar has no way to omit blur
-    // while supplying spread), same plain-px-number convention as this
-    // scene DSL's other length fields (no unit suffixes needed for box-
-    // shadow's own length values). List order is preserved AS-IS (this
-    // scene DSL's own array order === CSS's comma-separated list order,
-    // per writeShadows' own doc comment on index 0 = first-listed).
-    if (n.boxShadows?.length) {
-      const shadowsCss = n.boxShadows.map((s) =>
-        `${s.inset ? "inset " : ""}${s.offsetX ?? 0}px ${s.offsetY ?? 0}px ${
-          s.blur ?? 0
-        }px ${s.spread ?? 0}px ${rgba(s.color)}`
-      ).join(", ");
-      d.push(`box-shadow:${shadowsCss}`);
-    }
-    // text-shadow (P6): same list-order preservation as box-shadow above.
-    if (n.textShadows?.length) {
-      const textShadowsCss = n.textShadows.map((sh) =>
-        `${sh.offsetX ?? 0}px ${sh.offsetY ?? 0}px ${sh.blur ?? 0}px ${
-          rgba(sh.color || { r: 0, g: 0, b: 0, a: 1 })
-        }`
-      ).join(", ");
-      d.push(`text-shadow:${textShadowsCss}`);
-    }
-    // filter (P8) / backdrop-filter (P8b): see filterListCss's own comment
-    // for the CSS mapping rules.
-    if (n.filter?.length) {
-      d.push(`filter:${filterListCss(n.filter)}`);
-    }
-    // backdrop-filter (P8b): SAME CSS function-list grammar as filter (see
-    // filterListCss's own comment) — the only difference is which property
-    // it lands on.
-    if (n.backdropFilter?.length) {
-      d.push(`backdrop-filter:${filterListCss(n.backdropFilter)}`);
-    }
-    if (n.position === 1) d.push("position:relative");
-    if (n.position === 2) d.push("position:absolute");
-    if (n.position === 3) d.push("position:fixed");
-    if (n.zIndex !== undefined) d.push(`z-index:${n.zIndex}`);
-    for (const side of ["top", "right", "bottom", "left"]) {
-      if (n[side] !== undefined) d.push(`${side}:${cssSize(n[side])}`);
-    }
-    if (n.opacity !== undefined) d.push(`opacity:${n.opacity}`);
-    if (n.transform !== undefined) {
-      const [a, b, c, dd, e, f] = n.transform;
-      d.push(`transform:matrix(${a},${b},${c},${dd},${e},${f})`);
-    }
-    if (n.blendMode !== undefined) d.push(`mix-blend-mode:${n.blendMode}`);
-    if (n.display === "image") {
-      d.push(`object-fit:${n.objectFit ?? "fill"}`);
-      const [posX, posY] = n.objectPosition ?? ["50%", "50%"];
-      d.push(
-        `object-position:${typeof posX === "number" ? posX + "px" : posX} ${
-          typeof posY === "number" ? posY + "px" : posY
-        }`,
-      );
-    }
-    if (n.imageRendering !== undefined) {
-      d.push(`image-rendering:${n.imageRendering}`);
-    }
-    return d.join(";");
-  }
-
-  // Minimal HTML-escaping for text node content — the only characters that
-  // can break attribute/element parsing in the plain-text positions this
-  // content is inserted into.
-  function escapeHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const needs = core.status("scene_css_needs", ...core.valueListInput([n.display, n.inlineCtx]));
+    const text = (needs & SCENE_CSS_NEEDS_FONT) !== 0;
+    const grid = (needs & SCENE_CSS_NEEDS_GRID) !== 0;
+    const tracks = (value) => Array.isArray(value) ? value.map(gridTrackCss) : undefined;
+    return core.string("scene_node_css", ...core.valueListInput([
+      n.display, n.boxSizing, n.bfc, n.overflow, n.clipPath,
+      text ? fontFamilyCssValue(n.fontFamily ?? fontStackKeysForCssValue(DEFAULT_FONT_FAMILY)[0]) : undefined,
+      text ? n.fontSize ?? DEFAULT_FONT_SIZE : undefined,
+      text ? fontWeightInCssUnits(n.fontWeight) : undefined,
+      n.fontStyle, n.textAlign, n.textDecoration, n.textOverflow, n.verticalAlign, n.color, n.lineHeight, n.inlineCtx,
+      n.tableLayout, n.borderCollapse, n.borderSpacing, n.captionSide, n.emptyCells,
+      n.flexDirection, n.justifyContent, n.alignItems, n.flexWrap, n.gap, n.rowGap, n.columnGap,
+      grid ? tracks(n.gridTemplateColumns) : undefined,
+      grid ? tracks(n.gridTemplateRows) : undefined,
+      n.gridTemplateAreas,
+      grid && n.gridAutoColumns !== undefined ? gridTrackCss(n.gridAutoColumns) : undefined,
+      grid && n.gridAutoRows !== undefined ? gridTrackCss(n.gridAutoRows) : undefined,
+      n.gridAutoFlow, n.justifyItems, n.alignContent,
+      n.flexGrow, n.flexShrink, n.flexBasis, n.alignSelf, n.order,
+      n.gridRowStart, n.gridRowEnd, n.gridColumnStart, n.gridColumnEnd, n.gridArea, n.justifySelf,
+      n.float, n.clear, n.width, n.height, n.aspectRatio, n.minWidth, n.minHeight, n.maxWidth, n.maxHeight,
+      n.margin, n.marginTop, n.marginBottom, n.marginLeft, n.marginRight, n.padding,
+      n.borderStyle, n.border, n.borderColor, n.borderRadius, n.bg, n.backgroundClip, n.backgroundOrigin,
+      n.backgroundGradient, undefined,
+      n.boxShadows, n.textShadows, n.filter, n.backdropFilter, n.position, n.zIndex,
+      n.top, n.right, n.bottom, n.left, n.opacity, n.transform, n.blendMode,
+      n.objectFit, n.objectPosition, n.imageRendering,
+      n.gridTemplateColumns, n.gridTemplateRows,
+      n.resolvedBackgroundImages, n.backgroundImages, n.backgroundAttachment,
+    ], { compositeJson: false }));
   }
 
   // Images (like fonts, see font-registry.js's fontDataUri) are embedded as
@@ -2589,127 +2042,34 @@ export async function createSceneRendererRuntime({
     return uri;
   }
 
-  // background-image CSS (Slice P5c) — separate from nodeCss (which stays
-  // synchronous) since the src->data:URI conversion is async, same reason
-  // <img>'s src attribute is built inside sceneHtml's own async renderNode
-  // rather than nodeCss. CSS list order matches node.backgroundImages'
-  // own order directly (unlike the WAT/pool side, which reverses it for
-  // paint order — CSS's own multi-background syntax is authored top-first
-  // too, so no reordering is needed here).
+  // The data URIs of the layers with a source, in layer order.
+  async function layerDataUris(layers, readImage) {
+    const uris = [];
+    for (const layer of Array.isArray(layers) ? layers : []) {
+      uris.push(layer?.src ? await imageDataUri(layer.src, readImage) : undefined);
+    }
+    return uris;
+  }
+
+  // The background-image, border-image and mask longhands of the oracle
+  // page (scene_layer_css): async only for the data URIs of their images.
   async function nodeCssBackgroundImages(n, readImage) {
-    // The SAME effective list the pool gets, so the two sides cannot
-    // disagree about whether a backgroundGradient is fused or a layer. When
-    // it fuses, nodeCss already emitted it as its own background-image
-    // declaration and this returns '' — the two paths are mutually
-    // exclusive by construction, which also fixes the pre-existing case
-    // where both emitted `background-image` and the second silently won.
-    const layers = backgroundLayerList(n);
-    if (!layers) return "";
-    const d = [];
-    const images = [],
-      sizes = [],
-      positions = [],
-      repeats = [],
-      blendModes = [];
-    for (const layer of layers) {
-      if (layer.src) images.push(`url(${await imageDataUri(layer.src, readImage)})`);
-      else if (layer.gradient) images.push(cssGradientImage(layer.gradient));
-      else images.push("none");
-      const [sizeW, sizeH] = layer.size ?? ["auto", "auto"];
-      if (sizeW === "cover" || sizeW === "contain") sizes.push(sizeW);
-      else sizes.push(`${cssSize(sizeW)} ${cssSize(sizeH)}`);
-      const [posX, posY] = layer.position ?? ["0%", "0%"];
-      positions.push(`${cssSize(posX)} ${cssSize(posY)}`);
-      const [repeatX, repeatY] = layer.repeat ?? ["repeat", "repeat"];
-      repeats.push(repeatX === repeatY ? repeatX : `${repeatX} ${repeatY}`);
-      blendModes.push(layer.blendMode ?? "normal");
-    }
-    d.push(`background-image:${images.join(",")}`);
-    d.push(`background-size:${sizes.join(",")}`);
-    d.push(`background-position:${positions.join(",")}`);
-    d.push(`background-repeat:${repeats.join(",")}`);
-    if (blendModes.some((m) => m !== "normal")) {
-      d.push(`background-blend-mode:${blendModes.join(",")}`);
-    }
-    return d.join(";");
+    const source = n.resolvedBackgroundImages ?? n.backgroundImages;
+    return core.string("scene_layer_css", SCENE_LAYER_BACKGROUNDS, ...core.valueListInput([
+      n.resolvedBackgroundImages, n.backgroundImages, n.backgroundAttachment, n.backgroundGradient,
+      await layerDataUris(source, readImage),
+    ], { compositeJson: false }));
   }
 
-  // border-image CSS (P14) — async for the same src->data:URI reason as
-  // nodeCssBackgroundImages above, and emitted as LONGHANDS for the same
-  // reason nodeCssMasks does: sandom consumes resolved style values, so
-  // there is no shorthand parser under test, and longhands keep every edge
-  // value explicit in the oracle CSS.
-  //
-  // The value forms have to round-trip EXACTLY as authored, because that is
-  // the whole comparison: a bare `4` in border-image-width means four times
-  // the border-width, while `4px` is a length — emitting one as the other
-  // would make the oracle agree with a different feature.
   async function nodeCssBorderImage(n, readImage) {
-    if (!n.borderImage || !n.borderImage.src) return "";
-    const spec = n.borderImage;
-    const d = [`border-image-source:url(${await imageDataUri(spec.src, readImage)})`];
-
-    const sliceQuad = edgeQuad(spec.slice, 100);
-    // CSS orders the slice shorthand top/right/bottom/left, same as our quad.
-    d.push(
-      `border-image-slice:${sliceQuad.join(" ")}${spec.fill ? " fill" : ""}`,
-    );
-
-    const widthQuad = edgeQuad(spec.width, 1);
-    d.push(`border-image-width:${widthQuad.join(" ")}`);
-
-    const outsetQuad = edgeQuad(spec.outset, 0);
-    d.push(`border-image-outset:${outsetQuad.join(" ")}`);
-
-    const [repeatX, repeatY] = Array.isArray(spec.repeat)
-      ? (spec.repeat.length === 1
-        ? [spec.repeat[0], spec.repeat[0]]
-        : spec.repeat)
-      : [spec.repeat ?? "stretch", spec.repeat ?? "stretch"];
-    d.push(`border-image-repeat:${repeatX} ${repeatY}`);
-
-    return d.join(";");
+    const uri = n.borderImage?.src ? await imageDataUri(n.borderImage.src, readImage) : undefined;
+    return core.string("scene_layer_css", SCENE_LAYER_BORDER_IMAGE, ...core.valueListInput([n.borderImage, uri], { compositeJson: false }));
   }
 
-  // mask CSS (P11) — async for the same src->data:URI reason as
-  // nodeCssBackgroundImages above, and emitted as LONGHANDS rather than the
-  // `mask` shorthand: sandom consumes resolved style values, so there is no
-  // shorthand parser under test here, and longhands keep each per-layer
-  // list explicit in the oracle CSS. List order matches node.masks
-  // directly (the pool side reverses; CSS is authored top-first).
-  // Unprefixed only: the oracle Chrome implements the css-masking-1
-  // longhands natively, and adding -webkit- aliases would only risk a
-  // differently-parsed keyword set silently overriding them.
   async function nodeCssMasks(n, readImage) {
-    if (!n.masks || !n.masks.length) return "";
-    const images = [], sizes = [], positions = [], repeats = [];
-    const modes = [], origins = [], clips = [], composites = [];
-    for (const layer of n.masks) {
-      if (layer.src) images.push(`url(${await imageDataUri(layer.src, readImage)})`);
-      else if (layer.gradient) images.push(cssGradientImage(layer.gradient));
-      else images.push("none");
-      const [sizeW, sizeH] = layer.size ?? ["auto", "auto"];
-      if (sizeW === "cover" || sizeW === "contain") sizes.push(sizeW);
-      else sizes.push(`${cssSize(sizeW)} ${cssSize(sizeH)}`);
-      const [posX, posY] = layer.position ?? ["0%", "0%"];
-      positions.push(`${cssSize(posX)} ${cssSize(posY)}`);
-      const [repeatX, repeatY] = layer.repeat ?? ["repeat", "repeat"];
-      repeats.push(repeatX === repeatY ? repeatX : `${repeatX} ${repeatY}`);
-      modes.push(layer.mode ?? "match-source");
-      origins.push(layer.origin ?? "border-box");
-      clips.push(layer.clip ?? "border-box");
-      composites.push(layer.composite ?? "add");
-    }
-    return [
-      `mask-image:${images.join(",")}`,
-      `mask-size:${sizes.join(",")}`,
-      `mask-position:${positions.join(",")}`,
-      `mask-repeat:${repeats.join(",")}`,
-      `mask-mode:${modes.join(",")}`,
-      `mask-origin:${origins.join(",")}`,
-      `mask-clip:${clips.join(",")}`,
-      `mask-composite:${composites.join(",")}`,
-    ].join(";");
+    return core.string("scene_layer_css", SCENE_LAYER_MASKS, ...core.valueListInput([
+      n.masks, await layerDataUris(n.masks, readImage),
+    ], { compositeJson: false }));
   }
 
   // The image bytes of the oracle page come from `host`, as every other
@@ -2763,952 +2123,60 @@ export async function createSceneRendererRuntime({
     });
   }
 
+  // The node fields the oracle page's markup reads (scene_html_field_names).
+  let sceneHtmlFields = null;
+
+  // The oracle page of a prepared scene: its style sheet (scene_css_rules)
+  // and its markup (scene_html). The binding resolves what the core
+  // cannot: the data URIs of images and the sine and cosine of each
+  // linear SVG gradient angle (WebAssembly has no sine and cosine).
   async function sceneHtmlPrepared(scene, readImage) {
-    const cssRules = await Promise.all(scene.nodes.map(async (n, i) => {
-      const extra = [
-        await nodeCssBackgroundImages(n, readImage),
-        await nodeCssMasks(n, readImage),
-        await nodeCssBorderImage(n, readImage),
-      ].filter(Boolean);
-      return `.s${scene.id}-n${i}{${
-        [nodeCss(n), ...extra].filter(Boolean).join(";")
-      }}`;
-    }));
-    const css = cssRules.join("\n");
-    // preserveAspectRatio: the DSL value is an SVG preserveAspectRatio
-    // attribute value, passed through unchanged ('xMidYMid meet' when the
-    // attribute is omitted).
-    // Plain length-or-percent resolver against a basis (JS-side port of
-    // engine.wat's own $resolveLength, needed here since gradient <defs>
-    // markup is generated in JS at oracle-build time, not resolved by the
-    // engine at emission time — same numeric contract, just a different
-    // caller).
-    function resolveLengthOrPercent(spec, basis) {
-      if (typeof spec === "number") return spec;
-      if (typeof spec === "string" && spec.endsWith("%")) {
-        return parseFloat(spec) / 100 * basis;
-      }
-      throw new Error(`resolveLengthOrPercent: bad spec "${spec}"`);
-    }
-
-    // JS port of engine.wat's $resolveRadialGradientGeometry — same 4
-    // extent-keyword formulas (including the closest-corner/farthest-corner
-    // closed-form ellipse-radii derivation css-images-3 deliberately leaves
-    // unspecified, derived from scratch and verified numerically when
-    // FIRST written for the engine — see that function's own comment in
-    // engine.wat for the derivation/verification detail; ported verbatim
-    // here rather than re-derived a second time).
-    // cx/cy: center relative to the shape's own top-left (NOT absolute
-    // page coordinates) — matches $resolveRadialGradientGeometry's own
-    // (cx,cy) parameter meaning.
-    function resolveRadialEndingShapeJs(cx, cy, shape, sizeSpec, w, h) {
-      if (Array.isArray(sizeSpec)) {
-        return { rx: sizeSpec[0] ?? 0, ry: sizeSpec[1] ?? sizeSpec[0] ?? 0 };
-      }
-      const sizeKeyword = sizeSpec ?? "farthest-corner";
-      const left = cx, right = w - cx, top = cy, bottom = h - cy;
-      const isCircle = shape === "circle";
-      if (sizeKeyword === "closest-side") {
-        if (isCircle) {
-          const r = Math.min(left, right, top, bottom);
-          return { rx: r, ry: r };
-        }
-        return { rx: Math.min(left, right), ry: Math.min(top, bottom) };
-      }
-      if (sizeKeyword === "farthest-side") {
-        if (isCircle) {
-          const r = Math.max(left, right, top, bottom);
-          return { rx: r, ry: r };
-        }
-        return { rx: Math.max(left, right), ry: Math.max(top, bottom) };
-      }
-      const closest = sizeKeyword === "closest-corner";
-      const cornerL = closest ? Math.min(left, right) : Math.max(left, right);
-      const cornerV = closest ? Math.min(top, bottom) : Math.max(top, bottom);
-      const ratioRx = cornerL, ratioRy = cornerV;
-      if (isCircle) {
-        const r = Math.sqrt(cornerL * cornerL + cornerV * cornerV);
-        return { rx: r, ry: r };
-      }
-      if (ratioRx === 0) return { rx: 0, ry: cornerV };
-      const ry = Math.sqrt(
-        cornerV * cornerV + (cornerL * ratioRy / ratioRx) ** 2,
-      );
-      const rx = ry * (ratioRx / ratioRy);
-      return { rx, ry };
-    }
-
-    // Gradient <defs> accumulator (SVG gradients) — NOT shared closure
-    // state (a prior version used one shared array + counter for the whole
-    // sceneHtml() call, which raced: renderNode recurses through
-    // Promise.all, so TWO SIBLING svg roots' subtrees run concurrently, and
-    // whichever root's own "read svgGradientDefs.length" line happened to
-    // run AFTER the other root's shape already pushed its own gradient
-    // would silently print the WRONG root's gradients into its own <defs>
-    // — found via a live-browser-tab visual review showing genuinely wrong
-    // gradient POSITIONS/colors per shape, not a display/color-profile
-    // difference as first suspected). Each svg root now creates its OWN
-    // fresh accumulator array (see the 'svg' root branch below) and passes
-    // it down through renderNode/svgFillAttr/svgGradientDef explicitly —
-    // sibling svg roots' concurrent subtrees can never see each other's
-    // pushes. svgGradientIdCounter stays a single shared per-sceneHtml()
-    // counter (harmless to race on a plain increment for uniqueness
-    // purposes only — worst case two ids interleave differently across
-    // runs, never producing a COLLISION or cross-contaminating which
-    // gradient markup lands in which root's own accumulator array).
-    let svgGradientIdCounter = 0;
-    const svgGradientIdPrefix = String(scene.id ?? "scene").replace(
-      /[^A-Za-z0-9_-]/g,
-      "-",
-    );
-
-    // Convert this scene DSL's {kind,angle,center,shape,size,stops} shape
-    // (the SAME object shape CSS's own backgroundGradient uses — see
-    // writeGradientStops' own comment) into a REAL SVG gradient element,
-    // in userSpaceOnUse coordinates so the resolved geometry EXACTLY
-    // matches what $resolveLinearGradientGeometry/$resolveRadialGradient
-    // Geometry compute in engine.wat (verified numerically before writing
-    // this: userSpaceOnUse reproduces css-images-3's own w/h-dependent
-    // gradient-length formula exactly; objectBoundingBox's unit-square
-    // normalization would visibly DISTORT a non-square shape's gradient
-    // direction/length, since it flattens aspect ratio away).
-    // shapeX/Y/W/H: the shape's own resolved bounding box in the SAME
-    // user-space coordinates its own geometry attributes use (e.g. a rect's
-    // x/y/width/height, or a circle's cx-r/cy-r/2r/2r). defsAccumulator:
-    // THIS shape's own enclosing svg root's private array (see the 'svg'
-    // root branch below) — pushed into directly, never the shared
-    // svgGradientDefs closure this function used before the sibling-race
-    // fix (see that variable's own removal comment above).
-    function svgGradientDef(
-      gradient,
-      shapeX,
-      shapeY,
-      shapeW,
-      shapeH,
-      defsAccumulator,
-    ) {
-      const id =
-        `sandom-${svgGradientIdPrefix}-svg-grad-${svgGradientIdCounter++}`;
-      const stopsMarkup = gradient.stops.map((s) => {
-        const c = col(s.color);
-        return `<stop offset="${(s.position ?? 0) * 100}%" stop-color="rgb(${
-          Math.round(c.r * 255)
-        },${Math.round(c.g * 255)},${
-          Math.round(c.b * 255)
-        })" stop-opacity="${c.a}"></stop>`;
-      }).join("");
-      if (gradient.kind === "linear") {
-        // Same direction+length formula this project's own
-        // $resolveLinearGradientGeometry implements (css-images-3 SS3.1,
-        // 0deg=up/clockwise convention) — see that function's own doc
-        // comment in engine.wat for the derivation/verification.
-        const rad = (gradient.angle ?? 0) * Math.PI / 180;
-        const dx = Math.sin(rad), dy = -Math.cos(rad);
-        const length = Math.abs(shapeW * Math.sin(rad)) +
-          Math.abs(shapeH * Math.cos(rad));
-        const cx = shapeX + shapeW / 2, cy = shapeY + shapeH / 2;
-        const halfLen = length / 2;
-        const x1 = cx - dx * halfLen, y1 = cy - dy * halfLen;
-        const x2 = cx + dx * halfLen, y2 = cy + dy * halfLen;
-        defsAccumulator.push(
-          `<linearGradient id="${id}" gradientUnits="userSpaceOnUse" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}">${stopsMarkup}</linearGradient>`,
-        );
-      } else if (gradient.kind === "radial") {
-        // SVG's native <radialGradient> is CIRCULAR ONLY (cx/cy/r, no rx/ry
-        // — confirmed via direct spec research before assuming otherwise:
-        // SVG has no elliptical radial-gradient attribute at all). An
-        // elliptical shape gets a non-uniform gradientTransform scale
-        // instead — center the transform's own scale on the gradient's
-        // OWN center point (a plain scale from origin would also shift
-        // the center, which a translate-scale-translate-back fold avoids).
-        const [centerXSpec, centerYSpec] = gradient.center ?? ["50%", "50%"];
-        const cx = shapeX + resolveLengthOrPercent(centerXSpec, shapeW);
-        const cy = shapeY + resolveLengthOrPercent(centerYSpec, shapeH);
-        // Ending-shape radii: reuse this project's OWN already-verified
-        // radial-geometry resolution (writeGradientStops' sibling function
-        // resolveRadialEndingShape, extracted below) rather than
-        // re-deriving the 4 extent-keyword formulas a second time here.
-        const { rx, ry } = resolveRadialEndingShapeJs(
-          cx - shapeX,
-          cy - shapeY,
-          gradient.shape ?? "ellipse",
-          gradient.size,
-          shapeW,
-          shapeH,
-        );
-        const isCircle = Math.abs(rx - ry) < 1e-4;
-        const transformAttr = isCircle
-          ? ""
-          : ` gradientTransform="translate(${cx} ${cy}) scale(1 ${
-            ry / rx
-          }) translate(${-cx} ${-cy})"`;
-        const r = isCircle ? rx : rx; // the (pre-transform) circle radius is rx either way — ry comes from the non-uniform Y scale
-        defsAccumulator.push(
-          `<radialGradient id="${id}" gradientUnits="userSpaceOnUse" cx="${cx}" cy="${cy}" r="${r}"${transformAttr}>${stopsMarkup}</radialGradient>`,
-        );
-      }
-      return id;
-    }
-
-    function svgFillAttr(
-      fill,
-      gradient,
-      shapeX,
-      shapeY,
-      shapeW,
-      shapeH,
-      defsAccumulator,
-    ) {
-      if (gradient) {
-        const id = svgGradientDef(
-          gradient,
-          shapeX,
-          shapeY,
-          shapeW,
-          shapeH,
-          defsAccumulator,
-        );
-        return ` fill="url(#${id})"`;
-      }
-      if (fill === undefined) return ""; // SVG default fill is black — omitting the attribute IS the default.
-      if (fill === "none") return ' fill="none"';
-      return ` fill="${rgba(fill)}"`;
-    }
-    // stroke (S3): SVG default is 'none' — omitting the attribute IS the
-    // default, same convention as svgFillAttr above. strokeWidth similarly
-    // omits when unset (SVG default is 1, but only meaningful with a stroke).
-    // A svgStrokeGradient paints url(#…) of a gradient over gradientBox, the
-    // box the engine resolves the stroke's gradient against: the fill
-    // path's, as SVG's object bounding box excludes the stroke.
-    function svgStrokeAttrs(n, gradientBox, defsAccumulator) {
-      let paint;
-      if (n.svgStrokeGradient && gradientBox) {
-        paint = `url(#${
-          svgGradientDef(n.svgStrokeGradient, ...gradientBox, defsAccumulator)
-        })`;
-      } else if (n.stroke === undefined || n.stroke === "none") {
-        return "";
-      } else {
-        paint = rgba(n.stroke);
-      }
-      const widthAttr = n.strokeWidth !== undefined
-        ? ` stroke-width="${n.strokeWidth}"`
-        : "";
-      const dashAttr = n.strokeDasharray && n.strokeDasharray.length
-        ? ` stroke-dasharray="${n.strokeDasharray.join(",")}"`
-        : "";
-      const dashOffsetAttr = n.strokeDashoffset !== undefined
-        ? ` stroke-dashoffset="${n.strokeDashoffset}"`
-        : "";
-      return ` stroke="${paint}"${widthAttr}${dashAttr}${dashOffsetAttr}`;
-    }
-    // Native path bounds in author coordinates.
-    function loweredGradientBox(n) {
-      const bbox = n.resolvedPathBbox;
-      if (bbox === undefined) return null;
-      return [bbox.xMin, bbox.yMin, bbox.xMax - bbox.xMin, bbox.yMax - bbox.yMin];
-    }
-    // defsAccumulator (S7): null outside any svg root's subtree (the
-    // overwhelmingly common case — text/image/flex/block nodes never touch
-    // it); set to a FRESH array by the 'svg' root branch below, then
-    // threaded through this same parameter to every descendant's own
-    // recursive renderNode call, so sibling svg roots' concurrent subtrees
-    // (Promise.all runs them interleaved, not sequentially) each only ever
-    // see their OWN gradients, never a sibling's — see the accumulator
-    // variable's own removal comment above for the race this replaces.
-    async function renderNode(i, defsAccumulator = null) {
-      const n = scene.nodes[i];
-      if (n.display === "text") {
-        return `<div class="s${scene.id}-n${i}">${
-          escapeHtml(n.text ?? "")
-        }</div>`;
-      }
-      if (n.display === "image") {
-        const src = n.src ? await imageDataUri(n.src, readImage) : "";
-        return `<img class="s${scene.id}-n${i}" src="${src}">`;
-      }
-      // svg root (design/svg-rendering.md): a real <svg> element — width/height/
-      // viewBox/preserveAspectRatio are genuine SVG attributes (also styled
-      // via nodeCss's ordinary width/height CSS declarations, since CSS
-      // sizing DOES apply to <svg> as a replaced element — both are present
-      // and Chrome reconciles them per the replaced-element sizing spec,
-      // same as sandom's own engine does).
-      if (n.display === "svg") {
-        // Each viewport owns the gradients of its descendant shapes.
-        const ownDefsAccumulator = [];
-        const kids = (await Promise.all((n.children || []).map((childIndex) =>
-          renderNode(childIndex, ownDefsAccumulator)
-        ))).join("");
-        const attrs = [`class="s${scene.id}-n${i}"`];
-        const nested = defsAccumulator !== null;
-        if (nested) {
-          attrs.push('style="transform:none"');
-          if (n.width !== undefined) attrs.push(`width="${n.width}"`);
-          if (n.height !== undefined) attrs.push(`height="${n.height}"`);
-        }
-        if (n.viewBox) {
-          attrs.push(`viewBox="${n.viewBox.join(" ")}"`);
-        }
-        if (n.preserveAspectRatio) {
-          attrs.push(`preserveAspectRatio="${n.preserveAspectRatio}"`);
-        }
-        // S7: any gradient fills collected from descendant shapes (rendered
-        // before this line via the recursive renderNode above) need a real
-        // <defs> host — SVG resolves url(#id) references anywhere in the
-        // document, but <defs> is the conventional non-rendering container.
-        const defsMarkup = ownDefsAccumulator.length
-          ? `<defs>${ownDefsAccumulator.join("")}</defs>`
-          : "";
-        const markup = `<svg ${attrs.join(" ")}>${defsMarkup}${kids}</svg>`;
-        return nested && n.transform
-          ? `<g transform="matrix(${n.transform.join(" ")})">${markup}</g>`
-          : markup;
-      }
-      // Native group rows carry their resolved affine and expanded children.
-      if (n.display === "svg-group") {
-        const kids = (await Promise.all((n.children || []).map((childIndex) =>
-          renderNode(childIndex, defsAccumulator)
-        ))).join("");
-        const transformAttr = n.transform !== undefined
-          ? (() => {
-            const [a, b, c, dd, e, f] = n.transform;
-            return ` transform="matrix(${a} ${b} ${c} ${dd} ${e} ${f})"`;
-          })()
-          : "";
-        return `<g class="s${scene.id}-n${i}"${transformAttr}>${kids}</g>`;
-      }
-      // Native SVG geometry uses SVG presentation attributes.
-      if (n.display === "svg-circle") {
-        const r = n.r ?? 0;
-        const box = await loweredGradientBox(n) ??
-          [(n.cx ?? 0) - r, (n.cy ?? 0) - r, 2 * r, 2 * r];
-        const fillAttr = svgFillAttr(
-          n.fill,
-          n.svgFillGradient,
-          ...box,
-          defsAccumulator,
-        );
-        return `<circle id="s${scene.id}-n${i}" class="s${scene.id}-n${i}" cx="${
-          n.cx ?? 0
-        }" cy="${n.cy ?? 0}" r="${r}"${fillAttr}${
-          svgStrokeAttrs(n, box, defsAccumulator)
-        }></circle>`;
-      }
-      if (n.display === "svg-ellipse") {
-        const rx = n.rx ?? 0, ry = n.ry ?? 0;
-        const box = await loweredGradientBox(n) ??
-          [(n.cx ?? 0) - rx, (n.cy ?? 0) - ry, 2 * rx, 2 * ry];
-        const fillAttr = svgFillAttr(
-          n.fill,
-          n.svgFillGradient,
-          ...box,
-          defsAccumulator,
-        );
-        return `<ellipse id="s${scene.id}-n${i}" class="s${scene.id}-n${i}" cx="${
-          n.cx ?? 0
-        }" cy="${n.cy ?? 0}" rx="${rx}" ry="${ry}"${fillAttr}${
-          svgStrokeAttrs(n, box, defsAccumulator)
-        }></ellipse>`;
-      }
-      if (n.display === "svg-rect") {
-        const rxAttr = n.rx !== undefined ? ` rx="${n.rx}"` : "";
-        const ryAttr = n.ry !== undefined ? ` ry="${n.ry}"` : "";
-        const box = await loweredGradientBox(n) ??
-          [n.x ?? 0, n.y ?? 0, n.width ?? 0, n.height ?? 0];
-        const fillAttr = svgFillAttr(
-          n.fill,
-          n.svgFillGradient,
-          ...box,
-          defsAccumulator,
-        );
-        return `<rect id="s${scene.id}-n${i}" class="s${scene.id}-n${i}" x="${
-          n.x ?? 0
-        }" y="${n.y ?? 0}" width="${n.width ?? 0}" height="${
-          n.height ?? 0
-        }"${rxAttr}${ryAttr}${fillAttr}${
-          svgStrokeAttrs(n, box, defsAccumulator)
-        }></rect>`;
-      }
-      if (n.display === "svg-line") {
-        // line (S3) has no fill attribute at all — SVG semantics, zero area
-        // unstroked (see writeSvgShape's own comment). stroke-linecap
-        // defaults to 'butt' when unset, same as sandom's own LINE_CAP default.
-        const capAttr = n.strokeLinecap !== undefined
-          ? ` stroke-linecap="${n.strokeLinecap}"`
-          : "";
-        return `<line class="s${scene.id}-n${i}" x1="${n.x1 ?? 0}" y1="${
-          n.y1 ?? 0
-        }" x2="${n.x2 ?? 0}" y2="${n.y2 ?? 0}"${
-          svgStrokeAttrs(n, await loweredGradientBox(n), defsAccumulator)
-        }${capAttr}></line>`;
-      }
-      if (n.display === "svg-path") {
-        // S4 (Tier B): the `d` string passes through UNCHANGED — same string
-        // sandom's own MSDF pipeline parses via buildShapeFromSvgPath, so
-        // Chrome and sandom render literally the same path definition.
-        const fillRuleAttr = n.fillRule === "evenodd"
-          ? ` fill-rule="evenodd"`
-          : "";
-        // S7 step 2: a gradient fill or stroke needs the path's own bounding
-        // box (the SAME space $writeGradientExtension resolves geom0..3
-        // against in engine.wat — see writeSvgShape's own bbox-warmup
-        // comment). Only computed when actually needed — a plain color/none
-        // paint (the overwhelmingly common case) skips this extra msdfgen
-        // round-trip entirely, same "don't pay for what you don't use"
-        // discipline as resolveSvgPathIndices' own stroke-bbox branch.
-        let box = null;
-        if (n.svgFillGradient || n.svgStrokeGradient) {
-          const bbox = n.resolvedPathBbox;
-          box = [bbox.xMin, bbox.yMin, bbox.xMax - bbox.xMin, bbox.yMax - bbox.yMin];
-        }
-        const fillAttr = n.svgFillGradient
-          ? svgFillAttr(n.fill, n.svgFillGradient, ...box, defsAccumulator)
-          : svgFillAttr(n.fill);
-        const capAttr = n.strokeLinecap === undefined
-          ? "" : ` stroke-linecap="${n.strokeLinecap}"`;
-        const joinAttr = n.strokeLinejoin === undefined
-          ? "" : ` stroke-linejoin="${n.strokeLinejoin}"`;
-        return `<path class="s${scene.id}-n${i}" d="${
-          n.d ?? ""
-        }"${fillRuleAttr}${fillAttr}${
-          svgStrokeAttrs(n, box, defsAccumulator)
-        }${capAttr}${joinAttr}></path>`;
-      }
-      // design/inline-layout.md: an inlineCtx:true container's DISPLAY_TEXT/
-      // DISPLAY_INLINE children render as real inline <span>s sharing this
-      // DIV's own line boxes — NOT independent block-level <div>s (the
-      // ordinary display:'text' branch above, correct for a BARE leaf, is
-      // wrong here: it would give Chrome N separate one-line paragraphs
-      // instead of one paragraph with N runs). No whitespace between
-      // sibling <span> tags in the generated markup — an accidental
-      // newline/indent there would be a MARKUP-level space Chrome's own
-      // whitespace collapsing would then fold in, not a real content space;
-      // callers wanting a real inter-item space put it INSIDE an item's own
-      // text (matching sandomInlineFragmentRects' own convention).
-      // An inline-block (display:inline-block in nodeCss) and an inline box
-      // hold their text children as inline <span>s, as an inlineCtx
-      // container does: an inline-block lays its text out as its own
-      // inline content.
-      if (n.display === "inline-block" || n.display === "inline") {
-        const kids =
-          (await Promise.all((n.children || []).map((childIndex) => {
-            const child = scene.nodes[childIndex];
-            if (child.display === "text") {
-              return `<span class="s${scene.id}-n${childIndex}">${
-                escapeHtml(child.text ?? "")
-              }</span>`;
-            }
-            return renderNode(childIndex, defsAccumulator);
-          }))).join("");
-        return `<span class="s${scene.id}-n${i}">${kids}</span>`;
-      }
-      if (n.inlineCtx) {
-        const kids =
-          (await Promise.all((n.children || []).map((childIndex) => {
-            const child = scene.nodes[childIndex];
-            if (child.display === "text") {
-              return `<span class="s${scene.id}-n${childIndex}">${
-                escapeHtml(child.text ?? "")
-              }</span>`;
-            }
-            return renderNode(childIndex, defsAccumulator);
-          }))).join("");
-        return `<div class="s${scene.id}-n${i}">${kids}</div>`;
-      }
-      const kids = (await Promise.all(
-        (n.children || []).map((childIndex) =>
-          renderNode(childIndex, defsAccumulator)
-        ),
-      )).join("");
-      return `<div class="s${scene.id}-n${i}">${kids}</div>`;
-    }
-    return { css, html: await renderNode(0) };
-  }
-
-  // Scale every length-valued field in a node by `scale`. Percentages, auto,
-  // and dimensionless ratios (flexGrow/flexShrink, alignSelf) pass through.
-  // Mirrors test/oracle/sandom-layout.js's scaleNode so a spec written for the
-  // layout oracle works here too. The scale parameter encodes Blink's
-  // LayoutZoomFactor — see test/oracle/README.md for the full model:
-  // Blink lays out in PHYSICAL LU (1/64 of a physical pixel). We match by
-  // pre-scaling all input lengths so the engine sees physical-pixel inputs,
-  // then rasterizing at the matching device resolution.
-  function scaleLen(v, s) {
-    if (v === undefined || v === "auto") return v;
-    if (typeof v === "number") return v * s;
-    return v; // 'min-content' / 'max-content' / 'NN%' pass through
-  }
-  function scaleEdges(e, s) {
-    if (!e) return e;
-    return {
-      top: (e.top || 0) * s,
-      right: (e.right || 0) * s,
-      bottom: (e.bottom || 0) * s,
-      left: (e.left || 0) * s,
+    const declarations = await Promise.all(scene.nodes.map(async (n) => [
+      nodeCss(n),
+      await nodeCssBackgroundImages(n, readImage),
+      await nodeCssMasks(n, readImage),
+      await nodeCssBorderImage(n, readImage),
+    ]));
+    const css = core.string("scene_css_rules", ...core.valueListInput([scene.id, declarations], { compositeJson: false }));
+    const imageUris = await Promise.all(scene.nodes.map((n) =>
+      (core.status("scene_css_needs", ...core.valueListInput([n.display, n.inlineCtx])) & SCENE_CSS_NEEDS_IMAGE) !== 0 && n.src
+        ? imageDataUri(n.src, readImage)
+        : undefined
+    ));
+    const angle = (gradient) => {
+      const radians = (gradient?.angle ?? 0) * Math.PI / 180;
+      return [Math.sin(radians), Math.cos(radians)];
     };
-  }
-
-  // A gradient's own px lengths, pre-scaled for deviceScale: `center`, an
-  // explicit radial `size: [rx, ry]`, and the `pixels` length of a stop. An
-  // angle and a stop's `position` (a 0..1 fraction) are
-  // resolution-independent, and the extent KEYWORDS resolve against the
-  // box at emission time.
-  function scaleGradient(gradient, s) {
-    return {
-      ...gradient,
-      ...(gradient.center
-        ? { center: gradient.center.map((v) => scaleLen(v, s)) }
-        : {}),
-      ...(Array.isArray(gradient.size)
-        ? { size: gradient.size.map((v) => scaleLen(v, s)) }
-        : {}),
-      ...(gradient.stops?.some((stop) => stop.pixels !== undefined)
-        ? {
-          stops: gradient.stops.map((stop) =>
-            stop.pixels === undefined ? stop : { ...stop, pixels: stop.pixels * s }
-          ),
-        }
-        : {}),
-    };
-  }
-
-  function scaleNode(node, s) {
-    if (s === 1) return node;
-    const out = { ...node };
-    for (
-      const k of [
-        "width",
-        "height",
-        "minWidth",
-        "minHeight",
-        "maxWidth",
-        "maxHeight",
-        "top",
-        "right",
-        "bottom",
-        "left",
-        "fontSize",
-        "letterSpacing",
-        "scrollTop",
-        "scrollLeft",
-      ]
-    ) {
-      if (k in node) out[k] = scaleLen(node[k], s);
-    }
-    // SVG shape geometry: x/y (svg-rect),
-    // cx/cy/r (svg-circle), cx/cy/rx/ry (svg-ellipse, and svg-rect's own
-    // rounded-corner rx/ry), x1/y1/x2/y2 (svg-line) — all plain numbers in
-    // the shape's own user-unit space (1 unit = 1 CSS px when no viewBox is
-    // set, same convention svg-rect's width/height already scale under via
-    // the generic length-field loop above). These fields are exclusive to
-    // SVG shape nodes (confirmed: no other display kind reads x/y/cx/cy/r/
-    // rx/ry/x1/y1/x2/y2), so scaling them unconditionally here is safe.
-    // Mirrors clipPath's own cx/cy/r/rx/ry scaling a few lines below —
-    // same field names, same "user-space geometry tracks deviceScale"
-    // requirement, just for the shape's own top-level fields instead of a
-    // nested clipPath object.
-    for (
-      const k of ["x", "y", "cx", "cy", "r", "rx", "ry", "x1", "y1", "x2", "y2"]
-    ) {
-      if (typeof node[k] === "number") out[k] = node[k] * s;
-    }
-    if (typeof node.svgTextX === "number") out.svgTextX = node.svgTextX * s;
-    if (typeof node.svgTextY === "number") out.svgTextY = node.svgTextY * s;
-    // SVG stroke fields: a follow-on
-    // to the geometry fix above, found via a real stroke gallery scene —
-    // that fix's own regression test used fill-only shapes and never
-    // exercised a stroke, missing this. strokeWidth/strokeDashoffset are
-    // plain numbers; strokeDasharray is an ARRAY of numbers, each scaled
-    // individually (same "map over each entry" shape boxShadows/
-    // textShadows already use elsewhere in this function).
-    if (typeof node.strokeWidth === "number") {
-      out.strokeWidth = node.strokeWidth * s;
-    }
-    if (typeof node.strokeDashoffset === "number") {
-      out.strokeDashoffset = node.strokeDashoffset * s;
-    }
-    if (Array.isArray(node.strokeDasharray)) {
-      out.strokeDasharray = node.strokeDasharray.map((v) => v * s);
-    }
-    // viewBox (design/svg-rendering.md invariant 2): all four entries
-    // are author-unit lengths (minX/minY included — they're offsets in the
-    // same user-unit space, not just width/height) and must pre-scale like
-    // every other length field, so $computeViewBoxTransform's affine (built
-    // from the root's DEVICE-px content box over this array) stays
-    // deviceScale-free: (s*viewport)/(s*viewBox) = viewport/viewBox, applied
-    // to s*geometry = correct.
-    if (Array.isArray(node.viewBox)) {
-      out.viewBox = node.viewBox.map((v) => v * s);
-    }
-    if ("margin" in node) out.margin = scaleEdges(node.margin, s);
-    if ("padding" in node) out.padding = scaleEdges(node.padding, s);
-    if ("border" in node) out.border = scaleEdges(node.border, s);
-    if (typeof node.borderSpacing === "number") {
-      out.borderSpacing = node.borderSpacing * s;
-    } else if (Array.isArray(node.borderSpacing)) {
-      out.borderSpacing = node.borderSpacing.map((value) => value * s);
-    }
-    for (const property of ["gridTemplateColumns", "gridTemplateRows"]) {
-      if (!(property in node)) continue;
-      out[property] = Array.isArray(node[property])
-        ? node[property].map((track) => scaleGridTrack(track, s))
-        : scaleGridTrack(node[property], s);
-    }
-    if ("gridAutoColumns" in node) {
-      out.gridAutoColumns = scaleGridTrack(node.gridAutoColumns, s);
-    }
-    if ("gridAutoRows" in node) {
-      out.gridAutoRows = scaleGridTrack(node.gridAutoRows, s);
-    }
-    // border-image (P14): only the LENGTH forms scale to physical px.
-    //
-    // `slice` never does — it is source-image space, and the source does not
-    // grow with deviceScale. Bare numbers in `width`/`outset` never do
-    // either: they are multiples of border-width, which has already been
-    // scaled on the line above, so scaling them again would square the
-    // factor. Percentages resolve against the (already physical) border box.
-    // Only an explicit 'Npx' is a length in CSS px that must become physical.
-    if (node.borderImage) {
-      const scalePx = (
-        v,
-      ) => (typeof v === "string" && v.endsWith("px")
-        ? `${parseFloat(v) * s}px`
-        : v);
-      const scaleQuad = (q) => (Array.isArray(q) ? q.map(scalePx) : scalePx(q));
-      const bi = { ...node.borderImage };
-      if ("width" in bi) bi.width = scaleQuad(bi.width);
-      if ("outset" in bi) bi.outset = scaleQuad(bi.outset);
-      out.borderImage = bi;
-    }
-    if ("borderRadius" in node) {
-      const r = node.borderRadius;
-      // Percentages ("50%" strings and the negative encoded form) are
-      // scale-invariant: pass them through untouched.
-      if (typeof r === "number") {
-        out.borderRadius = r >= 0 ? r * s : r;
-      } else if (typeof r === "string") {
-        out.borderRadius = r;
-      } else if (typeof r === "object" && r !== null) {
-        const isPerCorner = "topLeft" in r || "topRight" in r ||
-          "bottomRight" in r || "bottomLeft" in r;
-        if (isPerCorner) {
-          // Per-corner form (Slice P2) — a corner is either a plain length or,
-          // as of P10, an elliptical {rx,ry} pair.
-          out.borderRadius = {};
-          for (
-            const corner of ["topLeft", "topRight", "bottomRight", "bottomLeft"]
-          ) {
-            const v = r[corner];
-            if (v === undefined) continue;
-            const scaleComponent = (value) =>
-              typeof value === "string" || value < 0 ? value : value * s;
-            out.borderRadius[corner] = typeof v === "object"
-              ? { rx: scaleComponent(v.rx || 0), ry: scaleComponent(v.ry || 0) }
-              : scaleComponent(v);
-          }
-        } else {
-          // P10 uniform-ellipse shorthand: {rx,ry} with no corner keys.
-          out.borderRadius = {
-            rx: typeof r.rx === "string" || r.rx < 0 ? r.rx : (r.rx || 0) * s,
-            ry: typeof r.ry === "string" || r.ry < 0 ? r.ry : (r.ry || 0) * s,
-          };
-        }
-      }
-    }
-    // textShadows (P6): offsets and blur are lengths.
-    if ("textShadows" in node) {
-      out.textShadows = node.textShadows.map((sh) => ({
-        ...sh,
-        offsetX: (sh.offsetX ?? 0) * s,
-        offsetY: (sh.offsetY ?? 0) * s,
-        blur: (sh.blur ?? 0) * s,
-      }));
-    }
-    // boxShadows (P3): offsets, blur, and spread are all lengths.
-    if ("boxShadows" in node) {
-      out.boxShadows = node.boxShadows.map((sh) => ({
-        ...sh,
-        offsetX: (sh.offsetX ?? 0) * s,
-        offsetY: (sh.offsetY ?? 0) * s,
-
-        blur: (sh.blur ?? 0) * s,
-        spread: (sh.spread ?? 0) * s,
-      }));
-    }
-    // outline (P10): width and offset are lengths.
-    if ("outline" in node) {
-      out.outline = {
-        ...node.outline,
-        ...(typeof node.outline.width === "number"
-          ? { width: node.outline.width * s }
-          : {}),
-        ...(typeof node.outline.offset === "number"
-          ? { offset: node.outline.offset * s }
-          : {}),
-      };
-    }
-    // objectPosition (P5b): only the LENGTH form (a plain number) is a real
-    // length needing pre-scaling; a percent string is resolution-independent.
-    if ("objectPosition" in node) {
-      out.objectPosition = node.objectPosition.map((v) => scaleLen(v, s));
-    }
-    // Background/mask LAYERS: each layer's size/position can independently
-    // mix length and percent forms (e.g. size:[40,'auto']) — same
-    // per-value scaleLen treatment as objectPosition above, applied
-    // per-layer. 'cover'/'contain'/'auto' keywords pass through scaleLen
-    // unchanged (its own guard only touches actual numbers).
-    const scaleLayer = (layer) => ({
-      ...layer,
-      ...(layer.size ? { size: layer.size.map((v) => scaleLen(v, s)) } : {}),
-      ...(layer.position
-        ? { position: layer.position.map((v) => scaleLen(v, s)) }
-        : {}),
-      ...(layer.gradient ? { gradient: scaleGradient(layer.gradient, s) } : {}),
-    });
-    if ("backgroundImages" in node) {
-      out.backgroundImages = node.backgroundImages.map(scaleLayer);
-    }
-    if ("masks" in node) out.masks = node.masks.map(scaleLayer);
-    // A gradient's OWN px lengths (a radial `center: [40, '50%']`, an
-    // explicit `size: [30, 20]`) are CSS px like any other length and must
-    // pre-scale too. This was a live P4 gap for backgroundGradient — px
-    // centers rendered at half position at deviceScale 2, unnoticed because
-    // percent forms, the common case, are resolution-independent. It stops
-    // being merely a gap once a backgroundGradient can LOWER into a layer
-    // (backgroundLayerList): the same declaration would otherwise scale
-    // differently depending on whether an unrelated sibling layer exists.
-    if (node.backgroundGradient) {
-      out.backgroundGradient = scaleGradient(node.backgroundGradient, s);
-    }
-    if (node.svgFillGradient) {
-      out.svgFillGradient = scaleGradient(node.svgFillGradient, s);
-    }
-    if (node.svgStrokeGradient) {
-      out.svgStrokeGradient = scaleGradient(node.svgStrokeGradient, s);
-    }
-    // clipPath (P9): numbers are px lengths (pre-scale like every other
-    // length); percent strings and closest/farthest-side keywords are
-    // resolution-independent and pass through. radius/radii mirror
-    // borderRadius's own px-only scaling above.
-    if ("clipPath" in node && node.clipPath) {
-      const clipPath = { ...node.clipPath };
-      for (
-        const key of [
-          "top",
-          "right",
-          "bottom",
-          "left",
-          "cx",
-          "cy",
-          "r",
-          "rx",
-          "ry",
-        ]
-      ) {
-        if (typeof clipPath[key] === "number") {
-          clipPath[key] = clipPath[key] * s;
-        }
-      }
-      if (clipPath.kind === "polygon" && Array.isArray(clipPath.points)) {
-        clipPath.points = clipPath.points.map(([x, y]) => [
-          typeof x === "number" ? x * s : x,
-          typeof y === "number" ? y * s : y,
-        ]);
-      }
-      if (clipPath.kind === "path" && typeof clipPath.d === "string") {
-        const tokens = clipPath.d.match(
-          /[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g,
-        ) ?? [];
-        const parameterCounts = {
-          M: 2,
-          L: 2,
-          H: 1,
-          V: 1,
-          C: 6,
-          S: 4,
-          Q: 4,
-          T: 2,
-          A: 7,
-          Z: 0,
-        };
-        let currentCommand = null;
-        let parameterIndex = 0;
-        clipPath.d = tokens.map((token) => {
-          if (/^[a-zA-Z]$/.test(token)) {
-            currentCommand = token.toUpperCase();
-            parameterIndex = 0;
-            return token;
-          }
-          if (!currentCommand || !(currentCommand in parameterCounts)) {
-            throw new Error(
-              `clipPath path: unsupported SVG path command near ${
-                JSON.stringify(token)
-              }`,
-            );
-          }
-          const unscaledArcParameter = currentCommand === "A" &&
-            (parameterIndex === 2 || parameterIndex === 3 ||
-              parameterIndex === 4);
-          const result = unscaledArcParameter
-            ? Number(token)
-            : Number(token) * s;
-          parameterIndex = (parameterIndex + 1) %
-            parameterCounts[currentCommand];
-          return String(result);
-        }).join(" ");
-      }
-      if (typeof clipPath.radius === "number") {
-        clipPath.radius = clipPath.radius * s;
-      }
-      if (clipPath.radii) {
-        const radii = {};
-        for (
-          const corner of ["topLeft", "topRight", "bottomRight", "bottomLeft"]
-        ) {
-          const v = clipPath.radii[corner];
-          if (v === undefined) continue;
-          radii[corner] = typeof v === "object"
-            ? { rx: (v.rx || 0) * s, ry: (v.ry || 0) * s }
-            : v * s;
-        }
-        clipPath.radii = radii;
-      }
-      out.clipPath = clipPath;
-    }
-    if ("gap" in node) {
-      out.gap = typeof node.gap === "number"
-        ? node.gap * s
-        : node.gap && typeof node.gap === "object" &&
-            Number.isFinite(node.gap.pixels) &&
-            Number.isFinite(node.gap.percentage)
-        ? { ...node.gap, pixels: node.gap.pixels * s }
-        : node.gap;
-    }
-    if ("rowGap" in node) {
-      out.rowGap = typeof node.rowGap === "number"
-        ? node.rowGap * s
-        : node.rowGap && typeof node.rowGap === "object" &&
-            Number.isFinite(node.rowGap.pixels) &&
-            Number.isFinite(node.rowGap.percentage)
-        ? { ...node.rowGap, pixels: node.rowGap.pixels * s }
-        : node.rowGap;
-    }
-    if ("columnGap" in node) {
-      out.columnGap = typeof node.columnGap === "number"
-        ? node.columnGap * s
-        : node.columnGap && typeof node.columnGap === "object" &&
-            Number.isFinite(node.columnGap.pixels) &&
-            Number.isFinite(node.columnGap.percentage)
-        ? { ...node.columnGap, pixels: node.columnGap.pixels * s }
-        : node.columnGap;
-    }
-    if ("flexBasis" in node && typeof node.flexBasis === "number") {
-      out.flexBasis = node.flexBasis * s;
-    }
-    // lineHeight: a unitless number (CSS line-height:1.5) must NOT scale (it's
-    // a ratio against fontSize, already scaled) — only the explicit LENGTH
-    // form ({px: N}) is a real length needing the same pre-scaling.
-    if (
-      "lineHeight" in node && typeof node.lineHeight === "object" &&
-      typeof node.lineHeight.px === "number"
-    ) {
-      out.lineHeight = { px: node.lineHeight.px * s };
-    }
-    if (
-      "verticalAlign" in node && typeof node.verticalAlign === "object" &&
-      typeof node.verticalAlign.px === "number"
-    ) {
-      out.verticalAlign = { px: node.verticalAlign.px * s };
-    }
-    // transform (Slice 8B): only the TRANSLATION component is a length (needs
-    // the same physical-px pre-scaling every other length field gets);
-    // rotate (degrees) and scale (a dimensionless ratio) must NOT scale —
-    // scaling them would make a Retina render's fan/rotation look different
-    // from a 1x render of the identical CSS, which is wrong (found via a
-    // real gallery bug: node.transform wasn't touched here at all, so at
-    // deviceScale 2 the translate offset landed at half its intended CSS-px
-    // distance, visibly compressing the whole composition toward center).
-    if ("transform" in node) {
-      const t = node.transform;
-      if (t.kind === "cssTransform") {
-        const scaleLengthPercentage = (length) => ({
-          ...length,
-          pixels: (length.pixels ?? 0) * s,
-        });
-        out.transform = {
-          ...t,
-          components: t.components.map((component) => {
-            if (component.kind === "translate") {
-              return {
-                ...component,
-                x: scaleLengthPercentage(component.x),
-                y: scaleLengthPercentage(component.y),
-              };
-            }
-            if (
-              component.kind === "translateX" || component.kind === "translateY"
-            ) {
-              return {
-                ...component,
-                value: scaleLengthPercentage(component.value),
-              };
-            }
-            if (component.kind === "matrix") {
-              return {
-                ...component,
-                value: component.value.map((entry, index) =>
-                  index >= 4 ? entry * s : entry
-                ),
-              };
-            }
-            return component;
-          }),
-        };
-        if (node.transformOrigin) {
-          out.transformOrigin = {
-            ...node.transformOrigin,
-            x: scaleLengthPercentage(node.transformOrigin.x),
-            y: scaleLengthPercentage(node.transformOrigin.y),
-          };
-        }
-      } else if (Array.isArray(t)) {
-        out.transform = [t[0], t[1], t[2], t[3], t[4] * s, t[5] * s];
-      } else {
-        out.transform = { ...t };
-        if (t.translate) {
-          out.transform.translate = {
-            x: (t.translate.x ?? 0) * s,
-            y: (t.translate.y ?? 0) * s,
-          };
-        }
-      }
-    }
-    return out;
+    const trigonometry = scene.nodes.map((n) => [...angle(n.svgFillGradient), ...angle(n.svgStrokeGradient)]);
+    sceneHtmlFields ??= core.string("scene_html_field_names").split(" ");
+    const nodes = scene.nodes.map((n) => Object.fromEntries(sceneHtmlFields.map((field) => [field, n[field]])));
+    const html = core.string("scene_html", ...core.valueListInput(
+      [scene.id, nodes, imageUris, trigonometry],
+      { compositeJson: false },
+    ));
+    return { css, html };
   }
 
   // Emits the commands of one page of the rows the engine holds: `page` is
   // { height, index, rulesKey, box } (renderScenePixelsNow's page option).
   // The engine records every page's start while it counts the pages. A
   // later emission of the same rows, size and fonts seeks the page it
-  // shows; any other counts the pages again. A row write takes a new
-  // claim. An animation sample takes none, and stamps the rows whose layout
-  // it changes with the current generation: the newest row generation, with
-  // the engine epoch, names those changes. The engine advances the header
-  // generation at every sample, also when no row changes, so the header
-  // generation is not a key. Returns the command bytes, the page count, the
+  // shows; any other counts the pages again. The rows are the same while
+  // the newest row generation and the engine epoch are: a row write stamps
+  // each row it changes with a new generation, and so does an animation
+  // sample for the rows whose layout it changes. A write that changes no
+  // row (a geometry getter's layout of an unchanged document) keeps the
+  // count. The engine advances the header generation at every sample, also
+  // when no row changes, so the header generation is not a key. Returns
+  // the command bytes, the page count, the
   // page shown (the requested one, or the last page when the document is
-  // shorter) and the scene indices of the nodes on other pages.
+  // shorter) and the scene indices of the nodes on other pages. A count
+  // also records each scene node's fragments (pagedLayoutRecord.nodeFragments:
+  // per node, null or [{ page, rect, content }] in page order).
   function emitPageCommands(scene, nodes, page, writeOwner) {
-    let rowGeneration = 0;
-    for (let index = 0; index < nodes.length; index++) {
-      const generation = view.getUint32(
-        layoutBufferBase + index * LAYOUT_NODE_SIZE + LAYOUT_NODE_OFFSET_CHANGED_GEN,
-        true,
-      );
-      if (generation > rowGeneration) rowGeneration = generation;
-    }
+    const rowGeneration = engine.exports.layout_rows_generation(nodes.length) >>> 0;
     const pageKey = [
-      writeOwner, engineWriteClaims.get(engine.memory), nodes.length,
+      writeOwner, nodes.length,
       rowGeneration, engine.exports.engine_epoch(),
       scene.width, page.height, page.rulesKey ?? "", fontRegistry.revision, core.status("resource_revision"),
     ];
@@ -3725,8 +2193,16 @@ export async function createSceneRendererRuntime({
       // size without margins. The page area is the viewport the page lays
       // out in.
       const pages = [];
-      // Pages counted so far in each page group, by its element.
-      const groupPages = new Map();
+      // Each scene node's fragments, in page order, from the fragment
+      // records the engine writes after each page's layout
+      // (page_write_fragments).
+      const nodeFragments = new Array(scene.nodes.length).fill(null);
+      const sceneIndexOfEngineNode = new Int32Array(nodes.length).fill(-1);
+      for (let sceneIndex = 0; sceneIndex < scene.nodes.length; sceneIndex++) {
+        const engineIndex = engineIndexOfSceneNode(nodes, sceneIndex);
+        if (engineIndex >= 0) sceneIndexOfEngineNode[engineIndex] = sceneIndex;
+      }
+      const unit = (offset) => view.getInt32(offset, true) / LAYOUT_UNIT;
       pageCount = 0;
       engine.exports.page_begin(page.height);
       do {
@@ -3734,19 +2210,19 @@ export async function createSceneRendererRuntime({
         const nameId = engine.exports.page_name();
         // The page groups the page is in (CSS Generated Content for Paged
         // Media 3, 3.2), outermost first: each group's name and the page's
-        // position in it, from 1.
+        // position in it, from 1 (page_group_position).
         const groups = [];
         const groupCount = engine.exports.page_group_count();
         for (let group = 0; group < groupCount; group++) {
-          const element = engine.exports.page_group_node(group);
-          const position = (groupPages.get(element) ?? 0) + 1;
-          groupPages.set(element, position);
-          groups.push({ name: core.string("page_name_text", engine.exports.page_group_name(group)), position });
+          groups.push({
+            name: core.string("page_name_text", engine.exports.page_group_name(group)),
+            position: engine.exports.page_group_position(group),
+          });
         }
         const description = {
           index,
           name: nameId === 0 ? "" : core.string("page_name_text", nameId),
-          side: index % 2 === 0 ? "right" : "left",
+          side: core.string("frame_page_side", index),
           blank: engine.exports.page_blank() !== 0,
           groups,
         };
@@ -3760,9 +2236,37 @@ export async function createSceneRendererRuntime({
         engine.exports.page_set_block_size(box.area.height);
         engine.exports.page_set_box(box.width, box.height, box.margin.top, box.margin.right, box.margin.bottom, box.margin.left);
         engine.exports.layout(nodes.length, box.area.width, box.area.height);
+        engine.exports.page_write_fragments(nodes.length);
         pageCount++;
       } while (engine.exports.page_advance());
-      pagedLayoutRecord = { key: pageKey, count: pageCount, pages, serial: engine.exports.page_record_serial() };
+      const fragmentSize = engine.exports.page_fragment_size();
+      const fragmentBase = engine.exports.page_fragment_base();
+      const fragmentCount = engine.exports.page_fragment_count();
+      for (let fragment = 0; fragment < fragmentCount; fragment++) {
+        const record = fragmentBase + fragment * fragmentSize;
+        const sceneIndex = sceneIndexOfEngineNode[view.getUint32(record + PAGE_FRAGMENT_NODE, true)];
+        if (sceneIndex < 0) continue;
+        const boxBase = record + PAGE_FRAGMENT_BOX;
+        (nodeFragments[sceneIndex] ??= []).push(Object.freeze({
+          page: view.getUint32(record + PAGE_FRAGMENT_PAGE, true),
+          rect: Object.freeze({
+            x: unit(boxBase + BOX_OFFSET_X),
+            y: unit(boxBase + BOX_OFFSET_Y),
+            width: unit(boxBase + BOX_OFFSET_WIDTH),
+            height: unit(boxBase + BOX_OFFSET_HEIGHT),
+          }),
+          content: Object.freeze({
+            x: unit(boxBase + BOX_OFFSET_CONTENT_X),
+            y: unit(boxBase + BOX_OFFSET_CONTENT_Y),
+            width: unit(boxBase + BOX_OFFSET_CONTENT_W),
+            height: unit(boxBase + BOX_OFFSET_CONTENT_H),
+          }),
+        }));
+      }
+      for (const fragments of nodeFragments) {
+        if (fragments !== null) Object.freeze(fragments);
+      }
+      pagedLayoutRecord = { key: pageKey, count: pageCount, pages, nodeFragments, serial: engine.exports.page_record_serial() };
     }
     const pageIndex = Math.min(page.index, pageCount - 1);
     if (!engine.exports.page_seek(pageIndex)) {
@@ -3801,6 +2305,9 @@ export async function createSceneRendererRuntime({
       commitTextRunKeys,
       captureNodeMarkers = false,
       engineWriteOwner = null,
+      // The time to sample the write owner's tracks at; by default the
+      // time of its last tick.
+      sampleTimeMilliseconds,
       // The page to list (emitPageCommands); null lists the continuous
       // document.
       page = null,
@@ -3826,7 +2333,7 @@ export async function createSceneRendererRuntime({
     // Sample the write owner's animations onto the rows just written. The
     // owner takes the shared animation table in this synchronous turn, so
     // the layout below reads no other renderer's tracks.
-    engineWriteOwner?.resample();
+    engineWriteOwner?.resample(sampleTimeMilliseconds);
     if (page === null) prepareLayoutSvgGeometry(nodes.length, scene.width, scene.height);
     if (!emitPaintCommands) {
       engine.exports.layout(
@@ -3910,40 +2417,14 @@ export async function createSceneRendererRuntime({
       );
     }
     if (!retained) ensureNodeCapacity(nodes.length);
-    if (generationReservation && !generationReservation.consumed) {
-      generationReservation.consumed = true;
-      const currentGeneration = view.getUint32(
-        HEADER_BASE + HEADER_OFFSET_GENERATION,
-        true,
-      );
-      const drifted = generationReservation.published
-        ? currentGeneration !== generationReservation.generation
-        : currentGeneration + 1 !== generationReservation.generation;
-      if (drifted) {
-        // A QUERY emit interleaved between the reservation and this
-        // write: synchronous layout getters can barge into the awaits of
-        // an async analytical pass on the shared engine, advancing the
-        // generation and overwriting the pre-stamped analytical state.
-        // The reservation's prediction is stale, not corrupt — re-derive
-        // it: advance to a fresh generation and re-stamp the analytical
-        // baseline with the ACTUAL number. The full node write below
-        // rebuilds everything else from the caller's own scene.
-        sceneGeneration = engine.exports.advance_generation() >>> 0;
-        stampAnalyticalState(generationReservation.nodeCount, sceneGeneration);
-      } else if (generationReservation.published) {
-        sceneGeneration = generationReservation.generation;
-      } else {
-        sceneGeneration = engine.exports.advance_generation() >>> 0;
-        if (sceneGeneration !== generationReservation.generation) {
-          throw new Error(
-            `Prepared analytical generation ${generationReservation.generation} ` +
-              `advanced to ${sceneGeneration}`,
-          );
-        }
-      }
-    } else {
-      sceneGeneration = engine.exports.advance_generation() >>> 0;
-    }
+    const reserved = Boolean(generationReservation) && !generationReservation.consumed;
+    if (reserved) generationReservation.consumed = true;
+    sceneGeneration = core.status(
+      "engine_record_generation", reserved ? 1 : 0,
+      reserved ? generationReservation.generation : 0,
+      reserved && generationReservation.published ? 1 : 0,
+      reserved ? generationReservation.nodeCount : 0,
+    ) >>> 0;
     let sparseValid = true;
     if (!retained) {
       publishCoreFrame(nodes, null, scene.rowRevision ?? 0);
@@ -3970,8 +2451,8 @@ export async function createSceneRendererRuntime({
             const index = patchIndex ?? row;
             rowView.setUint32(cursor + EngineFrameFinishRowFields.index, index, true);
             rowView.setUint32(cursor + EngineFrameFinishRowFields.flags,
-              (forceGenerationNodeIndices?.has(index) ? 1 : 0) |
-                (scrollOnlyNodeIndices?.has(index) ? 2 : 0), true);
+              (forceGenerationNodeIndices?.has(index) ? ENGINE_FINISH_FORCE_GENERATION : 0) |
+                (scrollOnlyNodeIndices?.has(index) ? ENGINE_FINISH_SCROLL_ONLY : 0), true);
             cursor += EngineFrameFinishRowSize;
           }
         }
@@ -4030,35 +2511,33 @@ export async function createSceneRendererRuntime({
     return sparseValid;
   }
 
-  // The grid the engine marks damage in (layout.js TILE_CONFIG_*): the
-  // raster target's 64 device px tiles, or a coarser multiple of 64 when
-  // that grid holds more tiles than the dirty map has bits. Returns the
-  // tile side in device px.
+  // The grid the engine marks damage in (tile_grid_write). Returns the tile
+  // side in device px.
   function writeTileGrid(scene, deviceWidth, deviceHeight, deviceScale, visibleRectangle) {
-    let tileSize = 64;
-    while (
-      Math.ceil(deviceWidth / tileSize) * Math.ceil(deviceHeight / tileSize) >
-        TILE_DIRTY_MAP_SIZE * 8
-    ) tileSize *= 2;
-    view.setUint32(TILE_CONFIG_BASE + TILE_CONFIG_OFFSET_TILE_SIZE, tileSize, true);
-    view.setUint32(TILE_CONFIG_BASE + TILE_CONFIG_OFFSET_COLUMNS, Math.ceil(deviceWidth / tileSize), true);
-    view.setUint32(TILE_CONFIG_BASE + TILE_CONFIG_OFFSET_ROWS, Math.ceil(deviceHeight / tileSize), true);
-    view.setUint32(TILE_CONFIG_BASE + TILE_CONFIG_OFFSET_FRAME_WIDTH, scene.width, true);
-    view.setUint32(TILE_CONFIG_BASE + TILE_CONFIG_OFFSET_FRAME_HEIGHT, scene.height, true);
-    view.setFloat32(TILE_CONFIG_BASE + TILE_CONFIG_OFFSET_DEVICE_SCALE, deviceScale, true);
-    view.setFloat32(TILE_CONFIG_BASE + TILE_CONFIG_OFFSET_ORIGIN_X, visibleRectangle?.x ?? 0, true);
-    view.setFloat32(TILE_CONFIG_BASE + TILE_CONFIG_OFFSET_ORIGIN_Y, visibleRectangle?.y ?? 0, true);
-    return tileSize;
+    return engine.exports.tile_grid_write(
+      deviceWidth, deviceHeight, scene.width, scene.height, deviceScale,
+      visibleRectangle?.x ?? 0, visibleRectangle?.y ?? 0,
+    );
   }
 
   // Layout getters use registered resources without waiting for host effects.
+  // With `page` ({ height, index, rulesKey, box }, as a page frame's) the
+  // emission lays out that page of the document's page count
+  // (emitPageCommands) and returns its `paging`: { count, index (the page
+  // laid out), offPageNodes (scene indices of the nodes on other pages),
+  // pages (each page's description and box), nodeFragments (each scene
+  // node's fragments on each page, null for a node on none) }. Without
+  // it, `paging` is null.
   function emitSceneCommandsSync(
     scene,
-    { layoutNodeCapacity = Infinity, commitTextRunKeys, discardCommands = false, engineWriteOwner = null, captureNodeMarkers = false, textGeometry = false } = {},
+    { layoutNodeCapacity = Infinity, commitTextRunKeys, discardCommands = false, engineWriteOwner = null, sampleTimeMilliseconds, prepareEngine = null, captureNodeMarkers = false, textGeometry = false, page = null } = {},
     generationReservation = null,
     emitPaintCommands = true,
   ) {
     validateLayoutNodeCapacity(layoutNodeCapacity);
+    if (page !== null && !emitPaintCommands) {
+      throw new Error("emitSceneCommandsSync: a page layout emits the page's commands; it needs emitPaintCommands");
+    }
     engine.exports.set_device_scale(1);
     const resources = prepareImagesSync(resolveFontIndices(scene.nodes), scene.imageSources);
     const used = prepareAuthoredSceneInput(core, resources, fontRegistry);
@@ -4072,11 +2551,14 @@ export async function createSceneRendererRuntime({
       generationReservation,
       commitTextRunKeys,
     );
-    engineWriteOwner?.resample();
-    prepareLayoutSvgGeometry(nodes.length, scene.width, scene.height);
+    // The caller declares tracks over the rows just written, before they
+    // are sampled (render-surface's _declareUnrenderedEffects).
+    prepareEngine?.();
+    engineWriteOwner?.resample(sampleTimeMilliseconds);
+    if (page === null) prepareLayoutSvgGeometry(nodes.length, scene.width, scene.height);
     if (!emitPaintCommands) {
       engine.exports.layout(nodes.length, scene.width, scene.height);
-      return { view: null, bytesWritten: 0, nodes, globalPreparation };
+      return { view: null, bytesWritten: 0, nodes, globalPreparation, paging: null };
     }
     engine.exports.set_paint_artifact_capture(captureNodeMarkers ? 1 : 0);
     // QUERY emit — same contract as emitSceneCommands above. A text
@@ -4085,18 +2567,31 @@ export async function createSceneRendererRuntime({
     engine.exports.set_query_emit(1);
     engine.exports.set_query_text_geometry(textGeometry ? 1 : 0);
     let bytesWritten;
+    let paging = null;
     try {
-      bytesWritten = engine.exports.emit_commands(nodes.length);
+      if (page === null) {
+        bytesWritten = engine.exports.emit_commands(nodes.length);
+      } else {
+        const emitted = emitPageCommands(scene, nodes, page, engineWriteOwner);
+        bytesWritten = emitted.bytes;
+        paging = Object.freeze({
+          count: emitted.pageCount,
+          index: emitted.pageIndex,
+          offPageNodes: Object.freeze(emitted.offPageNodes),
+          pages: pagedLayoutRecord.pages,
+          nodeFragments: pagedLayoutRecord.nodeFragments,
+        });
+      }
     } finally {
       engine.exports.set_query_emit(0);
       engine.exports.set_query_text_geometry(0);
     }
     if (discardCommands) {
-      return { view: null, bytesWritten, nodes, globalPreparation };
+      return { view: null, bytesWritten, nodes, globalPreparation, paging };
     }
     const commandBase = engine.exports.command_buffer_base();
     const copy = engine.memory.buffer.slice(commandBase, commandBase + bytesWritten);
-    return { view: new DataView(copy), bytesWritten, nodes, globalPreparation };
+    return { view: new DataView(copy), bytesWritten, nodes, globalPreparation, paging };
   }
 
   // Native snapshots include SVG source bounds transformed into CSS pixels.
@@ -4119,24 +2614,16 @@ export async function createSceneRendererRuntime({
     core.status("engine_record_analytical_reset", nodeCount, forcedGeneration);
   }
 
+  // The generation reservation of an analytical pass
+  // (engine_record_generation_reserve).
   function resetAnalyticalLayoutState(nodeCount, inheritRetained = false) {
-    const currentGeneration = view.getUint32(
-      HEADER_BASE + HEADER_OFFSET_GENERATION,
-      true,
-    );
-    const generationReservation = currentGeneration === 0xFFFF_FFFF
-      ? {
-        generation: engine.exports.advance_generation() >>> 0,
-        published: true,
-        consumed: false,
-        nodeCount,
-      }
-      : {
-        generation: currentGeneration + 1,
-        published: false,
-        consumed: false,
-        nodeCount,
-      };
+    const generation = core.exports.engine_record_generation_reserve() >>> 0;
+    const generationReservation = {
+      generation,
+      published: core.exports.engine_record_generation_reserve_published() !== 0,
+      consumed: false,
+      nodeCount,
+    };
     if (!inheritRetained) {
       stampAnalyticalState(nodeCount, generationReservation.generation);
     }
@@ -4213,6 +2700,23 @@ export async function createSceneRendererRuntime({
   // synchronous offsetWidth/getBoundingClientRect/etc. exactly. Throws if
   // the tree references an unregistered font/image/SVG-path (see
   function layoutTreeBoxesSync(scene, options = {}) {
+    if (options.page !== undefined && options.page !== null) {
+      throw new Error("layoutTreeBoxesSync lays out the continuous document; layoutPageBoxesSync lays out a page");
+    }
+    return analyticalBoxesSync(scene, options).boxes;
+  }
+
+  // layoutTreeBoxesSync for one page of a paged document: `options.page`
+  // ({ height, index, rulesKey, box }, as a page frame's) names the page.
+  // Returns { boxes, paging }: the boxes of the page's layout, in its page
+  // area's coordinates (a node on another page has no box on it; paging
+  // lists those), and the page count's paging (emitSceneCommandsSync).
+  function layoutPageBoxesSync(scene, options) {
+    if (!options?.page) throw new Error("layoutPageBoxesSync needs options.page");
+    return analyticalBoxesSync(scene, options);
+  }
+
+  function analyticalBoxesSync(scene, options) {
     const analytical = analyticalWriteOptions(scene, options);
     // emitPaintCommands stays ON for the analytical path: a non-atomic
     // inline box's computed box is the union of its per-line fragment
@@ -4227,29 +2731,28 @@ export async function createSceneRendererRuntime({
       analytical.generationReservation,
       true,
     );
-    return finishAnalyticalWrite(scene, analytical, written);
+    return { boxes: finishAnalyticalWrite(scene, analytical, written), paging: written.paging };
   }
 
   // A synchronous layout with the text geometry of every text node it lays
   // out (CSSOM View Range.getClientRects, caretPositionFromPoint): the
-  // boxes, as layoutTreeBoxesSync gives them, and one operation per text
-  // command of a query emit that lists hidden text and skipped contents
-  // and gives the spaces a line end removes no advance
-  // (set_query_text_geometry). An operation holds the source node index of
-  // its text (`nodeIndex`), in scroll space as the geometry records hold
-  // their boxes (no scroll container's offset; a reader adds the scroll of
-  // the text's record), its line box (`lineTop`, `lineHeight`), its text box on the
-  // line (`textTop`, `textHeight`: from the baseline less the ascent of the
-  // node's primary font to the baseline plus its descent), whether its
-  // glyphs run right to left (`rtl`), and its glyphs in visual order:
-  // `x`, `width`, and the authored UTF-8 byte range `start`, `end` of the
-  // cluster (the prepared run's mapping of its cluster bounds).
+  // boxes, as layoutTreeBoxesSync gives them, and the text geometry capture
+  // of a query emit that lists hidden text and skipped contents and gives
+  // the spaces a line end removes no advance (set_query_text_geometry;
+  // geometry_text_query_capture), in scroll space as the geometry records
+  // hold their boxes, moved by `options.textOffset` ({ x, y }, the place of
+  // a page in the space of a paged surface; none for the page shown). The
+  // caller takes the capture (geometry_text_store_of_query or
+  // geometry_text_release); 0 when the emit wrote no command. With
+  // `options.page` the layout is that page's and `paging` describes the
+  // page count (emitSceneCommandsSync); else `paging` is null.
   function layoutTextGeometrySync(scene, options = {}) {
-    const analytical = analyticalWriteOptions(scene, options);
+    const { textOffset = null, ...layoutOptions } = options;
+    const analytical = analyticalWriteOptions(scene, layoutOptions);
     const written = emitSceneCommandsSync(
       scene,
       {
-        ...options,
+        ...layoutOptions,
         ...(analytical.inherited ? { commitTextRunKeys: true } : {}),
         captureNodeMarkers: true,
         textGeometry: true,
@@ -4257,131 +2760,134 @@ export async function createSceneRendererRuntime({
       analytical.generationReservation,
       true,
     );
-    const commandView = written.view;
-    const glyphBase = engine.exports.glyph_buffer_base();
-    const glyphView = new DataView(
-      engine.memory.buffer.slice(glyphBase, glyphBase + engine.exports.glyph_bytes()),
-    );
-    const textRuns = currentTextBatch.copyRuns();
-    const textOperations = [];
-    let emittedNode = null;
-    for (let offset = 0; offset < written.bytesWritten;) {
-      const opcode = commandView.getUint8(offset);
-      if (opcode === CMD_SET_NODE) {
-        emittedNode = commandView.getUint32(offset + CMD_SET_NODE_OFFSET_INDEX, true);
-      } else if (
-        opcode === CMD_TEXT &&
-        (commandView.getUint8(offset + CMD_TEXT_OFFSET_FLAGS) & CMD_TEXT_FLAG_TEXT_SHADOW) === 0
-      ) {
-        if (emittedNode === null) {
-          throw new Error(`text geometry: the text command at byte ${offset} has no node marker before it`);
-        }
-        const glyphCount = commandView.getUint16(offset + CMD_TEXT_OFFSET_GCOUNT, true);
-        const glyphOffset = commandView.getUint32(offset + CMD_TEXT_OFFSET_GOFF, true);
-        const run = textRuns[emittedNode];
-        if (!run && glyphCount > 0) {
-          throw new Error(
-            `text geometry: the text command at byte ${offset} under node ${emittedNode} has glyphs, but the node carries no prepared text run`,
-          );
-        }
-        // The query emit's glyph entries hold px ($queryTextGeometry).
-        const x = commandView.getFloat32(offset + CMD_TEXT_OFFSET_X, true);
-        const lineTop = commandView.getFloat32(offset + CMD_TEXT_OFFSET_Y, true);
-        const glyphs = new Array(glyphCount);
-        for (let index = 0; index < glyphCount; index++) {
-          const entry = glyphOffset + index * GLYPH_ENTRY_SIZE;
-          glyphs[index] = Object.freeze({
-            x: x + glyphView.getFloat32(entry + GLYPH_OFFSET_X_OFFSET, true),
-            width: glyphView.getFloat32(entry + GLYPH_OFFSET_X_ADVANCE, true),
-            start: run.mapping[glyphView.getUint32(entry + GLYPH_OFFSET_CLUSTER_START, true)],
-            end: run.mapping[glyphView.getUint32(entry + GLYPH_OFFSET_CLUSTER_END, true)],
-          });
-        }
-        const ascent = engine.exports.text_font_extent(emittedNode, 0);
-        const descent = engine.exports.text_font_extent(emittedNode, 1);
-        const baseline = lineTop + commandView.getFloat32(offset + CMD_TEXT_OFFSET_BL, true);
-        textOperations.push(Object.freeze({
-          nodeIndex: run?.sourceId ?? written.nodes[emittedNode]?._inspectionSourceNodeIndex ?? emittedNode,
-          lineTop,
-          lineHeight: commandView.getFloat32(offset + CMD_TEXT_OFFSET_LH, true),
-          textTop: baseline - ascent,
-          textHeight: ascent + descent,
-          rtl: glyphCount > 1 && glyphs[0].start > glyphs[glyphCount - 1].start,
-          glyphs: Object.freeze(glyphs),
-        }));
-      }
-      offset += commandByteSize(commandView, offset);
+    const textCapture = written.bytesWritten === 0 ? 0 : core.status("geometry_text_query_capture", written.bytesWritten,
+      currentTextBatch.resultsBase(), scene.nodes[0]?._corePublication?.handle ?? 0, textOffset?.x ?? 0, textOffset?.y ?? 0);
+    try {
+      return { boxes: finishAnalyticalWrite(scene, analytical, written), textCapture, paging: written.paging ?? null };
+    } catch (error) {
+      if (textCapture !== 0) core.status("geometry_text_release", textCapture);
+      throw error;
     }
-    const boxes = finishAnalyticalWrite(scene, analytical, written);
-    return { boxes, textOperations };
   }
 
   // Canvas 2D text (src/dom/canvas-2d-text.js). Lays `scene` out alone, as
-  // a standalone analytical layout does, and returns what the engine shaped
-  // for each of its text nodes `textNodes`: each glyph in logical order with
-  // its face, its advance in font units, its cluster, its bidi level byte
-  // and whether it is a synthesized small capital, the primary face of the
-  // first node, and the size of that node's synthesized small capitals.
-  // The engine shapes canvas text as it shapes CSS text: font stack,
-  // fallback faces, bidi levels over all the nodes, features,
-  // letter-spacing; it shapes each node on its own. The faces carry what
-  // glyph atlases and font metrics need; one face object stands for a font
-  // index for the runtime's life.
-  const standaloneTextFaces = new Map();
-  function shapeStandaloneTextSync(scene, textNodes) {
+  // a standalone analytical layout does, then lays the canvas text of its
+  // text nodes `textNodes` out (canvas_text_layout,
+  // core/engine/canvas-text-layout.watpart) for `style`: its size, letter and
+  // word spacings in px and slope. Returns the width, the ink bounds and
+  // the primary face's metrics, the glyphs in drawing order with their
+  // faces, and `measure(textAlign, textBaseline, direction)`
+  // (canvas_text_measure): the TextMetrics values, the align factor and
+  // the alphabetic baseline. The engine shapes canvas text as it shapes
+  // CSS text: font stack, fallback faces, bidi levels over all the nodes,
+  // features. One face object stands for a font index for the runtime's
+  // life.
+  const canvasTextFaces = new Map();
+  function canvasTextFace(fontIndex) {
+    let described = canvasTextFaces.get(fontIndex);
+    if (described !== undefined && described.bytes !== registeredFontBytes(fontIndex)) described = undefined;
+    if (described !== undefined) return described;
+    const entry = FONT_TABLE_BASE + fontIndex * FONT_TABLE_ENTRY_SIZE;
+    const fontView = new DataView(engine.memory.buffer);
+    const subdividedUpem = fontView.getUint32(entry + FONT_TABLE_OFFSET_UPEM, true);
+    const weight = fontView.getUint16(entry + FONT_TABLE_OFFSET_WEIGHT, true);
+    described = Object.freeze({
+      fontIndex,
+      bytes: registeredFontBytes(fontIndex),
+      faceIndex: fontIdentityForDocument(fontIndex, 0n).faceIndex,
+      weight,
+      variationWidth: fontVariationWidth(fontIndex),
+      variationSlant: fontVariationSlant(fontIndex),
+      upem: subdividedUpem / FONT_UNIT_SUBDIVISION,
+    });
+    canvasTextFaces.set(fontIndex, described);
+    return described;
+  }
+  function layoutCanvasTextSync(scene, textNodes, style) {
     const analytical = analyticalWriteOptions(scene, {});
     emitSceneCommandsSync(scene, {}, analytical.generationReservation, false);
     syncLayoutWrite = null;
-    const faces = standaloneTextFaces;
-    const face = (fontIndex) => {
-      let described = faces.get(fontIndex);
-      if (described !== undefined && described.bytes !== registeredFontBytes(fontIndex)) described = undefined;
-      if (described !== undefined) return described;
-      const entry = FONT_TABLE_BASE + fontIndex * FONT_TABLE_ENTRY_SIZE;
-      const subdividedUpem = view.getUint32(entry + FONT_TABLE_OFFSET_UPEM, true);
-      described = Object.freeze({
-        fontIndex,
-        bytes: registeredFontBytes(fontIndex),
-        faceIndex: fontIdentityForDocument(fontIndex, 0n).faceIndex,
-        weight: view.getUint16(entry + FONT_TABLE_OFFSET_WEIGHT, true),
-        variationWidth: fontVariationWidth(fontIndex),
-        variationSlant: fontVariationSlant(fontIndex),
-        italic: view.getUint32(entry + FONT_TABLE_OFFSET_ITALIC, true) !== 0,
-        upem: subdividedUpem / FONT_UNIT_SUBDIVISION,
-        subdividedUpem,
-        ascender: view.getInt32(entry + FONT_TABLE_OFFSET_ASCENDER, true),
-        descender: view.getInt32(entry + FONT_TABLE_OFFSET_DESCENDER, true),
-        lineGap: view.getInt32(entry + FONT_TABLE_OFFSET_LINE_GAP, true),
-      });
-      faces.set(fontIndex, described);
-      return described;
-    };
-    const shapedNodes = textNodes.map((textNode) => {
-      const run = textRunDirBase + textNode * TEXT_RUN_ENTRY_SIZE;
-      const glyphBase = view.getUint32(run + TEXT_RUN_OFFSET_GLYPH_OFFSET, true);
-      const glyphCount = view.getUint16(run + TEXT_RUN_OFFSET_GLYPH_COUNT, true);
-      const glyphs = new Array(glyphCount);
-      for (let index = 0; index < glyphCount; index++) {
-        const glyph = glyphBase + index * SHAPED_GLYPH_ENTRY_SIZE;
-        const flags = view.getUint16(glyph + SHAPED_GLYPH_OFFSET_FLAGS, true);
-        glyphs[index] = {
-          id: view.getUint16(glyph + SHAPED_GLYPH_OFFSET_ID, true),
-          advance: view.getInt32(glyph + SHAPED_GLYPH_OFFSET_X_ADVANCE, true),
-          unscaledAdvance: view.getInt32(glyph + SHAPED_GLYPH_OFFSET_UNSCALED_ADVANCE, true),
-          cluster: view.getUint32(glyph + SHAPED_GLYPH_OFFSET_CLUSTER_START, true),
-          level: flags >>> 8,
-          face: face(view.getUint16(glyph + SHAPED_GLYPH_OFFSET_FONT, true) & SHAPED_GLYPH_FONT_INDEX),
-          synthesized: (view.getUint16(glyph + SHAPED_GLYPH_OFFSET_FONT, true) & SHAPED_GLYPH_FONT_SYNTHESIZED) !== 0,
-        };
-      }
-      return glyphs;
+    const nodes = engine.exports.abi_malloc(textNodes.length * 4);
+    let output;
+    try {
+      new Uint32Array(engine.memory.buffer, nodes, textNodes.length).set(textNodes);
+      output = engine.exports.canvas_text_layout(nodes, textNodes.length, style.size, style.letterSpacingPx,
+        style.wordSpacingPx, style.slope);
+    } finally {
+      engine.exports.abi_free(nodes);
+    }
+    // Every value is read before a face is described: describing one may
+    // grow the memory.
+    const record = new DataView(engine.memory.buffer, output);
+    const number = (offset) => record.getFloat64(offset, true);
+    const raw = Array.from({ length: record.getUint32(CANVAS_TEXT_LAYOUT.GLYPH_COUNT, true) }, (_, index) => {
+      const at = CANVAS_TEXT_LAYOUT.GLYPHS + index * CANVAS_TEXT_GLYPH.SIZE;
+      return [record.getUint32(at + CANVAS_TEXT_GLYPH.ID, true), record.getUint32(at + CANVAS_TEXT_GLYPH.FONT, true),
+        record.getUint32(at + CANVAS_TEXT_GLYPH.OBLIQUE, true), record.getUint32(at + CANVAS_TEXT_GLYPH.RUN_FONT, true),
+        number(at + CANVAS_TEXT_GLYPH.X)];
     });
-    const firstNode = layoutBufferBase + textNodes[0] * LAYOUT_NODE_SIZE;
-    const primary = face(nodePrimaryFontIndex(firstNode));
-    const synthesizedSize = engine.exports.caps_synthesized_size(
-      view.getFloat32(firstNode + LAYOUT_NODE_OFFSET_FONT_SIZE, true),
-    );
-    return { nodes: shapedNodes, primary, synthesizedSize };
+    const ink = CANVAS_TEXT_LAYOUT.INK;
+    const layout = {
+      width: number(CANVAS_TEXT_LAYOUT.WIDTH),
+      ink: { x: number(ink), y: number(ink + 8), width: number(ink + 16), height: number(ink + 24) },
+      ascent: number(CANVAS_TEXT_LAYOUT.ASCENT),
+      descent: number(CANVAS_TEXT_LAYOUT.DESCENT),
+      lineGap: number(CANVAS_TEXT_LAYOUT.LINE_GAP),
+      typoAscent: number(CANVAS_TEXT_LAYOUT.TYPO_ASCENT),
+      typoDescent: number(CANVAS_TEXT_LAYOUT.TYPO_DESCENT),
+      size: number(CANVAS_TEXT_LAYOUT.SIZE),
+      synthesizedSize: number(CANVAS_TEXT_LAYOUT.SYNTHESIZED_SIZE),
+    };
+    layout.glyphs = raw.map(([id, font, oblique, runFont, x]) => ({
+      id,
+      face: canvasTextFace(font & SHAPED_GLYPH_FONT_INDEX),
+      synthesized: (font & SHAPED_GLYPH_FONT_SYNTHESIZED) !== 0,
+      oblique: oblique !== 0,
+      runFont,
+      x,
+    }));
+    layout.measure = (textAlign, textBaseline, direction) => {
+      const measured = engine.exports.canvas_text_measure(layout.width, layout.ink.x, layout.ink.y, layout.ink.width,
+        layout.ink.height, layout.ascent, layout.descent, layout.typoAscent, layout.typoDescent, textAlign, textBaseline, direction);
+      const F64 = Float64Array.BYTES_PER_ELEMENT;
+      const values = new DataView(engine.memory.buffer, measured, CANVAS_TEXT_MEASURE_COUNT * F64);
+      return Array.from({ length: CANVAS_TEXT_MEASURE_COUNT }, (_, index) => values.getFloat64(index * F64, true));
+    };
+    return layout;
+  }
+
+  // The words of canvas text (canvas_text_word_ends, which also prepares
+  // the text in place), each laid out as a text node of its own.
+  function canvasTextWordsSync(text) {
+    const bytes = new TextEncoder().encode(text);
+    // The text, then room for one u32 end for each byte and for one more.
+    const input = engine.exports.abi_malloc(bytes.length + (bytes.length + 1) * Uint32Array.BYTES_PER_ELEMENT);
+    try {
+      new Uint8Array(engine.memory.buffer, input, bytes.length).set(bytes);
+      const output = input + bytes.length;
+      const count = engine.exports.canvas_text_word_ends(input, bytes.length, output);
+      const prepared = new Uint8Array(engine.memory.buffer, input, bytes.length);
+      const ends = new DataView(engine.memory.buffer, output, count * Uint32Array.BYTES_PER_ELEMENT);
+      const decoder = new TextDecoder();
+      const words = [];
+      let start = 0;
+      for (let index = 0; index < count; index++) {
+        const end = ends.getUint32(index * Uint32Array.BYTES_PER_ELEMENT, true);
+        words.push(decoder.decode(prepared.subarray(start, end)));
+        start = end;
+      }
+      return words;
+    } finally {
+      engine.exports.abi_free(input);
+    }
+  }
+
+  // The outline of glyph `glyphId` of the registered font `fontIndex` at
+  // the optical size `opticalSize` (canvas_text_glyph_outline), in font
+  // units, for strokeText.
+  function canvasTextGlyphOutlineSync(fontIndex, opticalSize, glyphId) {
+    const pointer = engine.exports.canvas_text_glyph_outline(fontIndex, opticalSize, glyphId);
+    return new Uint8Array(engine.memory.buffer, pointer, engine.exports.glyph_outline_length()).slice();
   }
 
   function artifactBytes(value) {
@@ -4400,9 +2906,9 @@ export async function createSceneRendererRuntime({
     return value;
   }
 
-  function edgeValue(node, group, side) {
-    return node?.[group]?.[side] ?? 0;
-  }
+  // A box's used margins and padding (top, right, bottom, left each), from
+  // the core's box snapshot (geometry_boxes: zero when it has none).
+  const NO_USED_EDGES = Object.freeze([0, 0, 0, 0, 0, 0, 0, 0]);
 
   function expandedBox(box, top, right, bottom, left) {
     return {
@@ -4411,79 +2917,6 @@ export async function createSceneRendererRuntime({
       width: box.width + left + right,
       height: box.height + top + bottom,
     };
-  }
-
-  // The primary face of a node, as the engine's $nodePrimaryFont reads it:
-  // the loaded font of the primary slot of a stack with unicode-range
-  // faces, else the node's font index.
-  function nodePrimaryFontIndex(nodeBase) {
-    const stack = view.getUint16(nodeBase + LAYOUT_NODE_OFFSET_FONT_STACK, true);
-    if (stack !== 0) {
-      const entry = FONT_STACK_TABLE_BASE + stack * FONT_STACK_ENTRY_SIZE;
-      const slots = view.getUint32(entry + FONT_STACK_OFFSET_SLOTS, true);
-      if (slots !== 0) {
-        const primary = view.getUint16(entry + FONT_STACK_OFFSET_PRIMARY, true);
-        const font = view.getUint16(slots + FONT_STACK_SLOT_HEADER_SIZE + primary * FONT_STACK_SLOT_SIZE, true);
-        if (font !== FONT_STACK_UNLOADED) return font;
-      }
-    }
-    return view.getUint16(nodeBase + LAYOUT_NODE_OFFSET_FONT_INDEX, true);
-  }
-
-  function textMetricsForNode(nodeIndex) {
-    const nodeBase = layoutBufferBase + nodeIndex * LAYOUT_NODE_SIZE;
-    const fontIndex = nodePrimaryFontIndex(nodeBase);
-    const fontBase = FONT_TABLE_BASE + fontIndex * FONT_TABLE_ENTRY_SIZE;
-    const unitsPerEm = view.getUint32(
-      fontBase + FONT_TABLE_OFFSET_UPEM,
-      true,
-    );
-    const fontSize = view.getFloat32(
-      nodeBase + LAYOUT_NODE_OFFSET_FONT_SIZE,
-      true,
-    );
-    const scale = Math.fround(fontSize / unitsPerEm);
-    const metricPixels = (units) =>
-      Math.fround(Math.floor(units * scale + 0.5));
-    const ascender = metricPixels(
-      view.getInt32(fontBase + FONT_TABLE_OFFSET_ASCENDER, true),
-    );
-    const descender = -metricPixels(
-      -view.getInt32(fontBase + FONT_TABLE_OFFSET_DESCENDER, true),
-    );
-    const lineGap = Math.fround(
-      view.getInt32(fontBase + FONT_TABLE_OFFSET_LINE_GAP, true) * scale,
-    );
-    const lineHeightTag = view.getUint8(
-      nodeBase + LAYOUT_NODE_OFFSET_LINE_HEIGHT_TAG,
-    );
-    const authoredLineHeight = view.getFloat32(
-      nodeBase + LAYOUT_NODE_OFFSET_LINE_HEIGHT,
-      true,
-    );
-    let lineHeight;
-    if (lineHeightTag === LINE_HEIGHT_NORMAL) {
-      lineHeight = Math.fround(ascender - descender + lineGap);
-    } else if (lineHeightTag === LINE_HEIGHT_LENGTH) {
-      lineHeight = Math.round(authoredLineHeight * LAYOUT_UNIT) / LAYOUT_UNIT;
-    } else if (lineHeightTag === LINE_HEIGHT_NUMBER) {
-      lineHeight = Math.floor(
-        Math.fround(authoredLineHeight * fontSize) * LAYOUT_UNIT,
-      ) / LAYOUT_UNIT;
-    } else {
-      throw new Error(
-        `layout artifact: unknown line-height tag ${lineHeightTag}`,
-      );
-    }
-    const lineHeightUnits = Math.round(lineHeight * LAYOUT_UNIT);
-    const fontHeightUnits = Math.round(
-      Math.fround(ascender - descender) * LAYOUT_UNIT,
-    );
-    const halfLeadingUnits = Math.trunc(
-      (lineHeightUnits - fontHeightUnits) / 2,
-    );
-    const baseline = (halfLeadingUnits >> 6) + ascender;
-    return { baseline, lineHeight };
   }
 
   function readLayoutArtifact(scene, nodes) {
@@ -4510,20 +2943,9 @@ export async function createSceneRendererRuntime({
         height: view.getInt32(boxBase + BOX_OFFSET_CONTENT_H, true) /
           LAYOUT_UNIT,
       };
-      const paddingBox = expandedBox(
-        contentBox,
-        edgeValue(node, "padding", "top"),
-        edgeValue(node, "padding", "right"),
-        edgeValue(node, "padding", "bottom"),
-        edgeValue(node, "padding", "left"),
-      );
-      const marginBox = expandedBox(
-        borderBox,
-        edgeValue(node, "margin", "top"),
-        edgeValue(node, "margin", "right"),
-        edgeValue(node, "margin", "bottom"),
-        edgeValue(node, "margin", "left"),
-      );
+      const edges = scrollBoxes[nodeIndex].usedEdges ?? NO_USED_EDGES;
+      const paddingBox = expandedBox(contentBox, edges[4], edges[5], edges[6], edges[7]);
+      const marginBox = expandedBox(borderBox, edges[0], edges[1], edges[2], edges[3]);
       return {
         nodeIndex,
         parentIndex: parentIndices[nodeIndex],
@@ -4547,14 +2969,13 @@ export async function createSceneRendererRuntime({
         runBase + TEXT_RUN_OFFSET_LINE_OFFSET,
         true,
       );
-      const lineCount = view.getUint16(
+      const lineCount = view.getUint32(
         runBase + TEXT_RUN_OFFSET_LINE_COUNT,
         true,
       );
       if (lineCount === 0) continue;
-      const metrics = textMetricsForNode(nodeIndex);
+      const [lineHeight, baselineOffset] = engine.exports.text_line_metrics(nodeIndex);
       const contentBox = boxes[nodeIndex].contentBox;
-      const textAlign = nodes[nodeIndex].textAlign ?? "left";
       for (let lineIndex = 0; lineIndex < lineCount; lineIndex++) {
         // lineOffset is the ABSOLUTE byte address of this node's span
         // ($layoutText stores its $textLineCursor grab directly); the
@@ -4570,13 +2991,8 @@ export async function createSceneRendererRuntime({
           true,
         );
         // x is the line's band left; the glyphs start after the text-align
-        // shift, mirroring the paint emitter's math exactly.
-        const alignmentSlack = Math.max(availableWidth - width, 0);
-        const alignedX = textAlign === "center"
-          ? lineX + alignmentSlack / 2
-          : textAlign === "right"
-          ? lineX + alignmentSlack
-          : lineX;
+        // shift the paint emitter takes (text_line_align_offset).
+        const alignedX = lineX + engine.exports.text_line_align_offset(nodeIndex, width, availableWidth);
         lineBoxes.push({
           nodeIndex,
           lineIndex,
@@ -4584,9 +3000,9 @@ export async function createSceneRendererRuntime({
           y: lineY,
           alignedX,
           width,
-          height: metrics.lineHeight,
+          height: lineHeight,
           availableWidth,
-          baseline: lineY + metrics.baseline,
+          baseline: lineY + baselineOffset,
           firstGlyph: view.getUint32(
             lineBase + TEXT_LINE_OFFSET_FIRST_GLYPH,
             true,
@@ -4638,45 +3054,66 @@ export async function createSceneRendererRuntime({
     });
   }
 
-  const COMMAND_NAMES = new Map([
-    [CMD_RECT, "rectangle"],
-    [CMD_TEXT, "text"],
-    [CMD_IMAGE, "image"],
-    [CMD_BOX_SHADOW, "box-shadow"],
-    [CMD_PUSH_CLIP, "push-clip"],
-    [CMD_POP_CLIP, "pop-clip"],
-    [CMD_PUSH_OPACITY, "push-opacity"],
-    [CMD_POP_OPACITY, "pop-opacity"],
-    [CMD_SVG_PATH, "svg-path"],
-    [CMD_PUSH_BACKDROP_FILTER, "push-backdrop-filter"],
-    [CMD_POP_BACKDROP_FILTER, "pop-backdrop-filter"],
-    [CMD_PUSH_MASK, "push-mask"],
-    [CMD_PUSH_MASK_LAYER, "push-mask-layer"],
-    [CMD_POP_MASK_LAYER, "pop-mask-layer"],
-    [CMD_PUSH_BACKGROUND, "push-background"],
-    [CMD_PUSH_BLEND_LAYER, "push-blend-layer"],
-    [CMD_POP_BLEND_LAYER, "pop-blend-layer"],
-    [CMD_POP_BACKGROUND, "pop-background"],
-    [CMD_SET_NODE, "set-node"],
-  ]);
+  // The paint record of a scene without a raster target: the rows are
+  // written and the commands emitted as a frame does, and the core decodes
+  // the command stream where the engine wrote it. No render context,
+  // raster plan, GPU submission, readback or encoding takes part. Returns
+  // the paint artifact facade and the prepared nodes.
+  async function createPaintRecord(
+    scene,
+    {
+      resolveResource = null,
+      onImageLoadError = null,
+      layoutNodeCapacity = Infinity,
+    } = {},
+  ) {
+    validateLayoutNodeCapacity(layoutNodeCapacity);
+    return await runExclusiveEngineOperation(async () => {
+      for (;;) {
+        engine.exports.set_device_scale(1);
+        const resources = await prepareImages(resolveFontIndices(scene.nodes),
+          resolveResource, scene.imageSources, onImageLoadError);
+        const nodes = await prepareSvgPathResources(
+          prepareAuthoredSceneInput(core, resources, fontRegistry));
+        writeSceneNodesAndTileConfig(scene, nodes, null, layoutNodeCapacity, null, true, null, null, false);
+        engine.exports.clear_tile_dirty_map();
+        engine.exports.set_paint_artifact_capture(1);
+        engine.exports.set_retained_frame_enabled(0);
+        const bytes = engine.exports.emit_commands(nodes.length);
+        // Registry fallback faces that the layout requested: answer them,
+        // then write and emit again, so the text shapes with them.
+        const answering = answerFallbackFaces();
+        if (answering !== null) {
+          await answering;
+          continue;
+        }
+        const paintArtifact = capturePaintRecord(core, {
+          commands: { pointer: engine.exports.command_buffer_base(), length: bytes },
+          glyphs: { pointer: engine.exports.glyph_buffer_base(), length: engine.exports.glyph_bytes() },
+          nodes,
+          textRuns: currentTextBatch.runSpans(),
+          sceneChildren: scene.nodes.map((node) => node.children ?? []),
+          width: scene.width,
+          height: scene.height,
+        });
+        commandDecodeWork.commands += paintArtifact.commandCount;
+        return { paintArtifact, nodes };
+      }
+    });
+  }
 
-  const GROUP_PAIRS = new Map([
-    [CMD_PUSH_OPACITY, CMD_POP_OPACITY],
-    [CMD_PUSH_BACKDROP_FILTER, CMD_POP_BACKDROP_FILTER],
-    [CMD_PUSH_MASK_LAYER, CMD_POP_MASK_LAYER],
-    [CMD_PUSH_BLEND_LAYER, CMD_POP_BLEND_LAYER],
-    [CMD_PUSH_BACKGROUND, CMD_POP_BACKGROUND],
-  ]);
-
-  const BLEND_MODE_NAMES_BY_VALUE = Object.freeze(
-    Object.fromEntries(
-      Object.entries(BLEND_MODE_NAMES).map(([name, value]) => [value, name]),
-    ),
-  );
+  // The name of a command (command_name); undefined for a command that has
+  // none.
+  const commandNames = new Map();
+  function commandName(opcode) {
+    if (!commandNames.has(opcode)) commandNames.set(opcode, core.string("command_name", opcode) ?? undefined);
+    return commandNames.get(opcode);
+  }
 
   function decodeClipEntries(commandView, commandOffset, deviceScale = 1) {
-    const count = commandView.getUint8(
+    const count = commandView.getUint16(
       commandOffset + CMD_PUSH_CLIP_OFFSET_COUNT,
+      true,
     );
     const entries = [];
     for (let index = 0; index < count; index++) {
@@ -4728,13 +3165,13 @@ export async function createSceneRendererRuntime({
   function decodeRectanglePaint(commandView, commandOffset) {
     const flags = commandView.getUint8(commandOffset + CMD_RECT_OFFSET_FLAGS);
     const fill = (flags & CMD_RECT_FLAG_FILL)
-      ? [0, 1, 2, 3].map((channel) => commandView.getFloat32(commandOffset + CMD_RECT_OFFSET_FILL + channel * 4, true))
+      ? [0, 1, 2, 3].map((channel) => commandView.getFloat32(commandOffset + CMD_RECT_OFFSET_FILL + channel * F32, true))
       : null;
     const borders = [CMD_RECT_OFFSET_BORDER_TOP, CMD_RECT_OFFSET_BORDER_RIGHT, CMD_RECT_OFFSET_BORDER_BOTTOM,
       CMD_RECT_OFFSET_BORDER_LEFT].map((field) =>
         (flags & CMD_RECT_FLAG_BORDER) ? commandView.getFloat32(commandOffset + field, true) : 0);
     const radii = Array.from({ length: 8 }, (_, index) =>
-      commandView.getFloat32(commandOffset + CMD_RECT_OFFSET_RADIUS_TOP_LEFT_X + index * 4, true));
+      commandView.getFloat32(commandOffset + CMD_RECT_OFFSET_RADIUS_TOP_LEFT_X + index * F32, true));
     return { fill, borders, radii, transformed: (flags & CMD_RECT_FLAG_TRANSFORM) !== 0 };
   }
   function decodeCommandGeometry(commandView, commandOffset, opcode) {
@@ -4805,726 +3242,6 @@ export async function createSceneRendererRuntime({
   }
 
   const utf8Decoder = new TextDecoder();
-  // The source of a text command whose glyphs name no source bytes: the
-  // glyphs MathMLPainter paints in place of no text (a radical's surd,
-  // under its msqrt or mroot) carry clusters [0, 0) and need no prepared
-  // run; their node may have none.
-  const NO_SOURCE_BYTES = new Uint8Array(0);
-  // UTF-16 code unit offset at each UTF-8 byte offset of a run's bytes;
-  // null when every byte is ASCII. Cached on the run's byte array.
-  const utf16OffsetTables = new WeakMap();
-  function utf16OffsetsOf(bytes) {
-    let table = utf16OffsetTables.get(bytes);
-    if (table !== undefined) return table;
-    table = null;
-    for (let i = 0; i < bytes.length; i++) {
-      if (bytes[i] >= 0x80) {
-        table = new Uint32Array(bytes.length + 1);
-        let units = 0;
-        for (let k = 0; k < bytes.length; k++) {
-          table[k] = units;
-          const byte = bytes[k];
-          // A code unit begins at every non-continuation byte; a 4-byte
-          // sequence (astral) is a surrogate pair.
-          if ((byte & 0xc0) !== 0x80) units += byte >= 0xf0 ? 2 : 1;
-        }
-        table[bytes.length] = units;
-        break;
-      }
-    }
-    utf16OffsetTables.set(bytes, table);
-    return table;
-  }
-
-  // glyphs and glyphAdvances of a text operation, built on first read
-  // and then plain data properties. Glyph cluster bounds are UTF-8 byte
-  // offsets into the run; the artifact reports UTF-16 code unit offsets.
-  function defineLazyGlyphs(operation, source, deviceScale) {
-    const build = () => {
-      const { entries, count, x, fontSize, unitsPerEm, preparedBytes } = source;
-      const view = new DataView(
-        entries.buffer,
-        entries.byteOffset,
-        entries.byteLength,
-      );
-      const units = utf16OffsetsOf(preparedBytes);
-      const glyphAdvances = new Array(count);
-      const glyphs = new Array(count);
-      // A right-to-left run's glyphs come in visual order, with decreasing
-      // cluster offsets; each glyph's cluster end is its logical end.
-      const rtl = count > 1 &&
-        view.getUint32(GLYPH_OFFSET_CLUSTER_START, true) >
-          view.getUint32((count - 1) * GLYPH_ENTRY_SIZE + GLYPH_OFFSET_CLUSTER_START, true);
-      for (let index = 0; index < count; index++) {
-        const entryOffset = index * GLYPH_ENTRY_SIZE;
-        const xOffset = view.getFloat32(
-          entryOffset + GLYPH_OFFSET_X_OFFSET,
-          true,
-        );
-        const advance = view.getFloat32(
-          entryOffset + GLYPH_OFFSET_X_ADVANCE,
-          true,
-        );
-        const sourceStart = view.getUint32(
-          entryOffset + GLYPH_OFFSET_CLUSTER_START,
-          true,
-        );
-        const sourceEnd = view.getUint32(
-          entryOffset + GLYPH_OFFSET_CLUSTER_END,
-          true,
-        );
-        const logicalAdvance = advance * fontSize / unitsPerEm / deviceScale;
-        glyphAdvances[index] = logicalAdvance;
-        glyphs[index] = Object.freeze({
-          x: (x + xOffset * fontSize / unitsPerEm) / deviceScale,
-          width: logicalAdvance,
-          sourceStart: units === null ? sourceStart : units[sourceStart],
-          sourceEnd: units === null ? sourceEnd : units[sourceEnd],
-          rtl,
-        });
-      }
-      Object.defineProperties(operation, {
-        glyphAdvances: {
-          value: glyphAdvances,
-          enumerable: true,
-          writable: true,
-          configurable: true,
-        },
-        glyphs: {
-          value: Object.freeze(glyphs),
-          enumerable: true,
-          writable: true,
-          configurable: true,
-        },
-      });
-    };
-    Object.defineProperties(operation, {
-      glyphCount: { value: source.count, enumerable: true, configurable: true },
-      glyphAdvances: {
-        get() {
-          build();
-          return operation.glyphAdvances;
-        },
-        enumerable: true,
-        configurable: true,
-      },
-      glyphs: {
-        get() {
-          build();
-          return operation.glyphs;
-        },
-        enumerable: true,
-        configurable: true,
-      },
-    });
-  }
-
-  function createPaintArtifact(
-    commandView,
-    bytesWritten,
-    scene,
-    emittedNodes,
-    deviceScale,
-    glyphBuffer,
-    frameTextRuns,
-  ) {
-    const glyphView = new DataView(
-      glyphBuffer.buffer,
-      glyphBuffer.byteOffset,
-      glyphBuffer.byteLength,
-    );
-    const boxes = [];
-    const operations = [];
-    const compositingGroups = [];
-    const clipStack = [];
-    const compositingGroupStack = [];
-    // The group-derived fields of the current group stack (see below);
-    // null after a push or pop.
-    let activeGroupState = null;
-    let currentNodeIndex = null;
-    let currentRunIndex = null;
-    let currentClipEntries = [];
-    let commandIndex = 0;
-    for (let byteOffset = 0; byteOffset < bytesWritten; commandIndex++) {
-      const opcode = commandView.getUint8(byteOffset);
-      if (opcode === CMD_SET_NODE) {
-        const emittedNodeIndex = commandView.getUint32(
-          byteOffset + CMD_SET_NODE_OFFSET_INDEX,
-          true,
-        );
-        currentRunIndex = emittedNodeIndex;
-        currentNodeIndex = frameTextRuns[emittedNodeIndex]?.sourceId ??
-          emittedNodes[emittedNodeIndex]?._inspectionSourceNodeIndex ??
-          emittedNodeIndex;
-      } else if (opcode === CMD_PUSH_CLIP) {
-        currentClipEntries = decodeClipEntries(
-          commandView,
-          byteOffset,
-          deviceScale,
-        );
-        clipStack.push(currentClipEntries);
-      } else if (opcode === CMD_POP_CLIP) {
-        if (clipStack.length === 0) {
-          throw new Error("paint artifact: clip stack underflow");
-        }
-        clipStack.pop();
-        currentClipEntries = clipStack.at(-1) ?? [];
-      }
-
-      if (GROUP_PAIRS.has(opcode)) {
-        const group = {
-          identifier: `paint-group-${compositingGroups.length}`,
-          kind: COMMAND_NAMES.get(opcode).slice(5),
-          nodeIndex: currentNodeIndex,
-          startCommandIndex: commandIndex,
-          endCommandIndex: null,
-          startOperationIndex: operations.length,
-          endOperationIndex: null,
-        };
-        if (opcode === CMD_PUSH_OPACITY) {
-          const flags = commandView.getUint8(
-            byteOffset + CMD_PUSH_OPACITY_OFFSET_FLAGS,
-          );
-          group.opacity = commandView.getFloat32(
-            byteOffset + CMD_PUSH_OPACITY_OFFSET_ALPHA,
-            true,
-          );
-          group.blendMode = BLEND_MODE_NAMES_BY_VALUE[
-            (flags & CMD_PUSH_OPACITY_FLAG_BLEND_MASK) >>
-            CMD_PUSH_OPACITY_FLAG_BLEND_SHIFT
-          ];
-          group.stackingContext = true;
-        } else if (opcode === CMD_PUSH_BLEND_LAYER) {
-          group.blendMode = BLEND_MODE_NAMES_BY_VALUE[
-            commandView.getUint8(
-              byteOffset + CMD_PUSH_BLEND_LAYER_OFFSET_MODE,
-            )
-          ];
-          group.stackingContext = false;
-        } else {
-          group.stackingContext = opcode === CMD_PUSH_BACKDROP_FILTER;
-        }
-        compositingGroups.push(group);
-        compositingGroupStack.push({
-          group,
-          popOpcode: GROUP_PAIRS.get(opcode),
-        });
-        activeGroupState = null;
-      } else if (
-        compositingGroupStack.length > 0 &&
-        opcode === compositingGroupStack.at(-1).popOpcode
-      ) {
-        const { group } = compositingGroupStack.pop();
-        group.endCommandIndex = commandIndex;
-        group.endOperationIndex = operations.length - 1;
-        activeGroupState = null;
-      }
-
-      const geometry = decodeCommandGeometry(commandView, byteOffset, opcode);
-      if (
-        opcode === CMD_RECT || opcode === CMD_TEXT || opcode === CMD_IMAGE ||
-        opcode === CMD_SVG_PATH || opcode === CMD_BOX_SHADOW
-      ) {
-        if (currentNodeIndex === null) {
-          // Diagnostic depth matters here: this fires when a draw command
-          // appears before any CMD_SET_NODE marker — historically a
-          // symptom of another emit clobbering the shared buffers while a
-          // frame was parked at an await (fixed by the frame snapshot in
-          // renderScenePixels), so name the command and its geometry.
-          const preceding = [];
-          for (let o = 0; o < byteOffset;) {
-            const k = commandView.getUint8(o);
-            preceding.push(COMMAND_NAMES.get(k) ?? `op${k}`);
-            o += commandByteSize(commandView, o);
-          }
-          throw new Error(
-            `paint artifact: ${COMMAND_NAMES.get(opcode)} has no scene node ` +
-              `(command ${commandIndex}, geometry ${
-                JSON.stringify(geometry)
-              }, ` +
-              `preceding: ${preceding.join(" ")})`,
-          );
-        }
-        const textFlags = opcode === CMD_TEXT
-          ? commandView.getUint8(byteOffset + CMD_TEXT_OFFSET_FLAGS)
-          : 0;
-        let logicalRectangle;
-        let textMetrics = null;
-        let lazyGlyphs = null;
-        if (opcode === CMD_TEXT) {
-          const glyphCount = commandView.getUint16(
-            byteOffset + CMD_TEXT_OFFSET_GCOUNT,
-            true,
-          );
-          const glyphOffset = commandView.getUint32(
-            byteOffset + CMD_TEXT_OFFSET_GOFF,
-            true,
-          );
-          const fontSize = engine.exports.used_font_size(commandView.getFloat32(
-            byteOffset + CMD_TEXT_OFFSET_FSIZE,
-            true,
-          ));
-          const unitsPerEm = commandView.getUint16(
-            byteOffset + CMD_TEXT_OFFSET_UPEM,
-            true,
-          );
-          let width = 0;
-          let clusterStart = Number.MAX_SAFE_INTEGER;
-          let clusterEnd = 0;
-          for (let glyphIndex = 0; glyphIndex < glyphCount; glyphIndex++) {
-            const entryOffset = glyphOffset + glyphIndex * GLYPH_ENTRY_SIZE;
-            const xOffset = glyphView.getFloat32(
-              entryOffset + GLYPH_OFFSET_X_OFFSET,
-              true,
-            );
-            const advance = glyphView.getFloat32(
-              entryOffset + GLYPH_OFFSET_X_ADVANCE,
-              true,
-            );
-            width = Math.max(width, xOffset + advance);
-            clusterStart = Math.min(
-              clusterStart,
-              glyphView.getUint32(
-                entryOffset + GLYPH_OFFSET_CLUSTER_START,
-                true,
-              ),
-            );
-            clusterEnd = Math.max(
-              clusterEnd,
-              glyphView.getUint32(entryOffset + GLYPH_OFFSET_CLUSTER_END, true),
-            );
-          }
-          const preparedRun = frameTextRuns[currentRunIndex];
-          if (!preparedRun && clusterEnd > 0) {
-            throw new Error(
-              `paint artifact: text command under node ${currentRunIndex} (${
-                emittedNodes[currentRunIndex]?.display ?? "absent"
-              }) names source bytes ${clusterStart}..${clusterEnd}, but the node carries no prepared text run`,
-            );
-          }
-          const preparedBytes = preparedRun?.bytes ?? NO_SOURCE_BYTES;
-          const text = glyphCount === 0 ? "" : utf8Decoder.decode(
-            preparedBytes.subarray(clusterStart, clusterEnd),
-          );
-          // The per-glyph objects (glyphs, glyphAdvances) are built on
-          // first read from a copy of the command's glyph entries: a frame
-          // reads them only for text nodes whose geometry it cannot keep
-          // from the previous frame (render-surface), and a frame of a
-          // thousand runs would otherwise build them all.
-          lazyGlyphs = {
-            entries: glyphBuffer.slice(
-              glyphOffset,
-              glyphOffset + glyphCount * GLYPH_ENTRY_SIZE,
-            ),
-            count: glyphCount,
-            x: geometry.x,
-            fontSize,
-            unitsPerEm,
-            preparedBytes,
-          };
-          const baseline = commandView.getFloat32(
-            byteOffset + CMD_TEXT_OFFSET_BL,
-            true,
-          );
-          textMetrics = {
-            text,
-            fontSize: fontSize / deviceScale,
-            lineHeight: commandView.getFloat32(
-              byteOffset + CMD_TEXT_OFFSET_LH,
-              true,
-            ) / deviceScale,
-            ascent: commandView.getFloat32(
-              byteOffset + CMD_TEXT_OFFSET_ASCENT,
-              true,
-            ) / deviceScale,
-            descent: commandView.getFloat32(
-              byteOffset + CMD_TEXT_OFFSET_DESCENT,
-              true,
-            ) / deviceScale,
-            baseline: {
-              x: geometry.x / deviceScale,
-              y: (geometry.y + baseline) / deviceScale,
-            },
-          };
-          logicalRectangle = {
-            x: geometry.x / deviceScale,
-            y: geometry.y / deviceScale,
-            width: width * fontSize / unitsPerEm / deviceScale,
-            height: commandView.getFloat32(
-              byteOffset + CMD_TEXT_OFFSET_LH,
-              true,
-            ) / deviceScale,
-          };
-        } else {
-          logicalRectangle = {
-            x: geometry.x / deviceScale,
-            y: geometry.y / deviceScale,
-            width: geometry.width / deviceScale,
-            height: geometry.height / deviceScale,
-          };
-        }
-
-        let affine = null;
-        let affineOffset = null;
-        if (
-          opcode === CMD_RECT &&
-          (commandView.getUint8(byteOffset + CMD_RECT_OFFSET_FLAGS) &
-              CMD_RECT_FLAG_TRANSFORM) !== 0
-        ) {
-          affineOffset = CMD_RECT_OFFSET_XFORM;
-        } else if (
-          opcode === CMD_TEXT &&
-          (textFlags & CMD_TEXT_FLAG_TRANSFORM) !== 0
-        ) {
-          affineOffset = CMD_TEXT_OFFSET_XFORM;
-        } else if (
-          opcode === CMD_IMAGE &&
-          (commandView.getUint8(byteOffset + CMD_IMAGE_OFFSET_FLAGS) &
-              CMD_IMAGE_FLAG_TRANSFORM) !== 0
-        ) {
-          affineOffset = CMD_IMAGE_OFFSET_XFORM;
-        } else if (
-          opcode === CMD_SVG_PATH &&
-          (commandView.getUint8(byteOffset + CMD_SVG_PATH_OFFSET_FLAGS) &
-              CMD_SVG_PATH_FLAG_TRANSFORM) !== 0
-        ) {
-          affineOffset = CMD_SVG_PATH_OFFSET_XFORM;
-        } else if (
-          opcode === CMD_BOX_SHADOW &&
-          (commandView.getUint8(byteOffset + CMD_BOX_SHADOW_OFFSET_FLAGS) &
-              CMD_BOX_SHADOW_FLAG_TRANSFORM) !== 0
-        ) {
-          affineOffset = CMD_BOX_SHADOW_OFFSET_XFORM;
-        }
-        if (affineOffset !== null) {
-          const affineAt = byteOffset + affineOffset;
-          affine = [
-            commandView.getFloat32(affineAt, true),
-            commandView.getFloat32(affineAt + 4, true),
-            commandView.getFloat32(affineAt + 8, true),
-            commandView.getFloat32(affineAt + 12, true),
-            commandView.getFloat32(affineAt + 16, true) / deviceScale,
-            commandView.getFloat32(affineAt + 20, true) / deviceScale,
-          ];
-        }
-
-        // The group-derived fields change only at a group push or pop; the
-        // operations between share them (consumers only read them).
-        if (activeGroupState === null) {
-          const activeGroups = compositingGroupStack.map(({ group }) => group);
-          activeGroupState = {
-            opacity: activeGroups.reduce(
-              (opacity, group) => group.opacity === undefined ? opacity : opacity * group.opacity,
-              1,
-            ),
-            blendMode: activeGroups.findLast((group) => group.blendMode !== undefined)?.blendMode ??
-              "normal",
-            compositingGroupIdentifiers: activeGroups.map((group) => group.identifier),
-            stackingContextIdentifiers: activeGroups
-              .filter((group) => group.stackingContext)
-              .map((group) => group.identifier),
-          };
-        }
-        const kind = opcode === CMD_TEXT &&
-            (textFlags & CMD_TEXT_FLAG_TEXT_SHADOW) !== 0
-          ? "text-shadow"
-          : COMMAND_NAMES.get(opcode);
-        // Two literals, not one with a conditional spread: the spread made
-        // every operation a slow dictionary object (a page of color glyph
-        // layers is thousands of them a frame). The text fields keep their
-        // place after logicalRectangle.
-        const operation = textMetrics === null
-          ? {
-            operationIndex: operations.length,
-            commandIndex,
-            kind,
-            nodeIndex: currentNodeIndex,
-            logicalRectangle,
-            affine,
-            clipEntries: currentClipEntries,
-            opacity: activeGroupState.opacity,
-            blendMode: activeGroupState.blendMode,
-            compositingGroupIdentifiers: activeGroupState.compositingGroupIdentifiers,
-            stackingContextIdentifiers: activeGroupState.stackingContextIdentifiers,
-          }
-          : {
-            operationIndex: operations.length,
-            commandIndex,
-            kind,
-            nodeIndex: currentNodeIndex,
-            logicalRectangle,
-            text: textMetrics.text,
-            fontSize: textMetrics.fontSize,
-            lineHeight: textMetrics.lineHeight,
-            ascent: textMetrics.ascent,
-            descent: textMetrics.descent,
-            baseline: textMetrics.baseline,
-            affine,
-            clipEntries: currentClipEntries,
-            opacity: activeGroupState.opacity,
-            blendMode: activeGroupState.blendMode,
-            compositingGroupIdentifiers: activeGroupState.compositingGroupIdentifiers,
-            stackingContextIdentifiers: activeGroupState.stackingContextIdentifiers,
-          };
-        if (lazyGlyphs !== null) {
-          defineLazyGlyphs(operation, lazyGlyphs, deviceScale);
-        }
-        operations.push(operation);
-
-        if (
-          opcode === CMD_RECT || opcode === CMD_IMAGE ||
-          opcode === CMD_SVG_PATH
-        ) {
-          boxes.push({
-            kind: "shape",
-            box: logicalRectangle,
-            affine,
-          });
-        } else if (
-          opcode === CMD_TEXT &&
-          (textFlags & CMD_TEXT_FLAG_TEXT_SHADOW) === 0
-        ) {
-          boxes.push({
-            kind: "text-run",
-            box: logicalRectangle,
-            affine,
-          });
-        }
-      }
-      byteOffset += commandByteSize(commandView, byteOffset);
-    }
-    // Clip pushes replace the complete raster state. A terminal state needs
-    // no restoring pop because the command stream is discarded after replay.
-    if (compositingGroupStack.length !== 0) {
-      throw new Error("paint artifact: unclosed compositing group");
-    }
-    commandDecodeWork.commands += commandIndex;
-    return {
-      kind: "paint",
-      viewport: { width: scene.width, height: scene.height },
-      boxes,
-      operations,
-      compositingGroups,
-    };
-  }
-
-  // The text operations of the commands in [start, end) of a command
-  // stream, as the text geometry artifact holds them, and the byte offset
-  // of each one's command. A text command reports the node of the last
-  // node marker before it in the range; text shadows are not text
-  // operations. The glyphs stay lazy, as the paint artifact's are: a frame
-  // reads those of the text owners whose geometry it rebuilds, not every
-  // operation's. Geometry deliberately has no opacity or blend fields:
-  // those may change while these owned glyph and rectangle facts do not.
-  function decodeTextGeometryOperations(
-    commandView,
-    start,
-    end,
-    emittedNodes,
-    deviceScale,
-    glyphBuffer,
-    frameTextRuns,
-  ) {
-    const glyphView = new DataView(
-      glyphBuffer.buffer,
-      glyphBuffer.byteOffset,
-      glyphBuffer.byteLength,
-    );
-    const operations = [];
-    const offsets = [];
-    let currentNodeIndex = null;
-    let currentRunIndex = null;
-    let byteOffset = start;
-    while (byteOffset < end) {
-      const opcode = commandView.getUint8(byteOffset);
-      commandDecodeWork.commands++;
-      if (opcode === CMD_SET_NODE) {
-        const emittedNodeIndex = commandView.getUint32(
-          byteOffset + CMD_SET_NODE_OFFSET_INDEX,
-          true,
-        );
-        currentRunIndex = emittedNodeIndex;
-        currentNodeIndex = frameTextRuns[emittedNodeIndex]?.sourceId ??
-          emittedNodes[emittedNodeIndex]?._inspectionSourceNodeIndex ??
-          emittedNodeIndex;
-      } else if (
-        opcode === CMD_TEXT &&
-        (commandView.getUint8(byteOffset + CMD_TEXT_OFFSET_FLAGS) &
-            CMD_TEXT_FLAG_TEXT_SHADOW) === 0
-      ) {
-        if (currentNodeIndex === null) {
-          throw new Error(
-            `text geometry: the text command at byte ${byteOffset} has no node marker before it in bytes ${start}..${end}`,
-          );
-        }
-        const geometry = decodeCommandGeometry(commandView, byteOffset, opcode);
-        const glyphCount = commandView.getUint16(
-          byteOffset + CMD_TEXT_OFFSET_GCOUNT,
-          true,
-        );
-        const glyphOffset = commandView.getUint32(
-          byteOffset + CMD_TEXT_OFFSET_GOFF,
-          true,
-        );
-        const fontSize = engine.exports.used_font_size(commandView.getFloat32(
-          byteOffset + CMD_TEXT_OFFSET_FSIZE,
-          true,
-        ));
-        const unitsPerEm = commandView.getUint16(
-          byteOffset + CMD_TEXT_OFFSET_UPEM,
-          true,
-        );
-        let width = 0;
-        let clusterEnd = 0;
-        for (let glyphIndex = 0; glyphIndex < glyphCount; glyphIndex++) {
-          const entryOffset = glyphOffset + glyphIndex * GLYPH_ENTRY_SIZE;
-          width = Math.max(
-            width,
-            glyphView.getFloat32(entryOffset + GLYPH_OFFSET_X_OFFSET, true) +
-              glyphView.getFloat32(entryOffset + GLYPH_OFFSET_X_ADVANCE, true),
-          );
-          clusterEnd = Math.max(
-            clusterEnd,
-            glyphView.getUint32(entryOffset + GLYPH_OFFSET_CLUSTER_END, true),
-          );
-        }
-        const preparedRun = frameTextRuns[currentRunIndex];
-        if (!preparedRun && clusterEnd > 0) {
-          throw new Error(
-            `text geometry: text command under node ${currentRunIndex} (${
-              emittedNodes[currentRunIndex]?.display ?? "absent"
-            }) names source bytes up to ${clusterEnd}, but the node carries no prepared text run`,
-          );
-        }
-        const affine = (commandView.getUint8(byteOffset + CMD_TEXT_OFFSET_FLAGS) &
-            CMD_TEXT_FLAG_TRANSFORM) === 0
-          ? null
-          : Object.freeze(Array.from({ length: 6 }, (_, index) => {
-            const value = commandView.getFloat32(
-              byteOffset + CMD_TEXT_OFFSET_XFORM + index * 4,
-              true,
-            );
-            return index < 4 ? value : value / deviceScale;
-          }));
-        const glyphSource = {};
-        defineLazyGlyphs(glyphSource, {
-          entries: glyphBuffer.slice(
-            glyphOffset,
-            glyphOffset + glyphCount * GLYPH_ENTRY_SIZE,
-          ),
-          count: glyphCount,
-          x: geometry.x,
-          fontSize,
-          unitsPerEm,
-          preparedBytes: preparedRun?.bytes ?? NO_SOURCE_BYTES,
-        }, deviceScale);
-        operations.push(Object.freeze({
-          kind: "text",
-          nodeIndex: currentNodeIndex,
-          logicalRectangle: Object.freeze({
-            x: geometry.x / deviceScale,
-            y: geometry.y / deviceScale,
-            width: width * fontSize / unitsPerEm / deviceScale,
-            height: commandView.getFloat32(byteOffset + CMD_TEXT_OFFSET_LH, true) /
-              deviceScale,
-          }),
-          affine,
-          glyphCount,
-          get glyphs() {
-            return glyphSource.glyphs;
-          },
-        }));
-        offsets.push(byteOffset);
-      }
-      byteOffset += commandByteSize(commandView, byteOffset);
-    }
-    if (byteOffset !== end) {
-      throw new Error(
-        `text geometry: the commands of bytes ${start}..${end} end at byte ${byteOffset}`,
-      );
-    }
-    return { operations, offsets };
-  }
-
-  // The text geometry of a stream that edits made from the previous
-  // stream: the previous operations outside the edited ranges, at their
-  // moved offsets, and the operations decoded from each edit's new bytes.
-  // Edits are in stream order: { oldOffset, oldBytes, offset, byteLength }.
-  // The previous artifact itself when no edit held or holds a text
-  // operation.
-  function spliceTextGeometry(
-    previousArtifact,
-    previousOffsets,
-    edits,
-    commandView,
-    emittedNodes,
-    deviceScale,
-    glyphBuffer,
-    frameTextRuns,
-  ) {
-    const lowerBound = (offset) => {
-      let low = 0;
-      let high = previousOffsets.length;
-      while (low < high) {
-        const middle = (low + high) >>> 1;
-        if (previousOffsets[middle] < offset) low = middle + 1;
-        else high = middle;
-      }
-      return low;
-    };
-    const replaced = edits.map((edit) => ({
-      first: lowerBound(edit.oldOffset),
-      end: lowerBound(edit.oldOffset + edit.oldBytes),
-      decoded: decodeTextGeometryOperations(
-        commandView,
-        edit.offset,
-        edit.offset + edit.byteLength,
-        emittedNodes,
-        deviceScale,
-        glyphBuffer,
-        frameTextRuns,
-      ),
-    }));
-    const operationsChanged = replaced.some(({ first, end, decoded }) =>
-      first !== end || decoded.operations.length !== 0
-    );
-    const count = replaced.reduce(
-      (total, { first, end, decoded }) =>
-        total - (end - first) + decoded.operations.length,
-      previousOffsets.length,
-    );
-    const offsets = new Uint32Array(count);
-    const operations = operationsChanged ? new Array(count) : null;
-    let cursor = 0;
-    let previousIndex = 0;
-    let shift = 0;
-    const keep = (end) => {
-      for (; previousIndex < end; previousIndex++, cursor++) {
-        offsets[cursor] = previousOffsets[previousIndex] + shift;
-        if (operations !== null) {
-          operations[cursor] = previousArtifact.operations[previousIndex];
-        }
-      }
-    };
-    for (let index = 0; index < edits.length; index++) {
-      const { first, end, decoded } = replaced[index];
-      keep(first);
-      for (let added = 0; added < decoded.operations.length; added++, cursor++) {
-        offsets[cursor] = decoded.offsets[added];
-        operations[cursor] = decoded.operations[added];
-      }
-      previousIndex = end;
-      shift += edits[index].byteLength - edits[index].oldBytes;
-    }
-    keep(previousOffsets.length);
-    return {
-      artifact: operations === null ? previousArtifact : Object.freeze({
-        kind: "text-geometry",
-        operations: Object.freeze(operations),
-      }),
-      offsets,
-    };
-  }
 
   // The engine row of scene node $sceneIndex: the same index unless a
   // normalization (order-modified children, SVG use) renumbered the rows,
@@ -5539,23 +3256,13 @@ export async function createSceneRendererRuntime({
     );
   }
 
-  // Marks the 64-device-px raster tiles over a $width x $height target that
-  // a device-px rectangle covers. The raster rounds an edge to the device
-  // grid inside the pixel the edge cuts, so the right and bottom edges are
-  // exclusive. A caller grows a rectangle whose shape antialiases past it.
-  function markDirtyRectangle(tiles, width, height, x, y, w, h) {
-    if (!(w > 0) || !(h > 0)) return;
-    const columns = Math.ceil(width / 64);
-    const rows = Math.ceil(height / 64);
-    const left = Math.max(0, Math.floor(x / 64));
-    const top = Math.max(0, Math.floor(y / 64));
-    const right = Math.min(columns - 1, Math.ceil((x + w) / 64) - 1);
-    const bottom = Math.min(rows - 1, Math.ceil((y + h) / 64) - 1);
-    for (let row = top; row <= bottom; row++) {
-      for (let column = left; column <= right; column++) {
-        tiles[row * columns + column] = 1;
-      }
-    }
+  // A copy of the raster tile map $tiles with the engine's damage marked
+  // (raster-tiles.watpart). An empty map has no tile to mark.
+  function rasterDirtyTiles(exportName, tiles, ...parameters) {
+    if (tiles.byteLength === 0) return tiles;
+    core.status(exportName, ...core.byteInput(tiles), ...parameters);
+    const pointer = core.exports.abi_output_pointer();
+    return core.refreshBytes().slice(pointer, pointer + core.exports.abi_output_length());
   }
 
   // `page` lists one page of a paged scene (emitPageCommands); null lists
@@ -5584,12 +3291,12 @@ export async function createSceneRendererRuntime({
         // (engine-layout.watpart $shapeFeaturesBuild).
         nodeFeatures: Array.from(scene.nodes, (_, index) => {
           const count = engine.exports.shape_features(index);
-          const view = new DataView(engine.memory.buffer, engine.exports.shape_features_pointer(), count * 16);
+          const view = new DataView(engine.memory.buffer, engine.exports.shape_features_pointer(), count * SHAPE_FEATURE_SIZE);
           return Array.from({ length: count }, (_, feature) => {
-            const tag = view.getUint32(feature * 16, true);
+            const tag = view.getUint32(feature * SHAPE_FEATURE_SIZE + SHAPE_FEATURE_TAG, true);
             return [
               String.fromCharCode(tag >>> 24, (tag >>> 16) & 0xFF, (tag >>> 8) & 0xFF, tag & 0xFF),
-              view.getUint32(feature * 16 + 4, true),
+              view.getUint32(feature * SHAPE_FEATURE_SIZE + SHAPE_FEATURE_VALUE, true),
             ];
           });
         }),
@@ -5639,7 +3346,10 @@ export async function createSceneRendererRuntime({
         );
         const glyphIds = new Array(glyphCount);
         const advances = new Array(glyphCount);
+        // Where each glyph draws: its pen plus its ink offset (the
+        // HarfBuzz offsets, glyphInkY up), in the units of the advances.
         const glyphPositions = new Array(glyphCount);
+        const glyphInkY = new Array(glyphCount);
         const clusters = new Array(glyphCount);
         let clusterStart = Number.MAX_SAFE_INTEGER;
         let clusterEnd = 0;
@@ -5649,8 +3359,12 @@ export async function createSceneRendererRuntime({
             entryOffset + GLYPH_OFFSET_ID,
             true,
           );
-          glyphPositions[glyphIndex] = glyphView.getFloat32(
-            entryOffset + GLYPH_OFFSET_X_OFFSET,
+          glyphPositions[glyphIndex] = Math.fround(
+            glyphView.getFloat32(entryOffset + GLYPH_OFFSET_X_OFFSET, true) +
+              glyphView.getFloat32(entryOffset + GLYPH_OFFSET_INK_X, true),
+          ) * fontSize / unitsPerEm;
+          glyphInkY[glyphIndex] = glyphView.getFloat32(
+            entryOffset + GLYPH_OFFSET_INK_Y,
             true,
           ) * fontSize / unitsPerEm;
           advances[glyphIndex] = glyphView.getFloat32(
@@ -5680,6 +3394,8 @@ export async function createSceneRendererRuntime({
             preparedBytes.subarray(clusterStart, clusterEnd),
           );
         textRun = {
+          // The scene node whose text the run paints (its CMD_SET_NODE).
+          nodeIndex: currentNodeIndex,
           text,
           characterCount: text.length,
           // The node's whole prepared text, which clusters index as UTF-8
@@ -5696,11 +3412,17 @@ export async function createSceneRendererRuntime({
           letterSpacing: emitted.textRuns[currentNodeIndex]?.letterSpacing ?? 0,
           glyphIds,
           glyphPositions,
+          glyphInkY,
           advances,
           clusters,
           fontSize,
           unitsPerEm,
           fontWeight: emitted.view.getUint8(byteOffset + CMD_TEXT_OFFSET_WEIGHT) * 100,
+          // The variation instance of the glyph outlines: the optical size
+          // (CSS px) the face was shaped at, whether font-optical-sizing
+          // is none, and the font-variation-settings pairs.
+          opticalSize: emitted.view.getFloat32(byteOffset + CMD_TEXT_OFFSET_OPSZ, true),
+          ...textVariationControl(engine, emitted.view.getUint16(byteOffset + CMD_TEXT_OFFSET_VARIATIONS, true)),
           fontStyle: emitted.view.getUint8(byteOffset + CMD_TEXT_OFFSET_STYLE) === 1
             ? "italic"
             : "normal",
@@ -5717,7 +3439,7 @@ export async function createSceneRendererRuntime({
                 CMD_TEXT_FLAG_TRANSFORM) === 0
               ? null
               : Array.from({ length: 6 }, (_, index) =>
-                emitted.view.getFloat32(byteOffset + CMD_TEXT_OFFSET_XFORM + index * 4, true)
+                emitted.view.getFloat32(byteOffset + CMD_TEXT_OFFSET_XFORM + index * F32, true)
               ),
           textShadow:
             (emitted.view.getUint8(byteOffset + CMD_TEXT_OFFSET_FLAGS) &
@@ -5734,14 +3456,15 @@ export async function createSceneRendererRuntime({
         }
         clipStack.pop();
       }
-      if (GROUP_PAIRS.has(opcode)) {
+      const popOpcode = core.exports.command_group_close(opcode);
+      if (popOpcode !== 0) {
         const group = {
-          kind: COMMAND_NAMES.get(opcode).slice(5),
+          kind: core.string("command_group_kind", opcode),
           startCommandIndex: commandIndex,
           endCommandIndex: null,
         };
         groups.push(group);
-        groupStack.push({ group, popOpcode: GROUP_PAIRS.get(opcode) });
+        groupStack.push({ group, popOpcode });
       } else if (
         groupStack.length > 0 &&
         opcode === groupStack[groupStack.length - 1].popOpcode
@@ -5753,7 +3476,7 @@ export async function createSceneRendererRuntime({
         byteOffset,
         byteLength,
         opcode,
-        name: COMMAND_NAMES.get(opcode),
+        name: commandName(opcode),
         clipDepth: clipStack.length,
         groupDepth: groupStack.length,
         clipEntries,
@@ -5787,32 +3510,19 @@ export async function createSceneRendererRuntime({
     if (!Number.isInteger(tileSize) || tileSize <= 0) {
       throw new TypeError("tileSize must be a positive integer");
     }
-    const columns = Math.ceil(frame.width / tileSize);
-    const rows = Math.ceil(frame.height / tileSize);
-    const tileMap = new Array(columns * rows).fill(false);
+    const frameReason = frame.invalidationReason ??
+      core.string("frame_invalidation_reason", frame.frameSequence ?? NaN);
     const dirtyRectangles = (frame.dirtyRectangles ?? frame.dirtyRects ?? [])
-      .map(
-        (rectangle) => ({
-          ...rectangle,
-          reason: rectangle.reason ?? frame.invalidationReason ??
-            (frame.frameSequence === 1
-              ? "initial-render"
-              : "render-state-change"),
-        }),
-      );
-    for (const rectangle of dirtyRectangles) {
-      const firstColumn = Math.floor(rectangle.x / tileSize);
-      const lastColumn = Math.ceil((rectangle.x + rectangle.w) / tileSize);
-      const firstRow = Math.floor(rectangle.y / tileSize);
-      const lastRow = Math.ceil((rectangle.y + rectangle.h) / tileSize);
-      for (let row = firstRow; row < lastRow; row++) {
-        for (let column = firstColumn; column < lastColumn; column++) {
-          if (row >= 0 && row < rows && column >= 0 && column < columns) {
-            tileMap[row * columns + column] = true;
-          }
-        }
-      }
-    }
+      .map((rectangle) => ({ ...rectangle, reason: rectangle.reason ?? frameReason }));
+    // The tiles the dirty rectangles cover (frame_invalidation_tiles).
+    const rectangles = new Float64Array(dirtyRectangles.length * 4);
+    dirtyRectangles.forEach((rectangle, index) => rectangles.set([rectangle.x, rectangle.y, rectangle.w, rectangle.h], index * 4));
+    core.status("frame_invalidation_tiles", frame.width, frame.height, tileSize,
+      ...core.byteInput(new Uint8Array(rectangles.buffer)));
+    const output = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), core.exports.abi_output_length());
+    const columns = output.getUint32(FRAME_TILES.COLUMNS, true);
+    const rows = output.getUint32(FRAME_TILES.ROWS, true);
+    const tileMap = Array.from({ length: columns * rows }, (_, tile) => output.getUint8(FRAME_TILES.MAP + tile) !== 0);
     const value = {
       kind: "invalidation",
       frameSequence: frame.frameSequence ?? null,
@@ -6005,7 +3715,7 @@ export async function createSceneRendererRuntime({
 
   // The number of records, one per command, of a prepared raster plan.
   function rasterPlanRecordCount(plan) {
-    return new DataView(engine.memory.buffer).getUint32(plan + 12, true);
+    return new DataView(engine.memory.buffer).getUint32(plan + RASTER_PLAN_HEADER_RECORD_COUNT, true);
   }
 
   async function renderScenePixelsNow(
@@ -6065,10 +3775,23 @@ export async function createSceneRendererRuntime({
       // The engine decides every break; the frame reports whether a later
       // page follows. null paints the continuous document.
       page = null,
+      // The scene index of the root whose subtree the raster draws, or
+      // null for the whole scene. Layout and emission still cover the whole
+      // scene; raster_commands_select copies the subtree's commands and the
+      // groups around them, and the plan rasters only those.
+      selectedSceneIndex = null,
+      // The paint group index of the layer that the raster draws, with all
+      // it holds, or null. It excludes selectedSceneIndex.
+      selectedLayer = null,
+      // With node markers captured: the result carries the emission's text
+      // geometry capture (`textCapture`, geometry_text_capture), which the
+      // caller releases (geometry_text_release).
+      textCapture: textCaptureRequested = false,
       ...rasterOptions
     } = renderOptions;
     const textOperationsRequired = captureTextGeometry;
-    const captureNodeMarkers = capturePaintArtifact || textOperationsRequired;
+    // A selection reads the node markers to find the subtree's commands.
+    const captureNodeMarkers = capturePaintArtifact || textOperationsRequired || selectedSceneIndex !== null;
     // Only coordinate inspection requires bytes with current sticky offsets.
     const artifactCoordinatesRead = capturePaintArtifact ||
       (captureTextGeometry && textGeometryArtifactRead);
@@ -6078,24 +3801,16 @@ export async function createSceneRendererRuntime({
     // version for this frame's device pixels.
     svgImageDensity = Math.max(1, deviceScale);
     await selectBrokenImageIcon();
-    if (page !== null) {
-      if (!(page.height > 0) || !Number.isInteger(page.index) || page.index < 0) {
-        throw new RangeError(
-          `page needs a positive height and a page index of 0 or more; got height ${page.height}, index ${page.index}`,
-        );
-      }
-    }
-    if (visibleRectangle !== null) {
-      const { x, y, width, height } = visibleRectangle;
-      if (
-        !(width > 0) || !(height > 0) || !Number.isFinite(x) ||
-        !Number.isFinite(y)
-      ) {
-        throw new RangeError(
-          "visibleRectangle requires finite x/y and positive width/height",
-        );
-      }
-    }
+    core.statusRaw("frame_render_target_check", ...core.valueListInput([
+      page === null ? null : Number(page.height),
+      page === null ? null : String(page.height),
+      page === null ? null : page.index,
+      page === null ? null : String(page.index),
+      visibleRectangle === null ? null : visibleRectangle.x,
+      visibleRectangle === null ? null : visibleRectangle.y,
+      visibleRectangle === null ? null : Number(visibleRectangle.width),
+      visibleRectangle === null ? null : Number(visibleRectangle.height),
+    ]));
     const logicalTargetWidth = visibleRectangle?.width ?? scene.width;
     const logicalTargetHeight = visibleRectangle?.height ?? scene.height;
     if (!renderContext) {
@@ -6123,14 +3838,11 @@ export async function createSceneRendererRuntime({
       ? null
       : new Set(changedNodeIndices);
     for (const index of forceGenerationNodeIndices ?? []) changed?.add(index);
-    for (const index of changed ?? []) {
-      if (
-        !Number.isInteger(index) || index < 0 || index >= scene.nodes.length
-      ) {
-        throw new RangeError(
-          `Changed node index ${index} is outside a scene of ${scene.nodes.length} nodes`,
-        );
-      }
+    if (changed !== null && changed.size > 0) {
+      core.statusRaw("frame_changed_rows_check", ...core.valueListInput([
+        scene.nodes.length,
+        ...[...changed].flatMap((index) => [index, `${index}`]),
+      ]), changed.size);
     }
     const provenanceMatches = scene.changedRows == null ||
       (scene.publicationRevision !== undefined &&
@@ -6154,9 +3866,7 @@ export async function createSceneRendererRuntime({
       previous.width === scene.width && previous.height === scene.height &&
       !capturePaintArtifact &&
       previous.captureNodeMarkers === captureNodeMarkers &&
-      (!textOperationsRequired || previous.textGeometryArtifact !== null) &&
-      (!scene.imageSources?.size ||
-        previous.imageSources === scene.imageSources);
+      canvasSourcesHold(previous.imageSourceRevisions, scene.imageSources);
     const previousResourcesHold = previousRowInputsHold &&
       previous.page?.height === page?.height &&
       previous.page?.index === page?.index;
@@ -6546,8 +4256,7 @@ export async function createSceneRendererRuntime({
       )
       : null;
     // Commands moved: an edit's new bytes differ in size from its old.
-    const commandsMoved = retainedCommands &&
-      ranges.some((range) => range.byteLength !== range.oldBytes);
+    const commandsMoved = retainedCommands && engine.exports.retained_command_changes_moved() !== 0;
     const rasterResourceRevision = reusedCommands
       ? previous.rasterResourceRevision
       : {};
@@ -6563,70 +4272,36 @@ export async function createSceneRendererRuntime({
     if (!engineDamageOwned && !authoritativeDirtyTiles && renderWriteOwner !== null) {
       rasterOptions.dirtyTiles = null;
     }
-    if (retainedCommands && rasterOptions.dirtyTiles === undefined) {
-      rasterOptions.dirtyTiles = new Uint8Array(
-        Math.ceil(pxW / 64) * Math.ceil(pxH / 64),
-      );
+    // The damage tracks the document, not the selection: a selected frame,
+    // and the first frame after one, rasterizes every tile.
+    const selected = selectedSceneIndex !== null || selectedLayer !== null;
+    if (selected || previous?.selected) {
+      rasterOptions.dirtyTiles = null;
     }
-    if (rasterOptions.dirtyTiles && !authoritativeDirtyTiles) {
-      // The engine's dirty map covers the raster target's grid
-      // (writeTileGrid): 64 device px tiles, or a multiple of 64 that
-      // spans that many raster tiles across and down.
-      const damageMeasurement = globalThis[domMeasurementKey];
+    if (retainedCommands && rasterOptions.dirtyTiles === undefined) {
+      rasterOptions.dirtyTiles = new Uint8Array(core.exports.frame_raster_tile_count(pxW, pxH));
+    }
+    // The raster tile map also repaints the engine's damage: its dirty map
+    // of this target's grid (writeTileGrid), unless the caller's tiles are
+    // authoritative, and its paint damage in every frame mode.
+    if (rasterOptions.dirtyTiles) {
+      const damageMeasurement = authoritativeDirtyTiles ? null : globalThis[domMeasurementKey];
       const damageStart = damageMeasurement ? hostNow() : 0;
-      const combinedDirtyTiles = rasterOptions.dirtyTiles.slice();
-      const dirtyMapAddress = engine.exports.tile_dirty_map_base();
-      const engineColumns = Math.ceil(pxW / engineTileSize);
-      const engineRows = Math.ceil(pxH / engineTileSize);
-      const span = engineTileSize / 64;
-      const physicalColumns = Math.ceil(pxW / 64);
-      const physicalRows = Math.ceil(pxH / 64);
-      for (let index = 0; index < engineColumns * engineRows; index++) {
-        const byte = view.getUint8(dirtyMapAddress + (index >>> 3));
-        if (!(byte & (1 << (index & 7)))) continue;
-        const firstColumn = (index % engineColumns) * span;
-        const firstRow = ((index / engineColumns) | 0) * span;
-        const lastColumn = Math.min(physicalColumns, firstColumn + span);
-        const lastRow = Math.min(physicalRows, firstRow + span);
-        for (let row = firstRow; row < lastRow; row++) {
-          for (let column = firstColumn; column < lastColumn; column++) {
-            combinedDirtyTiles[row * physicalColumns + column] = 1;
-          }
-        }
-      }
+      rasterOptions.dirtyTiles = rasterDirtyTiles(
+        "frame_raster_tiles", rasterOptions.dirtyTiles, pxW, pxH,
+        engineTileSize, authoritativeDirtyTiles ? 0 : 1, deviceScale,
+        visibleRectangle?.x ?? 0, visibleRectangle?.y ?? 0,
+      );
       if (damageMeasurement) {
         damageMeasurement.record({
           category: "damage",
           operation: "dirty-tiles.merge",
           direction: "engine-to-host",
-          bytes: engineColumns * engineRows,
+          bytes: Math.ceil(pxW / engineTileSize) * Math.ceil(pxH / engineTileSize),
           allocations: 1,
-          allocationBytes: combinedDirtyTiles.byteLength,
+          allocationBytes: rasterOptions.dirtyTiles.byteLength,
           milliseconds: hostNow() - damageStart,
         });
-      }
-      rasterOptions.dirtyTiles = combinedDirtyTiles;
-    }
-    // The engine's paint damage (a caret that moved, appeared or went)
-    // repaints in every frame mode: a pure-scroll frame's declared tiles,
-    // which leave the engine's dirty map out, include it too.
-    if (rasterOptions.dirtyTiles) {
-      const damageCount = engine.exports.paint_damage_count();
-      if (damageCount > 0) {
-        rasterOptions.dirtyTiles = rasterOptions.dirtyTiles.slice();
-      }
-      for (let index = 0; index < damageCount; index++) {
-        markDirtyRectangle(
-          rasterOptions.dirtyTiles,
-          pxW,
-          pxH,
-          engine.exports.paint_damage_value(index, 0) * deviceScale -
-            (visibleRectangle?.x ?? 0) * deviceScale,
-          engine.exports.paint_damage_value(index, 1) * deviceScale -
-            (visibleRectangle?.y ?? 0) * deviceScale,
-          engine.exports.paint_damage_value(index, 2) * deviceScale,
-          engine.exports.paint_damage_value(index, 3) * deviceScale,
-        );
       }
     }
     // Geometry capture needs owned text runs on a full frame and on a
@@ -6634,8 +4309,7 @@ export async function createSceneRendererRuntime({
     // their runs). Certified paint-only replay keeps the immutable geometry
     // artifact, so neither text run copying nor command decoding repeats
     // during animation or scrolling.
-    const splicedBlocks = retainedCommands &&
-      ranges.some((range) => range.kind === 0);
+    const splicedBlocks = retainedCommands && engine.exports.retained_command_changes_spliced() !== 0;
     const frameTextRuns = captureNodeMarkers &&
         (!reusedCommands || splicedBlocks)
       ? currentTextBatch.copyRuns()
@@ -6643,6 +4317,9 @@ export async function createSceneRendererRuntime({
     // A preparation reads the laid-out engine rows here, before the raster
     // awaits (examples/animation-playground-sandom.js keeps its result).
     preparation.inspect?.();
+    // The scan writes the index of each image size into the commands, so
+    // the snapshot below copies them with those indices.
+    const drawnResources = drawnImagesAndSlots(bytes);
     // FRAME SNAPSHOT — the frame owns its bytes. A synchronous layout
     // getter (getBoundingClientRect → layoutTreeBoxesSync →
     // emitSceneCommandsSync) can barge into the SHARED engine while this
@@ -6650,8 +4327,8 @@ export async function createSceneRendererRuntime({
     // glyph, gradient-stop, and scroll buffers for a DIFFERENT scene.
     // The promise chain (runExclusiveEngineOperation) cannot serialize a
     // synchronous caller, so live views over engine memory across awaits
-    // are corrupted frames waiting to happen (found via react_select:
-    // createPaintArtifact walked another emit's marker-free stream).
+    // are corrupted frames waiting to happen (found via react_select: the
+    // paint decoder walked another emit's marker-free stream).
     // Copy everything the rest of this frame reads, before ANY await.
     // A retained frame whose edits moved commands copies the whole spliced
     // stream; one whose edits kept every offset patches the previous copy.
@@ -6676,6 +4353,13 @@ export async function createSceneRendererRuntime({
         );
       }
     }
+    // The text geometry of the emission (geometry_text_capture), taken
+    // before any await: another engine writer may emit after it. The
+    // caller releases it (geometry_text_release).
+    const textCapture = captureNodeMarkers && textCaptureRequested
+      ? core.status("geometry_text_capture", bytes, currentTextBatch.resultsBase(),
+        nodes[0]?._corePublication?.handle ?? 0)
+      : 0;
     const scrollTable = retainedCommands
       ? previous.scrollTable
       : new Float32Array(
@@ -6684,10 +4368,14 @@ export async function createSceneRendererRuntime({
           scrollTableBase + scrollTableSize,
         ),
       );
+    // The gradient stop pool moves to a larger block when a frame's stops
+    // need more (gradient_stop_pool_base), so its base and size are read
+    // from the engine at each use.
+    const gradientStopPoolBase = engine.exports.gradient_stop_pool_base();
     const gradientStopPool = new Uint8Array(
       engine.memory.buffer.slice(
-        GRADIENT_STOP_POOL_BASE,
-        GRADIENT_STOP_POOL_BASE + GRADIENT_STOP_POOL_SIZE,
+        gradientStopPoolBase,
+        gradientStopPoolBase + engine.exports.gradient_stop_pool_size(),
       ),
     );
     // The layout boxes too: a render orphaned by a rejected Promise.all
@@ -6711,8 +4399,8 @@ export async function createSceneRendererRuntime({
     // Generate glyph atlases on the CPU for every raster backend. The WebGPU
     // atlas generator is not cross-browser safe: Chrome produced empty atlases,
     // Firefox produced partial atlases, and Safari produced complete atlases.
-    await prepareColorGlyphBitmaps(cmdView, bytes, deviceScale);
-    await selectSvgImageRasters(cmdView, bytes, Math.max(1, deviceScale), svgImageTimings);
+    await prepareColorGlyphBitmaps(drawnResources.slots, deviceScale);
+    await selectSvgImageRasters(drawnResources.images, Math.max(1, deviceScale), svgImageTimings);
     let colorGlyphFrame = null;
     synchronizeImageRasterResources();
     let rasterPlan = null;
@@ -6748,9 +4436,6 @@ export async function createSceneRendererRuntime({
       };
     let svgPathAtlas;
     let paintArtifact = null;
-    let textGeometryArtifact = null;
-    // The byte offset of each text geometry operation's command.
-    let textOperationOffsets = null;
     let rasterMilliseconds = 0;
     // This render's share of the work counters that every render of this
     // runtime adds to.
@@ -6761,52 +4446,21 @@ export async function createSceneRendererRuntime({
     try {
       colorGlyphFrame = colorGlyphCache.prepare(cmdView, bytes, deviceScale);
       const rasterStartedAt = hostNow();
-      // The command stream is CSS px natively; the paint artifact's
-      // logical rectangles need no division.
+      // The core decodes the frame's paint command stream into a retained
+      // paint record (src/dom/paint-projection.js); the frame holds its
+      // facade.
       paintArtifact = capturePaintArtifact
-        ? createPaintArtifact(
-          cmdView,
-          bytes,
-          scene,
+        ? capturePaintRecord(core, {
+          commands: new Uint8Array(cmdView.buffer, cmdView.byteOffset, bytes),
+          glyphs: glyphBuffer,
           nodes,
-          1,
-          glyphBuffer,
-          frameTextRuns,
-        )
+          textRuns: frameTextRuns,
+          sceneChildren: scene.nodes.map((node) => node.children ?? []),
+          width: scene.width,
+          height: scene.height,
+        })
         : null;
-      if (textOperationsRequired) {
-        if (reusedCommands && !splicedBlocks) {
-          textGeometryArtifact = previous.textGeometryArtifact;
-          textOperationOffsets = previous.textOperationOffsets;
-        } else if (splicedBlocks) {
-          ({ artifact: textGeometryArtifact, offsets: textOperationOffsets } =
-            spliceTextGeometry(
-              previous.textGeometryArtifact,
-              previous.textOperationOffsets,
-              ranges.filter((range) => range.kind === 0),
-              cmdView,
-              nodes,
-              1,
-              glyphBuffer,
-              frameTextRuns,
-            ));
-        } else {
-          const decoded = decodeTextGeometryOperations(
-            cmdView,
-            0,
-            bytes,
-            nodes,
-            1,
-            glyphBuffer,
-            frameTextRuns,
-          );
-          textGeometryArtifact = Object.freeze({
-            kind: "text-geometry",
-            operations: Object.freeze(decoded.operations),
-          });
-          textOperationOffsets = Uint32Array.from(decoded.offsets);
-        }
-      }
+      if (paintArtifact !== null) commandDecodeWork.commands += paintArtifact.commandCount;
       const images = buildImageRenderResources();
       const atlasStartedAt = svgPathStageTimings && !reusedCommands
         ? hostNow()
@@ -6832,7 +4486,7 @@ export async function createSceneRendererRuntime({
         scrollTableBase,
         scrollTable.length,
       ).set(scrollTable);
-      engineBytes.set(gradientStopPool, GRADIENT_STOP_POOL_BASE);
+      engineBytes.set(gradientStopPool, engine.exports.gradient_stop_pool_base());
       // The scrollbar rows the plan expands the scrollbar markers from:
       // each painted part under its scroller's engine row, -1 for the
       // viewport's.
@@ -6874,6 +4528,8 @@ export async function createSceneRendererRuntime({
         // A new color glyph cache layout moves entries the plan packed.
         colorGlyphFrame?.generation ?? 0,
       ];
+      // frame_raster_plan_reuse compares the first targetConfigurationLength
+      // values (the target) and the rest (the scrollbar rows) of two frames.
       const targetConfigurationLength = rasterPlanConfiguration.length;
       for (const value of frameScrollbarRows) rasterPlanConfiguration.push(value);
       // One allocation holds this frame's rows, the previous frame's, and
@@ -6912,22 +4568,10 @@ export async function createSceneRendererRuntime({
             1 / deviceScale,
           );
           if (damageCount > 0) {
-            rasterOptions.dirtyTiles = rasterOptions.dirtyTiles.slice();
-          }
-          const damage = new Float32Array(
-            engine.memory.buffer,
-            damageTable,
-            damageCount * 4,
-          );
-          for (let index = 0; index < damageCount; index++) {
-            markDirtyRectangle(
-              rasterOptions.dirtyTiles,
-              pxW,
-              pxH,
-              (damage[index * 4] - (visibleRectangle?.x ?? 0)) * deviceScale,
-              (damage[index * 4 + 1] - (visibleRectangle?.y ?? 0)) * deviceScale,
-              damage[index * 4 + 2] * deviceScale,
-              damage[index * 4 + 3] * deviceScale,
+            rasterOptions.dirtyTiles = rasterDirtyTiles(
+              "frame_raster_tiles_mark", rasterOptions.dirtyTiles, pxW, pxH,
+              damageTable, damageCount, deviceScale,
+              visibleRectangle?.x ?? 0, visibleRectangle?.y ?? 0,
             );
           }
         }
@@ -6937,18 +4581,23 @@ export async function createSceneRendererRuntime({
         bindPathRasterAtlas(svgPathAtlas);
         rasterPlan = (() => {
           const previousConfiguration = previous?.rasterPlanConfiguration;
+          // frame_raster_plan_reuse compares the two configurations.
+          const configurationBytes = (values) => new Uint8Array(Float64Array.from(values).buffer);
+          const planReuse = previousConfiguration == null ? RASTER_PLAN_REUSE.NONE : core.status(
+            "frame_raster_plan_reuse",
+            ...core.byteInput(configurationBytes(previousConfiguration)),
+            ...core.byteInput(configurationBytes(rasterPlanConfiguration)),
+            targetConfigurationLength,
+          );
           // Patches address byte ranges in the engine's emitted stream.
-          const canPatch = retainedCommands && reusedCommands && previous.rasterPlan &&
-            previousConfiguration?.length === rasterPlanConfiguration.length &&
-            previousConfiguration.every((value, index) =>
-              value === rasterPlanConfiguration[index]
-            );
+          const canPatch = !selected && retainedCommands && reusedCommands && previous.rasterPlan &&
+            planReuse === RASTER_PLAN_REUSE.SAME;
           if (canPatch) {
             // Spliced blocks replan their new commands in place of their
             // old ones; opacity groups patched in place repack after that,
             // at their offsets in the new stream.
-            const splicedRanges = ranges.filter((range) => range.kind === 0);
-            const patchedRanges = ranges.filter((range) => range.kind === 1);
+            const splicedRanges = ranges.filter((range) => range.kind === RETAINED_EDIT_SPLICE);
+            const patchedRanges = ranges.filter((range) => range.kind === RETAINED_EDIT_PATCH);
             const spliceRecordsBefore = engine.exports
               .raster_plan_splice_records_written();
             if (
@@ -6966,7 +4615,7 @@ export async function createSceneRendererRuntime({
                     splicedRanges.length,
                     engineCommandBase,
                     bytes,
-                    GRADIENT_STOP_POOL_BASE,
+                    engine.exports.gradient_stop_pool_base(),
                     scrollTableBase,
                   ) === 1)) &&
               (patchedRanges.length === 0 ||
@@ -6995,19 +4644,14 @@ export async function createSceneRendererRuntime({
           // A replayed emission changed only the scroll table and the
           // scrollbar rows: the retained plan is written again in place,
           // from its own copy of the commands, for the same target.
-          const canRescroll = replayedCommands && reusedCommands && previous.rasterPlan &&
-            previousConfiguration != null &&
-            previousConfiguration.length >= targetConfigurationLength &&
-            rasterPlanConfiguration.every((value, index) =>
-              index >= targetConfigurationLength ||
-              value === previousConfiguration[index]
-            );
+          const canRescroll = !selected && replayedCommands && reusedCommands && previous.rasterPlan &&
+            planReuse !== RASTER_PLAN_REUSE.NONE;
           if (
             canRescroll &&
             engine.exports.raster_plan_rescroll(
                 previous.rasterPlan.plan,
                 scrollTableBase,
-                GRADIENT_STOP_POOL_BASE,
+                engine.exports.gradient_stop_pool_base(),
                 scrollbarTable,
                 scrollbarRowCount,
               ) === 1
@@ -7018,16 +4662,48 @@ export async function createSceneRendererRuntime({
             );
             return previous.rasterPlan;
           }
+          let planCommandBase = engineCommandBase;
+          let planBytes = bytes;
+          if (selected) {
+            let selectedEngineIndex = -1;
+            if (selectedSceneIndex !== null) {
+              selectedEngineIndex = engineIndexOfSceneNode(nodes, selectedSceneIndex);
+              if (selectedEngineIndex < 0) {
+                throw new RangeError(`Scene row ${selectedSceneIndex} has no engine node: it is not laid out.`);
+              }
+            }
+            planBytes = engine.exports.raster_commands_select(
+              engineCommandBase,
+              bytes,
+              nodes.length,
+              selectedEngineIndex,
+              selectedLayer ?? -1,
+            );
+            if (planBytes < 0) {
+              const value = engine.exports.raster_commands_select_failure_value();
+              throw new Error([
+                null,
+                `raster_commands_select cannot size the command at byte ${value} of ${bytes}`,
+                `raster_commands_select found engine node ${value} with its children before it`,
+                `raster_commands_select cannot allocate ${value} bytes`,
+                `raster_commands_select received root ${value} outside ${nodes.length} engine nodes`,
+                `raster_commands_select found ${value} groups open at the end of the stream`,
+                `raster_commands_select found a pop at byte ${value} that closes no open clip or group`,
+                `Layer ${selectedLayer} is outside the frame's ${value} paint groups.`,
+              ][engine.exports.raster_commands_select_failure()]);
+            }
+            planCommandBase = engine.exports.raster_commands_selected_base();
+          }
           const plan = engine.exports.raster_plan_prepare(
-            engineCommandBase,
-            bytes,
+            planCommandBase,
+            planBytes,
             commandRevision,
             pxW,
             pxH,
             deviceScale,
             renderContext.renderMode === "high-dynamic-range" ? 1 : 0,
             scrollTableBase,
-            GRADIENT_STOP_POOL_BASE,
+            engine.exports.gradient_stop_pool_base(),
             visibleRectangle?.x ?? 0,
             visibleRectangle?.y ?? 0,
             visibleRectangle?.width ?? scene.width,
@@ -7160,9 +4836,8 @@ export async function createSceneRendererRuntime({
         page,
         rasterPlan,
         rasterPlanConfiguration,
+        selected,
         scrollbarRows: frameScrollbarRows,
-        textGeometryArtifact,
-        textOperationOffsets,
         commandRevision,
         layoutRevision,
         rasterResourceRevision,
@@ -7176,13 +4851,13 @@ export async function createSceneRendererRuntime({
         height: scene.height,
         writeClaim,
         publicationRevision: scene.publicationRevision,
-        imageSources: scene.imageSources,
+        imageSourceRevisions: canvasSourceRevisions(scene.imageSources),
         globalPreparation,
       });
     }
     // Copy the readback so the context-owned ring/persistent buffer can be
     // reused by the next frame while the caller holds this one.
-    const pixels = result.pixels ? new Float32Array(result.pixels) : null;
+    const pixels = result.pixels ? result.pixels.slice() : null;
     // The shared manager retains the unpinned revision for other rendering APIs.
     // The pixel buffer is at physical resolution; boxes were read before
     // the raster await above.
@@ -7257,10 +4932,11 @@ export async function createSceneRendererRuntime({
       wallMilliseconds: hostNow() - renderWallStartedAt,
     });
     if (onPerformance !== null) onPerformance(performanceRecord);
-    // The result IS the working ImageDescriptor (float32 rgba in the mode's
-    // working encoding, premultiplied - see rasterize.js's
-    // workingRenderResult) plus boxes, performance, and dirty tracking.
-    // readback: "none" returns the direct textureImage instead.
+    // The result IS the working ImageDescriptor (rgba in the mode's working
+    // encoding, premultiplied; float32 samples, or uint8 for an "rgba8"
+    // readback - see rasterize.js's workingRenderResult) plus boxes,
+    // performance, and dirty tracking. readback: "none" returns the direct
+    // textureImage instead.
     return {
       ...(pixels
         ? {
@@ -7283,8 +4959,8 @@ export async function createSceneRendererRuntime({
       ...(page !== null
         ? {
           // The page shown: its index, name, side, blankness and page box,
-          // the page count, every page's description in order, and the
-          // nodes on other pages.
+          // the page count, every page's description in order, the nodes on
+          // other pages, and each scene node's fragments.
           page: {
             height: page.height,
             rulesKey: page.rulesKey ?? "",
@@ -7292,13 +4968,12 @@ export async function createSceneRendererRuntime({
             count: pageCount,
             pages: pagedLayoutRecord.pages,
             offPageNodes,
+            nodeFragments: pagedLayoutRecord.nodeFragments,
           },
         }
         : {}),
       ...(paintArtifact ? { paintArtifact } : {}),
-      ...(captureTextGeometry && textGeometryArtifact
-        ? { textGeometryArtifact }
-        : {}),
+      ...(textCapture !== 0 ? { textCapture } : {}),
       performance: performanceRecord,
       width: pxW,
       height: pxH,
@@ -7360,7 +5035,25 @@ export async function createSceneRendererRuntime({
     return JSON.stringify(node);
   }
 
-  async function createSceneRenderer({
+  // A persistent scene renderer whose graphics context is ready; one whose
+  // context fails to start shuts down and rethrows.
+  async function createSceneRenderer(options) {
+    const renderer = openSceneRenderer(options);
+    try {
+      await renderer.ready;
+    } catch (error) {
+      await renderer.shutdown();
+      throw error;
+    }
+    return renderer;
+  }
+
+  // A persistent scene renderer at once: its engine side (the animation
+  // controller, its engine write token, track declarations and samples)
+  // works immediately, and `ready` settles when its graphics context
+  // exists, rejecting with the context's creation error. Rendering, resizing
+  // and shutdown wait for the context.
+  function openSceneRenderer({
     width,
     height,
     deviceScale = 1,
@@ -7388,9 +5081,15 @@ export async function createSceneRendererRuntime({
     let visibleRectangle = null;
     let physicalWidth = width * deviceScale;
     let physicalHeight = height * deviceScale;
+    // The render context's physical size. A size or region change rebuilds
+    // the context only when that size changes: a region that moves at one
+    // size keeps its context (and the context allocates its target at its
+    // first frame, so a size replaced before a frame costs nothing).
+    const targetWidth = () => (visibleRectangle?.width ?? width) * deviceScale;
+    const targetHeight = () => (visibleRectangle?.height ?? height) * deviceScale;
     async function rebuildContext() {
-      physicalWidth = (visibleRectangle?.width ?? width) * deviceScale;
-      physicalHeight = (visibleRectangle?.height ?? height) * deviceScale;
+      physicalWidth = targetWidth();
+      physicalHeight = targetHeight();
       context = await createRenderContext({
         width: physicalWidth,
         height: physicalHeight,
@@ -7399,15 +5098,18 @@ export async function createSceneRendererRuntime({
         ...(renderMode !== undefined ? { renderMode } : {}),
         ...(renderPrecision !== undefined ? { renderPrecision } : {}),
       });
+      if (frameComparison !== null) attachFrameComparison(context);
     }
-    let context = await createRenderContext({
-      width: physicalWidth,
-      height: physicalHeight,
-      graphicsBackend,
-      sharedStateOwner: rendererGraphicsStateOwner,
-      ...(renderMode !== undefined ? { renderMode } : {}),
-      ...(renderPrecision !== undefined ? { renderPrecision } : {}),
-    });
+    // An attached frame comparison session (src/gpu-frame-comparison.js):
+    // each render context gets its own owner, so a context rebuild starts
+    // a new comparison epoch.
+    let frameComparison = null;
+    function attachFrameComparison(target) {
+      if (target.kind === "webgpu") target.attachComparison(frameComparison);
+      else frameComparison.rejectBackend(target.kind);
+    }
+    let context = null;
+    const ready = rebuildContext();
     let shutDown = false;
     let previousNodeSignatures = null;
     let previousStyleGeneration = 0;
@@ -7447,6 +5149,9 @@ export async function createSceneRendererRuntime({
       // The record folds the transform list into one affine, which CSS
       // cannot interpolate component-wise, so the CSS form the
       // serializations captured (serialize.js) comes along.
+      // Both records leave out the effects of the running transitions that
+      // computed resolution applies (engine_record_after_change): the
+      // planner compares the styles that the transitions run between.
       return animations.planTransitions({
         previousRecord,
         nextRecord: nextNode._coreRecord,
@@ -7454,12 +5159,14 @@ export async function createSceneRendererRuntime({
         previousTransform: previousNode.transform,
         nextTransform: nextNode.transform,
         definitions: nextNode.transitionDefinitions,
+        pseudoElement: nextNode.pseudoElement ?? "",
       });
     }
-    function renderFrame(scene, renderOptions, readback) {
+    async function renderFrame(scene, renderOptions, readback) {
+      await ready;
       // Serialize renders across every renderer sharing this runtime's
       // engine (see engineRenderChain above).
-      return runExclusiveEngineOperation(() =>
+      return await runExclusiveEngineOperation(() =>
         renderFrameNow(scene, renderOptions, readback)
       );
     }
@@ -7572,8 +5279,10 @@ export async function createSceneRendererRuntime({
       const declarations = [];
       if (previousSceneNodes !== null && changedNodeIndices?.size) {
         for (const nodeIndex of changedNodeIndices) {
+          // A node the last scene did not hold plans from the style a read
+          // kept of it (render-surface.js, _planPendingTransitions).
           const plan = planNodeTransitions(
-            previousSceneNodes[nodeIndex],
+            previousSceneNodes[nodeIndex] ?? renderOptions.readBaseline?.(nodeIndex) ?? undefined,
             scene.nodes[nodeIndex],
             previousBoxes[nodeIndex],
           );
@@ -7699,6 +5408,7 @@ export async function createSceneRendererRuntime({
     }
 
     return Object.freeze({
+      ready,
       async resize(nextWidth, nextHeight, nextDeviceScale = deviceScale) {
         if (shutDown) throw new Error("persistent scene renderer is shut down");
         if (
@@ -7712,11 +5422,14 @@ export async function createSceneRendererRuntime({
         }
         const densityOnlyResize = width === nextWidth &&
           height === nextHeight;
-        await context.destroy();
+        await ready;
         width = nextWidth;
         height = nextHeight;
         deviceScale = nextDeviceScale;
-        await rebuildContext();
+        if (targetWidth() !== physicalWidth || targetHeight() !== physicalHeight) {
+          await context.destroy();
+          await rebuildContext();
+        }
         // A density-only resize is raster-only: layout, the scene cache,
         // and the node signatures stay valid because the engine lays out
         // in CSS pixels and deviceScale never reaches it. Only a logical
@@ -7730,8 +5443,8 @@ export async function createSceneRendererRuntime({
       },
       /** Selects the CSS-px rectangle of the scene the raster target
        * covers, or the full scene with null. Raster-only: layout, the
-       * scene cache, and the node signatures stay valid; only the
-       * render context and the raster target are replaced. */
+       * scene cache, and the node signatures stay valid; only a new size
+       * replaces the render context and its raster target. */
       async setVisibleRectangle(rectangle) {
         if (shutDown) throw new Error("persistent scene renderer is shut down");
         if (rectangle !== null) {
@@ -7758,18 +5471,39 @@ export async function createSceneRendererRuntime({
           width: Number(rectangle.width),
           height: Number(rectangle.height),
         };
-        await context.destroy();
-        await rebuildContext();
+        await ready;
+        if (targetWidth() !== physicalWidth || targetHeight() !== physicalHeight) {
+          await context.destroy();
+          await rebuildContext();
+        }
       },
-      // The resolved raster backend ("webgpu" | "webgl2"). Presentation
-      // consumers branch on this: only the webgpu backend can return a
-      // GPU texture image; the webgl2 backend always reads back pixels.
+      // The resolved raster backend ("webgpu" | "webgl2"), null until the
+      // context is ready. Presentation consumers branch on this: only the
+      // webgpu backend can return a GPU texture image; the webgl2 backend
+      // always reads back pixels.
       get graphicsBackend() {
-        return context.kind;
+        return context?.kind ?? null;
       },
-      // The GPUDevice the webgpu backend renders on; null for webgl2.
+      // Attaches a frame comparison session; the next frame of the context
+      // creates its owner.
+      async attachFrameComparison(session) {
+        if (shutDown) throw new Error("persistent scene renderer is shut down");
+        if (frameComparison !== null) throw new Error("a frame comparison is already attached; detach it first");
+        // Set before the wait: a frame requested after this call finds it.
+        frameComparison = session;
+        await ready;
+        if (frameComparison === session) attachFrameComparison(context);
+      },
+      // Detaches the session and releases the context's owner.
+      async detachFrameComparison() {
+        await ready;
+        frameComparison = null;
+        if (context.kind === "webgpu") await context.detachComparison();
+      },
+      // The GPUDevice the webgpu backend renders on; null for webgl2 and
+      // until the context is ready.
       get graphicsDevice() {
-        return context.kind === "webgpu" ? context.device : null;
+        return context?.kind === "webgpu" ? context.device : null;
       },
       // The token this renderer claims the engine's layout buffer with.
       // A synchronous layout getter over the tree this renderer renders
@@ -7779,8 +5513,14 @@ export async function createSceneRendererRuntime({
       get engineWriteToken() {
         return animations;
       },
+      // `renderOptions.readback` selects "float32" (the default) or, for the
+      // rgba8unorm render precision, "rgba8" samples.
       render(scene, renderOptions = {}) {
-        return renderFrame(scene, renderOptions, "float32");
+        const readback = renderOptions.readback ?? "float32";
+        if (readback !== "float32" && readback !== "rgba8") {
+          throw new Error(`render: readback must be "float32" or "rgba8", got ${JSON.stringify(readback)}; renderTexture delivers a texture`);
+        }
+        return renderFrame(scene, renderOptions, readback);
       },
       renderTexture(scene, renderOptions = {}) {
         return renderFrame(scene, renderOptions, "none");
@@ -7836,6 +5576,12 @@ export async function createSceneRendererRuntime({
           nextNode,
           previousBoxes[previousIndex],
         )?.transitions ?? [];
+      },
+      // The transitions from a before-change style that a read kept of a
+      // node the last rendered scene did not hold.
+      planTransitionsFrom(previousNode, nextNode) {
+        if (shutDown) throw new Error("persistent scene renderer is shut down");
+        return planNodeTransitions(previousNode, nextNode, undefined)?.transitions ?? [];
       },
       declareTransitionTrack(nodeIndex, propertyName, keyframes, timing, declarationOptions = {}) {
         if (shutDown) throw new Error("persistent scene renderer is shut down");
@@ -7898,7 +5644,9 @@ export async function createSceneRendererRuntime({
         if (engineWriteOwner === animations) engineWriteOwner = null;
         if (retainedRowsOwner === animations) retainedRowsOwner = null;
         releaseRetainedPreparation(animations);
-        await context.destroy();
+        // A context that failed to start reported its error through `ready`
+        // and holds nothing to release.
+        await ready.then(() => context.destroy(), () => {});
         if (rendererGraphicsStateOwner !== graphicsStateOwner) {
           await releaseSharedWebgpuStates(rendererGraphicsStateOwner);
           await releaseSharedWebgl2State(rendererGraphicsStateOwner);
@@ -7949,27 +5697,32 @@ export async function createSceneRendererRuntime({
     prewarmCssTextGlyphs,
     imagePixelsFor,
     sharedSvgPathAtlas,
-    floatByte,
-    clearByte,
     sceneHtml,
-    scaleNode,
     emitSceneCommands,
     emitSceneCommandsSync,
     layoutTreeBoxes,
     layoutTreeBoxesSync,
+    layoutPageBoxesSync,
     layoutTextGeometrySync,
     registerDecodedImage,
     canvasImageEntry: canvasImagePixels,
-    shapeStandaloneTextSync,
+    layoutCanvasTextSync,
+    canvasTextWordsSync,
+    canvasTextGlyphOutlineSync,
     createLayoutArtifact,
+    createPaintRecord,
     createDisplayListArtifact,
     createInvalidationArtifact,
     releaseRenderContexts,
+    useGraphicsDevice,
+    hasGraphicsDevice,
+    hostGraphicsDevice,
     getDefaultGlyphResourceManager,
     shutdownDefaultGlyphResourceManager,
     renderScenePixels,
     createPersistentSceneRenderer,
     createSceneRenderer: createSceneRenderer,
+    openSceneRenderer,
     fontRegistry,
     shapingRuntime,
     atlasRuntime,
@@ -8002,6 +5755,8 @@ export const defaultImageRuntime = Object.freeze({
 
 export const createLayoutArtifact = (...arguments_) =>
   defaultSceneRendererRuntime.createLayoutArtifact(...arguments_);
+export const createPaintRecord = (...arguments_) =>
+  defaultSceneRendererRuntime.createPaintRecord(...arguments_);
 export const createDisplayListArtifact = (...arguments_) =>
   defaultSceneRendererRuntime.createDisplayListArtifact(...arguments_);
 export const createInvalidationArtifact = (...arguments_) =>
@@ -8010,12 +5765,16 @@ export const layoutTreeBoxes = (...arguments_) =>
   defaultSceneRendererRuntime.layoutTreeBoxes(...arguments_);
 export const layoutTreeBoxesSync = (...arguments_) =>
   defaultSceneRendererRuntime.layoutTreeBoxesSync(...arguments_);
+export const layoutPageBoxesSync = (...arguments_) =>
+  defaultSceneRendererRuntime.layoutPageBoxesSync(...arguments_);
 export const layoutTextGeometrySync = (...arguments_) =>
   defaultSceneRendererRuntime.layoutTextGeometrySync(...arguments_);
-export const shapeStandaloneTextSync = (...arguments_) =>
-  defaultSceneRendererRuntime.shapeStandaloneTextSync(...arguments_);
-export const glyphOutlinesSync = (...arguments_) =>
-  defaultSceneRendererRuntime.shapingRuntime.glyphOutlinesSync(...arguments_);
+export const layoutCanvasTextSync = (...arguments_) =>
+  defaultSceneRendererRuntime.layoutCanvasTextSync(...arguments_);
+export const canvasTextWordsSync = (...arguments_) =>
+  defaultSceneRendererRuntime.canvasTextWordsSync(...arguments_);
+export const canvasTextGlyphOutlineSync = (...arguments_) =>
+  defaultSceneRendererRuntime.canvasTextGlyphOutlineSync(...arguments_);
 export const engineCounters = (...arguments_) =>
   defaultSceneRendererRuntime.engineCounters(...arguments_);
 export const releaseRenderContexts = (...arguments_) =>
@@ -8024,6 +5783,14 @@ export const createPersistentSceneRenderer = (...arguments_) =>
   defaultSceneRendererRuntime.createPersistentSceneRenderer(...arguments_);
 export const createSceneRenderer = (...arguments_) =>
   defaultSceneRendererRuntime.createSceneRenderer(...arguments_);
+export const openSceneRenderer = (...arguments_) =>
+  defaultSceneRendererRuntime.openSceneRenderer(...arguments_);
+// The host's GPU device for every surface of the realm's default runtime
+// (useGraphicsDevice above): call it once, before the first surface renders.
+export const useGraphicsDevice = (device) =>
+  defaultSceneRendererRuntime.useGraphicsDevice(device);
+export const hasGraphicsDevice = () => defaultSceneRendererRuntime.hasGraphicsDevice();
+export const hostGraphicsDevice = () => defaultSceneRendererRuntime.hostGraphicsDevice();
 export async function createSandomRuntime(options = {}) {
   return await __createSandomRuntimeFromPrepared(
     await prepareSandomRuntimeOptions(options),
@@ -8101,11 +5868,15 @@ export async function __createSandomRuntimeFromPrepared(prepared) {
     loadFont: (...arguments_) =>
       sceneRendererRuntime.fontRegistry.loadFont(...arguments_),
     createSceneRenderer: sceneRendererRuntime.createSceneRenderer,
+    openSceneRenderer: sceneRendererRuntime.openSceneRenderer,
     createPersistentSceneRenderer:
       sceneRendererRuntime.createPersistentSceneRenderer,
     createLayoutArtifact: sceneRendererRuntime.createLayoutArtifact,
+    createPaintRecord: sceneRendererRuntime.createPaintRecord,
     createDisplayListArtifact: sceneRendererRuntime.createDisplayListArtifact,
     releaseRenderContexts: sceneRendererRuntime.releaseRenderContexts,
+    useGraphicsDevice: sceneRendererRuntime.useGraphicsDevice,
+    hasGraphicsDevice: sceneRendererRuntime.hasGraphicsDevice,
   };
   return Object.freeze(runtime);
 }

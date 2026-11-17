@@ -1,111 +1,92 @@
-// The image loading of the DOM: the state of each img element that a
-// script sees, the HTML Standard "update the image data" steps, the load
-// and error events, decode(), and the delay of the window load event
-// (docs/design/dom-webassembly-core.md, "Images and forms"). The order of
-// events and the member values follow Chrome, as the parity pages of
+// The host effects of image loading (docs/design/dom-webassembly-core.md,
+// "Images and forms"): the DOM core keeps each img element's request and
+// decides each step (image-elements.watpart); this module resolves URLs,
+// fetches and decodes, registers the decoded image, queues tasks and
+// fires events, and settles decode() promises. The order of events and
+// the member values follow Chrome, as the parity pages of
 // test/images/image_dom_test.js measure.
 //
 // An image is a demand of the document's host resource session
 // (document._resolveResource). The loader keeps one demand for each image
 // URL and src/image-decode.js one decode for each resource, so the scene
 // renderer that paints the image later takes the same fetch and the same
-// decode. When an image completes, its readiness and natural size go into
-// the element's resource record in the DOM core, where layout reads them.
+// decode.
 import { decodeImageResource, UndecodableImageError } from "../image-decode.js";
 import { defaultImageRuntime } from "../scene-renderer.js";
 import { SandomHostError } from "../host/contract.js";
 import { documentScripts } from "./scripts.js";
 import { withLiveGeometry } from "./live-geometry.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+const IMAGE_AXIS_WIDTH = layoutConstant("IMAGE_AXIS_WIDTH");
+const IMAGE_AXIS_HEIGHT = layoutConstant("IMAGE_AXIS_HEIGHT");
 
-const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
+const IMAGE_ACTION_AVAILABLE = layoutConstant("IMAGE_ACTION_AVAILABLE");
+const IMAGE_ACTION_AWAIT_STABLE = layoutConstant("IMAGE_ACTION_AWAIT_STABLE");
+const IMAGE_ACTION_FETCH = layoutConstant("IMAGE_ACTION_FETCH");
+const IMAGE_ACTION_ERROR_EVENT = layoutConstant("IMAGE_ACTION_ERROR_EVENT");
+const IMAGE_ACTION_FAIL_SILENT = layoutConstant("IMAGE_ACTION_FAIL_SILENT");
+const IMAGE_ACTION_LOAD_EVENT = layoutConstant("IMAGE_ACTION_LOAD_EVENT");
+const IMAGE_MUTATION_ATTRIBUTE = layoutConstant("IMAGE_MUTATION_ATTRIBUTE");
+const IMAGE_MUTATION_ADOPTED = layoutConstant("IMAGE_MUTATION_ADOPTED");
+const IMAGE_MUTATION_CLONED = layoutConstant("IMAGE_MUTATION_CLONED");
+const IMAGE_DECODE_WAIT = layoutConstant("IMAGE_DECODE_WAIT");
+const IMAGE_DECODE_SETTLE = layoutConstant("IMAGE_DECODE_SETTLE");
+const IMAGE_STATE_COMPLETE = layoutConstant("IMAGE_STATE_COMPLETE");
+const IMAGE_STATE_BROKEN = layoutConstant("IMAGE_STATE_BROKEN");
 
-function isImageElement(node) {
-  return node.nodeType === 1 && node.localName === "img" && node.namespaceURI === HTML_NAMESPACE;
-}
+// The image entries of the decoded images (the canvas image and the
+// resource), by the entry number that the core keeps for each request and
+// available image.
+const imageEntries = new Map();
+let nextImageEntry = 1;
 
 // A document loads images for its DOM when it has a browsing context: a
 // document with a window. A document from DOMParser or createHTMLDocument
 // has none, as in a browser.
-function activeDocument(document) {
-  return document !== null && document !== undefined && document.defaultView != null;
+function activeFlag(document) {
+  return Number(document?.defaultView != null);
 }
 
 function encodingError() {
   return new DOMException("The source image cannot be decoded.", "EncodingError");
 }
 
-// The image loading record of a document: the list of available images
-// (URL -> natural size and record size), the count of image requests that
-// delay its load event, and the elements that have an image state. The
-// state lives on the element's wrapper, which the DOM core holds weakly:
-// the document keeps the wrapper, so that every later read of the element
-// gets the same wrapper and its state.
-function documentImages(document) {
-  document._imageLoading ??= { available: new Map(), delaying: 0, elements: new Set() };
-  return document._imageLoading;
+// The src attribute resolved against the document base URL; the empty
+// string when it does not parse.
+function resolvedSource(element) {
+  return URL.parse(element.getAttribute("src"), element.ownerDocument.baseURI)?.href ?? "";
 }
 
-// The end of parsing waits for this to be false before the window load
-// event (src/dom/scripts.js); a change wakes it.
-export function imagesDelayLoadEvent(document) {
-  return (document._imageLoading?.delaying ?? 0) > 0;
+// The decode() requests that wait for the element's request.
+function decodeRequests(element) {
+  element._imageDecodeRequests ??= [];
+  return element._imageDecodeRequests;
 }
 
-function releaseLoadEvent(document) {
-  const images = documentImages(document);
-  images.delaying -= 1;
-  if (images.delaying === 0) document._scriptProcessing?.notify();
-}
-
-// The image state of an element: its current request (state, URL, natural
-// size and, once complete, the decoded image that a canvas draws); whether
-// an update of the image data waits for its request, and the decode()
-// requests that wait with it; the document whose load event the update
-// delays until the update's event has run; and the generation that each
-// update advances, so that the result of an older update is ignored.
-function imageState(element) {
-  if (element._image === undefined) {
-    element._image = {
-      generation: 0,
-      state: "unavailable",
-      currentURL: "",
-      naturalWidth: 0,
-      naturalHeight: 0,
-      canvasImage: null,
-      pending: false,
-      decodeRequests: [],
-      delayedDocument: null,
-    };
-    documentImages(element.ownerDocument).elements.add(element);
-  }
-  return element._image;
-}
-
-function rejectDecodeRequests(state) {
-  const requests = state.decodeRequests;
-  state.decodeRequests = [];
+function rejectDecodeRequests(element) {
+  const requests = decodeRequests(element);
+  element._imageDecodeRequests = [];
   for (const request of requests) request.reject(encodingError());
 }
 
-// An update delays the load event of its document until its event has
-// run, or until a later update replaces it.
-function delayLoadEvent(state, document) {
-  state.delayedDocument = document;
-  documentImages(document).delaying += 1;
-}
-
-function releaseDelay(state) {
-  const document = state.delayedDocument;
-  state.delayedDocument = null;
-  if (document !== null) releaseLoadEvent(document);
+// Wakes the script processing of the document that the last image export
+// left without a delaying request.
+function wakeReleasedDocument(core) {
+  core.wrapperFor(core.handle("image_released_document"))?._scriptProcessing?.notify();
 }
 
 function queueElementTask(element, task) {
   documentScripts(element.ownerDocument).queueTask(task);
 }
 
-function fireImageEvent(element, type) {
-  documentScripts(element.ownerDocument).fire(element, type);
+// The task of the load or error event of the request of `generation`.
+function queueImageEvent(element, generation, type) {
+  queueElementTask(element, () => {
+    const core = element._domCore;
+    if (core.status("image_event_task", element._coreHandle, generation) === 0) return;
+    documentScripts(element.ownerDocument).fire(element, type);
+    wakeReleasedDocument(core);
+  });
 }
 
 // The renderer runtime of the document: its synchronous layout is the one
@@ -125,328 +106,225 @@ export function queueDocumentTask(document, task) {
   documentScripts(document).queueTask(task);
 }
 
-// The element's resource record in the DOM core, while the record's key is
-// still the requested src, else null.
-function resourceRecord(element, src) {
-  if (element.getAttribute("src") !== src) return null;
-  const handle = element._domCore.sceneResourceNode(element._coreHandle);
-  return handle === 0n ? null : handle;
-}
-
 // The decoded image enters the renderer runtime under the element's
 // resource record: the record gets the readiness and size that layout
-// reads, and the renderer the registration that it paints. Returns null
-// when that is done, else a promise (an SVG image rasterizes first).
-function registerImage(element, src, resource) {
-  const handle = resourceRecord(element, src);
-  if (handle === null) return null;
+// reads, and the renderer the registration that it paints. Returns a
+// promise when the registration waits (an SVG image rasterizes first).
+function registerImage(element, resource) {
+  const handle = element._domCore.sceneResourceNode(element._coreHandle);
+  if (handle === 0n) return null;
   return rendererRuntime(element.ownerDocument).registerDecodedImage(handle, resource);
 }
 
-function markBroken(element, src) {
-  const handle = resourceRecord(element, src);
-  if (handle !== null) element._domCore.resourceUpdate(handle, 2, 0, 0, false, 1);
-}
-
-// "Update the image data" (HTML Standard 4.8.4.3.5), for an img without
-// srcset or picture: Sandom paints neither.
+// "Update the image data" (HTML Standard 4.8.4.3.5).
 export function updateImageData(element) {
+  const core = element._domCore;
   const document = element.ownerDocument;
-  if (!activeDocument(document)) return;
-  const state = imageState(element);
-  const generation = state.generation += 1;
+  const action = core.status("image_update", element._coreHandle, activeFlag(document), ...core.input(resolvedSource(element)));
+  wakeReleasedDocument(core);
+  if (action !== IMAGE_ACTION_AVAILABLE && action !== IMAGE_ACTION_AWAIT_STABLE) return;
   // A decode() of the previous request does not see this one.
-  rejectDecodeRequests(state);
-  state.pending = false;
-  releaseDelay(state);
-  const src = element.getAttribute("src");
-  if (src !== null && src !== "") {
-    const url = URL.parse(src, document.baseURI);
-    const available = url === null ? undefined : documentImages(document).available.get(url.href);
-    if (available !== undefined) {
-      // The list of available images has the URL: the image is complete
-      // at once, and its load event is a task, which the window load event
-      // waits for, as in Chrome.
-      state.state = "complete";
-      state.currentURL = url.href;
-      state.naturalWidth = available.naturalWidth;
-      state.naturalHeight = available.naturalHeight;
-      state.canvasImage = available.canvasImage;
-      registerImage(element, src, available.resource)?.catch((error) => document._reportException?.(error));
-      delayLoadEvent(state, document);
-      queueElementTask(element, () => {
-        if (state.generation !== generation) return;
-        fireImageEvent(element, "load");
-        releaseDelay(state);
-      });
-      return;
-    }
-  }
-  state.pending = true;
-  delayLoadEvent(state, document);
-  queueMicrotask(() => continueUpdate(element, state, generation));
-}
-
-function failRequest(element, state, generation, currentURL, fire) {
-  state.state = "broken";
-  state.currentURL = currentURL;
-  state.naturalWidth = 0;
-  state.naturalHeight = 0;
-  state.canvasImage = null;
-  state.pending = false;
-  rejectDecodeRequests(state);
-  if (!fire) {
-    releaseDelay(state);
+  rejectDecodeRequests(element);
+  const generation = core.status("image_generation", element._coreHandle);
+  if (action === IMAGE_ACTION_AVAILABLE) {
+    const entry = imageEntries.get(core.status("image_entry", element._coreHandle));
+    registerImage(element, entry.resource)?.catch((error) => document._reportException?.(error));
+    queueImageEvent(element, generation, "load");
     return;
   }
-  queueElementTask(element, () => {
-    if (state.generation !== generation) return;
-    fireImageEvent(element, "error");
-    releaseDelay(state);
-  });
+  queueMicrotask(() => continueUpdate(element, generation));
+}
+
+function performFailure(element, generation, action) {
+  wakeReleasedDocument(element._domCore);
+  rejectDecodeRequests(element);
+  if (action === IMAGE_ACTION_ERROR_EVENT) queueImageEvent(element, generation, "error");
+}
+
+function fetchFailed(element, generation) {
+  const action = element._domCore.status("image_fetch_failed", element._coreHandle, generation);
+  if (action === IMAGE_ACTION_ERROR_EVENT) performFailure(element, generation, action);
 }
 
 // The steps after "await a stable state".
-async function continueUpdate(element, state, generation) {
-  if (state.generation !== generation) return;
+async function continueUpdate(element, generation) {
+  const core = element._domCore;
+  const current = () => core.status("image_current", element._coreHandle, generation) === 1;
+  if (!current()) return;
   const document = element.ownerDocument;
+  const action = core.status("image_continue", element._coreHandle, generation, ...core.input(resolvedSource(element)));
+  if (action === IMAGE_ACTION_ERROR_EVENT || action === IMAGE_ACTION_FAIL_SILENT) {
+    performFailure(element, generation, action);
+    return;
+  }
+  if (action !== IMAGE_ACTION_FETCH) return;
   const src = element.getAttribute("src");
-  if (src === null || src === "") {
-    // No selected source: an empty src fires error, a missing one nothing.
-    failRequest(element, state, generation, "", src === "");
-    return;
-  }
-  const url = URL.parse(src, document.baseURI);
-  if (url === null) {
-    failRequest(element, state, generation, src, true);
-    return;
-  }
-  // The request of the new URL replaces the current request at once, as
-  // in Chrome: until it completes, the image has no natural size and no
-  // current URL.
-  state.state = "unavailable";
-  state.currentURL = "";
-  state.naturalWidth = 0;
-  state.naturalHeight = 0;
-  state.canvasImage = null;
   let resource;
   let decoded;
   try {
     // The demand carries the reference as authored, which resolves against
-    // the document base URL, as `url` did.
+    // the document base URL, as the core's requested URL did.
     resource = await document._resolveResource({ requestedURL: src, kind: "image" });
     decoded = await decodeImageResource(resource, rendererRuntime(document).codecRuntime);
   } catch (error) {
-    if (state.generation !== generation) return;
+    if (!current()) return;
     // A host failure (a refused or failed fetch) and bytes that do not
     // decode both break the image. Any other error is a Sandom bug, which
     // the document reports.
     if (!(error instanceof UndecodableImageError) && !(error instanceof SandomHostError)) {
       document._reportException?.(error);
     }
-    markBroken(element, src);
-    failRequest(element, state, generation, url.href, true);
+    fetchFailed(element, generation);
     return;
   }
-  if (state.generation !== generation) return;
-  let entry;
+  if (!current()) return;
+  let rendererEntry;
   try {
-    await registerImage(element, src, resource);
+    await registerImage(element, resource);
     // The decoded image of a canvas that draws this element: the
     // renderer's entry of the same decode (an SVG image's raster).
-    entry = await rendererRuntime(document).canvasImageEntry(resource);
-    if (entry === null) throw new Error(`Image ${url.href}: the decoded image has no renderer entry`);
+    rendererEntry = await rendererRuntime(document).canvasImageEntry(resource);
+    if (rendererEntry === null) throw new Error(`Image ${src}: the decoded image has no renderer entry`);
   } catch (error) {
-    if (state.generation !== generation) return;
+    if (!current()) return;
     document._reportException?.(error);
-    markBroken(element, src);
-    failRequest(element, state, generation, url.href, true);
+    fetchFailed(element, generation);
     return;
   }
-  if (state.generation !== generation) return;
-  state.state = "complete";
-  state.currentURL = url.href;
-  state.naturalWidth = Math.round(decoded.naturalWidth);
-  state.naturalHeight = Math.round(decoded.naturalHeight);
-  state.canvasImage = Object.freeze({
-    entry,
-    // An opaque response taints a canvas that draws the image
-    // (src/dom/document-resources.js).
-    opaque: resource.opaque === true,
-    // An SVG image whose root gives no width or height has the default
-    // object size as its natural size, and no natural dimensions.
-    naturalDimensions: decoded.kind !== "svg" || decoded.naturalDimensions !== false,
-  });
-  state.pending = false;
-  documentImages(document).available.set(url.href, {
-    naturalWidth: state.naturalWidth,
-    naturalHeight: state.naturalHeight,
-    canvasImage: state.canvasImage,
+  const entry = nextImageEntry;
+  nextImageEntry += 1;
+  imageEntries.set(entry, {
     resource,
+    canvasImage: Object.freeze({
+      entry: rendererEntry,
+      // An opaque response taints a canvas that draws the image
+      // (src/dom/document-resources.js).
+      opaque: resource.opaque === true,
+      // An SVG image whose root gives no width or height has the default
+      // object size as its natural size, and no natural dimensions.
+      naturalDimensions: decoded.kind !== "svg" || decoded.naturalDimensions !== false,
+    }),
   });
-  queueElementTask(element, () => {
-    if (state.generation !== generation) return;
-    fireImageEvent(element, "load");
-    releaseDelay(state);
-  });
+  const completed = core.status(
+    "image_fetch_complete",
+    element._coreHandle,
+    generation,
+    decoded.naturalWidth,
+    decoded.naturalHeight,
+    entry,
+  );
+  if (completed !== IMAGE_ACTION_LOAD_EVENT) return;
+  queueImageEvent(element, generation, "load");
   // A decode() that waited for the request settles in the task after the
   // load event, as Chrome orders them.
-  const decodeRequests = state.decodeRequests;
-  state.decodeRequests = [];
-  if (decodeRequests.length > 0) {
-    queueElementTask(element, () => {
-      for (const request of decodeRequests) request.resolve(undefined);
-    });
-  }
+  const waiting = decodeRequests(element);
+  element._imageDecodeRequests = [];
+  queueElementTask(element, () => {
+    for (const request of waiting) request.resolve(undefined);
+  });
+}
+
+function mutationUpdates(element, mutation, name = "") {
+  const core = element._domCore;
+  return core.status("image_mutation_updates", element._coreHandle, mutation, ...core.input(name)) === 1;
 }
 
 // The relevant mutations of an img (HTML Standard 4.8.4.3.6) that Sandom
 // sees: its src attribute changes, the parser or fragment parsing makes it,
 // it is cloned, or it is adopted into a document.
 export function imageAttributeChanged(element, name) {
-  if (name === "src" && isImageElement(element)) updateImageData(element);
+  if (mutationUpdates(element, IMAGE_MUTATION_ATTRIBUTE, name)) updateImageData(element);
 }
 
-export function imageAdopted(element, newDocument) {
-  if (isImageElement(element) && activeDocument(newDocument)) updateImageData(element);
+export function imageAdopted(element) {
+  if (mutationUpdates(element, IMAGE_MUTATION_ADOPTED)) updateImageData(element);
 }
 
 export function imageCloned(clone) {
-  if (isImageElement(clone) && clone.hasAttribute("src")) updateImageData(clone);
+  if (mutationUpdates(clone, IMAGE_MUTATION_CLONED)) updateImageData(clone);
 }
 
 // The images that the parser or fragment parsing made under `root` (a
-// document or a fragment): each one with a src and no image state yet
-// starts to load.
+// document or a fragment) start to load.
 export function imagesParsed(root) {
-  const document = root.nodeType === 9 ? root : root.ownerDocument;
-  if (!activeDocument(document)) return;
-  const images = root.nodeType === 9 ? root.getElementsByTagName("img") : root.querySelectorAll("img");
-  for (let index = 0; index < images.length; index += 1) {
-    const element = images[index];
-    if (element._image === undefined && isImageElement(element) && element.hasAttribute("src")) {
-      updateImageData(element);
-    }
+  const core = root._domCore;
+  for (const element of core.outputNodes(core.status("image_parsed_elements", root._coreHandle))) {
+    updateImageData(element);
   }
+}
+
+// The end of parsing waits for this to be false before the window load
+// event (src/dom/scripts.js); a change wakes it.
+export function imagesDelayLoadEvent(document) {
+  return document._domCore.status("image_delays_load", document._coreHandle) === 1;
 }
 
 // HTMLImageElement members.
 
 export function imageComplete(element) {
-  const src = element.getAttribute("src");
-  if (src === null || src === "") return true;
-  const state = element._image;
-  if (state === undefined) return false;
-  return !state.pending && (state.state === "complete" || state.state === "broken");
+  return element._domCore.status("image_complete", element._coreHandle) === 1;
 }
 
 export function imageNaturalWidth(element) {
-  return element._image?.naturalWidth ?? 0;
+  return element._domCore.status("image_natural_size", element._coreHandle, IMAGE_AXIS_WIDTH);
 }
 
 export function imageNaturalHeight(element) {
-  return element._image?.naturalHeight ?? 0;
+  return element._domCore.status("image_natural_size", element._coreHandle, IMAGE_AXIS_HEIGHT);
 }
 
 export function imageCurrentSrc(element) {
-  return element._image?.currentURL ?? "";
+  return element._domCore.string("image_current_src", element._coreHandle);
 }
 
-// The image of an img as a canvas image source (HTML "check the usability
-// of the image argument"): "broken" when a request for a URL failed (the
-// state in which Chrome throws; an img without src, or with an empty src,
-// is not broken there), "complete" with its natural size and decoded image,
-// else "unavailable" (a canvas draws nothing).
+// The image of an img as a canvas image source.
 export function imageCanvasSource(element) {
-  const state = element._image;
-  if (state === undefined) return { state: "unavailable" };
-  if (state.state === "broken") return { state: state.currentURL === "" ? "unavailable" : "broken" };
-  if (state.state !== "complete" || state.canvasImage === null) return { state: "unavailable" };
+  const core = element._domCore;
+  const state = core.status("image_canvas_state", element._coreHandle);
+  if (state === IMAGE_STATE_BROKEN) return { state: "broken" };
+  if (state !== IMAGE_STATE_COMPLETE) return { state: "unavailable" };
   return {
     state: "complete",
-    width: state.naturalWidth,
-    height: state.naturalHeight,
-    ...state.canvasImage,
+    width: imageNaturalWidth(element),
+    height: imageNaturalHeight(element),
+    ...imageEntries.get(core.status("image_entry", element._coreHandle)).canvasImage,
   };
 }
 
 export function imageDecode(element) {
   return new Promise((resolve, reject) => {
-    const state = element._image;
-    if (!activeDocument(element.ownerDocument) || state === undefined) {
-      reject(encodingError());
+    const core = element._domCore;
+    const answer = core.status("image_decode", element._coreHandle, activeFlag(element.ownerDocument));
+    if (answer === IMAGE_DECODE_WAIT) {
+      decodeRequests(element).push({ resolve, reject });
       return;
     }
-    if (state.pending) {
-      state.decodeRequests.push({ resolve, reject });
-      return;
-    }
-    if (state.state !== "complete") {
+    if (answer !== IMAGE_DECODE_SETTLE) {
       reject(encodingError());
       return;
     }
     // A complete image settles in a task queued after a microtask.
-    const generation = state.generation;
+    const generation = core.status("image_generation", element._coreHandle);
     queueMicrotask(() => {
       queueElementTask(element, () => {
-        if (state.generation === generation && state.state === "complete") resolve(undefined);
+        if (core.status("image_decode_settles", element._coreHandle, generation) === 1) resolve(undefined);
         else reject(encodingError());
       });
     });
   });
 }
 
-// "Rules for parsing non-negative integers".
-function parseNonNegativeInteger(value) {
-  if (value === null) return null;
-  const match = /^[\t\n\f\r ]*\+?(\d+)/.exec(value);
-  return match === null ? null : Number(match[1]);
-}
-
-// Geometry values (geometry.watpart, geometry_value): client width and
-// height, padding top, right, bottom and left, and whether the node has a
-// box.
-const CLIENT_WIDTH = 14;
-const CLIENT_HEIGHT = 15;
-const PADDING_TOP = 40;
-const PADDING_RIGHT = 41;
-const PADDING_BOTTOM = 42;
-const PADDING_LEFT = 43;
-const HAS_BOX = 45;
-
-// The content box size of the element in CSS pixels from one layout pass,
-// or null when the element is not being rendered.
-function renderedContentSize(element) {
-  if (!element.isConnected) return null;
-  // The geometry of an element with display: none keeps a row with a box.
-  if (element.ownerDocument.getComputedStyle(element).display === "none") return null;
-  return withLiveGeometry(element, undefined, ({ core, handle }) => {
-    const value = (field) => core.status("geometry_value", handle, element._coreHandle, field);
-    if (value(HAS_BOX) === 0) return null;
-    return [
-      value(CLIENT_WIDTH) - value(PADDING_LEFT) - value(PADDING_RIGHT),
-      value(CLIENT_HEIGHT) - value(PADDING_TOP) - value(PADDING_BOTTOM),
-    ];
-  });
-}
-
-// The width (axis 0) and height (axis 1) IDL attributes: the rendered size
-// when the image is being rendered, else the dimension attribute when it
-// parses, else the natural size of an available image, else 0 (Chrome's
-// order).
+// The width (axis 0) and height (axis 1) IDL attributes.
 export function imageDimension(element, axis) {
-  const rendered = renderedContentSize(element);
-  if (rendered !== null) return Math.round(rendered[axis]);
-  const attribute = parseNonNegativeInteger(element.getAttribute(axis === 0 ? "width" : "height"));
-  if (attribute !== null) return attribute;
-  return axis === 0 ? imageNaturalWidth(element) : imageNaturalHeight(element);
+  const core = element._domCore;
+  if (core.status("image_dimension_rendered", element._coreHandle) === 0) {
+    return core.status("image_dimension", 0n, element._coreHandle, axis);
+  }
+  return withLiveGeometry(element, undefined, ({ handle }) => core.status("image_dimension", handle, element._coreHandle, axis));
 }
 
-// The content attribute value of an unsigned long reflected attribute: a
-// value above 2147483647 sets 0.
-export function unsignedLongAttributeValue(value) {
-  const number = Number(value);
-  const integer = Number.isFinite(number) ? Math.trunc(number) : 0;
-  const unsigned = ((integer % 2 ** 32) + 2 ** 32) % 2 ** 32;
-  return String(unsigned > 2147483647 ? 0 : unsigned);
+// The content attribute value that the width and height setters of an img
+// write.
+export function unsignedLongAttributeValue(core, value) {
+  return String(core.status("image_dimension_value", Number(value)));
 }

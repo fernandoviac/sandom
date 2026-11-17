@@ -41,17 +41,6 @@ async function ensureWebp() {
   return instance;
 }
 
-// Mirrors the shim's return codes (webp-wasm-rs/src/lib.rs in
-// @sandom/image-codecs). -4 is the one that is not a failure of the file:
-// an animated WebP is a valid image this slice deliberately does not
-// handle, so its message says so
-// and names the frame count rather than reading as corruption.
-const DECODE_ERRORS = {
-  '-1': 'internal error: decode() called before alloc()',
-  '-2': 'not a decodable WebP (truncated, corrupt, or an unsupported variant)',
-  '-3': 'internal error: decoder returned a buffer that is neither width*height*3 nor *4',
-};
-
 /**
  * Decodes a still WebP — lossy (VP8) or lossless (VP8L), with or without
  * alpha — to RGBA8.
@@ -70,12 +59,16 @@ async function decodeWebP(bytes) {
 
   const status = decode();
   if (status !== 0) {
+    // -4 is an animated WebP: a valid image whose animation Sandom does not
+    // decode, so its message names the frame count.
     const frameCount = status === -4 ? frames() : 0;
+    const text = new TextDecoder().decode(
+      new Uint8Array(memory.buffer, wasm.exports.status_message(status), wasm.exports.status_message_length(status)));
     release();
     if (status === -4) {
       throw new Error(`decodeWebP: animated WebP (${frameCount} frames) is not supported — animation is plans/images/PLAN-animated-images.md, and decoding frame 1 as a still would be silently wrong`);
     }
-    throw new Error(`decodeWebP failed (${status}): ${DECODE_ERRORS[String(status)] ?? 'unknown decoder status'}`);
+    throw new Error(`decodeWebP failed (${status}): ${text}`);
   }
 
   const w = width();

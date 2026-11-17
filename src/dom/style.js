@@ -1,24 +1,27 @@
-// The `style` proxy accepts CSS-shaped property writes and resolves them into
-// the flat fields consumed by the scene writer. As in CSSOM, a value that
-// does not parse leaves the declaration block unchanged and throws nothing;
-// unknown named-property assignments are no-ops. Rejected setter values and
-// the unsupported declarations of a parsed list are exposed through
-// `style.diagnostics`.
-//
-// serialize.js reads an element's resolved fields via style._fields — a
-// plain object shaped exactly like a test/fixtures/scenes.js node (minus
-// `children`, which the tree walk supplies).
+// The `style` proxy accepts CSS-shaped property writes into the core's
+// declaration block. As in CSSOM, a value that does not parse leaves the
+// declaration block unchanged and throws nothing; unknown named-property
+// assignments are no-ops. Rejected setter values and the unsupported
+// declarations of a parsed list are exposed through `style.diagnostics`.
 
 import { parseCSSEasing } from "../dom-wasm/easing.js";
 import { sharedDomCore } from "../dom-wasm/core.js";
 import {
-  animationLength as parseAnimationLength,
-  animationLineHeight,
   animationProperty,
-  animationPropertyValueKind,
+  animationPropertyFor,
+  animationValueFromText,
+  keyframeMember,
+  KEYFRAME_MEMBER,
+  keyframePropertyNames,
   normalizeAnimationOffsets,
 } from "../dom-wasm/animation.js";
 import { createInlineStyleClass } from "./dom-bindings.generated.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+import { withCustomElementReactions } from "./custom-elements.js";
+
+const CALLBACK_RECORD_ATTRIBUTES = layoutConstant("CALLBACK_RECORD_ATTRIBUTES");
+const STYLE_SET_PROPERTY = layoutConstant("STYLE_SET_PROPERTY");
+const STYLE_RESULT_NOTHING_REMOVED = layoutConstant("STYLE_RESULT_NOTHING_REMOVED");
 
 // ---- value parsing ----
 
@@ -43,50 +46,6 @@ export function parseColor(raw) {
   if (color === null) throw new Error(`CSS color "${raw}": invalid value`);
   return color;
 }
-
-
-
-
-export function repeatedListValue(values, index) {
-  if (!Array.isArray(values) || values.length === 0) {
-    throw new TypeError("Cannot repeat an empty style list");
-  }
-  return values[sharedDomCore.status("animation_list_index", values.length, index)];
-}
-
-
-// The ONE way to read an element's style facts outside the style system:
-// cascade-resolved fields (stylesheet rules plus inline style) when a
-// style system exists, inline fields otherwise (detached trees, tests).
-// Reading `element.style._fields` directly misses class-driven values -
-// the interaction snapshot, scrollbars, anchoring, and snapping all
-// consume this instead (presented-frame refactor, Slice 3).
-export function resolvedElementFields(element) {
-  if (element?.nodeType !== 1) return {};
-  return element.ownerDocument?._styleSystem?.resolvedFields?.(element) ??
-    element.style?._fields ?? {};
-}
-
-export function resolvedOverflowAxes(fields) {
-  let x = fields.overflowX ?? fields.overflow ?? "visible";
-  let y = fields.overflowY ?? fields.overflow ?? "visible";
-  const originalX = x;
-  const originalY = y;
-  if (originalX === "visible" && !["visible", "clip"].includes(originalY)) {
-    x = "auto";
-  }
-  if (originalY === "visible" && !["visible", "clip"].includes(originalX)) {
-    y = "auto";
-  }
-  if (originalX === "clip" && !["visible", "clip"].includes(originalY)) {
-    x = "hidden";
-  }
-  if (originalY === "clip" && !["visible", "clip"].includes(originalX)) {
-    y = "hidden";
-  }
-  return { x, y };
-}
-
 export function cssPropertyToIDLName(name) {
   return sharedDomCore.styleIDLName(String(name));
 }
@@ -94,19 +53,6 @@ export function cssPropertyToIDLName(name) {
 export function idlPropertyToCSSName(name) {
   return sharedDomCore.styleCSSName(String(name));
 }
-
-
-// Cascade swallow policy (`BUG-document-parity-divergences` (resolved; see
-// `activity/reports/REPORT-2026-10-14-document-parity-resolved-bug-records.md`),
-// decided 2026-08-25): the ENGINE stays CSS-conformant — an unsupported or
-// unparseable declaration is dropped from the cascade like a browser
-// drops an unknown property — but every drop is RECORDED here so the
-// parity gate can fail loudly on documents that silently lost styling.
-// Four separate document divergences (flex, border sides, place-items,
-// grid-row) each hid behind a silent drop before this registry existed.
-// Consumers (the parity harness) read and clear between documents.
-export const droppedDeclarations = new Set();
-
 
 // ---- CSSStyleDeclaration parity ----
 //
@@ -118,53 +64,18 @@ export const droppedDeclarations = new Set();
 // The proxy preserves this JavaScript property-assignment distinction; the
 // explicit methods use the core's custom declaration storage.
 
-
-// The individual transforms take `none`, the identity, as a keyword
-// (css-transforms-2); normalizeAnimationValue gives it the identity values.
-// With $element, lengths compute against the element.
-function parseAnimationTranslate(value, element = null) {
-  if (String(value).trim() === "none") return { kind: "keyword", keyword: "none" };
-  const slots = (element?._domCore ?? sharedDomCore).declarationSlots("translate", String(value), element);
-  if (!slots?.length || slots[0].kind === 1 || slots[0].value?.x === undefined) {
-    throw new TypeError(`Invalid translate value: ${String(value).trim()}`);
-  }
-  return {
-    kind: "translate",
-    x: slots[0].value.x,
-    y: slots[0].value.y,
-  };
-}
-// A transform list; `none` is the empty list, which interpolates with any
-// list as its identity functions (css-transforms-1 section 10).
-function parseAnimationTransform(value, element = null) {
-  if (String(value).trim() === "none") return { kind: "transform", components: [] };
-  return { kind: "transform", components: (element?._domCore ?? sharedDomCore).transformComponents(value, element) };
-}
-
-// An individual scale (one or two numbers) and rotate (an angle, as
-// radians), parsed by the core's transform grammar.
-function parseAnimationScale(value) {
-  const text = String(value).trim();
-  if (text === "none") return { kind: "keyword", keyword: "none" };
-  const [component] = sharedDomCore.transformComponents(`scale(${text.split(/\s+/).join(", ")})`) ?? [];
-  if (component?.kind !== "scale") throw new TypeError(`Invalid scale value: ${text}`);
-  return { kind: "scale", x: component.x, y: component.y };
-}
-function parseAnimationRotate(value) {
-  const text = String(value).trim();
-  if (text === "none") return { kind: "keyword", keyword: "none" };
-  const [component] = sharedDomCore.transformComponents(`rotate(${text})`) ?? [];
-  if (component?.kind !== "rotate") throw new TypeError(`Invalid rotate value: ${text}`);
-  return { kind: "scalar", value: component.radians };
-}
-
+const IMPLICIT = Object.freeze(Object.fromEntries([
+  "KEYFRAME_SIZE", "KEYFRAME_OFFSET", "KEYFRAME_PROPERTIES", "PLACEMENT_SIZE", "PLACEMENT_INDEX", "PLACEMENT_PROPERTIES",
+].map((name) => [name, layoutConstant(`IMPLICIT_${name}`)])));
 // The context of the keyframe values of an element's animation. A keyframe
 // value is a computed value of its target element (css-animations-1
 // section 3, web-animations-1 section 5.3.4): lengths compute against the
 // element's font sizes and the viewport, and currentcolor is the element's
 // color (its parent's for the color property itself). The underlying value
-// of a property is the element's computed value without animation effects.
-// `release()` gives back the computed views that the context read.
+// of a property is the element's computed value without animation effects;
+// a CSS-wide keyword computes as the element's own declaration of it
+// would (keywordComputedValue). `release()` gives back the computed views
+// that the context read.
 export function animationKeyframeContext(element) {
   const views = new Map();
   const baseValue = (target, name) => {
@@ -178,13 +89,15 @@ export function animationKeyframeContext(element) {
   return {
     element,
     underlyingValue(name) {
-      return baseValue(element, cssPropertyToIDLName(name));
+      return baseValue(element, name);
     },
-    // The color that currentcolor stands for in a keyframe of $name.
-    currentColor(name) {
-      if (name !== "color") return parseColor(baseValue(element, "color"));
-      const parent = element.parentElement;
-      return parseColor(parent ? baseValue(parent, "color") : "canvastext");
+    keywordValue(name, keyword) {
+      return element.ownerDocument._styleSystem.keywordComputedValue(element, name, keyword);
+    },
+    // The color that currentcolor stands for: the element's, or its
+    // parent's for a keyframe of the color property ($parent).
+    currentColor(parent) {
+      return parseColor(baseValue(parent ? element.parentElement : element, "color"));
     },
     release() {
       for (const view of views.values()) view.release();
@@ -193,41 +106,11 @@ export function animationKeyframeContext(element) {
   };
 }
 
-// A keyframe color. currentcolor, alone or inside a color function, takes
-// the context's current color.
-function parseAnimationColor(value, name, context) {
-  const text = String(value);
-  let color;
-  if (/currentcolor/i.test(text)) {
-    if (context === null) {
-      throw new TypeError(`The ${name} keyframe value ${text.trim()} needs the color of its target element`);
-    }
-    const currentColor = context.currentColor(name);
-    color = sharedDomCore.parseColor(text, currentColor);
-    if (color === "currentColor") color = currentColor;
-  } else {
-    color = sharedDomCore.parseColor(text);
-  }
-  if (color === null || color === "currentColor") {
-    throw new TypeError(`The ${name} keyframe value ${text.trim()} is not a color`);
-  }
-  return { kind: "color", value: [color.r, color.g, color.b, color.a] };
-}
-
-// One keyframe value of the animation property $property in the
-// controller's value shape, computed in $context (animationKeyframeContext)
-// or, without one, from the value alone.
+// One keyframe value of the animation property $property as a canonical
+// value (animation_value_from_text), computed in $context
+// (animationKeyframeContext) or, without one, from the value alone.
 function canonicalAnimationValue(property, value, context) {
-  const element = context?.element ?? null;
-  if (property.id === 12) return { kind: "scalar", value: Number(value) };
-  if (property.id === 15) return parseAnimationTransform(value, element);
-  if (animationPropertyValueKind(property.id) === 3) return parseAnimationColor(value, property.name, context);
-  if (property.id === 14) return { kind: "keyword", keyword: String(value) };
-  if (property.id === 25) return animationLineHeight(value, element);
-  if (property.id === 26) return parseAnimationTranslate(value, element);
-  if (property.id === 32) return parseAnimationScale(value);
-  if (property.id === 33) return parseAnimationRotate(value);
-  return parseAnimationLength(value, element);
+  return animationValueFromText(property, String(value), context?.element ?? null, context);
 }
 
 // A property the core does not animate, named by a transition or an
@@ -266,17 +149,18 @@ export function canonicalizeAnimationKeyframes(keyframes, onUnanimated, context)
   return keyframes.map((frame) => {
     const canonical = {};
     for (const [name, value] of Object.entries(frame)) {
-      if (name === "offset" || name === "composite") {
+      const member = keyframeMember(name);
+      if (member === KEYFRAME_MEMBER.OFFSET || member === KEYFRAME_MEMBER.COMPOSITE) {
         canonical[name] = value;
         continue;
       }
-      if (name === "easing") {
+      if (member === KEYFRAME_MEMBER.EASING) {
         canonical.easing = typeof value === "string"
           ? parseCSSEasing(value)
           : structuredClone(value);
         continue;
       }
-      const property = animationProperty(name);
+      const property = animationPropertyFor(name, context?.element);
       if (!property) {
         onUnanimated(name);
         continue;
@@ -287,18 +171,37 @@ export function canonicalizeAnimationKeyframes(keyframes, onUnanimated, context)
   });
 }
 
-// Adds the implicit keyframes of canonical $keyframes (web-animations-1
-// section 5.3.4, css-animations-1 section 3): a property without a value at
-// offset 0 takes the underlying value of the context's element there, and
-// so does a property without a value at offset 1. The value joins the first
-// keyframe at offset 0 (the last at offset 1), or a new keyframe with the
+// Adds the implicit keyframes of canonical $keyframes
+// (animation_implicit_keyframes): each property takes its underlying value
+// in the context where the core places it, a new keyframe having the
 // easing and composite of $implicit. Returns the keyframes with their
 // computed offsets.
 export function addImplicitKeyframes(keyframes, context, implicit) {
   const frames = normalizeAnimationOffsets(keyframes);
-  const properties = new Set(frames.flatMap((frame) =>
-    Object.keys(frame).filter((name) => name !== "offset" && name !== "easing" && name !== "composite")
-  ));
+  if (frames.length === 0) return frames;
+  const properties = new Map();
+  const core = sharedDomCore;
+  const pointer = core.exports.abi_allocate(frames.length * IMPLICIT.KEYFRAME_SIZE);
+  let view = new DataView(core.refreshBytes().buffer);
+  frames.forEach((frame, index) => {
+    let bits = 0n;
+    for (const name of keyframePropertyNames(frame)) {
+      if (!properties.has(name)) properties.set(name, animationProperty(name));
+      bits |= 1n << BigInt(properties.get(name).id);
+    }
+    view = new DataView(core.refreshBytes().buffer);
+    view.setFloat64(pointer + index * IMPLICIT.KEYFRAME_SIZE + IMPLICIT.KEYFRAME_OFFSET, frame.offset, true);
+    view.setBigUint64(pointer + index * IMPLICIT.KEYFRAME_SIZE + IMPLICIT.KEYFRAME_PROPERTIES, bits, true);
+  });
+  core.status("animation_implicit_keyframes", pointer, frames.length);
+  view = new DataView(core.refreshBytes().buffer);
+  const output = core.exports.abi_output_pointer();
+  // The placements at offset 0 and at offset 1: a keyframe index and the
+  // properties that it takes.
+  const placements = [0, 1].map((placement) => {
+    const at = output + placement * IMPLICIT.PLACEMENT_SIZE;
+    return [view.getInt32(at + IMPLICIT.PLACEMENT_INDEX, true), view.getBigUint64(at + IMPLICIT.PLACEMENT_PROPERTIES, true)];
+  });
   const implicitFrame = (offset) => ({
     offset,
     ...(implicit.easing === undefined ? {} : {
@@ -306,22 +209,23 @@ export function addImplicitKeyframes(keyframes, context, implicit) {
     }),
     ...(implicit.composite === undefined ? {} : { composite: implicit.composite }),
   });
-  for (const offset of [0, 1]) {
-    const missing = [...properties].filter((name) =>
-      !frames.some((frame) => frame.offset === offset && frame[name] !== undefined)
-    );
-    if (missing.length === 0) continue;
-    let frame = offset === 0
-      ? frames.find((candidate) => candidate.offset === 0)
-      : frames.findLast((candidate) => candidate.offset === 1);
-    if (frame === undefined) {
-      frame = implicitFrame(offset);
-      if (offset === 0) frames.unshift(frame);
-      else frames.push(frame);
+  const fill = (frame, bits) => {
+    for (const [name, property] of properties) {
+      if (bits & (1n << BigInt(property.id))) {
+        frame[name] = canonicalAnimationValue(property, context.underlyingValue(name), context);
+      }
     }
-    for (const name of missing) {
-      frame[name] = canonicalAnimationValue(animationProperty(name), context.underlyingValue(name), context);
-    }
+  };
+  const [[first, startBits], [last, finishBits]] = placements;
+  const start = startBits === 0n ? null : first >= 0 ? frames[first] : implicitFrame(0);
+  const finish = finishBits === 0n ? null : last >= 0 ? frames[last] : implicitFrame(1);
+  if (start !== null) {
+    if (first < 0) frames.unshift(start);
+    fill(start, startBits);
+  }
+  if (finish !== null) {
+    if (last < 0) frames.push(finish);
+    fill(finish, finishBits);
   }
   return frames;
 }
@@ -339,7 +243,6 @@ export function isStyleDeclaration(value) {
 class SDStyleRuntime {
   constructor(element) {
     this._element = element;
-    this._mutationOldValue = null;
   }
 
   _getDiagnostics() {
@@ -361,41 +264,47 @@ class SDStyleRuntime {
   _getCSSText() {
     return this._element._domCore.styleText(this._element._coreHandle);
   }
+  // cssText, setProperty(), removeProperty() and the named properties are
+  // [CEReactions]: the style attribute change enqueues attributeChanged.
   _replaceText(source) {
-    this._element._domCore.styleReplace(
-      this._element._coreHandle,
-      source,
-      false,
-      this._element.ownerDocument?._sandomFontRegistry ?? undefined,
-      this._element.ownerDocument ?? null,
-    );
-    this._deliverMutation();
-  }
-  _parseAttribute(source) {
-    this._element._assertMutationAllowed();
-    this._element._parsingStyleAttribute = true;
-    try {
+    withCustomElementReactions(() => {
       this._element._domCore.styleReplace(
         this._element._coreHandle,
         source,
-        true,
+        false,
         this._element.ownerDocument?._sandomFontRegistry ?? undefined,
         this._element.ownerDocument ?? null,
       );
-      this._element._domCore.callbackRecords();
-      this._element._notifyMutation("style");
-    } finally {
-      this._element._parsingStyleAttribute = false;
-    }
+      this._deliverMutation();
+    }, this._element._domCore);
   }
+  _parseAttribute(source) {
+    this._element._domCore.styleReplace(
+      this._element._coreHandle,
+      source,
+      true,
+      this._element.ownerDocument?._sandomFontRegistry ?? undefined,
+      this._element.ownerDocument ?? null,
+    );
+    this._element._domCore.callbackRecords();
+    this._element._notifyMutation("style");
+  }
+  // A CSSOM change of the declarations: the core synced the style
+  // attribute, and its record gives the attribute's old value.
   _deliverMutation(property) {
-    const core = this._element._domCore;
-    const hadAttribute = core.exports.style_mutation_had_attribute() !== 0;
-    const record = core.callbackRecords().find((entry) => entry.kind === 2);
-    this._mutationOldValue = hadAttribute ? record?.oldValue ?? "" : null;
-    this._element._notifyMutation("style", property);
+    const record = this._element._domCore.callbackRecords().find((entry) => entry.kind === CALLBACK_RECORD_ATTRIBUTES);
+    this._element._notifyMutation("style", property, {
+      type: "attributes",
+      target: this._element,
+      attributeName: "style",
+      attributeNamespace: null,
+      oldValue: record?.oldValue ?? null,
+    });
   }
   _set(name, value, priority, mode) {
+    withCustomElementReactions(() => this._setDeclaration(name, value, priority, mode), this._element._domCore);
+  }
+  _setDeclaration(name, value, priority, mode) {
     const changed = this._element._domCore.styleSet(
       this._element._coreHandle,
       name,
@@ -406,7 +315,7 @@ class SDStyleRuntime {
       this._element.ownerDocument ?? null,
     );
     if (!changed) return;
-    if (changed === 3) {
+    if (changed === STYLE_RESULT_NOTHING_REMOVED) {
       this._element._domCore.callbackRecords();
       return;
     }
@@ -415,19 +324,19 @@ class SDStyleRuntime {
       ? animationProperty(name) : null;
     if (animatedProperty) {
       // The base beneath the element's effects is its computed value
-      // without them: the new underlying value.
-      const context = animationKeyframeContext(this._element);
-      let base;
-      try {
-        base = canonicalAnimationValue(animatedProperty, context.underlyingValue(animatedProperty.name), context);
-      } finally {
-        context.release();
-      }
-      this._element._renderSurface._broadcastReplaceAnimationBase(this._element, animatedProperty.name, base);
+      // without them: the new underlying value, computed for a renderer
+      // whose effect stack takes it.
+      const element = this._element;
+      const base = () => {
+        const context = animationKeyframeContext(element);
+        try {
+          return canonicalAnimationValue(animatedProperty, context.underlyingValue(animatedProperty.name), context);
+        } finally {
+          context.release();
+        }
+      };
+      element._renderSurface._broadcastReplaceAnimationBase(element, animatedProperty.name, base);
     }
-  }
-  _assertMutation() {
-    this._element._assertMutationAllowed();
   }
   _invalidPriority(priority) {
     return !this._element._domCore.stylePriorityValid(priority);
@@ -439,7 +348,7 @@ class SDStyleRuntime {
     return !this._element._domCore.styleSupports(property);
   }
   _setPropertyNormalized(property, value, priority) {
-    this._set(property, value, priority, 1);
+    this._set(property, value, priority, STYLE_SET_PROPERTY);
   }
   _getPropertyValue(property) {
     return this._element._domCore.styleRead(
@@ -454,17 +363,19 @@ class SDStyleRuntime {
     );
   }
   _removeProperty(property) {
-    const previous = this._element._domCore.styleRemove(
-      this._element._coreHandle,
-      property,
-    );
-    if (previous !== "") this._deliverMutation(property);
-    else {
-      // The attribute operation still owns its record lifetime when removing
-      // an absent/empty declaration does not notify style consumers.
-      this._element._domCore.callbackRecords();
-    }
-    return previous;
+    return withCustomElementReactions(() => {
+      const previous = this._element._domCore.styleRemove(
+        this._element._coreHandle,
+        property,
+      );
+      if (previous !== "") this._deliverMutation(property);
+      else {
+        // The attribute operation still owns its record lifetime when removing
+        // an absent/empty declaration does not notify style consumers.
+        this._element._domCore.callbackRecords();
+      }
+      return previous;
+    }, this._element._domCore);
   }
 }
 
@@ -473,6 +384,8 @@ const SDStyle = createInlineStyleClass({ Base: SDStyleRuntime });
 Object.defineProperty(SDStyle.prototype, Symbol.iterator, {
   value: Array.prototype.values, writable: true, enumerable: false, configurable: true,
 });
+// An element's style attribute is a CSSStyleDeclaration (CSSOM §6.7).
+Object.defineProperty(SDStyle.prototype, Symbol.toStringTag, { value: "CSSStyleDeclaration", configurable: true });
 
 export function createStyle(element) {
   const style = new SDStyle(element);
@@ -497,7 +410,6 @@ export function createStyle(element) {
         target[prop] = value;
         return true;
       }
-      target._element._assertMutationAllowed();
       // Custom-property parity (see class doc above): plain assignment on
       // a dash-prefixed name is a silent no-op, exactly like a real
       // CSSStyleDeclaration — only setProperty (above) actually sets one.
@@ -505,7 +417,7 @@ export function createStyle(element) {
       const property = cssPropertyToIDLName(prop);
       if (target._unsupportedName(property)) return true;
       if (value === "") {
-        target.removeProperty(prop);
+        target.removeProperty(idlPropertyToCSSName(prop));
         return true;
       }
       // Keep the core's strict check for engine callers. Only the CSSOM named

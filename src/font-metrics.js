@@ -1,21 +1,34 @@
 import { sharedDomCore } from "./dom-wasm/core.js";
+import { layoutConstant } from "./wasm/layout-table.js";
 
 export const FONT_METRICS_PACKAGE_VERSION = "0.1.0";
 const metricsByBytes = new WeakMap();
 const decoder = new TextDecoder();
+const OPTIONAL_ABSENT = layoutConstant("OPTIONAL_ABSENT");
+const OPTIONAL_PRESENT = layoutConstant("OPTIONAL_PRESENT");
+const OPTIONAL_OTHER = layoutConstant("OPTIONAL_OTHER");
+const FAILURE = Object.freeze(Object.fromEntries(["CODE", "FIELD", "TEXT"]
+  .map((name) => [name, layoutConstant(`FONT_METRICS_FAILURE_${name}`)])));
+
+// The metric record of the @sandom/font-metrics library, which exports the
+// offset of each field (font_metrics_result_<field>_offset).
+function resultOffset(field) {
+  return sharedDomCore.exports[`font_metrics_result_${field}_offset`].value;
+}
 
 function readResult(pointer) {
   const view = new DataView(sharedDomCore.refreshBytes().buffer);
+  const signed = (field) => view.getInt32(pointer + resultOffset(field), true);
   return Object.freeze({
-    upem: view.getUint32(pointer + 4, true),
-    ascender: view.getInt32(pointer + 8, true),
-    descender: view.getInt32(pointer + 12, true),
-    lineGap: view.getInt32(pointer + 16, true),
-    underlinePosition: view.getInt32(pointer + 20, true),
-    underlineThickness: view.getInt32(pointer + 24, true),
-    strikeoutPosition: view.getInt32(pointer + 28, true),
-    strikeoutThickness: view.getInt32(pointer + 32, true),
-    zeroAdvanceRatio: view.getFloat64(pointer + 40, true),
+    upem: view.getUint32(pointer + resultOffset("upem"), true),
+    ascender: signed("ascender"),
+    descender: signed("descender"),
+    lineGap: signed("line_gap"),
+    underlinePosition: signed("underline_position"),
+    underlineThickness: signed("underline_thickness"),
+    strikeoutPosition: signed("strikeout_position"),
+    strikeoutThickness: signed("strikeout_thickness"),
+    zeroAdvanceRatio: view.getFloat64(pointer + resultOffset("zero_advance_ratio"), true),
   });
 }
 
@@ -27,7 +40,7 @@ export function readFontMetrics(bytes, { faceIndex } = {}) {
   }
   const index = sharedDomCore.status("font_face_index",
     typeof faceIndex === "number" ? faceIndex : 0,
-    faceIndex === undefined ? 0 : typeof faceIndex === "number" ? 1 : 2) >>> 0;
+    faceIndex === undefined ? OPTIONAL_ABSENT : typeof faceIndex === "number" ? OPTIONAL_PRESENT : OPTIONAL_OTHER) >>> 0;
   let cachedByFace = metricsByBytes.get(bytes);
   const cached = cachedByFace?.get(index);
   if (cached) return cached;
@@ -38,10 +51,10 @@ export function readFontMetrics(bytes, { faceIndex } = {}) {
   if (succeeded === 0) {
     const memory = sharedDomCore.refreshBytes();
     const view = new DataView(memory.buffer, pointer);
-    const error = new Error(decoder.decode(memory.subarray(pointer + 8,
+    const error = new Error(decoder.decode(memory.subarray(pointer + FAILURE.TEXT,
       pointer + sharedDomCore.exports.abi_output_length())));
-    error.fontMetricsCode = view.getUint32(0, true);
-    error.fontMetricsField = view.getUint32(4, true);
+    error.fontMetricsCode = view.getUint32(FAILURE.CODE, true);
+    error.fontMetricsField = view.getUint32(FAILURE.FIELD, true);
     throw error;
   }
   const metrics = readResult(pointer);

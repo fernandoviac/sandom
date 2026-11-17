@@ -1,6 +1,7 @@
 // One host-memory output boundary. Sandom supplies codec/container capability;
 // @sandom/color validates and performs the color transform.
 import { colorRuntime } from "../wasm/color-runtime.js";
+import { sharedDomCore } from "../dom-wasm/core.js";
 import { FORMAT_CAPABILITIES } from "./format-policy.js";
 import { packSignal } from "./packing.js";
 
@@ -10,41 +11,43 @@ function enumValue(runtime, name, value) {
   return result;
 }
 
-function setRecord(view, fields, values) {
-  for (const [name, value] of Object.entries(values)) {
-    const offset = fields[name];
-    if (offset === undefined) throw new Error(`color: ABI record has no ${name} field`);
-    if (typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= 0xffffffff && !["sourcePeak", "targetPeak", "referenceWhite", "sourceMin"].includes(name)) {
-      view.setUint32(offset, value, true);
-    } else {
-      view.setFloat64(offset, value, true);
-    }
+// The record bytes the library operation `build` writes into `size` bytes
+// of its own memory.
+function nativeRecord(runtime, size, build) {
+  const pointer = runtime.alloc(size);
+  try {
+    build(pointer, new DataView(runtime.memory.buffer, pointer, size));
+    return runtime.copyOut(pointer, size, Uint8Array);
+  } finally {
+    runtime.free(pointer);
   }
 }
 
+// The output policy of `request`: the library's defaults for its transfer
+// (color_policy_init) with the request's own values over them.
 export function outputPolicyBytes(request) {
   const runtime = colorRuntime();
-  const policy = runtime.abi.records.policy;
-  const bytes = new Uint8Array(policy.size);
-  setRecord(new DataView(bytes.buffer), policy.fields, {
-    version: runtime.abi.version,
-    primaries: enumValue(runtime, "primaries", request.colorEncoding.primaries),
-    transfer: enumValue(runtime, "transfer", request.colorEncoding.transferFunction),
-    depth: runtime.abi.depthCodes[request.bitDepth] ?? request.bitDepth,
-    alpha: enumValue(runtime, "alpha", request.alphaMode),
-    tone: enumValue(runtime, "tone", request.toneMap),
-    range: enumValue(runtime, "range", request.dynamicRange ?? ((request.colorEncoding.transferFunction === "pq" || request.colorEncoding.transferFunction === "hlg") ? "high" : "standard")),
-    sourcePeak: request.masteringDisplay?.maxLuminance ?? 203,
-    targetPeak: request.targetPeakLuminance ?? 203,
-    white: enumValue(runtime, "white", request.colorEncoding.whitePoint),
-    referenceWhite: request.colorEncoding.referenceWhiteLuminance,
-    gamut: enumValue(runtime, "gamut", request.gamutMap),
-    masteringPresent: request.masteringDisplay == null ? 0 : 1,
-    sourceMin: request.masteringDisplay?.minLuminance ?? 0,
+  const { size, fields } = runtime.abi.records.policy;
+  const { colorEncoding, masteringDisplay } = request;
+  return nativeRecord(runtime, size, (pointer, view) => {
+    runtime.check(runtime.exports.color_policy_init(pointer, enumValue(runtime, "transfer", colorEncoding.transferFunction)));
+    view.setUint32(fields.primaries, enumValue(runtime, "primaries", colorEncoding.primaries), true);
+    view.setUint32(fields.depth, runtime.abi.depthCodes[request.bitDepth] ?? request.bitDepth, true);
+    view.setUint32(fields.alpha, enumValue(runtime, "alpha", request.alphaMode), true);
+    view.setUint32(fields.tone, enumValue(runtime, "tone", request.toneMap), true);
+    if (request.dynamicRange != null) view.setUint32(fields.range, enumValue(runtime, "range", request.dynamicRange), true);
+    if (masteringDisplay?.maxLuminance != null) view.setFloat64(fields.sourcePeak, masteringDisplay.maxLuminance, true);
+    if (request.targetPeakLuminance != null) view.setFloat64(fields.targetPeak, request.targetPeakLuminance, true);
+    view.setUint32(fields.white, enumValue(runtime, "white", colorEncoding.whitePoint), true);
+    view.setFloat64(fields.referenceWhite, colorEncoding.referenceWhiteLuminance, true);
+    view.setUint32(fields.gamut, enumValue(runtime, "gamut", request.gamutMap), true);
+    view.setUint32(fields.masteringPresent, masteringDisplay == null ? 0 : 1, true);
+    if (masteringDisplay?.minLuminance != null) view.setFloat64(fields.sourceMin, masteringDisplay.minLuminance, true);
   });
-  return bytes;
 }
 
+// The capability of the request's output format (FORMAT_CAPABILITIES):
+// its depths, encodings, the request's alpha mode and the mastering flag.
 export function outputCapabilityBytes(request) {
   const contract = FORMAT_CAPABILITIES[request.format];
   if (!contract) throw new Error(`color: unknown output format ${JSON.stringify(request.format)}`);
@@ -52,31 +55,17 @@ export function outputCapabilityBytes(request) {
     throw new Error(`color: ${request.format} cannot represent ${request.alphaMode} alpha`);
   }
   const runtime = colorRuntime();
-  const capability = runtime.abi.records.capability;
-  let depthMask = 0;
-  for (const depth of contract.bitDepths) {
-    const code = runtime.abi.depthCodes[depth] ?? depth;
-    const bit = code === 8 ? 0 : code === 10 ? 1 : code === 12 ? 2 : code === 16 ? 3 : code === runtime.abi.depthCodes.float16 ? 4 : code === runtime.abi.depthCodes.float32 ? 5 : -1;
-    if (bit < 0) throw new Error(`color: unsupported capability depth ${depth}`);
-    depthMask |= 1 << bit;
-  }
-  let encodingLow = 0;
-  let encodingHigh = 0;
-  for (const [primaries, transfer] of contract.encodings) {
-    const bit = enumValue(runtime, "primaries", primaries) * 8 + enumValue(runtime, "transfer", transfer);
-    if (bit < 32) encodingLow = (encodingLow | (1 << bit)) >>> 0;
-    else encodingHigh = (encodingHigh | (1 << (bit - 32))) >>> 0;
-  }
-  const bytes = new Uint8Array(capability.size);
-  setRecord(new DataView(bytes.buffer), capability.fields, {
-    version: runtime.abi.version,
-    depthMask: depthMask >>> 0,
-    encodingLow,
-    encodingHigh,
-    alpha: enumValue(runtime, "alpha", request.alphaMode),
-    flags: contract.requiresMastering ? 1 : 0,
+  const { exports } = runtime;
+  return nativeRecord(runtime, runtime.abi.records.capability.size, (pointer) => {
+    runtime.check(exports.color_capability_init(pointer, enumValue(runtime, "alpha", request.alphaMode), contract.requiresMastering ? 1 : 0));
+    for (const depth of contract.bitDepths) {
+      runtime.check(exports.color_capability_accept_depth(pointer, runtime.abi.depthCodes[depth] ?? depth));
+    }
+    for (const [primaries, transfer] of contract.encodings) {
+      runtime.check(exports.color_capability_accept_encoding(pointer,
+        enumValue(runtime, "primaries", primaries), enumValue(runtime, "transfer", transfer)));
+    }
   });
-  return bytes;
 }
 
 export function validateNativeOutputPolicy(request) {
@@ -93,8 +82,8 @@ export function validateNativeOutputPolicy(request) {
 }
 
 export function transformImageForOutput(descriptor, request) {
-  const { pixels, width, height, colorEncoding } = descriptor;
-  if (!(pixels instanceof Float32Array)) throw new Error("output transform requires Float32Array working pixels");
+  const { width, height, colorEncoding } = descriptor;
+  const pixels = workingPixels(descriptor);
   if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0 || width * height > 16777214) throw new Error("output transform dimensions exceed color memory ceiling");
   const native = colorRuntime();
   const working = native.exports.color_working_code(
@@ -112,7 +101,7 @@ export function transformImageForOutput(descriptor, request) {
     capability = native.copyIn(outputCapabilityBytes(request));
     output = native.alloc(width * height * 16);
     native.check(native.exports.color_transform_output(input, pixels.byteLength, width, height,
-      descriptor.rowStride ?? width * 16, working, enumValue(native, "alpha", descriptor.alphaMode),
+      pixels === descriptor.pixels ? descriptor.rowStride ?? width * 16 : width * 16, working, enumValue(native, "alpha", descriptor.alphaMode),
       policy, capability, output, width * height * 16));
     return { pixels: native.copyOut(output, width * height * 16, Float32Array), width, height };
   } finally {
@@ -121,6 +110,27 @@ export function transformImageForOutput(descriptor, request) {
     native.free(policy);
     native.free(input);
   }
+}
+
+// The float32 working samples of `descriptor`: its own, or those of an
+// rgba8 readback (working_samples_from_unorm8 in
+// core/dom/image-conversion.watpart).
+function workingPixels(descriptor) {
+  const { pixels, width } = descriptor;
+  if (pixels instanceof Float32Array) return pixels;
+  if (!(pixels instanceof Uint8Array)) {
+    throw new Error(`output transform takes Float32Array or Uint8Array (rgba8) pixels; it received ${pixels?.constructor?.name ?? pixels}`);
+  }
+  if ((descriptor.rowStride ?? width * 4) !== width * 4) {
+    throw new Error(`output transform takes rgba8 rows of ${width * 4} bytes; this descriptor's rows are ${descriptor.rowStride} bytes`);
+  }
+  const core = sharedDomCore;
+  const [source, count] = core.byteInput(pixels);
+  if (core.exports.working_samples_from_unorm8(source, count) !== 1) {
+    throw new Error(`output transform: ${count} rgba8 samples exceed the 32-bit working memory; encode a smaller frame`);
+  }
+  const pointer = core.exports.abi_output_pointer();
+  return new Float32Array(core.refreshBytes().buffer.slice(pointer, pointer + count * 4));
 }
 
 export function quantizeWorkingPixels(pixels) {

@@ -14,10 +14,12 @@ import { SandomHostError } from "./contract.js";
 import { moduleScriptFunction } from "./module-script-function.js";
 
 // The lexer loads on the first module evaluation, so a session that never
-// evaluates a module needs no lexer in its realm.
+// evaluates a module needs no lexer in its realm. It is vendored
+// (docs/legal/es-module-lexer.md): a browser worker has no import map to
+// resolve a package name.
 let moduleLexer = null;
 async function loadModuleLexer() {
-  moduleLexer ??= import("es-module-lexer").then(async (lexer) => {
+  moduleLexer ??= import("../../vendor/es-module-lexer-1.7.0.mjs").then(async (lexer) => {
     await lexer.init;
     return lexer;
   });
@@ -27,7 +29,7 @@ async function loadModuleLexer() {
     moduleLexer = null;
     throw new SandomHostError(
       "module-resolution-failure",
-      `The module session needs the es-module-lexer package: ${cause?.message ?? String(cause)}`,
+      `The module session's es-module-lexer did not load: ${cause?.message ?? String(cause)}`,
       { cause },
     );
   }

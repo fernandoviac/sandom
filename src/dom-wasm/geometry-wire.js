@@ -1,7 +1,6 @@
 // Primitive geometry wire encoding; no DOM implementation or renderer imports.
 import { hostNow } from "../host-clock.js";
-const overflowCodes = { visible: 0, clip: 1, hidden: 2, auto: 3, scroll: 4 };
-const overscrollCodes = { auto: 0, contain: 1, none: 2 };
+import { layoutConstant } from "../wasm/layout-table.js";
 const boxNames = [
   "x",
   "y",
@@ -18,8 +17,6 @@ const boxNames = [
   "stickyLeft",
   "stickyTop",
 ];
-const sides = ["top", "right", "bottom", "left"];
-const identity = [1, 0, 0, 1, 0, 0];
 const noFragments = Object.freeze([]);
 
 // The box snapshot layout (geometry-build.watpart): a 24-byte header
@@ -35,32 +32,33 @@ const noFragments = Object.freeze([]);
 // (geometry.watpart) carries the same fragments after its glyph block. A
 // box object carries no scroll owner: an upload of box objects has none,
 // and its geometry holds client positions.
-export const BOX_SNAPSHOT_HEADER_SIZE = 24;
-export const BOX_SNAPSHOT_ROW_SIZE = 248;
-const BOX_SNAPSHOT_MAGIC = 0x584f4247;
-const BOX_ROW_SCROLLBAR_SPACE = 112;
-const BOX_ROW_FIRST_FRAGMENT = 144;
-const BOX_ROW_FRAGMENT_COUNT = 148;
-const BOX_ROW_SCROLL_OWNER = 152;
-export const GEOMETRY_FRAGMENT_SIZE = 32;
-const BOX_ROW_START_OVERFLOW_X = 176;
-const BOX_ROW_USED_EDGES = 184;
-export const GEOMETRY_ENVELOPE_SIZE = 160;
-export const GEOMETRY_RECORD_SIZE = 768;
-const GEOMETRY_SCROLLBAR_SIZE = 192;
-const GEOMETRY_CARET_SIZE = 64;
-const GEOMETRY_GLYPH_SIZE = 80;
-const GEOMETRY_ENVELOPE_FRAGMENT_COUNT = 100;
-const GEOMETRY_RECORD_FIRST_FRAGMENT = 592;
-const GEOMETRY_RECORD_FRAGMENT_COUNT = 596;
+export const BOX_SNAPSHOT_HEADER_SIZE = layoutConstant("GEOMETRY_BOXES_HEADER_SIZE");
+export const BOX_SNAPSHOT_ROW_SIZE = layoutConstant("GEOMETRY_BOXES_ROW_SIZE");
+const BOX_SNAPSHOT_MAGIC = layoutConstant("GEOMETRY_BOXES_MAGIC");
+const BOX_HEADER_MAGIC = layoutConstant("GEOMETRY_BOXES_HEADER_MAGIC");
+const BOX_HEADER_COUNT = layoutConstant("GEOMETRY_BOXES_HEADER_COUNT");
+const BOX_HEADER_FRAGMENTS = layoutConstant("GEOMETRY_BOXES_HEADER_FRAGMENTS");
+const BOX_HEADER_SVG = layoutConstant("GEOMETRY_BOXES_HEADER_SVG");
+const BOX_ROW_SCROLLBAR_SPACE = layoutConstant("GEOMETRY_BOXES_ROW_SCROLLBAR_SPACE");
+const BOX_ROW_FIRST_FRAGMENT = layoutConstant("GEOMETRY_BOXES_ROW_FIRST_FRAGMENT");
+const BOX_ROW_FRAGMENT_COUNT = layoutConstant("GEOMETRY_BOXES_ROW_FRAGMENT_COUNT");
+const BOX_ROW_SCROLL_OWNER = layoutConstant("GEOMETRY_BOXES_ROW_SCROLL_OWNER");
+const BOX_ROW_START_OVERFLOW_X = layoutConstant("GEOMETRY_BOXES_ROW_START_OVERFLOW_X");
+const BOX_ROW_USED_EDGES = layoutConstant("GEOMETRY_BOXES_ROW_USED_EDGES");
+const SVG_HEADER_SIZE = layoutConstant("GEOMETRY_SVG_HEADER_SIZE");
+const SVG_ROW_SIZE = layoutConstant("GEOMETRY_SVG_ROW_SIZE");
+export const GEOMETRY_FRAGMENT_SIZE = layoutConstant("GEOMETRY_FRAGMENT_SIZE");
+const FRAGMENT_FIELDS = ["X", "Y", "WIDTH", "HEIGHT"].map((name) => layoutConstant(`GEOMETRY_FRAGMENT_${name}`));
+export const GEOMETRY_RECORD_SIZE = layoutConstant("GEOMETRY_RECORD_SIZE");
+const GEOMETRY_SCROLLBAR_SIZE = layoutConstant("GEOMETRY_SCROLLBAR_SIZE");
+const SCROLLBAR = Object.fromEntries(["TRACK", "CLIP", "HAS_CLIP", "VERTICAL", "TARGET", "VALUES", "THUMB"]
+  .map((name) => [name, layoutConstant(`GEOMETRY_SCROLLBAR_${name}`)]));
+const GEOMETRY_TAIL_HEADER_SIZE = layoutConstant("GEOMETRY_TAIL_HEADER_SIZE");
+const GEOMETRY_TAIL_SCROLLBARS = layoutConstant("GEOMETRY_TAIL_SCROLLBARS");
 
-// Bytes of the geometry wire form: the envelope, then the record,
-// scrollbar, caret, glyph and fragment blocks (geometry.watpart
-// $geometryWireSize).
-export function geometryWireSize(records, scrollbars, carets, glyphs, fragments) {
-  return GEOMETRY_ENVELOPE_SIZE + records * GEOMETRY_RECORD_SIZE +
-    scrollbars * GEOMETRY_SCROLLBAR_SIZE + carets * GEOMETRY_CARET_SIZE +
-    glyphs * GEOMETRY_GLYPH_SIZE + fragments * GEOMETRY_FRAGMENT_SIZE;
+// Writes the fragment { x, y, w, h } at `at`, its origin moved by `origin`.
+function writeFragment(view, at, { x, y, w, h }, origin = { x: 0, y: 0 }) {
+  [x - origin.x, y - origin.y, w, h].forEach((value, index) => view.setFloat64(at + FRAGMENT_FIELDS[index], value, true));
 }
 
 // A box's fragments: none, or two and more for a box broken across
@@ -84,10 +82,13 @@ const boxSnapshotFinalizer = new FinalizationRegistry(({ core, handle }) => {
   core.exports.geometry_boxes_release(handle);
 });
 const measurementKey = Symbol.for("sandom.domCore.measurement");
+const F64 = Float64Array.BYTES_PER_ELEMENT;
+const U32 = Uint32Array.BYTES_PER_ELEMENT;
+const BOX_ROW_VALUES = layoutConstant("GEOMETRY_BOXES_ROW_VALUES");
 // A snapshot row in f64 words: the fourteen box values, then the u32 first
 // fragment and fragment count; a fragment in f64 words.
-export const BOX_SNAPSHOT_ROW_WORDS = BOX_SNAPSHOT_ROW_SIZE / 8;
-const FRAGMENT_WORDS = GEOMETRY_FRAGMENT_SIZE / 8;
+export const BOX_SNAPSHOT_ROW_WORDS = BOX_SNAPSHOT_ROW_SIZE / F64;
+const FRAGMENT_WORDS = GEOMETRY_FRAGMENT_SIZE / F64;
 
 function attach(boxes, core, handle) {
   const snapshot = { core, handle, count: boxes.length, references: 1 };
@@ -119,18 +120,19 @@ export function readEngineBoxes(core, count, deviceScale) {
   const handle = core.status("engine_boxes_snapshot", count, deviceScale);
   const bytes = core.refreshBytes();
   const header = new DataView(bytes.buffer, handle, BOX_SNAPSHOT_HEADER_SIZE);
-  if (header.getUint32(0, true) !== BOX_SNAPSHOT_MAGIC || header.getUint32(4, true) !== count) {
+  if (header.getUint32(BOX_HEADER_MAGIC, true) !== BOX_SNAPSHOT_MAGIC || header.getUint32(BOX_HEADER_COUNT, true) !== count) {
     throw new Error(`Box snapshot ${handle} does not hold ${count} rows`);
   }
-  const fragmentCount = header.getUint32(8, true);
+  const fragmentCount = header.getUint32(BOX_HEADER_FRAGMENTS, true);
   const bodyStart = handle + BOX_SNAPSHOT_HEADER_SIZE;
   const body = bytes.slice(
     bodyStart,
     bodyStart + count * BOX_SNAPSHOT_ROW_SIZE + fragmentCount * GEOMETRY_FRAGMENT_SIZE,
   );
-  const svgPointer = header.getUint32(20, true);
+  const svgPointer = header.getUint32(BOX_HEADER_SVG, true);
   const svgCount = svgPointer === 0 ? 0 : new DataView(bytes.buffer).getUint32(svgPointer, true);
-  const svg = svgCount === 0 ? null : bytes.slice(svgPointer + 8, svgPointer + 8 + svgCount * 64);
+  const svgRows = svgPointer + SVG_HEADER_SIZE;
+  const svg = svgCount === 0 ? null : bytes.slice(svgRows, svgRows + svgCount * SVG_ROW_SIZE);
   const boxes = boxList(core, handle, body, count, fragmentCount, svg, svgCount);
   measurement?.record({
     category: "geometry",
@@ -146,10 +148,12 @@ export function readEngineBoxes(core, count, deviceScale) {
 
 function boxList(core, handle, body, count, fragmentCount, svg, svgCount) {
   const values = new Float64Array(body.buffer);
-  const words = new Uint32Array(body.buffer, 0, count * BOX_SNAPSHOT_ROW_WORDS * 2);
+  const words = new Uint32Array(body.buffer, 0, count * BOX_SNAPSHOT_ROW_SIZE / U32);
   const fragmentBase = count * BOX_SNAPSHOT_ROW_WORDS;
   const target = new Array(count);
-  attach(target, core, handle);
+  // A list over a host-made body (boxesWithPageFragments) has no native
+  // snapshot: boxSnapshotFor imports its rows.
+  if (handle !== 0n) attach(target, core, handle);
   const rows = { core, body, count, fragmentCount, svg, svgCount, made: 0 };
   const boxAt = (index) => {
     const made = target[index];
@@ -201,10 +205,78 @@ function boxList(core, handle, body, count, fragmentCount, svg, svgCount) {
   return boxes;
 }
 
+// The box list `boxes` (an engine box list) with the rows of `edits`
+// replaced: a Map from row index to { border, content, fragments }, each
+// rectangle { x, y, w, h } in the coordinates of the other rows, and
+// `fragments` none or two and more border boxes. The row takes `border`
+// and `content`, the fragments relative to `border`'s origin, and no
+// scroll owner or scroll offsets: its rectangles are client positions.
+// Every other row, and the SVG rows, are the engine's.
+export function boxesWithPageFragments(boxes, edits) {
+  const rows = boxListRows.get(boxes);
+  if (rows === undefined) throw new Error("boxesWithPageFragments needs an engine box list (readEngineBoxes)");
+  let added = 0;
+  for (const edit of edits.values()) {
+    if (edit.fragments.length === 1) {
+      throw new Error("A page-fragmented box has one fragment; a box in one piece has none and a broken box two or more");
+    }
+    added += edit.fragments.length;
+  }
+  const rowBytes = rows.count * BOX_SNAPSHOT_ROW_SIZE;
+  const fragmentCount = rows.fragmentCount + added;
+  const body = new Uint8Array(rowBytes + fragmentCount * GEOMETRY_FRAGMENT_SIZE);
+  body.set(rows.body);
+  const view = new DataView(body.buffer);
+  let fragment = rows.fragmentCount;
+  for (const [index, { border, content, fragments }] of edits) {
+    const row = index * BOX_SNAPSHOT_ROW_SIZE;
+    const values = [border.x, border.y, border.w, border.h, content.x, content.y, content.w, content.h];
+    for (let field = 0; field < values.length; field++) view.setFloat64(row + BOX_ROW_VALUES + field * F64, values[field], true);
+    view.setUint32(row + BOX_ROW_FIRST_FRAGMENT, fragments.length === 0 ? 0 : fragment, true);
+    view.setUint32(row + BOX_ROW_FRAGMENT_COUNT, fragments.length, true);
+    for (let at = BOX_ROW_SCROLL_OWNER; at < BOX_ROW_START_OVERFLOW_X; at += U32) view.setUint32(row + at, 0, true);
+    for (const { x, y, w, h } of fragments) {
+      const at = rowBytes + fragment * GEOMETRY_FRAGMENT_SIZE;
+      writeFragment(view, at, { x, y, w, h }, border);
+      fragment++;
+    }
+  }
+  return boxList(rows.core, 0n, body, rows.count, fragmentCount, rows.svg, rows.svgCount);
+}
+
 // How many box objects `boxes` holds: every one of an array, the ones a
 // box list has made so far.
 export function boxesMade(boxes) {
   return boxListRows.get(boxes)?.made ?? boxes.length;
+}
+
+// Whether two engine box lists (readEngineBoxes, boxesWithPageFragments)
+// hold the same rows, fragments and SVG rows, byte for byte: a geometry
+// built from one is the geometry of the other. The renderer reads a new
+// list after each layout, so lists of one layout compare equal by content,
+// never by identity. A list that is not an engine box list compares equal
+// only to itself.
+export function boxesEqual(a, b) {
+  if (a === b) return true;
+  const left = boxListRows.get(a);
+  const right = boxListRows.get(b);
+  if (left === undefined || right === undefined) return false;
+  if (left.count !== right.count || left.fragmentCount !== right.fragmentCount || left.svgCount !== right.svgCount) {
+    return false;
+  }
+  return bytesEqual(left.body, right.body) && (left.svg === null || bytesEqual(left.svg, right.svg));
+}
+
+function bytesEqual(a, b) {
+  if (a.byteLength !== b.byteLength) return false;
+  // A body is its own buffer from offset 0 (a slice or a new array), so
+  // its whole words compare as one 32-bit view and its tail byte by byte.
+  const words = a.byteLength >>> 2;
+  const left = new Uint32Array(a.buffer, a.byteOffset, words);
+  const right = new Uint32Array(b.buffer, b.byteOffset, words);
+  for (let index = 0; index < words; index++) if (left[index] !== right[index]) return false;
+  for (let index = words << 2; index < a.byteLength; index++) if (a[index] !== b[index]) return false;
+  return true;
 }
 
 // The row a property key names: a canonical array index below `count`,
@@ -310,28 +382,25 @@ function importBoxSnapshot(boxes, core) {
   for (let index = 0; index < boxes.length; index++) {
     const box = boxes[index];
     const row = index * BOX_SNAPSHOT_ROW_SIZE;
-    for (let field = 0; field < 14; field++) {
-      view.setFloat64(row + field * 8, box?.[boxNames[field]] ?? 0, true);
+    for (let field = 0; field < boxNames.length; field++) {
+      view.setFloat64(row + BOX_ROW_VALUES + field * F64, box?.[boxNames[field]] ?? 0, true);
     }
     // A host box carries the classic scrollbar space a box list gave it.
     for (let side = 0; side < 4; side++) {
-      view.setFloat64(row + BOX_ROW_SCROLLBAR_SPACE + side * 8, box?.scrollbarSpace?.[side] ?? 0, true);
+      view.setFloat64(row + BOX_ROW_SCROLLBAR_SPACE + side * F64, box?.scrollbarSpace?.[side] ?? 0, true);
     }
     const fragments = boxFragments(box);
     view.setUint32(row + BOX_ROW_FIRST_FRAGMENT, fragments.length === 0 ? 0 : fragment, true);
     view.setUint32(row + BOX_ROW_FRAGMENT_COUNT, fragments.length, true);
     // No scroll owner, no effective scroll offsets.
-    for (let at = BOX_ROW_SCROLL_OWNER; at < BOX_SNAPSHOT_ROW_SIZE; at += 4) view.setUint32(row + at, 0, true);
+    for (let at = BOX_ROW_SCROLL_OWNER; at < BOX_SNAPSHOT_ROW_SIZE; at += U32) view.setUint32(row + at, 0, true);
     view.setFloat64(row + BOX_ROW_START_OVERFLOW_X, box?.startOverflowX ?? 0, true);
     for (let edge = 0; edge < 8; edge++) {
-      view.setFloat64(row + BOX_ROW_USED_EDGES + edge * 8, box?.usedEdges?.[edge] ?? 0, true);
+      view.setFloat64(row + BOX_ROW_USED_EDGES + edge * F64, box?.usedEdges?.[edge] ?? 0, true);
     }
     for (const { x, y, w, h } of fragments) {
       const at = fragmentBase + fragment * GEOMETRY_FRAGMENT_SIZE;
-      view.setFloat64(at, x, true);
-      view.setFloat64(at + 8, y, true);
-      view.setFloat64(at + 16, w, true);
-      view.setFloat64(at + 24, h, true);
+      writeFragment(view, at, { x, y, w, h });
       fragment++;
     }
   }
@@ -373,398 +442,39 @@ export function boxSnapshotFor(boxes, core) {
   };
 }
 
-// The host tail of a geometry build: counts, then the wire scrollbar,
-// caret and glyph blocks (a record index of -1 resolves in the core).
-// A text node's caret and glyph wire blocks, encoded once per geometry
-// object (they are frozen and reused across frames) with zero translation;
-// the tail copies them and patches the translation words of a scrolled
-// node. `carets` and `glyphs` still take individual records.
-// Keyed by the frozen caret-stop array: a scroll-only frame wraps the same
-// stops and glyphs in a new geometry object with a new translation.
-const wireBlocks = new WeakMap();
-export function textWireBlocks(node, geometry) {
-  const stops = geometry.caretStops;
-  const glyphs = geometry.glyphs ?? [];
-  let blocks = wireBlocks.get(stops);
-  if (
-    blocks !== undefined && blocks.handle === node._coreHandle &&
-    blocks.glyphSource === glyphs
-  ) return blocks;
-  const carets = new Uint8Array(stops.length * GEOMETRY_CARET_SIZE);
-  const caretView = new DataView(carets.buffer);
-  for (let index = 0; index < stops.length; index++) {
-    const stop = stops[index];
-    const offset = index * GEOMETRY_CARET_SIZE;
-    caretView.setBigUint64(offset, node._coreHandle, true);
-    caretView.setFloat64(offset + 8, stop.sourceOffset, true);
-    caretView.setFloat64(offset + 16, stop.x, true);
-    caretView.setFloat64(offset + 24, stop.top, true);
-    caretView.setFloat64(offset + 32, stop.bottom, true);
-    caretView.setInt32(offset + 40, -1, true);
-  }
-  const glyphBytes = new Uint8Array(glyphs.length * GEOMETRY_GLYPH_SIZE);
-  const glyphView = new DataView(glyphBytes.buffer);
-  for (let index = 0; index < glyphs.length; index++) {
-    const glyph = glyphs[index];
-    const offset = index * GEOMETRY_GLYPH_SIZE;
-    glyphView.setBigUint64(offset, node._coreHandle, true);
-    glyphView.setFloat64(offset + 8, glyph.sourceStart, true);
-    glyphView.setFloat64(offset + 16, glyph.sourceEnd, true);
-    glyphView.setFloat64(offset + 24, glyph.x, true);
-    glyphView.setFloat64(offset + 32, glyph.top, true);
-    glyphView.setFloat64(offset + 40, glyph.bottom, true);
-    glyphView.setFloat64(offset + 48, glyph.width, true);
-    glyphView.setInt32(offset + 72, -1, true);
-  }
-  blocks = {
-    handle: node._coreHandle,
-    glyphSource: glyphs,
-    carets,
-    glyphs: glyphBytes,
-    caretCount: stops.length,
-    glyphCount: glyphs.length,
-  };
-  wireBlocks.set(stops, blocks);
-  return blocks;
-}
-
-// Writes a text node's translation into its copied wire blocks, as it is:
-// a shared text block shifts it later, so a -0 stays -0 (the core reads a
-// pair of zeros as +0). The blocks are encoded with +0.
-function patchTranslation(bytes, base, stride, count, offsetInRecord, x, y) {
-  if (Object.is(x, 0) && Object.is(y, 0)) return;
-  const view = new DataView(bytes.buffer, bytes.byteOffset);
-  for (let index = 0; index < count; index++) {
-    view.setFloat64(base + index * stride + offsetInRecord, x, true);
-    view.setFloat64(base + index * stride + offsetInRecord + 8, y, true);
-  }
-}
-
-// One wire scrollbar block (192 bytes) at `offset`.
+// One wire scrollbar block at `offset`.
 function writeScrollbar(view, offset, scrollbar) {
   for (const [index, name] of ["x", "y", "width", "height"].entries()) {
-    view.setFloat64(offset + index * 8, scrollbar.track[name], true);
-    view.setFloat64(
-      offset + 32 + index * 8,
-      scrollbar.clip?.[name] ?? 0,
-      true,
-    );
-    view.setFloat64(
-      offset + 144 + index * 8,
-      scrollbar.thumb?.[name] ?? 0,
-      true,
-    );
+    view.setFloat64(offset + SCROLLBAR.TRACK + index * F64, scrollbar.track[name], true);
+    view.setFloat64(offset + SCROLLBAR.CLIP + index * F64, scrollbar.clip?.[name] ?? 0, true);
+    view.setFloat64(offset + SCROLLBAR.THUMB + index * F64, scrollbar.thumb?.[name] ?? 0, true);
   }
-  view.setUint32(offset + 64, scrollbar.clip ? 1 : 0, true);
-  view.setUint32(
-    offset + 68,
-    scrollbar.orientation === "vertical" ? 1 : 0,
-    true,
-  );
-  view.setBigUint64(
-    offset + 72,
-    scrollbar.element?._coreHandle ?? scrollbar.targetHandle ?? 0n,
-    true,
-  );
-  [
-    "value",
-    "minimum",
-    "maximum",
-    "range",
-    "viewportLength",
-    "scrollLength",
-    "thickness",
-  ].forEach((name, index) =>
-    view.setFloat64(offset + 80 + index * 8, scrollbar[name] ?? 0, true)
+  view.setUint32(offset + SCROLLBAR.HAS_CLIP, scrollbar.clip ? 1 : 0, true);
+  view.setUint32(offset + SCROLLBAR.VERTICAL, scrollbar.orientation === "vertical" ? 1 : 0, true);
+  view.setBigUint64(offset + SCROLLBAR.TARGET, scrollbar.element?._coreHandle ?? scrollbar.targetHandle ?? 0n, true);
+  ["value", "minimum", "maximum", "range", "viewportLength", "scrollLength", "thickness"].forEach((name, index) =>
+    view.setFloat64(offset + SCROLLBAR.VALUES + index * F64, scrollbar[name] ?? 0, true)
   );
 }
 
-// `textBlocks`: [{ blocks, translationX, translationY }] appended after the
-// individual carets and glyphs.
-export function encodeGeometryTail(
-  { scrollbars = [], carets = [], glyphs = [], textBlocks = [] },
-) {
-  let blockCarets = 0;
-  let blockGlyphs = 0;
-  for (const { blocks } of textBlocks) {
-    blockCarets += blocks.caretCount;
-    blockGlyphs += blocks.glyphCount;
-  }
-  const caretCount = carets.length + blockCarets;
-  const glyphCount = glyphs.length + blockGlyphs;
-  const bytes = new Uint8Array(
-    16 + scrollbars.length * GEOMETRY_SCROLLBAR_SIZE + caretCount * GEOMETRY_CARET_SIZE +
-      glyphCount * GEOMETRY_GLYPH_SIZE,
-  );
+// The host tail of a geometry build, or of a successor (geometry-build.watpart
+// geometry_scroll_successor, geometry_restyle_successor): the scrollbar
+// count in a GEOMETRY_TAIL header, then the wire scrollbar blocks. The
+// carets, glyphs and text come from the text geometry store.
+function encodeTail(scrollbars) {
+  const bytes = new Uint8Array(GEOMETRY_TAIL_HEADER_SIZE + scrollbars.length * GEOMETRY_SCROLLBAR_SIZE);
   const view = new DataView(bytes.buffer);
-  view.setUint32(0, scrollbars.length, true);
-  view.setUint32(4, caretCount, true);
-  view.setUint32(8, glyphCount, true);
-  let offset = 16;
+  view.setUint32(GEOMETRY_TAIL_SCROLLBARS, scrollbars.length, true);
+  let offset = GEOMETRY_TAIL_HEADER_SIZE;
   for (const scrollbar of scrollbars) {
     writeScrollbar(view, offset, scrollbar);
     offset += GEOMETRY_SCROLLBAR_SIZE;
   }
-  for (const caret of carets) {
-    view.setBigUint64(offset, caret.handle, true);
-    [caret.sourceOffset, caret.x, caret.top, caret.bottom].forEach((
-      value,
-      index,
-    ) => view.setFloat64(offset + 8 + index * 8, value, true));
-    view.setInt32(offset + 40, caret.recordIndex ?? -1, true);
-    view.setFloat64(offset + 48, caret.translationX ?? 0, true);
-    view.setFloat64(offset + 56, caret.translationY ?? 0, true);
-    offset += GEOMETRY_CARET_SIZE;
-  }
-  for (const { blocks, translationX, translationY } of textBlocks) {
-    bytes.set(blocks.carets, offset);
-    patchTranslation(
-      bytes,
-      offset,
-      GEOMETRY_CARET_SIZE,
-      blocks.caretCount,
-      48,
-      translationX,
-      translationY,
-    );
-    offset += blocks.caretCount * GEOMETRY_CARET_SIZE;
-  }
-  for (const glyph of glyphs) {
-    writeGlyph(view, offset, glyph);
-    offset += GEOMETRY_GLYPH_SIZE;
-  }
-  for (const { blocks, translationX, translationY } of textBlocks) {
-    bytes.set(blocks.glyphs, offset);
-    patchTranslation(
-      bytes,
-      offset,
-      GEOMETRY_GLYPH_SIZE,
-      blocks.glyphCount,
-      56,
-      translationX,
-      translationY,
-    );
-    offset += blocks.glyphCount * GEOMETRY_GLYPH_SIZE;
-  }
   return bytes;
 }
-
-// The host tail of a scroll successor (geometry-build.watpart
-// geometry_scroll_successor), a 16-byte header: u32 scrollbar count, u32
-// text entry count, u32 text mode, 4 reserved bytes; then the wire
-// scrollbars, then one entry per text node in the predecessor's caret and
-// glyph order: u64 node handle, f64 translation x and y. `shareText`
-// (text mode 1, no entries) keeps the predecessor's carets and glyphs. A
-// translation holds no scroll: the geometry records carry it.
-const GEOMETRY_SUCCESSOR_TAIL_HEADER_SIZE = 16;
-const GEOMETRY_SUCCESSOR_TEXT_ENTRY_SIZE = 24;
-export function encodeGeometrySuccessorTail({ scrollbars, textTranslations = [], shareText = false }) {
-  const bytes = new Uint8Array(
-    GEOMETRY_SUCCESSOR_TAIL_HEADER_SIZE + scrollbars.length * GEOMETRY_SCROLLBAR_SIZE +
-      textTranslations.length * GEOMETRY_SUCCESSOR_TEXT_ENTRY_SIZE,
-  );
-  const view = new DataView(bytes.buffer);
-  view.setUint32(0, scrollbars.length, true);
-  view.setUint32(4, textTranslations.length, true);
-  if (shareText) view.setUint32(8, 1, true);
-  let offset = GEOMETRY_SUCCESSOR_TAIL_HEADER_SIZE;
-  for (const scrollbar of scrollbars) {
-    writeScrollbar(view, offset, scrollbar);
-    offset += GEOMETRY_SCROLLBAR_SIZE;
-  }
-  for (const { handle, translationX, translationY } of textTranslations) {
-    view.setBigUint64(offset, handle, true);
-    view.setFloat64(offset + 8, translationX, true);
-    view.setFloat64(offset + 16, translationY, true);
-    offset += GEOMETRY_SUCCESSOR_TEXT_ENTRY_SIZE;
-  }
-  return bytes;
+export function encodeGeometryTail({ scrollbars = [] }) {
+  return encodeTail(scrollbars);
 }
-
-export function encodeGeometryFacts(
-  {
-    records,
-    scrollbars = [],
-    carets = [],
-    glyphs = [],
-    viewport,
-    revisions = {},
-    presented = false,
-  },
-) {
-  let fragmentCount = 0;
-  for (const record of records) fragmentCount += boxFragments(record.box).length;
-  const bytes = new Uint8Array(geometryWireSize(
-    records.length,
-    scrollbars.length,
-    carets.length,
-    glyphs.length,
-    fragmentCount,
-  ));
-  const view = new DataView(bytes.buffer);
-  view.setUint32(0, 1, true);
-  view.setUint32(4, GEOMETRY_RECORD_SIZE, true);
-  view.setUint32(8, records.length, true);
-  view.setUint32(12, scrollbars.length, true);
-  view.setUint32(16, carets.length, true);
-  view.setUint32(20, presented ? 1 : 0, true);
-  for (
-    const [index, name] of [
-      "document",
-      "style",
-      "resource",
-      "viewport",
-      "scene",
-      "presentation",
-    ].entries()
-  ) {
-    view.setBigUint64(24 + index * 8, BigInt(revisions[name] ?? 0), true);
-  }
-  view.setFloat64(72, viewport.width, true);
-  view.setFloat64(80, viewport.height, true);
-  view.setFloat64(88, viewport.deviceScale ?? 1, true);
-  view.setUint32(96, glyphs.length, true);
-  view.setUint32(GEOMETRY_ENVELOPE_FRAGMENT_COUNT, fragmentCount, true);
-  const fragmentBase = geometryWireSize(
-    records.length,
-    scrollbars.length,
-    carets.length,
-    glyphs.length,
-    0,
-  );
-  let fragment = 0;
-  let offset = GEOMETRY_ENVELOPE_SIZE;
-  for (const record of records) {
-    const fields = record.fields ?? {};
-    const box = record.box;
-    let flags = box ? 1 : 0;
-    if (record.hitable !== false) flags |= 2;
-    if ((fields.position ?? "static") !== "static") flags |= 4;
-    if (fields.zIndex !== undefined) flags |= 8;
-    if (fields.direction === "rtl") flags |= 32;
-    if (fields.display === "flex" || fields.display === "inline-flex") {
-      if (fields.flexDirection === "row-reverse") flags |= 16;
-      if (fields.flexDirection === "column-reverse") flags |= 256;
-    }
-    if (record.viewport) flags |= 64;
-    if (record.viewportClient) flags |= 128;
-    if (fields.visibility === "hidden") flags |= 512;
-    if (fields.pointerEvents === "none") flags |= 1024;
-    view.setBigUint64(offset, record.handle ?? 0n, true);
-    view.setInt32(offset + 8, record.parent ?? -1, true);
-    view.setInt32(offset + 12, record.engineIndex ?? -1, true);
-    view.setUint32(offset + 16, flags, true);
-    view.setInt32(offset + 20, overflowCodes[fields.overflowX] ?? -1, true);
-    view.setInt32(offset + 24, overflowCodes[fields.overflowY] ?? -1, true);
-    view.setUint32(
-      offset + 28,
-      {
-        "padding-box": 0,
-        "content-box": 1,
-        "border-box": 2,
-      }[fields.overflowClipMargin?.visualBox ?? "padding-box"],
-      true,
-    );
-    boxNames.forEach((name, index) =>
-      view.setFloat64(offset + 32 + index * 8, box?.[name] ?? 0, true)
-    );
-    for (const [index, name] of sides.entries()) {
-      view.setFloat64(
-        offset + 320 + index * 8,
-        fields.border?.[name] ?? 0,
-        true,
-      );
-      view.setFloat64(
-        offset + 352 + index * 8,
-        fields.padding?.[name] ?? 0,
-        true,
-      );
-      view.setFloat64(
-        offset + 384 + index * 8,
-        record.gutters?.[name] ?? 0,
-        true,
-      );
-    }
-    (record.matrix ?? identity).forEach((value, index) =>
-      view.setFloat64(offset + 416 + index * 8, value, true)
-    );
-    view.setFloat64(offset + 544, Number(fields.zIndex ?? 0), true);
-    view.setFloat64(offset + 552, fields.overflowClipMargin?.offset ?? 0, true);
-    view.setUint32(
-      offset + 560,
-      {
-        "horizontal-tb": 0,
-        "vertical-rl": 1,
-        "vertical-lr": 2,
-      }[fields.writingMode ?? "horizontal-tb"],
-      true,
-    );
-    view.setUint32(
-      offset + 564,
-      overscrollCodes[fields.overscrollBehaviorX ?? "auto"],
-      true,
-    );
-    view.setUint32(
-      offset + 568,
-      overscrollCodes[fields.overscrollBehaviorY ?? "auto"],
-      true,
-    );
-    view.setUint32(offset + 572, record.pseudo ?? 0, true);
-    view.setBigUint64(offset + 576, record.ownerHandle ?? 0n, true);
-    view.setUint32(offset + 584, record.kind ?? 0, true);
-    view.setInt32(offset + 588, overflowCodes[fields.overflow] ?? -1, true);
-    const fragments = boxFragments(box);
-    if (fragments.length > 0) {
-      view.setUint32(offset + GEOMETRY_RECORD_FIRST_FRAGMENT, fragment, true);
-      view.setUint32(offset + GEOMETRY_RECORD_FRAGMENT_COUNT, fragments.length, true);
-    }
-    for (const { x, y, w, h } of fragments) {
-      const at = fragmentBase + fragment * GEOMETRY_FRAGMENT_SIZE;
-      view.setFloat64(at, x, true);
-      view.setFloat64(at + 8, y, true);
-      view.setFloat64(at + 16, w, true);
-      view.setFloat64(at + 24, h, true);
-      fragment++;
-    }
-    offset += GEOMETRY_RECORD_SIZE;
-  }
-  for (const scrollbar of scrollbars) {
-    writeScrollbar(view, offset, scrollbar);
-    offset += GEOMETRY_SCROLLBAR_SIZE;
-  }
-  for (const caret of carets) {
-    view.setBigUint64(offset, caret.handle, true);
-    [caret.sourceOffset, caret.x, caret.top, caret.bottom].forEach((
-      value,
-      index,
-    ) => view.setFloat64(offset + 8 + index * 8, value, true));
-    view.setInt32(offset + 40, caret.recordIndex ?? -1, true);
-    view.setFloat64(offset + 48, caret.translationX ?? 0, true);
-    view.setFloat64(offset + 56, caret.translationY ?? 0, true);
-    offset += GEOMETRY_CARET_SIZE;
-  }
-  for (const glyph of glyphs) {
-    writeGlyph(view, offset, glyph);
-    offset += GEOMETRY_GLYPH_SIZE;
-  }
-  return bytes;
-}
-
-function writeGlyph(view, offset, glyph) {
-  view.setBigUint64(offset, glyph.handle, true);
-  for (
-    const [index, name] of [
-      "sourceStart",
-      "sourceEnd",
-      "x",
-      "top",
-      "bottom",
-      "width",
-    ].entries()
-  ) {
-    view.setFloat64(offset + 8 + index * 8, glyph[name], true);
-  }
-  view.setFloat64(offset + 56, glyph.translationX ?? 0, true);
-  view.setFloat64(offset + 64, glyph.translationY ?? 0, true);
-  view.setInt32(offset + 72, glyph.recordIndex ?? -1, true);
+export function encodeGeometrySuccessorTail({ scrollbars }) {
+  return encodeTail(scrollbars);
 }

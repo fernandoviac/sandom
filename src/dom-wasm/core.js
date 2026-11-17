@@ -1,24 +1,166 @@
 import { scheduleMutationObservers } from "../dom/mutation-observer.js";
 import { instantiateRendererCore } from "../wasm/renderer-core-binary.js";
 import { hostNow } from "../host-clock.js";
+import { encodeHostValues } from "../wasm/host-values.js";
+import { domStringCodec } from "./dom-string-transport.js";
 import {
   ANIMATION_RECORD_SIZE, LAYOUT_NODE_SIZE,
-  LAYOUT_NODE_OFFSET_BORDER_BOTTOM, LAYOUT_NODE_OFFSET_BORDER_LEFT,
-  LAYOUT_NODE_OFFSET_BORDER_RIGHT, LAYOUT_NODE_OFFSET_BORDER_TOP,
-  LAYOUT_NODE_OFFSET_BOX_SIZING, LAYOUT_NODE_OFFSET_MARGIN_BOTTOM,
-  LAYOUT_NODE_OFFSET_MARGIN_LEFT, LAYOUT_NODE_OFFSET_MARGIN_RIGHT,
-  LAYOUT_NODE_OFFSET_MARGIN_TOP, LAYOUT_NODE_OFFSET_POSITION,
   LAYOUT_NODE_OFFSET_SHADOW_COUNT, LAYOUT_NODE_OFFSET_SHADOW_OFFSET,
-  POSITION_ABSOLUTE, SHADOW_POOL_BASE, SHADOW_ENTRY_SIZE,
+  SHADOW_ENTRY_SIZE,
 } from "../wasm/layout.js";
 import {
   coreTransportPoolKinds,
   EngineFrameInputSize,
   EngineFrameResolutionSize,
   readEngineFrameOutput,
-  readEngineSvgRequest,
+  readSvgPathDefinition,
+  SceneBuildBoxFields,
   SceneBuildBoxSize
 } from "./record-readers.generated.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+
+// The codes that this file passes to or reads from WAT, by the names of
+// their WAT globals.
+const STYLE_DIAGNOSTIC_INVALID_DECLARATION = layoutConstant("STYLE_DIAGNOSTIC_INVALID_DECLARATION");
+// The kinds of a style sheet's diagnostics (css_sheet_diagnostic_at), by
+// the code the core gives each one.
+const STYLE_SHEET_DIAGNOSTICS = Object.freeze({
+  [layoutConstant("CSS_DIAGNOSTIC_INVALID_DECLARATION")]: { code: "css-invalid-declaration", message: "Invalid declaration" },
+  [layoutConstant("CSS_DIAGNOSTIC_UNIMPLEMENTED_PROPERTY")]: { code: "css-unimplemented-property", message: "Property that Sandom does not implement" },
+  [layoutConstant("CSS_DIAGNOSTIC_UNSUPPORTED_VALUE")]: { code: "css-unsupported-value", message: "Value that is invalid or that Sandom does not implement" },
+  [layoutConstant("CSS_DIAGNOSTIC_INVALID_SELECTOR")]: { code: "css-invalid-selector", message: "Invalid selector" },
+  [layoutConstant("CSS_DIAGNOSTIC_UNIMPLEMENTED_SELECTOR")]: { code: "css-unimplemented-selector", message: "Selector that Sandom does not implement" },
+  [layoutConstant("CSS_DIAGNOSTIC_INVALID_AT_RULE")]: { code: "css-invalid-at-rule", message: "Invalid at-rule" },
+  [layoutConstant("CSS_DIAGNOSTIC_UNIMPLEMENTED_AT_RULE")]: { code: "css-unimplemented-at-rule", message: "At-rule that Sandom does not implement" },
+});
+const MATHML_DIAGNOSTIC_ELEMENT = layoutConstant("MATHML_DIAGNOSTIC_ELEMENT");
+const COLOR_PARSED = layoutConstant("COLOR_PARSED");
+const COLOR_CURRENT = layoutConstant("COLOR_CURRENT");
+const NODE_STATE_HOVER = layoutConstant("NODE_STATE_HOVER");
+const COMPUTED_CONTEXT_PENDING = layoutConstant("COMPUTED_CONTEXT_PENDING");
+const TOKEN_RESULT = layoutConstant("TOKEN_RESULT");
+const TOKEN_RESULT_WRITE = layoutConstant("TOKEN_RESULT_WRITE");
+const CSS_REFERENCE_RECORD_KIND = layoutConstant("CSS_REFERENCE_RECORD_KIND");
+const CSS_REFERENCE_RECORD_LENGTH = layoutConstant("CSS_REFERENCE_RECORD_LENGTH");
+const CSS_REFERENCE_RECORD_REQUEST = layoutConstant("CSS_REFERENCE_RECORD_REQUEST");
+const CSS_REFERENCE_RECORD_INTEGRITY_LENGTH = layoutConstant("CSS_REFERENCE_RECORD_INTEGRITY_LENGTH");
+const CSS_REFERENCE_RECORD_HEADER_SIZE = layoutConstant("CSS_REFERENCE_RECORD_HEADER_SIZE");
+const NODE_STATE_ACTIVE = layoutConstant("NODE_STATE_ACTIVE");
+const FORCED_STATE_HOVER = layoutConstant("FORCED_STATE_HOVER");
+const FORCED_STATE_ACTIVE = layoutConstant("FORCED_STATE_ACTIVE");
+const FORCED_STATE_FOCUS = layoutConstant("FORCED_STATE_FOCUS");
+const FORCED_STATE_FOCUS_VISIBLE = layoutConstant("FORCED_STATE_FOCUS_VISIBLE");
+const FORCED_STATE_FOCUS_WITHIN = layoutConstant("FORCED_STATE_FOCUS_WITHIN");
+const CASCADE_STATE_HOVER = layoutConstant("CASCADE_STATE_HOVER");
+const CASCADE_STATE_ACTIVE = layoutConstant("CASCADE_STATE_ACTIVE");
+// The host runner of a custom element reaction scope; src/dom/custom-elements.js
+// registers it.
+let customElementReactionRunner = null;
+export function registerCustomElementReactionRunner(runner) {
+  customElementReactionRunner = runner;
+}
+const LENGTH_RESULT = Object.freeze(Object.fromEntries(["KEYWORD", "PIXELS", "PERCENTAGE", "MIXED", "EXPRESSION"]
+  .map((name) => [name, layoutConstant(`LENGTH_RESULT_${name}`)])));
+const ENGINE_FRAME_RECORDED = layoutConstant("ENGINE_FRAME_RECORDED");
+const ENGINE_FRAME_DECLINED = layoutConstant("ENGINE_FRAME_DECLINED");
+const IMAGE_RESOURCE = Object.freeze(Object.fromEntries(["BACKGROUND", "MASK", "BORDER", "KIND_COUNT"]
+  .map((name) => [name, layoutConstant(`IMAGE_RESOURCE_${name}`)])));
+const STYLE_FAMILY_AVAILABLE = layoutConstant("STYLE_FAMILY_AVAILABLE");
+const STYLE_FAMILY_REJECTED = layoutConstant("STYLE_FAMILY_REJECTED");
+const STYLE_FAMILY_FAULT = layoutConstant("STYLE_FAMILY_FAULT");
+const STYLE_MUTATION_RETHROW = layoutConstant("STYLE_MUTATION_RETHROW");
+const ERROR_CLASS_TYPE_ERROR = layoutConstant("ERROR_CLASS_TYPE_ERROR");
+const ERROR_CLASS_RANGE_ERROR = layoutConstant("ERROR_CLASS_RANGE_ERROR");
+const ERROR_CLASS_DOM_EXCEPTION = layoutConstant("ERROR_CLASS_DOM_EXCEPTION");
+const SPECIFIED_GRAMMAR_PROPERTY = layoutConstant("SPECIFIED_GRAMMAR_PROPERTY");
+const OBSERVE_CHILD_LIST = layoutConstant("OBSERVE_CHILD_LIST");
+const OBSERVE_ATTRIBUTES = layoutConstant("OBSERVE_ATTRIBUTES");
+const OBSERVE_CHARACTER_DATA = layoutConstant("OBSERVE_CHARACTER_DATA");
+const OBSERVE_SUBTREE = layoutConstant("OBSERVE_SUBTREE");
+const OBSERVE_ATTRIBUTE_OLD_VALUE = layoutConstant("OBSERVE_ATTRIBUTE_OLD_VALUE");
+const OBSERVE_CHARACTER_DATA_OLD_VALUE = layoutConstant("OBSERVE_CHARACTER_DATA_OLD_VALUE");
+const OBSERVE_ATTRIBUTE_FILTER = layoutConstant("OBSERVE_ATTRIBUTE_FILTER");
+const ANIMATION_KIND_SHADOW = layoutConstant("ANIMATION_KIND_SHADOW");
+const COLOR_RGBA_SIZE = layoutConstant("COLOR_RGBA_SIZE");
+const COLOR_RGBA_R = layoutConstant("COLOR_RGBA_R");
+const COLOR_RGBA_G = layoutConstant("COLOR_RGBA_G");
+const COLOR_RGBA_B = layoutConstant("COLOR_RGBA_B");
+const COLOR_RGBA_A = layoutConstant("COLOR_RGBA_A");
+const DAMAGE_RECT_SIZE = layoutConstant("DAMAGE_RECT_SIZE");
+const DAMAGE_RECT_X = layoutConstant("DAMAGE_RECT_X");
+const DAMAGE_RECT_Y = layoutConstant("DAMAGE_RECT_Y");
+const DAMAGE_RECT_WIDTH = layoutConstant("DAMAGE_RECT_WIDTH");
+const DAMAGE_RECT_HEIGHT = layoutConstant("DAMAGE_RECT_HEIGHT");
+const COMMIT_GROUP_SIZE = layoutConstant("COMMIT_GROUP_SIZE");
+const COMMIT_GROUP_FRAME = layoutConstant("COMMIT_GROUP_FRAME");
+const COMMIT_GROUP_REVISION = layoutConstant("COMMIT_GROUP_REVISION");
+const SELECTION_SPAN_SIZE = layoutConstant("SELECTION_SPAN_SIZE");
+const SELECTION_SPAN_NODE = layoutConstant("SELECTION_SPAN_NODE");
+const SELECTION_SPAN_START = layoutConstant("SELECTION_SPAN_START");
+const SELECTION_SPAN_END = layoutConstant("SELECTION_SPAN_END");
+const HANDLER_ELEMENT_SIZE = layoutConstant("HANDLER_ELEMENT_SIZE");
+const HANDLER_ELEMENT_NODE = layoutConstant("HANDLER_ELEMENT_NODE");
+const HANDLER_ELEMENT_LINE = layoutConstant("HANDLER_ELEMENT_LINE");
+const HANDLER_ELEMENT_COLUMN = layoutConstant("HANDLER_ELEMENT_COLUMN");
+const SELECTION_BOUNDARIES = Object.freeze(Object.fromEntries(["SIZE", "FIRST_NODE", "FIRST_OFFSET", "SECOND_NODE",
+  "SECOND_OFFSET"].map((name) => [name, layoutConstant(`SELECTION_BOUNDARIES_${name}`)])));
+const SELECTION_FOREIGN_PAIR = Object.freeze(Object.fromEntries(["SIZE", "RECORD", "DOCUMENT"]
+  .map((name) => [name, layoutConstant(`SELECTION_FOREIGN_PAIR_${name}`)])));
+const OKLAB_STOP_INTERPOLATED = layoutConstant("OKLAB_STOP_INTERPOLATED");
+const OKLAB_STOP_OWN = layoutConstant("OKLAB_STOP_OWN");
+const CSS_URL_START = layoutConstant("CSS_URL_START");
+const CSS_URL_END = layoutConstant("CSS_URL_END");
+const CSS_URL_LENGTH = layoutConstant("CSS_URL_LENGTH");
+const CSS_URL_REQUEST = layoutConstant("CSS_URL_REQUEST");
+const CSS_URL_INTEGRITY_LENGTH = layoutConstant("CSS_URL_INTEGRITY_LENGTH");
+const CSS_URL_HEADER_SIZE = layoutConstant("CSS_URL_HEADER_SIZE");
+const KEYFRAME_RECORD_SIZE = layoutConstant("KEYFRAME_RECORD_SIZE");
+const KEYFRAME_RECORD_OFFSET = layoutConstant("KEYFRAME_RECORD_OFFSET");
+const KEYFRAME_RECORD_FRAME = layoutConstant("KEYFRAME_RECORD_FRAME");
+const KEYFRAME_RECORD_RULE = layoutConstant("KEYFRAME_RECORD_RULE");
+const UNICODE_RANGE_SIZE = layoutConstant("UNICODE_RANGE_SIZE");
+const RESOURCE_INFO_SIZE = layoutConstant("RESOURCE_INFO_SIZE");
+const RESOURCE_INFO_FIELDS = Object.freeze([
+  ["id", "RESOURCE_INFO_ID", "getUint32"], ["kind", "RESOURCE_INFO_KIND", "getUint32"],
+  ["references", "RESOURCE_INFO_REFERENCES", "getUint32"], ["readiness", "RESOURCE_INFO_READINESS", "getUint32"],
+  ["contentGeneration", "RESOURCE_INFO_CONTENT_GENERATION", "getUint32"],
+  ["metricsGeneration", "RESOURCE_INFO_METRICS_GENERATION", "getUint32"],
+  ["width", "RESOURCE_INFO_WIDTH", "getFloat64"], ["height", "RESOURCE_INFO_HEIGHT", "getFloat64"],
+  ["failure", "RESOURCE_INFO_FAILURE", "getUint32"], ["revision", "RESOURCE_INFO_REVISION", "getUint32"],
+].map(([name, constant, read]) => [name, layoutConstant(constant), read]));
+const CANVAS_RESET_SIZE = layoutConstant("CANVAS_RESET_SIZE");
+const CANVAS_RESET_WIDTH = layoutConstant("CANVAS_RESET_WIDTH");
+const CANVAS_RESET_HEIGHT = layoutConstant("CANVAS_RESET_HEIGHT");
+const CANVAS_RESET_CONTENT_GENERATION = layoutConstant("CANVAS_RESET_CONTENT_GENERATION");
+const CANVAS_RESET_SIZE_CHANGED = layoutConstant("CANVAS_RESET_SIZE_CHANGED");
+const CALLBACK_EFFECT_RETAIN = layoutConstant("CALLBACK_EFFECT_RETAIN");
+const CALLBACK_EFFECT_SLOT_CHANGE = layoutConstant("CALLBACK_EFFECT_SLOT_CHANGE");
+const CALLBACK_FIELD_EFFECTS = layoutConstant("CALLBACK_FIELD_EFFECTS");
+const CALLBACK_FIELD_NOTIFY = layoutConstant("CALLBACK_FIELD_NOTIFY");
+const CALLBACK_FIELD_KIND = layoutConstant("CALLBACK_FIELD_KIND");
+const CALLBACK_FIELD_FLAGS = layoutConstant("CALLBACK_FIELD_FLAGS");
+const CALLBACK_FIELD_TARGET = layoutConstant("CALLBACK_FIELD_TARGET");
+const CALLBACK_FIELD_RELATED_A = layoutConstant("CALLBACK_FIELD_RELATED_A");
+const CALLBACK_FIELD_RELATED_B = layoutConstant("CALLBACK_FIELD_RELATED_B");
+const CALLBACK_FIELD_PREVIOUS = layoutConstant("CALLBACK_FIELD_PREVIOUS");
+const CALLBACK_FIELD_NEXT = layoutConstant("CALLBACK_FIELD_NEXT");
+const CALLBACK_FIELD_NAME_POINTER = layoutConstant("CALLBACK_FIELD_NAME_POINTER");
+const CALLBACK_FIELD_NAME_LENGTH = layoutConstant("CALLBACK_FIELD_NAME_LENGTH");
+const CALLBACK_FIELD_OLD_VALUE_POINTER = layoutConstant("CALLBACK_FIELD_OLD_VALUE_POINTER");
+const CALLBACK_FIELD_OLD_VALUE_LENGTH = layoutConstant("CALLBACK_FIELD_OLD_VALUE_LENGTH");
+const CALLBACK_FLAG_OLD_VALUE_ABSENT = layoutConstant("CALLBACK_FLAG_OLD_VALUE_ABSENT");
+const CALLBACK_FLAG_MOVED = layoutConstant("CALLBACK_FLAG_MOVED");
+const CALLBACK_RECORD_CHILD_LIST = layoutConstant("CALLBACK_RECORD_CHILD_LIST");
+const DETAILS_TOGGLE_SIZE = layoutConstant("DETAILS_TOGGLE_SIZE");
+const DETAILS_TOGGLE_NODE = layoutConstant("DETAILS_TOGGLE_NODE");
+const DETAILS_TOGGLE_TOKEN = layoutConstant("DETAILS_TOGGLE_TOKEN");
+const INDEX_REMAP_SIZE = layoutConstant("INDEX_REMAP_SIZE");
+const INDEX_REMAP_PREVIOUS = layoutConstant("INDEX_REMAP_PREVIOUS");
+const INDEX_REMAP_NEXT = layoutConstant("INDEX_REMAP_NEXT");
+const SVG_PATH_BOUNDS_X_MIN = layoutConstant("SVG_PATH_BOUNDS_X_MIN");
+const SVG_PATH_BOUNDS_Y_MIN = layoutConstant("SVG_PATH_BOUNDS_Y_MIN");
+const SVG_PATH_BOUNDS_X_MAX = layoutConstant("SVG_PATH_BOUNDS_X_MAX");
+const SVG_PATH_BOUNDS_Y_MAX = layoutConstant("SVG_PATH_BOUNDS_Y_MAX");
 const FRAME_MEASUREMENT = Symbol.for("sandom.domCore.measurement");
 
 const resourceMeasurementKey = Symbol.for("sandom.domCore.measurement");
@@ -28,37 +170,47 @@ const measurementKey = Symbol.for("sandom.domCore.measurement");
 const wrapperCores = new WeakMap();
 const applyNative = Reflect.apply;
 
-// An author value the core's own grammar rejected, marked at the throw
-// site. CSS Cascade 4 §4.2 drops such a declaration and keeps the rest of
-// the rule; a failure anywhere else in the same apply path is an internal
-// defect and must reach the caller
-// (BUG-style-resolution-swallows-internal-errors, resolved; see
-// activity/reports/REPORT-2026-10-09-resolved-bug-records.md). The mark
-// rides on the exception the CSSOM and `animate()` are specified to throw,
-// so those surfaces keep their TypeError/RangeError.
-const authorValueRejection = Symbol("sandom.authorValueRejection");
-
-export function markAuthorValueRejection(error) {
-  error[authorValueRejection] = true;
-  return error;
-}
-
-export function isAuthorValueRejection(error) {
-  return Boolean(error?.[authorValueRejection]);
-}
-
-// One list item of a declaration whose author value the binding rejected.
-const REJECTED_ITEM = Symbol("sandom.rejectedListItem");
-
 export function domCoreForWrapper(wrapper) {
   return wrapperCores.get(wrapper);
+}
+
+// A failure of a renderer-core export (a trap, or an exhausted WebAssembly
+// stack) carries the state of its call under this key: the export, its
+// arguments, the memory size and the allocator's state. A fault that does
+// not repeat can then be diagnosed from its one report; the test runner
+// writes the record into the test result (scripts/test-runner-execution.js).
+export const WASM_EXPORT_FAILURE = Symbol.for("sandom.wasmExportFailure");
+
+function failureArgument(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return typeof value === "bigint" ? `${value}n` : String(value);
+}
+
+// The allocator's state comes from its exported globals
+// (core/dom/memory.watpart), not from a call into the module that
+// failed.
+function wasmExportFailureState(name, args, memory, exports) {
+  const global = (key) => exports[key]?.value ?? null;
+  return {
+    export: name,
+    arguments: Array.from(args, failureArgument),
+    memoryBytes: memory.buffer.byteLength,
+    allocator: {
+      heapCursor: global("abi_heap_cursor_value"),
+      retainedBytes: global("abi_retained_bytes_value"),
+      transientCurrent: global("abi_transient_current_value"),
+      transientPrevious: global("abi_transient_previous_value"),
+      recordOwnedHead: global("abi_record_owned_head_value"),
+    },
+  };
 }
 
 // Wraps a module's exports so a memory growth inside any call is reported
 // before the caller can read a detached view. Only the DOM core's allocator
 // grows the shared memory, but it is reached from the engine's shaping
 // calls (through HarfBuzz) as well as from the core's own operations, so
-// both export sets are observed.
+// both export sets are observed. A failed call records its state on the
+// error (WASM_EXPORT_FAILURE).
 export function observeMemoryGrowth(memory, exports, notify) {
   let buffer = memory.buffer;
   const wrapped = {};
@@ -80,8 +232,15 @@ export function observeMemoryGrowth(memory, exports, notify) {
         result = applyNative(value, null, arguments);
       } catch (error) {
         // The export's own failure has precedence over a failure of the
-        // notification. After a normal return, a notification failure is
-        // the only failure and remains visible.
+        // record or the notification. After a normal return, a
+        // notification failure is the only failure and remains visible.
+        try {
+          if (error instanceof Error && Object.isExtensible(error)) {
+            error[WASM_EXPORT_FAILURE] = wasmExportFailureState(name, arguments, memory, exports);
+          }
+        } catch {
+          // The export's failure below is the failure of the call.
+        }
         try {
           observe();
         } catch {
@@ -95,42 +254,6 @@ export function observeMemoryGrowth(memory, exports, notify) {
   }
   return Object.freeze(wrapped);
 }
-
-// Cascade item pseudo-element kinds, indexed by the native discriminator.
-const PSEUDO_ELEMENT_NAMES = Object.freeze([
-  null,
-  "::before",
-  "::after",
-  "::unsupported",
-  "::selection",
-]);
-
-const ERROR_NAMES = new Map([
-  [5, "HierarchyRequestError"],
-  [6, "NotFoundError"],
-  [7, "SyntaxError"],
-  [8, "IndexSizeError"],
-  [9, "InvalidStateError"],
-  [10, "InvalidStateError"],
-  [11, "QuotaExceededError"],
-  [12, "NamespaceError"],
-  [13, "NotSupportedError"],
-
-  [15, "NotAllowedError"],
-  [16, "WrongDocumentError"],
-  [17, "InvalidNodeTypeError"],
-  [19, "NoModificationAllowedError"],
-  [20, "InvalidCharacterError"],
-  [21, "InUseAttributeError"],
-  [22, "InvalidAccessError"],
-]);
-
-const RADIAL_SIZES = [
-  "closest-side",
-  "closest-corner",
-  "farthest-side",
-  "farthest-corner",
-];
 
 // One scene box of a build (sceneBuild below). A class, not a literal
 // plus Object.defineProperty per box: an own accessor puts every box in
@@ -193,75 +316,31 @@ class SceneBuildBox {
   }
 }
 
-function lengthPercentage(pixels, percentage) {
-  return { kind: "lengthPercentage", pixels, percentage };
-}
-
-function transformComponent(name, valueKind, a, b, c, d) {
-  if (valueKind === 15) return [a, b];
-  switch (name) {
-    case "translate":
-      return {
-        kind: name,
-        x: lengthPercentage(a, b),
-        y: lengthPercentage(c, d),
-      };
-    case "translateX":
-    case "translateY":
-      return { kind: name, value: lengthPercentage(a, b) };
-    case "scale":
-      return { kind: name, x: a, y: b };
-    case "scaleX":
-    case "scaleY":
-      return { kind: name, value: a };
-    case "rotate":
-    case "skewX":
-    case "skewY":
-      return { kind: name, radians: a };
-    case "skew":
-      return { kind: name, xRadians: a, yRadians: b };
-    default:
-      return { kind: "matrix", value: [a, b, c, d] };
-  }
-}
-
-// Explicit disposal unregisters these tokens (`DomCore.dispose`), so a
-// finalizer only ever releases a handle the core still holds. A handle can
-// carry several registrations at once (`finalizerRegistrations`); each one
-// owns one retain, and only the last one drops the handle's cached state.
+// Each wrapper registration owns one retain of its handle. Its entry
+// ({ reference }, the wrapper's WeakRef) is also its unregister token, so
+// one registration can be cancelled without the others of the same handle.
+// A registration ends exactly once: by its finalizer, by
+// `releaseCollectedWrappers` once its WeakRef is cleared, or by `dispose`,
+// which cancels it because the disposal frees the handle.
 const wrapperFinalizer = typeof FinalizationRegistry === "function"
-  ? new FinalizationRegistry(({ coreReference, handle, reference }) => {
-    const core = coreReference.deref();
-    if (!core) return;
-    if (core.wrapperByHandle.get(handle) === reference) {
-      core.wrapperByHandle.delete(handle);
-    }
-    const registration = core.finalizerRegistrations.get(handle);
-    registration.count -= 1;
-    if (registration.count === 0) {
-      core.finalizerRegistrations.delete(handle);
-      core.nodeTypes.delete(handle);
-    }
-    core.status("node_release", handle);
+  ? new FinalizationRegistry(({ coreReference, handle, entry }) => {
+    coreReference.deref()?.releaseWrapperRegistration(handle, entry);
   })
   : null;
 
-const EDGE_SIDES = ["top", "right", "bottom", "left"];
-const FIELD_MEMBERS = {
-  borderRadius: ["topLeft", "topRight", "bottomRight", "bottomLeft"],
-  overflowClipMargin: ["visualBox", "offset"],
-  scrollSnapType: ["axis", "strictness"],
-  scrollSnapAlign: ["block", "inline"],
-};
-
 function rgba(view, offset) {
   return {
-    r: view.getFloat64(offset, true),
-    g: view.getFloat64(offset + 8, true),
-    b: view.getFloat64(offset + 16, true),
-    a: view.getFloat64(offset + 24, true),
+    r: view.getFloat64(offset + COLOR_RGBA_R, true),
+    g: view.getFloat64(offset + COLOR_RGBA_G, true),
+    b: view.getFloat64(offset + COLOR_RGBA_B, true),
+    a: view.getFloat64(offset + COLOR_RGBA_A, true),
   };
 }
+
+// The document wrappers whose core tree a disposal freed: work that a
+// document queued before its disposal (a style reconcile) finds it here and
+// does not run.
+const disposedDocuments = new WeakSet();
 
 // A document whose wrapper is unreachable (every node wrapper of a document
 // keeps its document wrapper alive) has no host reference left; its core
@@ -270,109 +349,10 @@ const documentFinalizer = typeof FinalizationRegistry === "function"
   ? new FinalizationRegistry(({ coreReference, handle }) => {
     const core = coreReference.deref();
     if (!core) return;
+    core.documentFinalizerEntries.delete(handle);
     core.dispose(handle);
   })
   : null;
-
-function attributeMetadata(core, handle, index) {
-  return {
-    namespaceURI:
-      core.attributeStringAt("attribute_namespace_at", handle, index) || null,
-    localName: core.attributeStringAt("attribute_local_name_at", handle, index),
-    prefix: core.attributeStringAt("attribute_prefix_at", handle, index) ||
-      null,
-  };
-}
-
-export class DomCoreAttributeMetadataMap {
-  constructor(core, handle) {
-    this.core = core;
-    this.handle = handle;
-  }
-
-  get size() {
-    return this.core.attributeCount(this.handle);
-  }
-
-  get(name) {
-    const wanted = String(name);
-    const count = this.size;
-    for (let index = 0; index < count; index += 1) {
-      if (
-        this.core.attributeStringAt("attribute_name_at", this.handle, index) ===
-          wanted
-      ) {
-        return attributeMetadata(this.core, this.handle, index);
-      }
-    }
-    return undefined;
-  }
-
-  has(name) {
-    return this.get(name) !== undefined;
-  }
-
-  set(_name, _metadata) {
-    return this;
-  }
-
-  delete(name) {
-    return !this.has(name);
-  }
-
-  *entries() {
-    const count = this.size;
-    for (let index = 0; index < count; index += 1) {
-      yield [
-        this.core.attributeStringAt("attribute_name_at", this.handle, index),
-        attributeMetadata(this.core, this.handle, index),
-      ];
-    }
-  }
-
-  *keys() {
-    for (const [name] of this) yield name;
-  }
-
-  *values() {
-    for (const [, metadata] of this) yield metadata;
-  }
-
-  [Symbol.iterator]() {
-    return this.entries();
-  }
-}
-
-// Read-only view of an element's stored computed custom properties.
-export class DomCoreComputedCustomProperties {
-  constructor(core, handle) {
-    this.core = core;
-    this.handle = handle;
-  }
-
-  get(name) {
-    return this.core.computedCustomProperty(this.handle, name) ?? undefined;
-  }
-
-  has(name) {
-    return this.core.computedCustomProperty(this.handle, name) !== null;
-  }
-
-  entries() {
-    if (!this.core.status("node_computed_select", this.handle)) {
-      return new Map();
-    }
-    return this.core.readCurrentCustomProperties();
-  }
-
-  keys() {
-    return this.entries().keys();
-  }
-
-  [Symbol.iterator]() {
-    return this.entries()[Symbol.iterator]();
-  }
-}
 
 // A renderer-core instance used without DOM wrappers: one memory, its raw
 // DOM/engine exports, and growth notification for the loader's engine facade.
@@ -393,6 +373,12 @@ export function createAllocatorCore() {
   });
 }
 
+// SANDOM_SCENE_CACHE_VERIFY=1 builds each scene twice, with the subtree
+// cache and without it, and fails a build whose rows differ
+// (core/dom/scene-cache.watpart). Tests and probes set it.
+const sceneCacheVerify = globalThis.Deno?.permissions?.querySync?.({ name: "env", variable: "SANDOM_SCENE_CACHE_VERIFY" })
+    .state === "granted" && globalThis.Deno.env.get("SANDOM_SCENE_CACHE_VERIFY") === "1";
+
 export class DomCore {
   constructor() {
     const instance = instantiateRendererCore();
@@ -406,17 +392,37 @@ export class DomCore {
       instance.exports,
       () => this.notifyGrowth(),
     );
+    if (sceneCacheVerify) instance.exports.scene_cache_verify(1);
     const measurement = globalThis[measurementKey];
     this.exports = measurement
       ? measurement.wrapExports(this.nativeExports, "core")
       : this.nativeExports;
-    this.encoder = new TextEncoder();
-    this.decoder = new TextDecoder();
+    // The error kind and output registers, read without a call.
+    this.errorKindRegister = instance.exports.abi_error_kind_value;
+    this.outputPointerRegister = instance.exports.abi_output_pointer_value;
+    this.outputLengthRegister = instance.exports.abi_output_length_value;
+    this.detailsToggleCountRegister = instance.exports.details_toggle_count_value;
+    this.selectedContentPendingRegister = instance.exports.selected_content_pending_value;
+    this.ownerEpochRegister = instance.exports.node_owner_epoch_value;
+    this.backupReactionsRegister = instance.exports.custom_reactions_backup;
+    // HTML "processing the backup element queue" flag.
+    this.backupReactionsQueued = false;
+    this.selectionDocumentEpochRegister = instance.exports.selection_document_epoch_value;
+    this.callbackRecordSize = instance.exports.callback_record_size();
+    // The DOMString transport (dom-string-transport.js): lossless for lone
+    // surrogates, equal to UTF-8 for well-formed text.
+    this.encoder = domStringCodec;
+    this.decoder = domStringCodec;
     this.bytes = new Uint8Array(this.memory.buffer);
     this.wrapperCaches = new Map();
     this.wrapperHandles = new WeakMap();
     this.wrapperFactory = null;
+    // Observer id to a WeakRef of its MutationObserver, for delivery. An
+    // observing observer stays alive while its document wrapper does
+    // (observingObserversByDocument), so an observer that is never
+    // disconnected does not keep its document from being collected.
     this.observersById = new Map();
+    this.observingObserversByDocument = new WeakMap();
     this.nextObserverId = 1;
     this.observerFinalizer = new FinalizationRegistry((id) => {
       this.status("observer_release", id);
@@ -455,17 +461,17 @@ export class DomCore {
         category: "damage",
         operation: "frame_damage_export",
         direction: "core-to-host",
-        bytes: count * 32,
+        bytes: count * DAMAGE_RECT_SIZE,
         allocations: count + 1,
       });
     }
     return Array.from({ length: count }, (_, index) => {
-      const at = pointer + index * 32;
+      const at = pointer + index * DAMAGE_RECT_SIZE;
       return {
-        x: view.getFloat64(at, true),
-        y: view.getFloat64(at + 8, true),
-        width: view.getFloat64(at + 16, true),
-        height: view.getFloat64(at + 24, true),
+        x: view.getFloat64(at + DAMAGE_RECT_X, true),
+        y: view.getFloat64(at + DAMAGE_RECT_Y, true),
+        width: view.getFloat64(at + DAMAGE_RECT_WIDTH, true),
+        height: view.getFloat64(at + DAMAGE_RECT_HEIGHT, true),
       };
     });
   }
@@ -477,14 +483,9 @@ export class DomCore {
     const view = new DataView(
       this.refreshBytes().buffer,
       this.exports.abi_output_pointer(),
-      32,
+      COLOR_RGBA_SIZE,
     );
-    return {
-      r: view.getFloat64(0, true),
-      g: view.getFloat64(8, true),
-      b: view.getFloat64(16, true),
-      a: view.getFloat64(24, true),
-    };
+    return rgba(view, 0);
   }
 
   frameDamageTiles(frame, width, height, tileSize) {
@@ -507,15 +508,12 @@ export class DomCore {
   }
 
   frameCommitGroupInput(entries) {
-    const pointer = this.exports.abi_allocate(entries.length * 16);
+    const pointer = this.exports.abi_allocate(entries.length * COMMIT_GROUP_SIZE);
     const view = new DataView(this.refreshBytes().buffer);
     for (let index = 0; index < entries.length; index++) {
-      view.setBigUint64(pointer + index * 16, entries[index].handle, true);
-      view.setBigUint64(
-        pointer + index * 16 + 8,
-        entries[index].revision,
-        true,
-      );
+      const at = pointer + index * COMMIT_GROUP_SIZE;
+      view.setBigUint64(at + COMMIT_GROUP_FRAME, entries[index].handle, true);
+      view.setBigUint64(at + COMMIT_GROUP_REVISION, entries[index].revision, true);
     }
     const measurement = globalThis[FRAME_MEASUREMENT];
     if (measurement) {
@@ -523,7 +521,7 @@ export class DomCore {
         category: "lifecycle",
         operation: "frame_commit_group",
         direction: "host-to-core",
-        bytes: entries.length * 16,
+        bytes: entries.length * COMMIT_GROUP_SIZE,
       });
     }
     return pointer;
@@ -562,7 +560,7 @@ export class DomCore {
       (left.length + right.length) * 2,
     );
     for (let index = 0; index < left.length; index++) {
-      view.setUint16(index * 2, left.charCodeAt(index), true);
+      view.setUint16(index * Uint16Array.BYTES_PER_ELEMENT, left.charCodeAt(index), true);
     }
     for (let index = 0; index < right.length; index++) {
       view.setUint16((left.length + index) * 2, right.charCodeAt(index), true);
@@ -592,9 +590,14 @@ export class DomCore {
     return value === null || value === undefined ? [0, 0] : this.input(value);
   }
 
+  // A host value list (core/engine/host-values.watpart).
+  valueListInput(values, options = undefined) {
+    return this.byteInput(encodeHostValues(values, options));
+  }
+
   outputString() {
-    const pointer = this.exports.abi_output_pointer();
-    const length = this.exports.abi_output_length();
+    const pointer = this.outputPointerRegister.value;
+    const length = this.outputLengthRegister.value;
     const measurement = globalThis[measurementKey];
     const start = measurement ? hostNow() : 0;
     const result = this.decoder.decode(
@@ -613,29 +616,38 @@ export class DomCore {
     return result;
   }
 
+  // The core reports the message and the exception class of its error
+  // (abi_error_report); `rawMessage` asks for the message without its
+  // detail numbers, for a caller that names the subject itself. When the
+  // call put the first reaction into the backup element queue
+  // (custom_reactions_backup), a microtask processes that queue.
   throwIfError(rawMessage = false) {
-    const kind = this.exports.abi_error_kind();
-    if (kind === 0) return;
-    const pointer = this.exports.abi_error_pointer();
-    const length = this.exports.abi_error_length();
-    const baseMessage = this.decoder.decode(
-      this.refreshBytes().subarray(pointer, pointer + length),
-    );
-    const detailA = this.exports.abi_error_detail_a();
-    const detailB = this.exports.abi_error_detail_b();
-    const message = rawMessage || kind === 16 || kind === 17 || kind === 19
-      ? baseMessage
-      : kind === 3
-      ? `${baseMessage}: supplied ${detailA}, live ${detailB}`
-      : `${baseMessage}: observed ${detailA}, limit ${detailB}`;
-    if (kind === 1 || kind === 2) throw new TypeError(message);
-    if (kind === 14) throw new RangeError(baseMessage);
-    if (kind === 18) throw new Error(baseMessage);
-    const errorName = ERROR_NAMES.get(kind);
-    if (errorName && typeof DOMException === "function") {
-      throw new DOMException(message, errorName);
+    if (this.backupReactionsRegister.value !== 0n && !this.backupReactionsQueued) this.queueBackupReactions();
+    if (this.errorKindRegister.value !== 0) throw this.currentError(rawMessage);
+  }
+
+  queueBackupReactions() {
+    this.backupReactionsQueued = true;
+    queueMicrotask(() => {
+      try {
+        const handle = this.handle("custom_reactions_backup_begin");
+        if (handle !== 0n) customElementReactionRunner(this, handle);
+      } finally {
+        this.backupReactionsQueued = false;
+      }
+    });
+  }
+
+  currentError(rawMessage) {
+    const errorClass = this.exports.abi_error_report(rawMessage ? 1 : 0);
+    const message = this.outputString();
+    if (errorClass === ERROR_CLASS_TYPE_ERROR) return new TypeError(message);
+    if (errorClass === ERROR_CLASS_RANGE_ERROR) return new RangeError(message);
+    if (errorClass === ERROR_CLASS_DOM_EXCEPTION && typeof DOMException === "function") {
+      this.exports.abi_error_name();
+      return new DOMException(message, this.outputString());
     }
-    throw new Error(message);
+    return new Error(message);
   }
 
   status(exportName, ...parameters) {
@@ -672,6 +684,56 @@ export class DomCore {
     return handle;
   }
 
+  // Range and Selection wrappers by record handle (src/dom/selection.js).
+  // A Range holds its boundary nodes, and a node holds its node document,
+  // so a wrapper keeps the wrapper of each other document that a boundary
+  // of its record is in (`_boundaryDocuments`), as the core reports it
+  // (selection_foreign_changes). The core frees such a document's nodes
+  // only after the record lets it go (document_dispose).
+  selectionRecords = new Map();
+  selectionDocumentEpoch = 0;
+
+  // Brings `_boundaryDocuments` up to date after a change that can move a
+  // boundary into or out of another document: an adoption (delivered by
+  // callbackRecords) or a Range or Selection operation. The core reports
+  // only the records that changed; document 0 means none.
+  syncSelectionDocuments() {
+    const epoch = this.selectionDocumentEpochRegister.value;
+    if (epoch === this.selectionDocumentEpoch) return;
+    this.selectionDocumentEpoch = epoch;
+    const count = this.status("selection_foreign_changes");
+    const view = new DataView(this.refreshBytes().buffer, this.exports.abi_output_pointer(), count * SELECTION_FOREIGN_PAIR.SIZE);
+    const documents = new Map();
+    for (let index = 0; index < count; index += 1) {
+      const pair = index * SELECTION_FOREIGN_PAIR.SIZE;
+      const handle = view.getBigUint64(pair + SELECTION_FOREIGN_PAIR.RECORD, true);
+      const document = view.getBigUint64(pair + SELECTION_FOREIGN_PAIR.DOCUMENT, true);
+      if (!documents.has(handle)) documents.set(handle, []);
+      if (document !== 0n) documents.get(handle).push(document);
+    }
+    for (const [handle, handles] of documents) {
+      const record = this.selectionRecords.get(handle)?.reference.deref();
+      if (!record) continue;
+      // A document wrapper cannot be made again: only a live one is held.
+      record._boundaryDocuments = handles.length === 0
+        ? null
+        : handles.map((document) => this.wrapperByHandle.get(document)?.deref() ?? null);
+    }
+  }
+
+  forgetSelectionRecord(handle) {
+    this.selectionRecords.delete(handle);
+  }
+
+  // Releases the native record of a Range or Selection wrapper once: `entry`
+  // is the wrapper's record entry (src/dom/selection.js), and an entry that
+  // is no longer the handle's was already released.
+  releaseSelectionRecord(handle, entry) {
+    if (entry === undefined || this.selectionRecords.get(handle) !== entry) return;
+    this.forgetSelectionRecord(handle);
+    this.status("selection_release", handle);
+  }
+
   selectionBoundaries(handle, ordered = false) {
     if (
       !this.selectionStatus(
@@ -680,11 +742,11 @@ export class DomCore {
       )
     ) return null;
     const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().buffer, pointer, 32);
-    const first = view.getBigUint64(0, true);
-    const firstOffset = view.getFloat64(8, true);
-    const second = view.getBigUint64(16, true);
-    const secondOffset = view.getFloat64(24, true);
+    const view = new DataView(this.refreshBytes().buffer, pointer, SELECTION_BOUNDARIES.SIZE);
+    const first = view.getBigUint64(SELECTION_BOUNDARIES.FIRST_NODE, true);
+    const firstOffset = view.getFloat64(SELECTION_BOUNDARIES.FIRST_OFFSET, true);
+    const second = view.getBigUint64(SELECTION_BOUNDARIES.SECOND_NODE, true);
+    const secondOffset = view.getFloat64(SELECTION_BOUNDARIES.SECOND_OFFSET, true);
     return [
       this.wrapperFor(first),
       firstOffset,
@@ -696,15 +758,15 @@ export class DomCore {
   selectionSpans(handle, node = 0n) {
     const count = this.status("selection_text_spans", handle, node);
     const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().buffer, pointer, count * 16);
+    const view = new DataView(this.refreshBytes().buffer, pointer, count * SELECTION_SPAN_SIZE);
     // Capture all transient facts before wrapper construction or data access
     // enters another operation; no native pointer crosses a host callback.
     const spans = new Array(count);
     for (let index = 0; index < count; index++) {
       spans[index] = [
-        view.getBigUint64(index * 16, true),
-        view.getUint32(index * 16 + 8, true),
-        view.getUint32(index * 16 + 12, true),
+        view.getBigUint64(index * SELECTION_SPAN_SIZE + SELECTION_SPAN_NODE, true),
+        view.getUint32(index * SELECTION_SPAN_SIZE + SELECTION_SPAN_START, true),
+        view.getUint32(index * SELECTION_SPAN_SIZE + SELECTION_SPAN_END, true),
       ];
     }
     for (const span of spans) span[0] = this.wrapperFor(span[0]);
@@ -789,12 +851,12 @@ export class DomCore {
   htmlParserTakeHandlerElements(parser) {
     const count = this.status("html_parser_take_handler_elements", parser);
     if (count === 0) return [];
-    const view = new DataView(this.memory.buffer, this.exports.abi_output_pointer(), count * 16);
+    const view = new DataView(this.memory.buffer, this.exports.abi_output_pointer(), count * HANDLER_ELEMENT_SIZE);
     // Copy the numbers before wrapper materialization can grow memory.
     const entries = Array.from({ length: count }, (_, index) => ({
-      handle: view.getBigUint64(index * 16, true),
-      line: view.getUint32(index * 16 + 8, true),
-      column: view.getUint32(index * 16 + 12, true),
+      handle: view.getBigUint64(index * HANDLER_ELEMENT_SIZE + HANDLER_ELEMENT_NODE, true),
+      line: view.getUint32(index * HANDLER_ELEMENT_SIZE + HANDLER_ELEMENT_LINE, true),
+      column: view.getUint32(index * HANDLER_ELEMENT_SIZE + HANDLER_ELEMENT_COLUMN, true),
     }));
     return entries.map(({ handle, line, column }) => ({ element: this.wrapperFor(handle), line, column }));
   }
@@ -910,11 +972,31 @@ export class DomCore {
     return result;
   }
 
+  // The wrappers of the `count` u64 node handles in standard output. The
+  // handles are copied before wrapperFor can reenter the core.
+  outputNodes(count) {
+    if (count <= 0) return [];
+    const view = new DataView(this.refreshBytes().buffer, this.exports.abi_output_pointer(), count * BigUint64Array.BYTES_PER_ELEMENT);
+    const handles = Array.from({ length: count }, (_, index) => view.getBigUint64(index * BigUint64Array.BYTES_PER_ELEMENT, true));
+    return handles.map((handle) => this.wrapperFor(handle));
+  }
+
+  // The nodes of a root that a collection filter accepts, and the named
+  // item among them (node_collection_list, form-collections.watpart).
+  collectionList(rootHandle, scope, filter, a, b) {
+    return this.outputNodes(this.status("node_collection_list", rootHandle, scope, filter, ...this.input(a), ...this.input(b)));
+  }
+
+  collectionListNamed(rootHandle, scope, filter, a, b, name) {
+    return this.wrapperFor(this.handle("node_collection_list_named", rootHandle, scope, filter,
+      ...this.input(a), ...this.input(b), ...this.input(name)));
+  }
+
   slotAssign(slotHandle, nodeHandles) {
     const pointer = this.exports.abi_allocate(nodeHandles.length * 8);
     const view = new DataView(this.refreshBytes().buffer);
     for (let index = 0; index < nodeHandles.length; index += 1) {
-      view.setBigUint64(pointer + index * 8, nodeHandles[index], true);
+      view.setBigUint64(pointer + index * BigUint64Array.BYTES_PER_ELEMENT, nodeHandles[index], true);
     }
     this.status("slot_assign", slotHandle, pointer, nodeHandles.length);
   }
@@ -923,8 +1005,8 @@ export class DomCore {
     return this.wrapperFor(this.handle("slot_assigned_slot", handle));
   }
 
-  assignedNodes(slotHandle) {
-    return this.resultHandles(this.status("slot_assigned_nodes", slotHandle));
+  assignedNodes(slotHandle, flatten) {
+    return this.resultHandles(this.status("slot_assigned_nodes", slotHandle, flatten ? 1 : 0));
   }
 
   flatTreeParent(handle) {
@@ -1003,20 +1085,16 @@ export class DomCore {
     return this.handle("node_create_shadow_root", hostHandle, flags);
   }
 
-  detachShadowRoot(hostHandle) {
-    this.status("node_detach_shadow_root", hostHandle);
-  }
-
   // Decode core-owned resource usages in CSS order for the element
   // (pseudo 0), its ::before (1) or its ::after (2). Device acquisition is
   // separate; these IDs remain stable across builds and shared renderers.
   sceneResourceLayers(handle, pseudo) {
     const count = this.status("scene_resource_layers", handle, pseudo);
     if (count === 0) return null;
-    const counts = Array.from(new Uint32Array(this.refreshBytes().buffer, this.exports.abi_output_pointer(), 3));
+    const counts = new Uint32Array(this.refreshBytes().buffer, this.exports.abi_output_pointer(), IMAGE_RESOURCE.KIND_COUNT).slice();
     const result = {};
     let index = 0;
-    for (const [kind, name] of ["backgroundImages", "masks", "borderImage"].entries()) {
+    for (const [kind, name] of [[IMAGE_RESOURCE.BACKGROUND, "backgroundImages"], [IMAGE_RESOURCE.MASK, "masks"], [IMAGE_RESOURCE.BORDER, "borderImage"]]) {
       const layers = new Array(counts[kind]);
       for (let layer = 0; layer < layers.length; layer++, index++) {
         const resource = this.handle("scene_resource_layer", handle, pseudo, index);
@@ -1025,17 +1103,13 @@ export class DomCore {
           resourceIdentifier: this.resourceId(resource),
         };
       }
-      if (layers.length) result[name] = kind === 2 ? layers[0] : layers;
+      if (layers.length) result[name] = kind === IMAGE_RESOURCE.BORDER ? layers[0] : layers;
     }
     return result;
   }
 
-  wrapperCache(handle) {
-    return this.documentWrapperCache(
-      this.handle("node_owner_document", handle),
-    );
-  }
-
+  // The wrapper cache of a document handle (node_owner_document of a node;
+  // 0 for documents).
   documentWrapperCache(documentHandle) {
     let cache = this.wrapperCaches.get(documentHandle);
     if (!cache) {
@@ -1062,53 +1136,165 @@ export class DomCore {
   // generation in the high bits), so a stale entry can only miss.
   wrapperByHandle = new Map();
 
-  // Unregister token per finalizer-registered handle (node wrappers and
-  // document wrappers): `dispose` must cancel finalization even for a
-  // wrapper that is already unreachable but not yet finalized. A collected
+  // The wrapper registrations of each handle (node wrappers and document
+  // wrappers): a Set of entries, one per registration. A collected
   // wrapper's WeakRef clears before its finalizer runs, so `wrapperFor` can
   // wrap the same handle again (with its own retain) while the first
-  // registration is still pending: every registration of a handle shares
-  // the handle's token, and `count` tracks how many are outstanding.
+  // registration is still pending.
   finalizerRegistrations = new Map();
-  documentFinalizerTokens = new Map();
+  // Per document handle, the entry of its wrapper's document finalizer:
+  // { reference }, also its unregister token.
+  documentFinalizerEntries = new Map();
+
+  // The wrappers of the nodes in a document's tree, keyed by the document's
+  // wrapper. A script can reach a connected node through its document at
+  // any time, so the node keeps one wrapper, with its expandos and the host
+  // state keyed by it, while the document wrapper lives. The key is weak:
+  // every node wrapper keeps its document wrapper, so a document wrapper
+  // that nothing else reaches is collected with the wrappers of its tree,
+  // and its finalizer disposes the document. A node that leaves the tree
+  // (removal, adoption) leaves the set, and its wrapper is weak again, as
+  // the wrapper of every detached node is. A node that no script reached has
+  // no wrapper and is in no set.
+  connectedWrappersByDocument = new WeakMap();
+  // The set of connectedWrappersByDocument that holds a node wrapper.
+  connectedWrapperHolders = new WeakMap();
+
+  // Holds `wrapper` in the connected wrappers of `documentWrapper`, or in
+  // no set when `documentWrapper` is undefined.
+  holdConnectedWrapper(wrapper, documentWrapper) {
+    const holder = this.connectedWrapperHolders.get(wrapper);
+    let wrappers;
+    if (documentWrapper !== undefined) {
+      wrappers = this.connectedWrappersByDocument.get(documentWrapper);
+      if (!wrappers) this.connectedWrappersByDocument.set(documentWrapper, wrappers = new Set());
+    }
+    if (holder === wrappers) return;
+    holder?.delete(wrapper);
+    if (wrappers === undefined) {
+      this.connectedWrapperHolders.delete(wrapper);
+      return;
+    }
+    wrappers.add(wrapper);
+    this.connectedWrapperHolders.set(wrapper, wrappers);
+  }
+
+  // The wrapper of the document whose tree node `handle` is in; undefined
+  // for a node that is not connected.
+  connectedDocumentWrapper(handle) {
+    if (this.status("node_is_connected", handle) !== 1) return undefined;
+    return this.wrapperByHandle.get(this.handle("node_owner_document", handle))?.deref();
+  }
+
+  // The durable identifier the core gave node `handle` when it created it
+  // (core/dom/node-identity.watpart).
+  nodeIdentifier(handle) {
+    return this.status("node_identifier", handle);
+  }
+
+  // The wrapper of the live node of `identifier` in document
+  // `documentHandle`, or null.
+  nodeByIdentifier(documentHandle, identifier) {
+    return this.wrapperFor(this.handle("node_by_identifier", documentHandle, identifier));
+  }
+
+  // Settles the wrappers of the subtree of `rootHandle`, which entered or
+  // left a document tree, against the tree: the core lists the nodes of the
+  // subtree with a host reference (node_retained_subtree), which include
+  // every node with a wrapper. The subtree shares one root, so one
+  // connectedness holds for all of them.
+  updateConnectedWrappers(rootHandle) {
+    const documentWrapper = this.connectedDocumentWrapper(rootHandle);
+    const count = this.status("node_retained_subtree", rootHandle);
+    if (count <= 0) return;
+    const view = new DataView(this.refreshBytes().buffer, this.exports.abi_output_pointer(), count * BigUint64Array.BYTES_PER_ELEMENT);
+    for (let index = 0; index < count; index += 1) {
+      const wrapper = this.wrapperByHandle.get(view.getBigUint64(index * BigUint64Array.BYTES_PER_ELEMENT, true))?.deref();
+      if (wrapper !== undefined) this.holdConnectedWrapper(wrapper, documentWrapper);
+    }
+  }
 
   registerDocumentWrapper(wrapper, handle) {
     if (!documentFinalizer) return;
-    const token = {};
-    this.documentFinalizerTokens.set(handle, token);
+    const entry = { reference: new WeakRef(wrapper) };
+    this.documentFinalizerEntries.set(handle, entry);
     documentFinalizer.register(wrapper, {
       coreReference: new WeakRef(this),
       handle,
-    }, token);
+    }, entry);
   }
 
-  registerWrapper(wrapper, handle, retained = true) {
+  registerWrapper(wrapper, handle, retained, documentHandle) {
     this.wrapperHandles.set(wrapper, handle);
     wrapperCores.set(wrapper, this);
     const existingReference = this.wrapperByHandle.get(handle);
     const reference = existingReference?.deref() === wrapper ? existingReference : new WeakRef(wrapper);
     this.wrapperByHandle.set(handle, reference);
-    this.wrapperCache(handle).set(handle, reference);
+    this.documentWrapperCache(documentHandle).set(handle, reference);
     if (wrapperFinalizer && retained) {
-      let registration = this.finalizerRegistrations.get(handle);
-      if (!registration) {
-        registration = { token: {}, count: 0 };
-        this.finalizerRegistrations.set(handle, registration);
+      let entries = this.finalizerRegistrations.get(handle);
+      if (!entries) {
+        entries = new Set();
+        this.finalizerRegistrations.set(handle, entries);
       }
-      registration.count += 1;
-      wrapperFinalizer.register(
-        wrapper,
-        { coreReference: new WeakRef(this), handle, reference },
-        registration.token,
-      );
+      const entry = { reference };
+      entries.add(entry);
+      wrapperFinalizer.register(wrapper, { coreReference: new WeakRef(this), handle, entry }, entry);
     }
   }
 
+  // Ends one wrapper registration of `handle`: gives its retain back, and
+  // with the handle's last registration drops its cached state. An entry
+  // that already ended is ignored.
+  releaseWrapperRegistration(handle, entry) {
+    const entries = this.finalizerRegistrations.get(handle);
+    if (!entries?.delete(entry)) return;
+    if (this.wrapperByHandle.get(handle) === entry.reference) this.wrapperByHandle.delete(handle);
+    if (entries.size === 0) {
+      this.finalizerRegistrations.delete(handle);
+      this.nodeTypes.delete(handle);
+    }
+    this.status("node_release", handle);
+  }
+
+  // Ends now what the collector has taken, as the finalizers would in later
+  // tasks: the native record of each collected Range or Selection wrapper,
+  // each registration of a collected node wrapper, and each document whose
+  // wrapper was collected (disposed). Their finalizers are cancelled. A host
+  // calls it after a collection to reach the core state the finalizers will
+  // leave, without waiting for their tasks. Returns the number of records,
+  // registrations and documents ended.
+  releaseCollectedWrappers() {
+    let released = 0;
+    for (const [handle, entry] of [...this.selectionRecords]) {
+      if (entry.reference.deref() !== undefined) continue;
+      entry.cancel();
+      this.releaseSelectionRecord(handle, entry);
+      released += 1;
+    }
+    for (const [handle, entries] of [...this.finalizerRegistrations]) {
+      for (const entry of [...entries]) {
+        if (entry.reference.deref() !== undefined) continue;
+        wrapperFinalizer.unregister(entry);
+        this.releaseWrapperRegistration(handle, entry);
+        released += 1;
+      }
+    }
+    for (const [handle, entry] of [...this.documentFinalizerEntries]) {
+      if (entry.reference.deref() !== undefined) continue;
+      this.documentFinalizerEntries.delete(handle);
+      documentFinalizer.unregister(entry);
+      this.dispose(handle);
+      released += 1;
+    }
+    return released;
+  }
+
   cancelFinalizer(handle) {
-    const registration = this.finalizerRegistrations.get(handle);
-    if (!registration) return;
+    const entries = this.finalizerRegistrations.get(handle);
+    if (!entries) return;
     this.finalizerRegistrations.delete(handle);
-    wrapperFinalizer.unregister(registration.token);
+    for (const entry of entries) wrapperFinalizer.unregister(entry);
   }
 
   handleForWrapper(wrapper) {
@@ -1119,15 +1305,20 @@ export class DomCore {
     if (handle === 0n) return null;
     const live = this.wrapperByHandle.get(handle)?.deref();
     if (live) return live;
-    const cache = this.wrapperCache(handle);
+    const ownerHandle = this.handle("node_owner_document", handle);
+    const cache = this.documentWrapperCache(ownerHandle);
     const existing = cache.get(handle)?.deref();
     if (existing) return existing;
     if (!this.wrapperFactory) {
       throw new Error(`No wrapper factory for DOM core handle ${handle}`);
     }
     this.status("node_retain", handle);
-    const wrapper = this.wrapperFactory(handle);
-    this.registerWrapper(wrapper, handle, true);
+    const wrapper = this.wrapperFactory(handle, ownerHandle);
+    this.registerWrapper(wrapper, handle, true, ownerHandle);
+    // The wrapper of a node in a document's tree lives with that tree.
+    if (ownerHandle !== 0n && this.status("node_is_connected", handle) === 1) {
+      this.holdConnectedWrapper(wrapper, this.wrapperByHandle.get(ownerHandle)?.deref());
+    }
     return wrapper;
   }
 
@@ -1158,15 +1349,9 @@ export class DomCore {
     return this.status("node_child_count", handle);
   }
 
-  // A child by index, or undefined past the end (a collection read).
+  // A child by index, or null past the end (a collection read).
   childAt(handle, index) {
-    const child = this.exports.node_child_at(handle, index);
-    if (child === 0n) {
-      const kind = this.exports.abi_error_kind();
-      if (kind === 8) return undefined;
-      this.throwIfError();
-    }
-    return this.wrapperFor(child);
+    return this.wrapperFor(this.handle("node_child_at", handle, index));
   }
 
   textContent(handle) {
@@ -1266,8 +1451,19 @@ export class DomCore {
     return this.status(
       "node_set_host_state",
       handle,
-      (hovered ? 2 : 0) | (active ? 4 : 0),
+      (hovered ? NODE_STATE_HOVER : 0) | (active ? NODE_STATE_ACTIVE : 0),
     );
+  }
+
+  // Forced user action pseudo-classes (core/dom/forced-state.watpart).
+  // Returns whether the forced set changed.
+  setForcedState(handle, { hover = false, active = false, focus = false, focusVisible = false, focusWithin = false }) {
+    return this.status(
+      "element_forced_state_set",
+      handle,
+      (hover ? FORCED_STATE_HOVER : 0) | (active ? FORCED_STATE_ACTIVE : 0) | (focus ? FORCED_STATE_FOCUS : 0) |
+        (focusVisible ? FORCED_STATE_FOCUS_VISIBLE : 0) | (focusWithin ? FORCED_STATE_FOCUS_WITHIN : 0),
+    ) === 1;
   }
 
   setDoctypePublicId(handle, value) {
@@ -1316,9 +1512,19 @@ export class DomCore {
     );
   }
 
-  setAttribute(handle, namespaceURI, qualifiedName, value) {
+  setAttribute(handle, qualifiedName, value) {
     return this.status(
       "attribute_set",
+      handle,
+      ...this.nullableInput(null),
+      ...this.input(qualifiedName),
+      ...this.input(value),
+    );
+  }
+
+  setAttributeNS(handle, namespaceURI, qualifiedName, value) {
+    return this.status(
+      "attribute_set_ns",
       handle,
       ...this.nullableInput(namespaceURI),
       ...this.input(qualifiedName),
@@ -1343,58 +1549,44 @@ export class DomCore {
     return this.status("attribute_count", handle);
   }
 
-  classCount(handle) {
-    return this.status("class_count", handle);
+  // DOMTokenList: the native ordered set of the attribute `name`
+  // (token_list_*). tokenListUpdate returns the operation's result and the
+  // serialized set that the update steps write, or null when they do not
+  // run.
+  tokenListCount(handle, name) {
+    return this.status("token_list_count", handle, ...this.input(name));
   }
 
-  classItem(handle, index) {
-    const result = this.exports.class_item(handle, index);
-    this.throwIfError();
-    return result === 0 ? null : this.outputString();
+  tokenListItem(handle, name, index) {
+    return this.string("token_list_item", handle, ...this.input(name), index);
   }
 
-  classRemove(handle, token) {
-    return this.status("class_remove", handle, ...this.input(token)) === 1;
+  tokenListContains(handle, name, token) {
+    return this.status("token_list_contains", handle, ...this.input(name), ...this.input(token)) === 1;
   }
 
-  classReplace(handle, oldToken, newToken) {
-    return this.status(
-      "class_replace",
-      handle,
-      ...this.input(oldToken),
-      ...this.input(newToken),
-    ) === 1;
-  }
-
-  classToggle(handle, token, force = -1) {
-    return this.status(
-      "class_toggle",
-      handle,
-      ...this.input(token),
-      force,
-    ) === 1;
+  tokenListUpdate(handle, name, mode, force, tokens) {
+    const encoded = tokens.map((token) => this.encoder.encode(token));
+    const bytes = new Uint8Array(encoded.reduce((total, token) => total + token.byteLength + 1, 0));
+    let offset = 0;
+    for (const token of encoded) {
+      bytes.set(token, offset);
+      offset += token.byteLength;
+      bytes[offset++] = 0xff;
+    }
+    const nameInput = this.input(name);
+    const result = this.status("token_list_update", handle, ...nameInput, mode, force,
+      ...this.byteInput(bytes), tokens.length);
+    return {
+      result: (result & TOKEN_RESULT) !== 0,
+      value: (result & TOKEN_RESULT_WRITE) === 0 ? null : this.outputString(),
+    };
   }
 
   attributeStringAt(exportName, handle, index) {
     const result = this.exports[exportName](handle, index);
     this.throwIfError();
     return result === 0 ? null : this.outputString();
-  }
-
-  classContains(handle, token) {
-    return this.status("class_contains", handle, ...this.input(token)) === 1;
-  }
-
-  classAdd(handle, token) {
-    return this.status("class_add", handle, ...this.input(token)) === 1;
-  }
-
-  styleGet(handle, name) {
-    return this.string("style_get", handle, ...this.input(name));
-  }
-
-  styleHas(handle, name) {
-    return this.status("style_has", handle, ...this.input(name)) === 1;
   }
 
   // `document`: the owner document of the element, whose @font-face
@@ -1417,22 +1609,11 @@ export class DomCore {
       mode,
       registry.fontCatalogHandle,
     );
-    return this.runStyleMutation(operation, registry, mode, document);
-  }
-
-  styleSetPriority(handle, name, important) {
-    return this.status(
-      "style_set_priority",
-      handle,
-      ...this.input(name),
-      important ? 1 : 0,
-    ) === 1;
+    return this.runStyleMutation(operation, registry, document);
   }
 
   stylePriority(handle, name) {
-    return this.status("style_get_priority", handle, ...this.input(name)) === 1
-      ? "important"
-      : "";
+    return this.string("style_get_priority", handle, ...this.input(name));
   }
 
   styleRemove(handle, name) {
@@ -1440,20 +1621,8 @@ export class DomCore {
     return this.outputString();
   }
 
-  styleClear(handle) {
-    return this.status("style_clear", handle) === 1;
-  }
-
   styleCount(handle) {
     return this.status("style_count", handle);
-  }
-
-  styleNameAt(handle, index) {
-    return this.attributeStringAt("style_name_at", handle, index);
-  }
-
-  styleValueAt(handle, index) {
-    return this.attributeStringAt("style_value_at", handle, index);
   }
 
   styleRead(handle, name) {
@@ -1461,7 +1630,7 @@ export class DomCore {
   }
 
   styleText(handle) {
-    return this.string("style_text", handle) ?? "";
+    return this.string("style_text", handle);
   }
 
   styleReplace(
@@ -1478,10 +1647,10 @@ export class DomCore {
       registry.fontCatalogHandle,
       attributeReplay ? 1 : 0,
     );
-    return this.runStyleMutation(operation, registry, attributeReplay ? 3 : 2, document);
+    return this.runStyleMutation(operation, registry, document);
   }
 
-  runStyleMutation(operation, registry, mode, document) {
+  runStyleMutation(operation, registry, document) {
     try {
       while (true) {
         const step = this.status("style_mutation_next", operation);
@@ -1489,33 +1658,39 @@ export class DomCore {
         // A rejected value completes the mutation; a fault (-1) sets the
         // ABI error registers, which status() throws.
         if (step !== 1) throw new Error(`style_mutation_next returned ${step} without an ABI error`);
-        const family = this.string("style_mutation_family", operation);
-        const token = this.handle("style_mutation_token", operation);
-        let failure;
-        let outcome = 0;
-        let message = "";
-        // The host learns of each family the value names. A value whose
-        // families are all unavailable still applies, as in Chrome: text
-        // in it draws with the initial family's face.
-        try {
-          registry.availableFontStackKeys(family, { document });
-        } catch (error) {
-          failure = error;
-          outcome = error instanceof Error ? 1 : 2;
-          if (mode >= 2 && outcome === 1) message = `${error.message}`;
-        }
-        this.status(
-          "style_mutation_resume",
-          operation,
-          token,
-          outcome,
-          ...this.input(message),
-        );
-        if (outcome === 2 || (outcome === 1 && mode < 2)) throw failure;
+        this.answerStyleFamily(operation, registry, document);
       }
     } finally {
       this.status("style_mutation_dispose", operation);
     }
+  }
+
+  // Answers the font family request of style mutation `operation`, which
+  // waits at a family (style_mutation_next 1, or batch effect 2).
+  answerStyleFamily(operation, registry, document) {
+    const family = this.string("style_mutation_family", operation);
+    const token = this.handle("style_mutation_token", operation);
+    let failure;
+    let outcome = STYLE_FAMILY_AVAILABLE;
+    let message = "";
+    // The host learns of each family the value names. A value whose
+    // families are all unavailable still applies, as in Chrome: text
+    // in it draws with the initial family's face.
+    try {
+      registry.availableFontStackKeys(family, { document });
+    } catch (error) {
+      failure = error;
+      outcome = error instanceof Error ? STYLE_FAMILY_REJECTED : STYLE_FAMILY_FAULT;
+      if (error instanceof Error) message = `${error.message}`;
+    }
+    const resumed = this.status(
+      "style_mutation_resume",
+      operation,
+      token,
+      outcome,
+      ...this.input(message),
+    );
+    if (resumed === STYLE_MUTATION_RETHROW) throw failure;
   }
 
   styleSupports(name) {
@@ -1523,15 +1698,15 @@ export class DomCore {
   }
 
   styleIDLName(name) {
-    return this.string("style_idl_name", ...this.input(name)) ?? "";
+    return this.string("style_idl_name", ...this.input(name));
   }
 
   styleMethodName(name) {
-    return this.string("style_method_name", ...this.input(name)) ?? "";
+    return this.string("style_method_name", ...this.input(name));
   }
 
   styleCSSName(name) {
-    return this.string("style_css_name", ...this.input(name)) ?? "";
+    return this.string("style_css_name", ...this.input(name));
   }
 
   styleCSSNameAt(handle, index) {
@@ -1555,7 +1730,7 @@ export class DomCore {
       const code = this.status("style_diagnostic_at", handle, index);
       const message = this.outputString();
       diagnostics[index] = Object.freeze(
-        code === 1
+        code === STYLE_DIAGNOSTIC_INVALID_DECLARATION
           ? {
             code: "css-invalid-declaration",
             severity: "warning",
@@ -1586,14 +1761,16 @@ export class DomCore {
       const kind = this.status("mathml_diagnostic_at", handle, index);
       if (kind === 0) return diagnostics;
       diagnostics.push({
-        code: kind === 1 ? "mathml-unsupported-element" : "mathml-unsupported-attribute",
+        code: kind === MATHML_DIAGNOSTIC_ELEMENT ? "mathml-unsupported-element" : "mathml-unsupported-attribute",
         message: this.outputString(),
       });
     }
   }
 
-  createStylesheet() {
-    return this.status("stylesheet_create");
+  // A sheet of the bindings: a constructed sheet of the document
+  // `documentHandle` (0n for none yet), or an owned (linked) sheet.
+  createStylesheet(documentHandle, owned) {
+    return this.status("stylesheet_create_bound", documentHandle, owned ? 1 : 0);
   }
 
   disposeStylesheet(sheetHandle) {
@@ -1617,177 +1794,100 @@ export class DomCore {
     this.status("stylesheet_disconnect", sheetHandle);
   }
 
-  stylesheetIsConnected(sheetHandle) {
-    return this.status("stylesheet_is_connected", sheetHandle) === 1;
+  // The declarations of a CSS rule: { property, value, important }.
+  ruleDeclarations(ruleHandle) {
+    const count = this.status("css_rule_declaration_count", ruleHandle);
+    const declarations = new Array(count);
+    for (let index = 0; index < count; index += 1) {
+      declarations[index] = Object.freeze({
+        property: this.string("css_rule_declaration_property", ruleHandle, index),
+        value: this.string("css_rule_declaration_value", ruleHandle, index),
+        important: this.status("css_rule_declaration_important", ruleHandle, index) === 1,
+      });
+    }
+    return Object.freeze(declarations);
   }
 
-  stylesheetSnapshot(
-    sheetHandle,
-    sourceURL = "about:blank",
-    source = "",
-  ) {
-    const readString = (exportName, handle) =>
-      this.string(exportName, handle) ?? "";
-    let sourceSearchOffset = 0;
-    const readDeclarations = (ruleHandle) => {
-      const count = this.status("css_rule_declaration_count", ruleHandle);
-      const declarations = new Array(count);
-      for (let index = 0; index < count; index += 1) {
-        declarations[index] = Object.freeze({
-          property:
-            this.string("css_rule_declaration_property", ruleHandle, index) ??
-              "",
-          value: this.string("css_rule_declaration_value", ruleHandle, index) ??
-            "",
-          important:
-            this.status("css_rule_declaration_important", ruleHandle, index) ===
-              1,
-        });
-      }
-      return Object.freeze(declarations);
-    };
-    const readRule = (ruleHandle) => {
-      const kind = this.status("css_rule_kind", ruleHandle);
-      const prelude = readString("css_rule_prelude", ruleHandle);
-      const cssText = readString("css_rule_source_text", ruleHandle);
-      const childCount = this.status("css_rule_child_count", ruleHandle);
-      const rules = new Array(childCount);
-      for (let index = 0; index < childCount; index += 1) {
-        rules[index] = readRule(
-          this.status("css_rule_child_at", ruleHandle, index),
-        );
-      }
-      const offset = source.indexOf(cssText, sourceSearchOffset);
-      const normalizedOffset = offset < 0 ? sourceSearchOffset : offset;
-      sourceSearchOffset = normalizedOffset + cssText.length;
-      return Object.freeze({
-        handle: ruleHandle,
-        kind,
-        type: kind === 1 || kind === 8 ? "style" : "at-rule",
-        name: readString("css_rule_name", ruleHandle),
-        prelude,
-        selectorText: prelude,
-        declarations: readDeclarations(ruleHandle),
-        rules: Object.freeze(rules),
-        cssText,
-        location: Object.freeze({
-          sourceURL,
-          line: 1,
-          column: normalizedOffset + 1,
-          offset: normalizedOffset,
-          endOffset: normalizedOffset + cssText.length,
-        }),
-      });
-    };
+  // The rule handles of a u64 list in the standard output.
+  outputRuleHandles(count) {
+    const pointer = this.exports.abi_output_pointer();
+    const view = new DataView(this.refreshBytes().buffer, pointer, count * 8);
+    return Array.from({ length: count }, (_, index) => view.getBigUint64(index * 8, true));
+  }
+
+  // The rules of a sheet named `name` (font-face, page, keyframes) that are
+  // active in the media environment (css_active_named_rules).
+  activeNamedRules(sheetHandle, name, environment) {
+    this.mediaEnvironmentSet(environment);
+    return this.outputRuleHandles(this.status("css_active_named_rules", sheetHandle, ...this.input(name)));
+  }
+
+  // The keyframes of the @keyframes rule `name` of a scope root in the
+  // media environment, ordered by offset: { offset, declarations } with
+  // the declarations of each keyframe rule at that offset in rule order;
+  // null without the rule.
+  keyframes(rootHandle, name, environment) {
+    this.mediaEnvironmentSet(environment);
+    const rule = this.handle("css_keyframes_rule", rootHandle, ...this.input(name));
+    if (rule === 0n) return null;
+    const count = this.status("css_keyframes_frames", rule);
+    const pointer = this.exports.abi_output_pointer();
+    const view = new DataView(this.refreshBytes().slice(pointer, pointer + count * KEYFRAME_RECORD_SIZE).buffer);
+    const frames = [];
+    for (let index = 0; index < count; index += 1) {
+      const record = index * KEYFRAME_RECORD_SIZE;
+      const frame = view.getUint32(record + KEYFRAME_RECORD_FRAME, true);
+      frames[frame] ??= { offset: view.getFloat64(record + KEYFRAME_RECORD_OFFSET, true), declarations: [] };
+      frames[frame].declarations.push(...this.ruleDeclarations(view.getBigUint64(record + KEYFRAME_RECORD_RULE, true)));
+    }
+    return frames;
+  }
+
+  // The top-level rule handles of a sheet, and its diagnostics.
+  stylesheetSnapshot(sheetHandle, sourceURL) {
     const count = this.status("css_sheet_rule_count", sheetHandle);
     const rules = new Array(count);
     for (let index = 0; index < count; index += 1) {
-      rules[index] = readRule(
-        this.status("css_sheet_rule_at", sheetHandle, index),
-      );
+      rules[index] = this.status("css_sheet_rule_at", sheetHandle, index);
     }
-    const invalidDeclarationCount = this.status(
-      "css_sheet_invalid_declaration_count",
-      sheetHandle,
-    );
-    const diagnostics = invalidDeclarationCount === 0 ? [] : [Object.freeze({
-      code: "css-invalid-declaration",
-      severity: "warning",
-      recoverable: true,
-      sourceURL,
-      line: 1,
-      column: 1,
-      message: "Invalid declaration animation-timing-function",
-    })];
+    const diagnosticCount = this.status("css_sheet_diagnostic_count", sheetHandle);
+    const diagnostics = new Array(diagnosticCount);
+    for (let index = 0; index < diagnosticCount; index += 1) {
+      const kind = STYLE_SHEET_DIAGNOSTICS[this.status("css_sheet_diagnostic_at", sheetHandle, index)];
+      const construct = this.outputString();
+      diagnostics[index] = Object.freeze({
+        code: kind.code,
+        severity: "warning",
+        recoverable: true,
+        sourceURL,
+        line: this.exports.css_sheet_diagnostic_line(),
+        column: this.exports.css_sheet_diagnostic_column(),
+        construct,
+        message: `${kind.message}: ${construct}`,
+      });
+    }
     return Object.freeze({
       rules: Object.freeze(rules),
       diagnostics: Object.freeze(diagnostics),
     });
   }
 
-  // Compiled complex selectors of one selector list; ranges are decoded
-  // back into strings so the binding never holds core offsets.
-  selectorCompile(selectorList, { strict = false } = {}) {
-    const text = String(selectorList);
-    const [pointer, length] = this.input(text);
-    const count = this.status(
-      "selector_compile",
-      pointer,
-      length,
-      strict ? 1 : 0,
-    );
-    const size = this.exports.selector_compile_record_size();
-    const base = this.exports.abi_output_pointer();
-    const view = new DataView(this.memory.buffer, base, count * size);
-    const bytes = this.refreshBytes();
-    const slice = (start, end) =>
-      this.decoder.decode(bytes.subarray(pointer + start, pointer + end));
-    const selectors = new Array(count);
-    for (let index = 0; index < count; index += 1) {
-      const at = index * size;
-      const start = view.getUint32(at, true);
-      const end = view.getUint32(at + 4, true);
-      const shape = view.getUint32(at + 40, true);
-      const argumentStart = view.getUint32(at + 44, true);
-      const argumentEnd = view.getUint32(at + 48, true);
-      const restStart = view.getUint32(at + 52, true);
-      const restEnd = view.getUint32(at + 56, true);
-      const keyLength = view.getUint32(at + 36, true);
-      const keyPointer = view.getUint32(at + 32, true);
-      const flags = view.getUint32(at + 60, true);
-      selectors[index] = {
-        selectorText: slice(start, end),
-        matchSelector: slice(start, view.getUint32(at + 8, true)),
-        pseudoElement: PSEUDO_ELEMENT_NAMES[view.getUint32(at + 12, true)],
-        specificity: [
-          view.getUint32(at + 16, true),
-          view.getUint32(at + 20, true),
-          view.getUint32(at + 24, true),
-        ],
-        keyKind: view.getUint32(at + 28, true),
-        key: keyLength === 0 ? "" : this.decoder.decode(
-          bytes.subarray(keyPointer, keyPointer + keyLength),
-        ),
-        shape,
-        argument: shape === 0 || (shape === 1 && argumentEnd === 0)
-          ? null
-          : slice(argumentStart, argumentEnd),
-        rest: shape === 0 || restEnd <= restStart
-          ? null
-          : slice(restStart, restEnd),
-        usesHover: (flags & 1) !== 0,
-        usesActive: (flags & 2) !== 0,
-      };
-    }
-    return selectors;
-  }
-
-  selectorStateProbe(handle, selectorList, state) {
-    return this.status(
-      "selector_state_probe",
-      handle,
-      ...this.input(selectorList),
-      state === "active" ? 4 : 2,
-    ) === 1;
-  }
-
+  // The media environment of a style system (media_environment_set
+  // reads its keywords).
   mediaEnvironmentSet(environment) {
     this.status(
       "media_environment_set",
       environment.viewportWidth,
       environment.viewportHeight,
-      environment.mediaType === "screen"
-        ? 0
-        : environment.mediaType === "print"
-        ? 1
-        : 2,
-      environment.colorScheme === "dark" ? 1 : 0,
+      ...this.input(String(environment.mediaType)),
+      ...this.input(String(environment.colorScheme)),
       environment.reducedMotion ? 1 : 0,
-      { srgb: 0, p3: 1, rec2020: 2 }[environment.colorGamut] ?? 0,
-      environment.dynamicRange === "high" ? 1 : 0,
-      environment.hoverCapability === "none" ? 0 : 1,
-      { none: 0, coarse: 1, fine: 2 }[environment.pointerAccuracy] ?? 2,
-      environment.scrollbarStyle === "classic" ? 1 : 0,
+      ...this.input(String(environment.colorGamut)),
+      ...this.input(String(environment.dynamicRange)),
+      ...this.input(String(environment.hoverCapability)),
+      ...this.input(String(environment.pointerAccuracy)),
+      ...this.input(String(environment.scrollbarStyle)),
+      ...this.input(String(environment.forcedColors ?? "none")),
     );
   }
 
@@ -1800,79 +1900,15 @@ export class DomCore {
     return this.status("supports_condition", ...this.input(text)) === 1;
   }
 
-  cascadePlanAddSheet(plan, sheetHandle, origin, entryIndex, forPart) {
-    this.status(
-      "cascade_plan_add_sheet",
-      plan,
-      sheetHandle,
-      origin,
-      entryIndex,
-      forPart ? 1 : 0,
-    );
-  }
-
-  cascadePlanSequence(plan) {
-    return this.status("cascade_plan_sequence", plan);
-  }
-
-  cascadePlanItem_(plan, index) {
-    const shapeFlags = this.status("cascade_plan_item_field", plan, index, 1);
-    const stateFlags = this.status("cascade_plan_item_field", plan, index, 3);
-    return {
-      index,
-      entryIndex: this.status("cascade_plan_item_field", plan, index, 0),
-      shape: shapeFlags & 7,
-      forPart: (shapeFlags & 8) !== 0,
-      pseudoElement: PSEUDO_ELEMENT_NAMES[
-        this.status("cascade_plan_item_field", plan, index, 2)
-      ],
-      usesHover: (stateFlags & 1) !== 0,
-      usesActive: (stateFlags & 2) !== 0,
-      matchSelector: this.string("cascade_plan_item_text", plan, index, 0),
-      argument: this.string("cascade_plan_item_text", plan, index, 1),
-      rest: this.string("cascade_plan_item_text", plan, index, 2),
-    };
-  }
-
-  // Items the binding matches itself: shadow-scoped shapes and ::part rules.
-  cascadePlanSpecialItems(plan) {
-    const items = [];
-    for (
-      let index = this.status("cascade_plan_special_next", plan, -1);
-      index >= 0;
-      index = this.status("cascade_plan_special_next", plan, index)
-    ) {
-      items.push(this.cascadePlanItem_(plan, index));
-    }
-    return items;
-  }
-
-  // Items whose selectors consult :hover (state 1) or :active (state 2).
-  cascadePlanProbeItems(plan, state) {
-    const items = [];
-    for (
-      let index = this.status("cascade_plan_probe_next", plan, 0, state);
-      index >= 0;
-      index = this.status("cascade_plan_probe_next", plan, index + 1, state)
-    ) {
-      items.push(this.cascadePlanItem_(plan, index));
-    }
-    return items;
-  }
-
-  cascadePlanOfferItem(plan, index) {
-    this.status("cascade_plan_offer_item", plan, index);
-  }
-
-  cascadeElementCollect(handle, pseudoKind) {
-    this.status("cascade_element_collect", handle, pseudoKind);
+  cascadeElementCollect(handle, pseudoElement) {
+    this.status("cascade_element_collect", handle, ...this.input(pseudoElement));
   }
 
   cascadeStateAffects(handle, state) {
     return this.status(
       "cascade_state_affects",
       handle,
-      state === "active" ? 2 : 1,
+      state === "active" ? CASCADE_STATE_ACTIVE : CASCADE_STATE_HOVER,
     ) === 1;
   }
 
@@ -1887,7 +1923,7 @@ export class DomCore {
     const pointer = this.exports.abi_allocate(sheetHandles.length * 4);
     const view = new DataView(this.refreshBytes().buffer);
     for (let index = 0; index < sheetHandles.length; index += 1) {
-      view.setUint32(pointer + index * 4, sheetHandles[index], true);
+      view.setUint32(pointer + index * Uint32Array.BYTES_PER_ELEMENT, sheetHandles[index], true);
     }
     this.status(
       "scope_adopted_stylesheets_set",
@@ -1897,17 +1933,29 @@ export class DomCore {
     );
   }
 
+  // The FontFaceSet sheets of a document, one for each added FontFace
+  // (core/dom/font-face-set.watpart).
+  setFontFaceSheets(documentHandle, sheetHandles) {
+    const pointer = this.exports.abi_allocate(sheetHandles.length * 4);
+    const view = new DataView(this.refreshBytes().buffer);
+    for (let index = 0; index < sheetHandles.length; index += 1) {
+      view.setUint32(pointer + index * Uint32Array.BYTES_PER_ELEMENT, sheetHandles[index], true);
+    }
+    this.status("document_font_face_sheets_set", documentHandle, pointer, sheetHandles.length);
+  }
+
+  // The active sheets of a scope root with their cascade origins: 0 the
+  // user agent, 1 the author.
   activeStylesheets(rootHandle) {
     const count = this.status("scope_active_stylesheet_count", rootHandle);
-    const handles = new Array(count);
+    const sheets = new Array(count);
     for (let index = 0; index < count; index += 1) {
-      handles[index] = this.status(
-        "scope_active_stylesheet_at",
-        rootHandle,
-        index,
-      );
+      sheets[index] = {
+        handle: this.status("scope_active_stylesheet_at", rootHandle, index),
+        origin: this.status("scope_active_stylesheet_origin", rootHandle, index),
+      };
     }
-    return handles;
+    return sheets;
   }
 
   stylesheetDisabled(sheetHandle) {
@@ -1915,15 +1963,11 @@ export class DomCore {
   }
 
   stylesheetMedia(sheetHandle) {
-    return this.string("stylesheet_media", sheetHandle) ?? "";
+    return this.string("stylesheet_media", sheetHandle);
   }
 
   stylesheetRevision(sheetHandle) {
     return this.status("stylesheet_revision", sheetHandle);
-  }
-
-  stylesheetSource(sheetHandle) {
-    return this.string("stylesheet_source", sheetHandle) ?? "";
   }
 
   stylesheetOwner(sheetHandle) {
@@ -1942,24 +1986,6 @@ export class DomCore {
     this.status("stylesheet_set_media", sheetHandle, ...this.input(media));
   }
 
-  // The participating children of an element as scene items: kind 1
-  // element, 2 text, 3/4 anonymous inline run open/close, 5/6 expansion
-  // open/close (a display:contents child or shadow-tree slot).
-  sceneChildren(handle) {
-    const count = this.status("scene_children", handle);
-    const items = new Array(count);
-    for (let index = 0; index < count; index += 1) {
-      const kind = this.status("scene_child_kind", index);
-      items[index] = {
-        kind,
-        node: kind === 3 || kind === 4 || kind === 6
-          ? null
-          : this.wrapperFor(this.handle("scene_child_handle", index)),
-      };
-    }
-    return items;
-  }
-
   // The scene box tree of a subtree root: boxes in engine order (breadth
   // first, children contiguous) with kind, display code, flags, owner box,
   // node and context handles, child indices, and text; plus the handles of
@@ -1976,41 +2002,42 @@ export class DomCore {
     const arena = this.exports.scene_text_arena_pointer();
     const boxes = new Array(count);
     const childBase = base + count * SceneBuildBoxSize;
+    const field = SceneBuildBoxFields;
     for (let index = 0; index < count; index += 1) {
       // Decoded field by field into its final shape: the generated reader
       // would build an intermediate object per box, and a text page has
       // thousands of boxes per build.
       const pointer = base + index * SceneBuildBoxSize;
-      const childOffset = view.getUint32(pointer + 24, true);
-      const childCount = view.getUint32(pointer + 28, true);
+      const childOffset = view.getUint32(pointer + field.childOffset, true);
+      const childCount = view.getUint32(pointer + field.childCount, true);
       const children = new Array(childCount);
       for (let child = 0; child < childCount; child += 1) {
         children[child] = view.getUint32(
-          childBase + (childOffset + child) * 4,
+          childBase + (childOffset + child) * Uint32Array.BYTES_PER_ELEMENT,
           true,
         );
       }
-      const textPointer = view.getUint32(pointer + 32, true);
-      const textLength = view.getUint32(pointer + 36, true);
+      const textPointer = view.getUint32(pointer + field.textPointer, true);
+      const textLength = view.getUint32(pointer + field.textLength, true);
       const hasText = textPointer !== 0 || textLength !== 0;
-      const owner = view.getInt32(pointer + 4, true);
+      const owner = view.getInt32(pointer + field.owner, true);
       boxes[index] = new SceneBuildBox(
-        view.getUint8(pointer + 0),
-        view.getUint8(pointer + 1),
-        view.getUint16(pointer + 2, true),
+        view.getUint8(pointer + field.kind),
+        view.getUint8(pointer + field.display),
+        view.getUint16(pointer + field.flags, true),
         owner < 0 ? undefined : owner,
-        view.getBigUint64(pointer + 8, true),
-        view.getBigUint64(pointer + 16, true),
+        view.getBigUint64(pointer + field.handle, true),
+        view.getBigUint64(pointer + field.context, true),
         children,
-        view.getBigUint64(pointer + 56, true),
-        view.getBigUint64(pointer + 64, true),
+        view.getBigUint64(pointer + field.stableId, true),
+        view.getBigUint64(pointer + field.sourceRevision, true),
         hasText ? textPointer - arena : 0,
         hasText ? textLength : 0,
-        view.getUint8(pointer + 40),
-        view.getUint8(pointer + 41),
-        view.getUint32(pointer + 44, true),
-        view.getFloat64(pointer + 48, true),
-        view.getUint8(pointer + 42),
+        view.getUint8(pointer + field.whiteSpace),
+        view.getUint8(pointer + field.textTransform),
+        view.getUint32(pointer + field.font, true),
+        view.getFloat64(pointer + field.letterSpacing, true),
+        view.getUint8(pointer + field.host),
         hasText ? publication : null,
         hasText ? this.decoder : null,
       );
@@ -2023,10 +2050,8 @@ export class DomCore {
       expansions[index] = this.handle("scene_expansion_handle", index);
     }
     const rootContext = {
-      direction: this.exports.scene_root_direction() === 1 ? "rtl" : "ltr",
-      writingMode: ["horizontal-tb", "vertical-rl", "vertical-lr"][
-        this.exports.scene_root_writing_mode()
-      ],
+      direction: this.string("scene_root_direction_keyword"),
+      writingMode: this.string("scene_root_writing_mode_keyword"),
     };
     return { boxes, expansions, rootContext };
   }
@@ -2038,14 +2063,9 @@ export class DomCore {
     const view = new DataView(
       this.memory.buffer,
       this.exports.abi_output_pointer(),
-      32,
+      COLOR_RGBA_SIZE,
     );
-    return {
-      r: view.getFloat64(0, true),
-      g: view.getFloat64(8, true),
-      b: view.getFloat64(16, true),
-      a: view.getFloat64(24, true),
-    };
+    return rgba(view, 0);
   }
 
   // Host generated-content overrides (animated pseudo-element content) for
@@ -2096,16 +2116,10 @@ export class DomCore {
         currentColor.a,
       );
     this.throwIfError();
-    if (status === 1) return "currentColor";
-    if (status !== 0) return null;
+    if (status === COLOR_CURRENT) return "currentColor";
+    if (status !== COLOR_PARSED) return null;
     const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.memory.buffer);
-    return {
-      r: view.getFloat64(pointer, true),
-      g: view.getFloat64(pointer + 8, true),
-      b: view.getFloat64(pointer + 16, true),
-      a: view.getFloat64(pointer + 24, true),
-    };
+    return rgba(new DataView(this.memory.buffer), pointer);
   }
 
   // Chrome's serialization of the color the last parseColor() returned when
@@ -2126,11 +2140,8 @@ export class DomCore {
     this.throwIfError();
     const pointer = this.exports.abi_output_pointer();
     const view = new DataView(this.memory.buffer);
-    const component = (index) => view.getFloat64(pointer + index * 8, true);
-    return {
-      stop: [component(0), component(1), component(2)],
-      own: [component(3), component(4), component(5)],
-    };
+    const color = (start) => [0, 1, 2].map((index) => view.getFloat64(pointer + start + index * Float64Array.BYTES_PER_ELEMENT, true));
+    return { stop: color(OKLAB_STOP_INTERPOLATED), own: color(OKLAB_STOP_OWN) };
   }
 
   // Every URL that CSS text names, with its escapes decoded by the core's
@@ -2158,17 +2169,54 @@ export class DomCore {
     const urls = new Array(count);
     let offset = 0;
     for (let index = 0; index < count; index++) {
-      const start = textOffsetOf(view.getUint32(offset, true));
-      const end = textOffsetOf(view.getUint32(offset + 4, true));
-      const urlLength = view.getUint32(offset + 8, true);
+      const start = textOffsetOf(view.getUint32(offset + CSS_URL_START, true));
+      const end = textOffsetOf(view.getUint32(offset + CSS_URL_END, true));
+      const urlLength = view.getUint32(offset + CSS_URL_LENGTH, true);
+      const integrityLength = view.getUint32(offset + CSS_URL_INTEGRITY_LENGTH, true);
+      const urlStart = offset + CSS_URL_HEADER_SIZE;
+      const integrityStart = urlStart + urlLength;
       urls[index] = {
         start,
         end,
-        url: this.decoder.decode(records.subarray(offset + 12, offset + 12 + urlLength)),
+        url: this.decoder.decode(records.subarray(urlStart, integrityStart)),
+        request: this.requestFields(view.getUint32(offset + CSS_URL_REQUEST, true),
+          this.decoder.decode(records.subarray(integrityStart, integrityStart + integrityLength))),
       };
-      offset += 12 + urlLength;
+      offset = integrityStart + integrityLength;
     }
     return urls;
+  }
+
+  // The references of a linked sheet's source that the host resolves, in
+  // css_sheet_flatten order: { kind (CSS_REFERENCE_*), url, request (the
+  // demand fields of its url()'s modifiers, requestFields) }.
+  cssSheetReferences(source) {
+    const count = this.status("css_sheet_references", ...this.input(source));
+    const pointer = this.exports.abi_output_pointer();
+    const records = this.refreshBytes().slice(pointer, pointer + this.exports.abi_output_length());
+    const view = new DataView(records.buffer);
+    const references = new Array(count);
+    let offset = 0;
+    for (let index = 0; index < count; index++) {
+      const length = view.getUint32(offset + CSS_REFERENCE_RECORD_LENGTH, true);
+      const integrityLength = view.getUint32(offset + CSS_REFERENCE_RECORD_INTEGRITY_LENGTH, true);
+      const urlStart = offset + CSS_REFERENCE_RECORD_HEADER_SIZE;
+      const integrityStart = urlStart + length;
+      references[index] = {
+        kind: view.getUint32(offset + CSS_REFERENCE_RECORD_KIND, true),
+        url: this.decoder.decode(records.subarray(urlStart, integrityStart)),
+        request: this.requestFields(view.getUint32(offset + CSS_REFERENCE_RECORD_REQUEST, true),
+          this.decoder.decode(records.subarray(integrityStart, integrityStart + integrityLength))),
+      };
+      offset = integrityStart + integrityLength;
+    }
+    return references;
+  }
+
+  // The flattened source of a linked sheet, given the result of each of
+  // its references: an import's flattened source, a url()'s absolute URL.
+  cssSheetFlatten(source, pieces) {
+    return this.string("css_sheet_flatten", ...this.input(source), ...this.valueListInput(pieces));
   }
 
   // The ranges of an @font-face unicode-range descriptor value as a
@@ -2178,35 +2226,7 @@ export class DomCore {
     const count = this.status("font_unicode_range_parse", ...this.input(text));
     if (count < 0) return null;
     const pointer = this.exports.abi_output_pointer();
-    return new Uint32Array(this.refreshBytes().buffer.slice(pointer, pointer + count * 8));
-  }
-
-  cascadePlanCreate() {
-    return this.status("cascade_plan_create");
-  }
-
-  cascadePlanDispose(plan) {
-    this.status("cascade_plan_dispose", plan);
-  }
-
-  // entries: [{ skipped, scopeRoot: handle|0n }] written as 16-byte rows.
-  cascadePlanCollect(plan, handle, pseudoKind, entries) {
-    const pointer = this.exports.abi_allocate(entries.length * 16);
-    const view = new DataView(this.refreshBytes().buffer);
-    for (let index = 0; index < entries.length; index += 1) {
-      const at = pointer + index * 16;
-      view.setUint32(at, entries[index].skipped ? 1 : 0, true);
-      view.setUint32(at + 4, 0, true);
-      view.setBigUint64(at + 8, entries[index].scopeRoot, true);
-    }
-    this.status(
-      "cascade_plan_collect",
-      plan,
-      handle,
-      pseudoKind,
-      pointer,
-      entries.length,
-    );
+    return new Uint32Array(this.refreshBytes().buffer.slice(pointer, pointer + count * UNICODE_RANGE_SIZE));
   }
 
   cascadeBegin() {
@@ -2214,45 +2234,9 @@ export class DomCore {
     this.throwIfError();
   }
 
-  cascadeOffer({
-    property,
-    value,
-    important,
-    origin,
-    specificity,
-    layerOrder,
-    order,
-  }) {
-    this.exports.cascade_offer(
-      ...this.input(property),
-      ...this.input(value),
-      important ? 1 : 0,
-      origin,
-      Number.isFinite(specificity[0]) ? specificity[0] : 0x7fff_ffff,
-      specificity[1],
-      specificity[2],
-      layerOrder,
-      order,
-    );
-    this.throwIfError();
-  }
-
   resourceRegister(kind, key) {
     const input = this.input(key);
     return this.handle("resource_register", kind, ...input);
-  }
-
-  resourceRegisterOwned(kind, owner, key) {
-    return this.handle(
-      "resource_register_owned",
-      kind,
-      owner,
-      ...this.input(key),
-    );
-  }
-
-  resourceFindId(id) {
-    return this.handle("resource_find_id", id);
   }
 
   resourceId(resource) {
@@ -2302,20 +2286,9 @@ export class DomCore {
     const view = new DataView(
       this.memory.buffer,
       this.exports.abi_output_pointer(),
-      64,
+      RESOURCE_INFO_SIZE,
     );
-    return {
-      id: view.getUint32(0, true),
-      kind: view.getUint32(4, true),
-      references: view.getUint32(8, true),
-      readiness: view.getUint32(12, true),
-      contentGeneration: view.getUint32(16, true),
-      metricsGeneration: view.getUint32(20, true),
-      width: view.getFloat64(24, true),
-      height: view.getFloat64(32, true),
-      failure: view.getUint32(40, true),
-      revision: view.getUint32(44, true),
-    };
+    return Object.fromEntries(RESOURCE_INFO_FIELDS.map(([name, offset, read]) => [name, view[read](offset, true)]));
   }
 
   resourceKey(handle) {
@@ -2323,17 +2296,43 @@ export class DomCore {
     return this.outputString();
   }
 
+  // The request a url()'s modifiers name for the resource (CSS Values 5
+  // §4.1.1; resource_request): the fields of a host resource demand.
+  resourceRequest(handle) {
+    const request = this.status("resource_request", handle);
+    return this.requestFields(request, this.outputString());
+  }
+
+  // The demand fields of a url() request: `request` holds the credentials
+  // mode in byte 0 (0 the destination's default, 1 "same-origin", 2
+  // "include", either making the mode "cors") and the referrer policy in
+  // byte 1 (css_referrer_policy_name; 0 none). A field the url() does not
+  // set is undefined, so the demand takes the destination's default.
+  requestFields(request, integrity) {
+    const credentials = request & 0xff;
+    const referrerPolicy = (request >> 8) & 0xff;
+    return {
+      mode: credentials === 0 ? undefined : "cors",
+      credentials: credentials === 0 ? undefined : credentials === 1 ? "same-origin" : "include",
+      integrity: integrity === "" ? undefined : integrity,
+      referrerPolicy: referrerPolicy === 0 ? undefined : this.string("css_referrer_policy_name", referrerPolicy),
+    };
+  }
+
+  // The resource whose id is `id` (resource_find_id).
+  resourceById(id) {
+    return this.handle("resource_find_id", id);
+  }
+
   sceneResourceNode(node) {
     return this.handle("scene_resource_node", node);
   }
 
-  // The URL that a captured SVG row's fill (which 0) or stroke (which 1)
-  // names as its paint server, with instance inheritance and escapes
-  // resolved, or null (SceneBuildBox.host bits 4 and 8).
-  sceneSvgPaintServer(stableId, sourceRevision, which) {
-    return this.status("scene_svg_paint_server", stableId, sourceRevision, which)
-      ? this.outputString()
-      : null;
+  // The image resource of the generated image a build row shows (a list
+  // marker's list-style-image, or an image of ::before or ::after
+  // content), bound to its element; 0n for none (scene_resource_generated).
+  sceneResourceGenerated(stableId, sourceRevision) {
+    return this.handle("scene_resource_generated", stableId, sourceRevision);
   }
 
   resourceEngineCreate() {
@@ -2342,10 +2341,6 @@ export class DomCore {
 
   resourceEngineBind(scope, resource, index, variant = 0) {
     this.status("resource_engine_bind", scope, resource, index, variant);
-  }
-
-  resourceEngineUnbind(scope, resource, variant = 0) {
-    return this.status("resource_engine_unbind", scope, resource, variant);
   }
 
   resourceEngineIndex(scope, id, variant = 0) {
@@ -2370,7 +2365,7 @@ export class DomCore {
       readiness,
       width,
       height,
-      contentChanged ? 1 : 0,
+      contentChanged,
       failure,
     );
     if (measurement) {
@@ -2391,20 +2386,8 @@ export class DomCore {
     return this.status("resource_bind", node, resource);
   }
 
-  resourceForNode(node) {
-    return this.handle("resource_for_node", node);
-  }
-
   resourceNodeDetach(node) {
     return this.status("resource_node_detach", node);
-  }
-
-  resourceMetricsChanged(handle) {
-    return this.status("resource_metrics_changed", handle);
-  }
-
-  resourceRetain(handle) {
-    return this.status("resource_retain", handle);
   }
 
   resourceRelease(handle) {
@@ -2423,20 +2406,13 @@ export class DomCore {
     return this.status("canvas_bitmap_dimension", node, axis);
   }
 
+  canvasDimensionValue(value, axis) {
+    return this.status("canvas_dimension_value", value, axis);
+  }
+
   canvasBitmapReset(node, sizeChanged, resetDevice) {
     const request = this.handle("canvas_bitmap_set", node, sizeChanged ? 1 : 0);
     this.canvasResetRequest(request, resetDevice);
-  }
-
-  canvasBitmapAttributeMatches(name, namespace) {
-    // Raw namespace/name identity checks must not coerce objects before the
-    // reflected attribute operation does. The native matcher sees only strings.
-    const input = typeof name === "string" ? this.input(name) : [0, 0];
-    return this.status(
-      "canvas_bitmap_attribute_matches",
-      ...input,
-      namespace === null ? 0 : 1,
-    ) === 1;
   }
 
   canvasBitmapAttribute(
@@ -2466,56 +2442,34 @@ export class DomCore {
       const view = new DataView(
         this.memory.buffer,
         this.exports.abi_output_pointer(),
-        24,
+        CANVAS_RESET_SIZE,
       );
       resetDevice({
-        width: view.getFloat64(0, true),
-        height: view.getFloat64(8, true),
-        contentGeneration: view.getUint32(16, true),
-        sizeChanged: view.getUint32(20, true) !== 0,
+        width: view.getFloat64(CANVAS_RESET_WIDTH, true),
+        height: view.getFloat64(CANVAS_RESET_HEIGHT, true),
+        contentGeneration: view.getUint32(CANVAS_RESET_CONTENT_GENERATION, true),
+        sizeChanged: view.getUint32(CANVAS_RESET_SIZE_CHANGED, true) !== 0,
       });
     } finally {
       this.status("canvas_reset_ack", request, invocation);
     }
   }
 
-  layoutRecords(rootHandle) {
-    const count = this.status("layout_records_export", rootHandle);
-    const base = this.exports.abi_output_pointer();
-    const length = this.exports.abi_output_length();
-    const view = new DataView(this.memory.buffer, base, length);
-    if (
-      view.getUint32(0, true) !== 1 ||
-      view.getUint32(4, true) !== 3 ||
-      view.getUint32(8, true) !== length ||
-      view.getUint32(12, true) !== count
-    ) {
-      throw new Error("Invalid DOM core layout record header");
-    }
-    const records = new Array(count);
-    for (let index = 0; index < count; index += 1) {
-      const offset = 16 + index * 24;
-      records[index] = {
-        handle: view.getBigUint64(offset, true),
-        parentHandle: view.getBigUint64(offset + 8, true),
-        nodeType: view.getUint32(offset + 16, true),
-        resourceId: view.getUint32(offset + 20, true),
-      };
-    }
-    return records;
-  }
   // The shared-memory path stays wholly native. An isolated renderer transports
   // the same raw ABI bytes, never decoded CSS values or a second style store.
-  captureComputedSample(engine, owner, identity, node, index, track, property, time) {
-    let record = engine.exports.layout_buffer_base() + index * LAYOUT_NODE_SIZE;
+  // `record` is the engine row the sample copies: the node's layout row, or
+  // a row with its stack composed at `time` (animation_track_stack_row).
+  // `pseudo` 1 or 2 samples the ::before or ::after of element `node`.
+  captureComputedSample(engine, owner, identity, node, pseudo, index, track, property, time,
+    record = engine.exports.layout_buffer_base() + index * LAYOUT_NODE_SIZE) {
     let shadows = 0;
     if (engine.memory !== this.memory) {
       const source = new DataView(engine.memory.buffer);
-      const shadowLength = property.kind === 7
+      const shadowLength = property.kind === ANIMATION_KIND_SHADOW
         ? source.getUint8(record + LAYOUT_NODE_OFFSET_SHADOW_COUNT) * SHADOW_ENTRY_SIZE
         : 0;
       shadows = shadowLength
-        ? SHADOW_POOL_BASE + source.getUint32(record + LAYOUT_NODE_OFFSET_SHADOW_OFFSET, true)
+        ? engine.exports.shadow_pool_base() + source.getUint32(record + LAYOUT_NODE_OFFSET_SHADOW_OFFSET, true)
         : 0;
       const bytes = new Uint8Array(ANIMATION_RECORD_SIZE + LAYOUT_NODE_SIZE + shadowLength);
       bytes.set(new Uint8Array(engine.memory.buffer, track, ANIMATION_RECORD_SIZE));
@@ -2527,112 +2481,83 @@ export class DomCore {
       record = pointer + ANIMATION_RECORD_SIZE;
       shadows = record + LAYOUT_NODE_SIZE;
     }
-    this.status("computed_samples_capture", owner, identity, node, index,
+    this.status("computed_samples_capture", owner, identity, node, pseudo, index,
       track, record, shadows, property.kind, property.valueOffset,
       property.tagOffset ?? 0, property.percentageOffset ?? 0, time);
   }
-  // Capture the layout-used values CSSOM exposes for ::before and ::after
-  // boxes (scene box kinds 14 and 15). The snapshot is renderer-owned like
-  // sampled animation values; the native view accepts it only while the
-  // element's cascade generation still matches. `generatedRows` lists the
-  // scene's rows of those boxes (a serialized scene carries them); without
-  // it every row's kind is read.
-  captureComputedPseudos(engine, owner, nodes, elements, boxes, generatedRows) {
+  // Capture the layout-used values CSSOM exposes for absolutely positioned
+  // ::before and ::after boxes (computed_pseudo_capture selects them and
+  // derives the values). The snapshot is renderer-owned like sampled
+  // animation values; the native view accepts it only while the element's
+  // cascade generation still matches. `generatedRows` lists the scene's
+  // ::before and ::after boxes as `{ row, element }`, the element being the
+  // originating element of the same serialization; serializeToScene gives
+  // them as generatedBoxRows.
+  captureComputedPseudos(engine, owner, nodes, boxes, generatedRows) {
+    if (!Array.isArray(generatedRows)) {
+      throw new TypeError(
+        `captureComputedPseudos needs the scene's generatedBoxRows; got ${String(generatedRows)}. ` +
+          "Pass serialized.generatedBoxRows of serializeToScene() in the scene.",
+      );
+    }
     this.status("computed_pseudos_clear", owner);
-    const view = new DataView(engine.memory.buffer);
     const base = engine.exports.layout_buffer_base();
-    const rows = generatedRows ?? nodes.keys();
-    for (const index of rows) {
-      const kind = nodes[index]._coreBox & 0xff;
-      if (kind !== 14 && kind !== 15) continue;
+    for (const { row: index, element } of generatedRows) {
+      if (element._domCore !== this) continue;
       const ownerIndex = nodes[index].generatedOwnerIndex;
-      const element = elements[ownerIndex];
-      if (!element || element._domCore !== this) continue;
-      const record = base + index * LAYOUT_NODE_SIZE;
-      // Absolute generated boxes are the layout-used CSSOM case. Relative
-      // and in-flow pseudos retain their ordinary computed inset keywords.
-      if (view.getUint8(record + LAYOUT_NODE_OFFSET_POSITION) !== POSITION_ABSOLUTE) {
-        continue;
-      }
-      // Read after the position: a frame's box list makes a box on its
-      // first read.
       const box = boxes[index];
       const containingBox = boxes[ownerIndex];
       if (!box || !containingBox) continue;
-      const containingRecord = base + ownerIndex * LAYOUT_NODE_SIZE;
-      const marginTop = view.getFloat32(record + LAYOUT_NODE_OFFSET_MARGIN_TOP, true);
-      const marginRight = view.getFloat32(record + LAYOUT_NODE_OFFSET_MARGIN_RIGHT, true);
-      const marginBottom = view.getFloat32(record + LAYOUT_NODE_OFFSET_MARGIN_BOTTOM, true);
-      const marginLeft = view.getFloat32(record + LAYOUT_NODE_OFFSET_MARGIN_LEFT, true);
-      const paddingTopEdge = containingBox.y +
-        view.getFloat32(containingRecord + LAYOUT_NODE_OFFSET_BORDER_TOP, true);
-      const paddingRightEdge = containingBox.x + containingBox.w -
-        view.getFloat32(containingRecord + LAYOUT_NODE_OFFSET_BORDER_RIGHT, true);
-      const paddingBottomEdge = containingBox.y + containingBox.h -
-        view.getFloat32(containingRecord + LAYOUT_NODE_OFFSET_BORDER_BOTTOM, true);
-      const paddingLeftEdge = containingBox.x +
-        view.getFloat32(containingRecord + LAYOUT_NODE_OFFSET_BORDER_LEFT, true);
-      const contentBox = view.getUint8(record + LAYOUT_NODE_OFFSET_BOX_SIZING) === 0;
+      let record = base + index * LAYOUT_NODE_SIZE;
+      let containingRecord = base + ownerIndex * LAYOUT_NODE_SIZE;
+      if (engine.memory !== this.memory) {
+        const bytes = new Uint8Array(2 * LAYOUT_NODE_SIZE);
+        bytes.set(new Uint8Array(engine.memory.buffer, record, LAYOUT_NODE_SIZE));
+        bytes.set(new Uint8Array(engine.memory.buffer, containingRecord, LAYOUT_NODE_SIZE), LAYOUT_NODE_SIZE);
+        [record] = this.byteInput(bytes);
+        containingRecord = record + LAYOUT_NODE_SIZE;
+      }
       this.status(
         "computed_pseudo_capture",
         owner,
         element._coreHandle,
-        kind - 13,
-        contentBox ? box.cw : box.w,
-        contentBox ? box.ch : box.h,
-        box.y - marginTop - paddingTopEdge,
-        paddingRightEdge - box.x - box.w - marginRight,
-        paddingBottomEdge - box.y - box.h - marginBottom,
-        box.x - marginLeft - paddingLeftEdge,
+        // src/dom/serialize.js packs the box kind into the low byte.
+        nodes[index]._coreBox & 0xff,
+        record,
+        containingRecord,
+        box.x, box.y, box.w, box.h, box.cw, box.ch,
+        containingBox.x, containingBox.y, containingBox.w, containingBox.h,
       );
     }
   }
 
 
   remapComputedSamples(owner, indexMap) {
-    const pointer = this.status("abi_allocate", indexMap.size * 8);
+    const pointer = this.status("abi_allocate", indexMap.size * INDEX_REMAP_SIZE);
     const view = new DataView(this.refreshBytes().buffer);
     let offset = pointer;
     for (const [previous, next] of indexMap) {
-      view.setUint32(offset, previous, true);
-      view.setUint32(offset + 4, next, true);
-      offset += 8;
+      view.setUint32(offset + INDEX_REMAP_PREVIOUS, previous, true);
+      view.setUint32(offset + INDEX_REMAP_NEXT, next, true);
+      offset += INDEX_REMAP_SIZE;
     }
     this.status("computed_samples_remap", owner, pointer, indexMap.size);
   }
 
-  // Resolve the current cascade result for an element. Returns the computed
-  // declarations (var() substituted, CSS-wide keywords applied) and the
-  // element's computed custom properties. A stored resolution supplies the
-  // inherited custom properties of its children.
-  computedStyleResolve(handle, parentHandle, store) {
-    const mode = store === true ? 1 : store === false ? 0 : store;
-    const count = this.status(
-      "computed_style_resolve",
-      handle,
-      parentHandle ?? 0n,
-      mode,
-    );
-    const declarations = new Array(count);
-    for (let index = 0; index < count; index += 1) {
-      declarations[index] = [
-        this.string("computed_declaration_property", index),
-        this.string("computed_declaration_value", index),
-      ];
-    }
-    // A stored resolution reads its custom properties from the element on
-    // demand; a transient one is decoded now, before the next resolution
-    // replaces it.
-    const customProperties = mode === 1
-      ? new DomCoreComputedCustomProperties(this, handle)
-      : this.readCurrentCustomProperties();
-    return { declarations, customProperties };
+  // Resolve the current cascade result for an element in resolution mode
+  // `mode` (COMPUTED_RESOLVE_*). Returns the computed declarations (var()
+  // substituted, CSS-wide keywords applied) as [property, value] pairs.
+  computedStyleResolve(handle, parentHandle, mode) {
+    return this.computedDeclarations(this.status("computed_style_resolve", handle, parentHandle ?? 0n, mode));
   }
 
   // Cascades and resolves the element after its flat-tree parent unless its
   // stored record is current for the document's style generation.
   styleElementResolve(handle) {
-    const count = this.status("style_element_resolve", handle);
+    return this.computedDeclarations(this.status("style_element_resolve", handle));
+  }
+
+  computedDeclarations(count) {
     const declarations = new Array(count);
     for (let index = 0; index < count; index += 1) {
       declarations[index] = [
@@ -2640,22 +2565,7 @@ export class DomCore {
         this.string("computed_declaration_value", index),
       ];
     }
-    return {
-      declarations,
-      customProperties: new DomCoreComputedCustomProperties(this, handle),
-    };
-  }
-
-  readCurrentCustomProperties() {
-    const customCount = this.status("computed_custom_count");
-    const customProperties = new Map();
-    for (let index = 0; index < customCount; index += 1) {
-      customProperties.set(
-        this.string("computed_custom_name_at", index),
-        this.string("computed_custom_value_at", index),
-      );
-    }
-    return customProperties;
+    return declarations;
   }
 
   // The viewport that vw, vh, vmin and vmax of the document of `handle`
@@ -2670,40 +2580,26 @@ export class DomCore {
   // cssText }; throws a SyntaxError on invalid input.
   resolveLength(value) {
     const kind = this.status("length_resolve", ...this.input(value));
-    if (kind === 1) return this.outputString();
-    if (kind === 5) {
+    if (kind === LENGTH_RESULT.KEYWORD) return this.outputString();
+    if (kind === LENGTH_RESULT.EXPRESSION) {
       return {
         expression: this.exports.length_result_expression(),
         cssText: this.outputString(),
       };
     }
     const pixels = this.exports.length_result_pixels();
-    if (kind === 2) return pixels;
+    if (kind === LENGTH_RESULT.PIXELS) return pixels;
     const percentage = this.exports.length_result_percentage();
-    if (kind === 3) return `${percentage * 100}%`;
+    if (kind === LENGTH_RESULT.PERCENTAGE) return `${percentage * 100}%`;
     return { pixels, percentage };
   }
 
-  // Field slots for the current computed record, in declaration order.
-  fieldRecord() {
-    return this.decodeFieldSlots(this.status("field_record_resolve"));
-  }
-
-  // The current record's element context: computed font size, root font
-  // size, color (when the element declared one), family key, direction,
-  // and writing mode.
+  // The current record's family key, and whether the record waits on a
+  // font-family answer or a face binding.
   computedContext() {
-    const number = (which) => this.exports.computed_context_number(which);
-    const hasColor = number(6) === 1;
     const context = {
-      fontSize: number(0),
-      rootFontSize: number(1),
-      color: { r: number(2), g: number(3), b: number(4), a: number(5) },
-      hasColor,
       fontFamily: this.string("computed_context_family"),
-      direction: number(7) === 1 ? "rtl" : "ltr",
-      writingMode: ["horizontal-tb", "vertical-rl", "vertical-lr"][number(8)],
-      pending: number(9) === 1,
+      pending: this.exports.computed_context_number(COMPUTED_CONTEXT_PENDING) === 1,
     };
     this.throwIfError();
     return context;
@@ -2720,156 +2616,10 @@ export class DomCore {
     return requests;
   }
 
-
-
-  // keys: the authored stack of cssValue, one key of each available
-  // family in authored order; empty when no family matches.
-  setFontFamily(cssValue, keys, zeroAdvanceRatio) {
-    const css = this.input(cssValue);
-    const inputs = keys.map((key) => this.input(key));
-    let rows = 0;
-    if (inputs.length !== 0) {
-      rows = this.exports.abi_allocate(inputs.length * 8);
-      if (!rows) this.throwIfError();
-      const view = new DataView(this.refreshBytes().buffer);
-      inputs.forEach(([pointer, length], index) => {
-        view.setUint32(rows + index * 8, pointer, true);
-        view.setUint32(rows + index * 8 + 4, length, true);
-      });
-    }
-    this.status("font_family_set", ...css, rows, inputs.length, zeroAdvanceRatio);
-  }
-
-  clearFontFamilies() {
-    this.status("font_family_clear");
-  }
-
-  // The current record's field store as the binding's field object: every
-  // entry (own and inherited) decoded into the scene field shapes.
-  // `rejectedDeclarations`, like `inheritedFields`, is an out-parameter:
-  // the binding pushes the index of every declaration whose AUTHOR value it
-  // rejected itself (field-lists.watpart: "an item the binding rejects (an
-  // easing function with invalid arguments) drops the whole declaration").
-  fieldStore(easing, inheritedFields = null, rejectedDeclarations = null) {
-    const count = this.status("field_store_count");
-    const fields = {};
-    const slot = () => this.decodeFieldSlots(1)[0];
-    const scalar = (index, which, sub, extra) => {
-      const status = this.status(
-        "field_store_slot",
-        index,
-        which,
-        sub ?? 0,
-        extra ?? 0,
-      );
-      return status === 0 ? undefined : slot();
-    };
-    // Easing text parses for plain list items; a joined list keeps the text.
-    // A rejected author easing is a dropped declaration, not a failure of
-    // this decode: the sentinel unwinds the entry, and every OTHER failure
-    // stays an exception on its way to the caller.
-    const itemValue = (decoded) => {
-      if (!(decoded.easing && decoded.kind === 7)) return decoded.value;
-      try {
-        return easing(decoded.value);
-      } catch (error) {
-        if (!isAuthorValueRejection(error)) throw error;
-        rejectedDeclarations?.push(decoded.declaration);
-        return REJECTED_ITEM;
-      }
-    };
-    for (let index = 0; index < count; index += 1) {
-      const kind = this.status("field_store_entry_scene", index);
-      if (kind === 0) continue;
-      const name = this.outputString();
-      if (kind === 1) {
-        fields[name] = scalar(index, 0).value;
-      } else if (kind === 2) {
-        const members = FIELD_MEMBERS[name] ?? EDGE_SIDES;
-        const fillKind = this.status("field_store_entry_field", index, 0);
-        const fill = fillKind === 1
-          ? scalar(index, 0).value
-          : fillKind === 2
-          ? {}
-          : undefined;
-        const value = {};
-        for (let side = 0; side < members.length; side += 1) {
-          const member = scalar(index, 1, side);
-          if (member !== undefined) value[members[side]] = member.value;
-          else if (fillKind !== 0) value[members[side]] = fill;
-        }
-        fields[name] = value;
-      } else if (kind === 3) {
-        const flags = this.status("field_store_entry_field", index, 0);
-        if (flags & 1 && !(flags & 2)) {
-          fields[name] = this.string("field_store_entry_text", index) ?? "";
-        } else {
-          const itemCount = this.status("field_store_entry_field", index, 1);
-          const items = new Array(itemCount);
-          let rejected = false;
-          for (let item = 0; item < itemCount; item += 1) {
-            const itemFlags = this.status(
-              "field_store_slot",
-              index,
-              2,
-              item,
-              0,
-            );
-            const value = itemFlags & 1 ? itemValue(slot()) : undefined;
-            if (value === REJECTED_ITEM) {
-              rejected = true;
-              break;
-            }
-            if (itemFlags & 2) {
-              this.status("field_store_slot", index, 3, item, 0);
-              value.gradient.size = slot().value;
-            }
-            const stops = this.status("field_store_item_count", index, item, 0);
-            for (let stop = 0; stop < stops; stop += 1) {
-              this.status("field_store_slot", index, 4, item, stop);
-              value.gradient.stops.push(slot().value);
-            }
-            const components = this.status(
-              "field_store_item_count",
-              index,
-              item,
-              1,
-            );
-            for (let component = 0; component < components; component += 1) {
-              this.status("field_store_slot", index, 5, item, component);
-              value.value.push(...slot().value);
-            }
-            items[item] = value;
-          }
-          if (!rejected) {
-            fields[name] = flags & 2
-              ? {
-                kind: "cssTransform",
-                components: items,
-                cssText: this.string("field_store_entry_text", index) ?? "",
-              }
-              : items;
-          }
-        }
-      } else if (kind === 4) {
-        fields[name] = {};
-      } else if (kind === 5) {
-        fields[name] = [];
-      } else if (kind === 6) {
-        fields[name] = this.string("field_store_entry_text", index) ?? "";
-      }
-      if (
-        inheritedFields !== null && fields[name] !== undefined &&
-        this.status("field_store_is_inherited", index)
-      ) inheritedFields[name] = fields[name];
-    }
-    this.throwIfError();
-    return fields;
-  }
-
   // Lowers every row of the last build into a retained publication and
   // returns its handle. The caller releases it (engineRecordRelease). A
-  // failure carries `sceneRow`, the index of the build row that failed.
+  // failure carries `sceneRow`, the index of the build row that failed,
+  // and `fontFailure`, whether a font failed it (engine_record_font_failed).
   // `scrollOwner` is the scroll owner of the render surface the build is
   // for (0n without one): the publication records each row's requested
   // scroll offsets from it.
@@ -2883,10 +2633,12 @@ export class DomCore {
     ]);
     if (native.abi_error_kind() !== 0) {
       const sceneRow = native.abi_error_detail_a();
+      const fontFailure = native.engine_record_font_failed() === 1;
       try {
         this.throwIfError();
       } catch (error) {
         error.sceneRow = sceneRow;
+        error.fontFailure = fontFailure;
         throw error;
       }
     }
@@ -2930,6 +2682,16 @@ export class DomCore {
     );
   }
 
+  // The query containers that the last scene build met
+  // (scene_query_containers), each as its element handle and its container
+  // types (1 size, 2 inline-size, 4 scroll-state).
+  sceneQueryContainers() {
+    const count = this.status("scene_query_containers");
+    const pointer = this.exports.abi_output_pointer();
+    const words = new BigInt64Array(this.refreshBytes().buffer.slice(pointer, pointer + count * 16));
+    return Array.from({ length: count }, (_, index) => ({ handle: words[index * 2], types: Number(words[index * 2 + 1]) }));
+  }
+
   // The unrelocated engine record of one published row, as owned bytes:
   // the record followed by its pool blocks (u32 legacy pool, u32 length,
   // payload). Frame publication does not use this; transition endpoints
@@ -2952,66 +2714,14 @@ export class DomCore {
     );
   }
 
-  // The geometry of a rect, circle, ellipse or line box whose record the
-  // core lowered to a path (its stroke names a paint server): six f32s in
-  // the order engine_record_svg_shape_geometry gives, or null for a record
-  // that keeps its own shape.
-  engineSvgShapeGeometry(stableId, sourceRevision) {
-    this.status("engine_record_capture", stableId, sourceRevision);
-    if (this.status("engine_record_svg_shape_geometry") === 0) return null;
+  // The after-change record of one row of the last scene build, as owned
+  // bytes in the form of engineRecordCopy: the transitions a style change
+  // starts compare it with the before-change record
+  // (engine_record_after_change).
+  engineRecordAfterChange(stableId, sourceRevision) {
+    this.status("engine_record_after_change", stableId, sourceRevision);
     const pointer = this.exports.abi_output_pointer();
-    return new Float32Array(this.refreshBytes().slice(pointer, pointer + 24).buffer);
-  }
-
-  // The native SVG path request of a path box: the lowered path bytes, its
-  // resource identity, fill rule and stroke parameters, read from the box's
-  // freshly lowered record.
-  engineSvgRequest(stableId, sourceRevision, path, pathIdentity) {
-    if (!(path instanceof Uint8Array)) {
-      throw new TypeError("Captured SVG path requires its raw bytes");
-    }
-    if (
-      typeof pathIdentity !== "bigint" || pathIdentity < 0n ||
-      pathIdentity > 0xffffffffffffffffn
-    ) {
-      throw new TypeError(
-        "Captured SVG path requires its actual lossless source identity",
-      );
-    }
-    this.status("engine_record_capture", stableId, sourceRevision);
-    const input = this.byteInput(path);
-    this.status("engine_record_svg_request", ...input, pathIdentity);
-    const request = readEngineSvgRequest(
-      new DataView(this.memory.buffer),
-      this.exports.abi_output_pointer(),
-    );
-    const pathUtf8 = this.refreshBytes().slice(
-      request.path,
-      request.path + request.length,
-    );
-    const dashArray = Array.from(
-      new Float64Array(
-        this.memory.buffer,
-        request.dashArray,
-        request.dashCount,
-      ),
-    );
-    return {
-      pathUtf8,
-      identity: request.identity,
-      resourceRevision: request.resourceRevision,
-      fillRule: request.fillRule,
-      stroke: request.strokePresent
-        ? {
-          width: request.width,
-          cap: request.cap,
-          join: request.join,
-          miterLimit: request.miterLimit,
-          dashArray,
-          dashPhase: request.dashPhase,
-        }
-        : null,
-    };
+    return this.refreshBytes().slice(pointer, pointer + this.exports.abi_output_length());
   }
 
   svgPathRegister(path, fillRule, stroke = null) {
@@ -3028,22 +2738,27 @@ export class DomCore {
 
   svgPathDefinition(pathIndex) {
     this.status("svg_path_definition", pathIndex);
-    const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().buffer);
-    const pathPointer = view.getUint32(pointer + 4, true);
-    const pathLength = view.getUint32(pointer + 8, true);
+    const record = readSvgPathDefinition(new DataView(this.refreshBytes().buffer), this.exports.abi_output_pointer());
     return {
       pathIndex,
-      pathDef: this.decoder.decode(this.bytes.subarray(pathPointer, pathPointer + pathLength)),
-      fillRule: view.getUint32(pointer + 12, true) === 1 ? "evenodd" : "nonzero",
-      stroke: view.getUint32(pointer + 16, true) ? {
-        width: view.getFloat32(pointer + 20, true),
-        cap: view.getUint32(pointer + 24, true),
-        join: view.getUint32(pointer + 28, true),
-        miterLimit: view.getFloat32(pointer + 32, true),
-        dashArray: Array.from(new Float32Array(this.memory.buffer,
-          view.getUint32(pointer + 36, true), view.getUint32(pointer + 40, true))),
-        dashPhase: view.getFloat32(pointer + 44, true),
+      pathDef: this.decoder.decode(this.bytes.subarray(record.dataPointer, record.dataPointer + record.dataLength)),
+      fillRule: record.fillRule ? "evenodd" : "nonzero",
+      stroke: record.stroked ? {
+        width: record.strokeWidth,
+        cap: record.cap,
+        join: record.join,
+        miterLimit: record.miterLimit,
+        dashArray: Array.from(new Float32Array(this.memory.buffer, record.dashPointer, record.dashCount)),
+        dashPhase: record.dashPhase,
+      } : null,
+      // A device coverage index: the raster the stroke fills, under the
+      // affine from path units into raster pixels. nonScalingStrokeScale is
+      // device pixels per host pixel for a non-scaling stroke, else 0.
+      device: record.deviceCoverage ? {
+        matrix: [record.deviceA, record.deviceB, record.deviceC, record.deviceD, record.deviceE, record.deviceF],
+        width: record.deviceWidth,
+        height: record.deviceHeight,
+        nonScalingStrokeScale: record.nonScalingStrokeScale,
       } : null,
     };
   }
@@ -3053,10 +2768,10 @@ export class DomCore {
     const pointer = this.exports.abi_output_pointer();
     const view = new DataView(this.refreshBytes().buffer);
     return {
-      xMin: view.getFloat64(pointer, true),
-      yMin: view.getFloat64(pointer + 8, true),
-      xMax: view.getFloat64(pointer + 16, true),
-      yMax: view.getFloat64(pointer + 24, true),
+      xMin: view.getFloat64(pointer + SVG_PATH_BOUNDS_X_MIN, true),
+      yMin: view.getFloat64(pointer + SVG_PATH_BOUNDS_Y_MIN, true),
+      xMax: view.getFloat64(pointer + SVG_PATH_BOUNDS_X_MAX, true),
+      yMax: view.getFloat64(pointer + SVG_PATH_BOUNDS_Y_MAX, true),
     };
   }
 
@@ -3105,8 +2820,8 @@ export class DomCore {
   engineRecordFrame() {
     this.engineFrameRevision = (this.engineFrameRevision ?? 0) + 1;
     const outcome = this.exports.engine_record_frame();
-    if (outcome === 2) return null;
-    if (outcome !== 1) this.throwIfError();
+    if (outcome === ENGINE_FRAME_DECLINED) return null;
+    if (outcome !== ENGINE_FRAME_RECORDED) this.throwIfError();
     const output = readEngineFrameOutput(
       new DataView(this.memory.buffer),
       this.exports.abi_output_pointer(),
@@ -3153,230 +2868,6 @@ export class DomCore {
     };
   }
 
-  fieldStoreDropped() {
-    const count = this.status("field_store_dropped_count");
-    const dropped = new Array(count);
-    for (let index = 0; index < count; index += 1) {
-      dropped[index] = this.status("field_store_dropped_at", index);
-    }
-    return dropped;
-  }
-
-  decodeFieldSlots(count) {
-    const base = this.exports.field_record_pointer();
-    const slotSize = this.exports.field_record_slot_size();
-    const view = new DataView(this.memory.buffer, base, count * slotSize);
-    const bytes = this.refreshBytes();
-    const text = (pointer, length) =>
-      this.decoder.decode(bytes.subarray(pointer, pointer + length));
-    const slots = new Array(count);
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * slotSize;
-      const kind = view.getUint32(offset, true);
-      const valueKind = view.getUint32(offset + 4, true);
-      const slot = {
-        kind,
-        declaration: view.getUint32(offset + 60, true),
-        field: kind >= 2
-          ? text(
-            view.getUint32(offset + 40, true),
-            view.getUint32(offset + 44, true),
-          )
-          : null,
-        side: view.getUint32(offset + 48, true),
-        value: undefined,
-      };
-      if (valueKind === 1 || valueKind === 5) {
-        const number = view.getFloat64(offset + 8, true);
-        slot.value = valueKind === 5 ? { px: number } : number;
-      } else if (valueKind === 2) {
-        slot.value = `${view.getFloat64(offset + 8, true)}%`;
-      } else if (valueKind === 3) {
-        slot.value = {
-          pixels: view.getFloat64(offset + 8, true),
-          percentage: view.getFloat64(offset + 16, true),
-        };
-      } else if (valueKind === 23) {
-        // A length expression: layout evaluates the interned program once
-        // it knows the percentage basis; cssText is the computed value.
-        slot.value = {
-          expression: view.getFloat64(offset + 8, true),
-          cssText: text(
-            view.getUint32(offset + 52, true),
-            view.getUint32(offset + 56, true),
-          ),
-        };
-      } else if (valueKind === 4 || valueKind === 6 || valueKind === 8) {
-        slot.value = text(
-          view.getUint32(offset + 52, true),
-          view.getUint32(offset + 56, true),
-        );
-        slot.color = valueKind === 6;
-        slot.easing = valueKind === 8;
-      } else if (valueKind === 17) {
-        slot.value = rgba(view, offset + 8);
-      } else if (valueKind === 18 || valueKind === 19) {
-        slot.value = {
-          offsetX: view.getFloat64(offset + 8, true),
-          offsetY: view.getFloat64(offset + 16, true),
-          blur: view.getFloat64(offset + 24, true),
-          spread: view.getFloat64(offset + 32, true),
-          color: rgba(
-            new DataView(this.memory.buffer),
-            view.getUint32(offset + 52, true),
-          ),
-          inset: valueKind === 19,
-        };
-        slot.shadow = true;
-      } else if (valueKind === 20) {
-        // An unresolved stop: `position`, the fraction of the gradient
-        // line, and `pixels`, a length the painted tile resolves. A stop
-        // without either is unpositioned; the paint fixes it up. A colour
-        // hint (flag bit 3) has no colour.
-        const position = view.getFloat64(offset + 8, true);
-        const pixels = view.getFloat64(offset + 16, true);
-        const hint = (view.getFloat64(offset + 24, true) & 8) !== 0;
-        slot.value = {
-          ...(Number.isNaN(position) ? {} : { position }),
-          ...(pixels !== 0 ? { pixels } : {}),
-          ...(hint ? { hint: true } : {
-            color: rgba(
-              new DataView(this.memory.buffer),
-              view.getUint32(offset + 52, true),
-            ),
-          }),
-        };
-        slot.gradient = 3;
-      } else if (valueKind === 7) {
-        slot.value = [
-          view.getFloat64(offset + 8, true),
-          view.getFloat64(offset + 16, true),
-        ];
-      } else if (valueKind === 9 || valueKind === 10) {
-        slot.value = {
-          offsetX: view.getFloat64(offset + 8, true),
-          offsetY: view.getFloat64(offset + 16, true),
-          blur: view.getFloat64(offset + 24, true),
-          spread: view.getFloat64(offset + 32, true),
-          color: text(
-            view.getUint32(offset + 52, true),
-            view.getUint32(offset + 56, true),
-          ),
-          inset: valueKind === 10,
-        };
-        slot.shadow = true;
-      } else if (valueKind === 11) {
-        const flags = view.getFloat64(offset + 16, true);
-        const clause = text(
-          view.getUint32(offset + 52, true),
-          view.getUint32(offset + 56, true),
-        );
-        const gradientKind = (flags >> 1) & 3;
-        const coordinate = (value, pixels) => pixels ? value : `${value}%`;
-        const gradient = {
-          kind: gradientKind === 0
-            ? "linear"
-            : gradientKind === 1
-            ? "radial"
-            : "conic",
-          ...(flags & 1 ? { repeating: true } : {}),
-          stops: [],
-        };
-        if (clause) {
-          const [space, method] = clause.toLowerCase().split(/\s+/);
-          gradient.interpolationSpace = space;
-          if (method) gradient.hueMethod = method;
-        }
-        if (gradientKind === 1) {
-          gradient.shape = flags & 8 ? "circle" : "ellipse";
-          gradient.size = undefined;
-        } else {
-          gradient.angle = view.getFloat64(offset + 8, true);
-        }
-        if (gradientKind !== 0) {
-          gradient.center = [
-            coordinate(view.getFloat64(offset + 24, true), flags & 16),
-            coordinate(view.getFloat64(offset + 32, true), flags & 32),
-          ];
-        }
-        slot.value = { gradient };
-        slot.gradient = 1;
-      } else if (valueKind === 21) {
-        // A url() image layer, or a `none` layer (empty).
-        const src = text(
-          view.getUint32(offset + 52, true),
-          view.getUint32(offset + 56, true),
-        );
-        slot.value = src ? { src } : {};
-      } else if (valueKind === 12) {
-        const sizeKind = view.getFloat64(offset + 8, true);
-        slot.value = sizeKind === 4
-          ? [
-            view.getFloat64(offset + 16, true),
-            view.getFloat64(offset + 24, true),
-          ]
-          : RADIAL_SIZES[sizeKind];
-        slot.gradient = 2;
-      } else if (valueKind === 13) {
-        const position = view.getFloat64(offset + 8, true);
-        const pixels = view.getFloat64(offset + 16, true);
-        slot.value = {
-          ...(Number.isNaN(position) ? {} : { position }),
-          ...(pixels !== 0 ? { pixels } : {}),
-          color: text(
-            view.getUint32(offset + 52, true),
-            view.getUint32(offset + 56, true),
-          ),
-        };
-        slot.gradient = 3;
-      } else if (valueKind === 14 || valueKind === 15) {
-        slot.value = transformComponent(
-          text(
-            view.getUint32(offset + 52, true),
-            view.getUint32(offset + 56, true),
-          ),
-          valueKind,
-          view.getFloat64(offset + 8, true),
-          view.getFloat64(offset + 16, true),
-          view.getFloat64(offset + 24, true),
-          view.getFloat64(offset + 32, true),
-        );
-        slot.transform = valueKind - 13;
-      } else if (valueKind === 16) {
-        slot.value = {
-          x: lengthPercentage(
-            view.getFloat64(offset + 8, true),
-            view.getFloat64(offset + 16, true),
-          ),
-          y: lengthPercentage(
-            view.getFloat64(offset + 24, true),
-            view.getFloat64(offset + 32, true),
-          ),
-          cssText: text(
-            view.getUint32(offset + 52, true),
-            view.getUint32(offset + 56, true),
-          ),
-        };
-      }
-      slots[index] = slot;
-    }
-    return slots;
-  }
-
-  // Field slots for one declaration outside a cascade, or null when the
-  // core has no entry for the property. With $element, its lengths compute
-  // against the element's font sizes and the rendering viewport.
-  declarationSlots(property, value, element = null) {
-    const count = this.status(
-      "field_declaration_parse",
-      ...this.input(property),
-      ...this.input(value),
-      element?._coreHandle ?? 0n,
-    );
-    if (count < 0) return null;
-    return this.decodeFieldSlots(count);
-  }
-
   // Whether the core's specified-value validation accepts this declaration:
   // the verdict `style.setProperty` succeeds or fails with
   // (style-mutations.watpart). The ABI separates the two failures the
@@ -3388,45 +2879,8 @@ export class DomCore {
       "specified_value_text",
       ...this.input(property),
       ...this.input(value),
-      0,
-    ) === 1;
-  }
-
-  fontShorthand(text) {
-    const count = this.status("font_parse", ...this.input(text));
-    const slots = this.decodeFieldSlots(count);
-    if (count === 0 || slots[0].kind === 1) return null;
-    const fields = {};
-    for (const slot of slots) fields[slot.field] = slot.value;
-    return fields;
-  }
-
-  // Parse a transform list outside a cascade. Returns the component list
-  // or throws for an invalid list. With $element, its lengths compute
-  // against the element's font sizes and the rendering viewport.
-  transformComponents(text, element = null) {
-    const count = this.status("transform_parse", ...this.input(text), element?._coreHandle ?? 0n);
-    const slots = this.decodeFieldSlots(count);
-    if (count === 0 || slots[0].kind === 1) {
-      throw new TypeError(`Invalid transform list: ${String(text).trim()}`);
-    }
-    const components = [];
-    for (const slot of slots) {
-      if (slot.transform === 2) {
-        components[slot.side].value.push(...slot.value);
-      } else {
-        components[slot.side] = slot.value;
-      }
-    }
-    return components;
-  }
-
-  computedCustomProperty(handle, name) {
-    return this.string(
-      "node_computed_custom_property",
-      handle,
-      ...this.input(name),
-    );
+      SPECIFIED_GRAMMAR_PROPERTY,
+    ) !== 0;
   }
 
   styleGeneration(documentHandle) {
@@ -3436,16 +2890,6 @@ export class DomCore {
   styleInvalidate(documentHandle) {
     this.status("document_style_invalidate", documentHandle);
   }
-  // ownOnly: an ancestor reporting its own :focus-within. pointerState: the
-  // change is :hover or :active (element_state_invalidate flags 1 and 2).
-  stateInvalidate(elementHandle, ownOnly, pointerState) {
-    this.status(
-      "element_state_invalidate",
-      elementHandle,
-      (ownOnly ? 1 : 0) | (pointerState ? 2 : 0),
-    );
-  }
-
   // The elements under a root whose stored scroll-snap-type is not none.
   snapContainers(rootHandle) {
     const count = this.status("scene_snap_containers", rootHandle);
@@ -3474,11 +2918,11 @@ export class DomCore {
   }
 
   observe(observerId, handle, options) {
-    const flags = (options.childList ? 1 : 0) | (options.attributes ? 2 : 0) |
-      (options.characterData ? 4 : 0) | (options.subtree ? 8 : 0) |
-      (options.attributeOldValue ? 16 : 0) |
-      (options.characterDataOldValue ? 32 : 0) |
-      (options.attributeFilter ? 64 : 0);
+    const flags = (options.childList ? OBSERVE_CHILD_LIST : 0) | (options.attributes ? OBSERVE_ATTRIBUTES : 0) |
+      (options.characterData ? OBSERVE_CHARACTER_DATA : 0) | (options.subtree ? OBSERVE_SUBTREE : 0) |
+      (options.attributeOldValue ? OBSERVE_ATTRIBUTE_OLD_VALUE : 0) |
+      (options.characterDataOldValue ? OBSERVE_CHARACTER_DATA_OLD_VALUE : 0) |
+      (options.attributeFilter ? OBSERVE_ATTRIBUTE_FILTER : 0);
     this.status(
       "observer_observe",
       observerId,
@@ -3488,48 +2932,76 @@ export class DomCore {
     );
   }
 
+  // An observer that observes a node stays alive while its document does.
+  retainObserver(observer) {
+    this.observersById.set(observer._id, new WeakRef(observer));
+    let observers = this.observingObserversByDocument.get(observer._document);
+    if (!observers) this.observingObserversByDocument.set(observer._document, observers = new Set());
+    observers.add(observer);
+  }
+
   disconnectObserver(observerId) {
     this.status("observer_disconnect", observerId);
+    const observer = this.observersById.get(observerId)?.deref();
     this.observersById.delete(observerId);
+    if (observer) this.observingObserversByDocument.get(observer._document)?.delete(observer);
+  }
+
+  // A step without tree records of its own changed what a select's
+  // selectedcontent shows (core/dom/selected-content.watpart): the core
+  // updates it when the records are taken, and they reach the facade
+  // through the handler SDDocument installs.
+  deliverSelectedContent() {
+    if (this.selectedContentPendingRegister.value === 0) return;
+    this.selectedContentHandler(this);
   }
 
   callbackRecords() {
     const count = this.exports.callback_records_export();
     this.throwIfError();
-    const recordSize = this.exports.callback_record_size();
-    const base = this.exports.abi_output_pointer();
-    const view = new DataView(this.memory.buffer, base, count * recordSize);
     const records = [];
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * recordSize;
-      records.push({
-        kind: view.getUint32(offset, true),
-        moved: (view.getUint32(offset + 4, true) & 2) !== 0,
-        target: view.getBigUint64(offset + 8, true),
-        relatedA: view.getBigUint64(offset + 16, true),
-        relatedB: view.getBigUint64(offset + 24, true),
-        previous: view.getBigUint64(offset + 32, true),
-        next: view.getBigUint64(offset + 40, true),
-        name: this.decoder.decode(
-          this.refreshBytes().subarray(
-            view.getUint32(offset + 48, true),
-            view.getUint32(offset + 48, true) +
-              view.getUint32(offset + 52, true),
-          ),
-        ),
-        oldValue: this.decoder.decode(
-          this.refreshBytes().subarray(
-            view.getUint32(offset + 56, true),
-            view.getUint32(offset + 56, true) +
-              view.getUint32(offset + 60, true),
-          ),
-        ),
-      });
+    // The roots of the subtrees that entered or left a tree. A moved node
+    // (moveBefore) stays connected.
+    const changedSubtrees = new Set();
+    if (count !== 0) {
+      const recordSize = this.callbackRecordSize;
+      const view = new DataView(this.memory.buffer, this.outputPointerRegister.value, count * recordSize);
+      for (let index = 0; index < count; index += 1) {
+        const offset = index * recordSize;
+        const text = (pointerField, lengthField) => {
+          const pointer = view.getUint32(offset + pointerField, true);
+          return this.decoder.decode(
+            this.refreshBytes().subarray(pointer, pointer + view.getUint32(offset + lengthField, true)),
+          );
+        };
+        const flags = view.getUint32(offset + CALLBACK_FIELD_FLAGS, true);
+        const kind = view.getUint32(offset + CALLBACK_FIELD_KIND, true);
+        const relatedA = view.getBigUint64(offset + CALLBACK_FIELD_RELATED_A, true);
+        const relatedB = view.getBigUint64(offset + CALLBACK_FIELD_RELATED_B, true);
+        if (kind === CALLBACK_RECORD_CHILD_LIST && (flags & CALLBACK_FLAG_MOVED) === 0) {
+          if (relatedA !== 0n) changedSubtrees.add(relatedA);
+          if (relatedB !== 0n) changedSubtrees.add(relatedB);
+        }
+        records.push({
+          kind,
+          effects: view.getUint32(offset + CALLBACK_FIELD_EFFECTS, true),
+          notify: view.getUint32(offset + CALLBACK_FIELD_NOTIFY, true),
+          target: view.getBigUint64(offset + CALLBACK_FIELD_TARGET, true),
+          relatedA,
+          relatedB,
+          previous: view.getBigUint64(offset + CALLBACK_FIELD_PREVIOUS, true),
+          next: view.getBigUint64(offset + CALLBACK_FIELD_NEXT, true),
+          name: text(CALLBACK_FIELD_NAME_POINTER, CALLBACK_FIELD_NAME_LENGTH),
+          oldValue: (flags & CALLBACK_FLAG_OLD_VALUE_ABSENT) !== 0
+            ? null
+            : text(CALLBACK_FIELD_OLD_VALUE_POINTER, CALLBACK_FIELD_OLD_VALUE_LENGTH),
+        });
+      }
+      this.exports.callback_records_acknowledge();
     }
-    this.exports.callback_records_acknowledge();
     scheduleMutationObservers(this);
     for (const record of records) {
-      if (record.kind === 4) {
+      if (record.effects & CALLBACK_EFFECT_RETAIN) {
         this.moveWrapperCacheEntry(
           record.target,
           record.relatedA,
@@ -3537,25 +3009,36 @@ export class DomCore {
         );
       }
     }
+    // Each subtree is settled once, against the tree the whole operation
+    // left.
+    for (const handle of changedSubtrees) this.updateConnectedWrappers(handle);
     for (const record of records) {
-      if (record.kind === 6) {
+      if (record.effects & CALLBACK_EFFECT_SLOT_CHANGE) {
         this.slotChangeHandler?.(this.wrapperFor(record.target));
       }
     }
     // Details toggle tasks the operation queued (details.watpart). The
     // entries are copied before wrapperFor can reenter the core.
-    const toggleCount = this.exports.details_toggle_take();
+    const toggleCount = this.detailsToggleCountRegister.value === 0 ? 0 : this.exports.details_toggle_take();
     if (toggleCount !== 0) {
-      const toggleView = new DataView(this.memory.buffer, this.exports.abi_output_pointer(), toggleCount * 16);
+      const toggleView = new DataView(this.memory.buffer, this.outputPointerRegister.value, toggleCount * DETAILS_TOGGLE_SIZE);
       const toggles = Array.from({ length: toggleCount }, (_, index) => [
-        toggleView.getBigUint64(index * 16, true),
-        toggleView.getUint32(index * 16 + 8, true) !== 0,
+        toggleView.getBigUint64(index * DETAILS_TOGGLE_SIZE + DETAILS_TOGGLE_NODE, true),
+        toggleView.getBigUint64(index * DETAILS_TOGGLE_SIZE + DETAILS_TOGGLE_TOKEN, true),
       ]);
-      for (const [handle, wasOpen] of toggles) {
-        this.detailsToggleHandler?.(this.wrapperFor(handle), wasOpen);
+      for (const [handle, token] of toggles) {
+        this.detailsToggleHandler?.(this, this.wrapperFor(handle), token);
       }
     }
+    // An adoption can carry a Range's boundary into another document.
+    this.syncSelectionDocuments();
     return records;
+  }
+
+  // Whether a disposal freed the core tree of the document wrapper
+  // `document`.
+  documentDisposed(document) {
+    return disposedDocuments.has(document);
   }
 
   dispose(documentHandle) {
@@ -3563,10 +3046,16 @@ export class DomCore {
       this,
       documentHandle,
     );
-    const documentToken = this.documentFinalizerTokens.get(documentHandle);
-    if (documentToken) {
-      this.documentFinalizerTokens.delete(documentHandle);
-      documentFinalizer.unregister(documentToken);
+    const documentEntry = this.documentFinalizerEntries.get(documentHandle);
+    if (documentEntry) {
+      this.documentFinalizerEntries.delete(documentHandle);
+      documentFinalizer.unregister(documentEntry);
+    }
+    // The disposal frees the document's tree, so it holds no wrapper.
+    const documentWrapper = this.wrapperByHandle.get(documentHandle)?.deref();
+    if (documentWrapper !== undefined) {
+      this.connectedWrappersByDocument.delete(documentWrapper);
+      disposedDocuments.add(documentWrapper);
     }
     this.cancelFinalizer(documentHandle);
     for (const handle of this.wrapperCaches.get(documentHandle)?.keys() ?? []) {
@@ -3577,13 +3066,15 @@ export class DomCore {
     this.wrapperCaches.delete(documentHandle);
     this.status("document_dispose", documentHandle);
     releaseEventIdentities?.();
-    for (const [id, observer] of this.observersById) {
-      if (observer._ownerHandle === documentHandle) {
+    for (const [id, reference] of this.observersById) {
+      const observer = reference.deref();
+      if (observer === undefined || observer._ownerHandle === documentHandle) {
         this.observersById.delete(id);
       }
     }
-    for (const [id, observer] of this.renderingObserversById ?? []) {
-      if (observer._ownerHandle === documentHandle) {
+    for (const [id, reference] of this.renderingObserversById ?? []) {
+      const observer = reference.deref();
+      if (observer === undefined || observer._ownerHandle === documentHandle) {
         this.renderingObserversById.delete(id);
       }
     }

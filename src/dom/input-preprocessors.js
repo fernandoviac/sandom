@@ -8,6 +8,7 @@ import { loadHTMLDocument, reportScriptingDisabled } from "./scripts.js";
 import { parseXMLDocument } from "./xml.js";
 import { exceedsInputBound } from "./interaction.js";
 import { SDDocument } from "./node.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
@@ -15,6 +16,10 @@ const stringTrim = String.prototype.trim;
 const stringLastIndexOf = String.prototype.lastIndexOf;
 const stringSlice = String.prototype.slice;
 const stringCharCodeAt = String.prototype.charCodeAt;
+// The value records of input_preprocessor_unique_count
+// (input-preprocessor.watpart), by WAT name.
+const VALUE = Object.freeze(Object.fromEntries(["HEADER_SIZE", "TAG", "LENGTH", "STRING", "NUMBER", "BIGINT", "IDENTITY",
+  "UNDEFINED", "NULL", "TRUE", "FALSE"].map((name) => [name, layoutConstant(`PREPROCESSOR_VALUE_${name}`)])));
 
 function preprocessorText(operation, text, ...parameters) {
   return sharedDomCore.status(
@@ -84,50 +89,50 @@ function preprocessorUniqueCount(values) {
     switch (typeof value) {
       case "string":
       case "bigint": {
-        tag = typeof value === "string" ? 1 : 3;
+        tag = typeof value === "string" ? VALUE.STRING : VALUE.BIGINT;
         const text = typeof value === "string" ? value : `${value}`;
-        payload = new Uint8Array(text.length * 2);
+        payload = new Uint8Array(text.length * Uint16Array.BYTES_PER_ELEMENT);
         const view = new DataView(payload.buffer);
         for (let index = 0; index < text.length; index++) {
-          view.setUint16(index * 2, Reflect.apply(stringCharCodeAt, text, [index]), true);
+          view.setUint16(index * Uint16Array.BYTES_PER_ELEMENT, Reflect.apply(stringCharCodeAt, text, [index]), true);
         }
         break;
       }
       case "number":
-        tag = 2;
-        payload = new Uint8Array(8);
+        tag = VALUE.NUMBER;
+        payload = new Uint8Array(Float64Array.BYTES_PER_ELEMENT);
         new DataView(payload.buffer).setFloat64(0, value, true);
         break;
       case "undefined":
-        tag = 5;
+        tag = VALUE.UNDEFINED;
         payload = new Uint8Array(0);
         break;
       case "boolean":
-        tag = value ? 7 : 8;
+        tag = value ? VALUE.TRUE : VALUE.FALSE;
         payload = new Uint8Array(0);
         break;
       default:
         if (value === null) {
-          tag = 6;
+          tag = VALUE.NULL;
           payload = new Uint8Array(0);
           break;
         }
-        tag = 4;
+        tag = VALUE.IDENTITY;
         if (!identities.has(value)) identities.set(value, identities.size);
-        payload = new Uint8Array(4);
+        payload = new Uint8Array(Uint32Array.BYTES_PER_ELEMENT);
         new DataView(payload.buffer).setUint32(0, identities.get(value), true);
     }
     records.push([tag, payload]);
-    bytes += 8 + payload.byteLength;
+    bytes += VALUE.HEADER_SIZE + payload.byteLength;
   }
   const block = new Uint8Array(bytes);
   const view = new DataView(block.buffer);
   let offset = 0;
   for (const [tag, payload] of records) {
-    view.setUint32(offset, tag, true);
-    view.setUint32(offset + 4, payload.byteLength, true);
-    block.set(payload, offset + 8);
-    offset += 8 + payload.byteLength;
+    view.setUint32(offset + VALUE.TAG, tag, true);
+    view.setUint32(offset + VALUE.LENGTH, payload.byteLength, true);
+    block.set(payload, offset + VALUE.HEADER_SIZE);
+    offset += VALUE.HEADER_SIZE + payload.byteLength;
   }
   return sharedDomCore.status(
     "input_preprocessor_unique_count",

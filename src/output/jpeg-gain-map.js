@@ -7,40 +7,23 @@ import {
   validateAdaptiveImageRecord,
 } from "./gain-map.js";
 import {
+  dequantizeRgbWithWasm,
   inspectWithWasm,
   packageWithWasm,
+  quantizeRgba8WithWasm,
 } from "./gain-map-wasm.js";
 import { encodeJpegRgba } from "./jpeg-encoder.js";
 
 function quantizeBaseImage(image) {
-  const pixels = new Uint8ClampedArray(image.width * image.height * 4);
-  for (let pixelIndex = 0; pixelIndex < image.width * image.height; pixelIndex++) {
-    for (let channel = 0; channel < 3; channel++) {
-      pixels[pixelIndex * 4 + channel] = Math.round(Math.max(0, Math.min(1, image.pixels[pixelIndex * 4 + channel])) * 255);
-    }
-    pixels[pixelIndex * 4 + 3] = 255;
-  }
-  return pixels;
+  return quantizeRgba8WithWasm(image, 4);
 }
 
 function quantizeGainMap(image) {
-  const pixels = new Uint8ClampedArray(image.width * image.height * 4);
-  for (let pixelIndex = 0; pixelIndex < image.width * image.height; pixelIndex++) {
-    for (let channel = 0; channel < 3; channel++) {
-      pixels[pixelIndex * 4 + channel] = Math.round(Math.max(0, Math.min(1, image.pixels[pixelIndex * 3 + channel])) * 255);
-    }
-    pixels[pixelIndex * 4 + 3] = 255;
-  }
-  return pixels;
+  return quantizeRgba8WithWasm(image, 3);
 }
 
 function decodedGainMapDescriptor(decoded) {
-  const pixels = new Float32Array(decoded.width * decoded.height * 3);
-  for (let pixelIndex = 0; pixelIndex < decoded.width * decoded.height; pixelIndex++) {
-    pixels[pixelIndex * 3] = decoded.pixels[pixelIndex * 4] / 255;
-    pixels[pixelIndex * 3 + 1] = decoded.pixels[pixelIndex * 4 + 1] / 255;
-    pixels[pixelIndex * 3 + 2] = decoded.pixels[pixelIndex * 4 + 2] / 255;
-  }
+  const pixels = dequantizeRgbWithWasm(decoded.pixels, decoded.width * decoded.height);
   return Object.freeze({
     width: decoded.width,
     height: decoded.height,

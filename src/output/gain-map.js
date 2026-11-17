@@ -1,9 +1,11 @@
 import { REFERENCE_WHITE_LUMINANCE } from "../color.js";
 import { validateImageDescriptor } from "../image-data.js";
 import {
+  GAIN_MAP_ERROR,
   generateWithWasm,
   measureGenerationWithWasm,
   measureWithWasm,
+  METADATA,
   reconstructWithWasm,
 } from "./gain-map-wasm.js";
 
@@ -194,35 +196,35 @@ function adaptiveRecordError(error, metadata) {
   const field = error?.gainMapField;
   const detail = `; ${error.message}`;
   const channelFields = [
-    [0, "gainMapMin", "finite"],
-    [24, "gainMapMax", "finite"],
-    [48, "gainMapGamma", "finite and greater than zero"],
-    [72, "baseOffset", "finite and greater than zero"],
-    [96, "alternateOffset", "finite and greater than zero"],
+    [METADATA.MIN, "gainMapMin", "finite"],
+    [METADATA.MAX, "gainMapMax", "finite"],
+    [METADATA.GAMMA, "gainMapGamma", "finite and greater than zero"],
+    [METADATA.BASE, "baseOffset", "finite and greater than zero"],
+    [METADATA.ALTERNATE, "alternateOffset", "finite and greater than zero"],
   ];
-  if (code === 7) {
+  if (code === GAIN_MAP_ERROR.NUMERIC) {
     for (const [offset, name, requirement] of channelFields) {
-      const channel = (field - offset) / 8;
+      const channel = (field - offset) / Float64Array.BYTES_PER_ELEMENT;
       if (Number.isInteger(channel) && channel >= 0 && channel < 3) {
         return new Error(
           `AdaptiveImageRecord: ${name}[${channel}] must be ${requirement}, got ${metadata[name][channel]}${detail}`,
         );
       }
     }
-    if (field === 120) {
+    if (field === METADATA.HEADROOM_MIN) {
       return new Error(`AdaptiveImageRecord: minimumDisplayHeadroom must be finite and nonnegative${detail}`);
     }
-    if (field === 128) {
+    if (field === METADATA.HEADROOM_MAX) {
       return new Error(`AdaptiveImageRecord: maximumDisplayHeadroom must be finite and nonnegative${detail}`);
     }
   }
-  if (code === 8 && field >= 24 && field < 48 && field % 8 === 0) {
-    const channel = (field - 24) / 8;
+  const maximumChannel = (field - METADATA.MAX) / Float64Array.BYTES_PER_ELEMENT;
+  if (code === GAIN_MAP_ERROR.RECORD && Number.isInteger(maximumChannel) && maximumChannel >= 0 && maximumChannel < 3) {
     return new Error(
-      `AdaptiveImageRecord: gainMapMax[${channel}] ${metadata.gainMapMax[channel]} is below gainMapMin[${channel}] ${metadata.gainMapMin[channel]}${detail}`,
+      `AdaptiveImageRecord: gainMapMax[${maximumChannel}] ${metadata.gainMapMax[maximumChannel]} is below gainMapMin[${maximumChannel}] ${metadata.gainMapMin[maximumChannel]}${detail}`,
     );
   }
-  if (code === 8 && field === 120) {
+  if (code === GAIN_MAP_ERROR.RECORD && field === METADATA.HEADROOM_MIN) {
     return new Error(
       `AdaptiveImageRecord: maximumDisplayHeadroom must exceed minimumDisplayHeadroom${detail}`,
     );

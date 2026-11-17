@@ -2,6 +2,7 @@ import {
   addEventListener,
   createEvent,
   dispatchEvent,
+  dispatchEventFromScript,
   removeEventListener,
 } from "./events.js";
 import { mediaMatches } from "./stylesheet.js";
@@ -36,7 +37,7 @@ export class MediaQueryList {
   }
 
   dispatchEvent(event) {
-    return dispatchEvent(this, event);
+    return dispatchEventFromScript(this, event);
   }
 
   addListener(callback) {
@@ -54,6 +55,7 @@ export class MediaQueryList {
     );
     if (matches === this.matches) return;
     this.matches = matches;
-    this.dispatchEvent(createEvent("change", { matches, media: this.media }));
+    dispatchEvent(this, createEvent("change", { matches, media: this.media }));
   }
 }
+Object.defineProperty(MediaQueryList.prototype, Symbol.toStringTag, { value: "MediaQueryList", configurable: true });

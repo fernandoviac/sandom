@@ -34,6 +34,65 @@ import { validateImageDescriptor } from './image-data.js';
 import { readPackageAsset } from './package-assets.js';
 import { transformImageForOutput } from './output/color-transform.js';
 import { packSignal, packHalf, unpackHalf } from './output/packing.js';
+import * as jpegXlRulesBinary from './wasm/jpeg-xl-container-binary.js';
+import { encodeHostValues } from './wasm/host-values.js';
+import { moduleLayoutConstants } from './wasm/layout-table.js';
+
+const rulesConstant = moduleLayoutConstants(jpegXlRulesBinary, 'jpeg-xl container');
+const SAMPLE_UINT8 = rulesConstant('SAMPLE_UINT8');
+const SAMPLE_UINT16 = rulesConstant('SAMPLE_UINT16');
+const SAMPLE_FLOAT32 = rulesConstant('SAMPLE_FLOAT32');
+const rulesConstants = (prefix, names) =>
+  Object.freeze(Object.fromEntries(names.map((name) => [name, rulesConstant(`${prefix}${name}`)])));
+// The rule outputs of jpeg-xl-container.wat, by WAT name.
+const SETTINGS = rulesConstants('SETTINGS_', ['COLOR_SPACE', 'EXPONENT_BITS', 'BITS', 'ACTION', 'SAMPLE_KIND']);
+const DECODED_COLOR = rulesConstants('DECODED_COLOR_', ['PRIMARIES', 'TRANSFER', 'PARAMETER', 'WHITE_POINT', 'PROFILE',
+  'LUMINANCE']);
+const SETTINGS_ACTION = rulesConstants('SETTINGS_ACTION_', ['PACK', 'HALF']);
+const FRAME_META = rulesConstants('FRAME_META_', ['DURATION', 'X', 'Y', 'WIDTH', 'HEIGHT', 'BLEND_MODE', 'BLEND_SOURCE',
+  'SAVE_AS_REFERENCE']);
+const ANIMATION = rulesConstants('ANIMATION_', ['TICKS_PER_SECOND', 'EXACT', 'LOOPS', 'WORST_ERROR', 'BOX_COUNT', 'BOXES',
+  'BOX_SIZE', 'BOX_TYPE', 'BOX_COMPRESSED']);
+const BOX_TYPE_PIECE = rulesConstant('BOX_TYPE_PIECE');
+
+// The JPEG XL rules module (core/build/jpeg-xl-container.wat): color
+// encodings, status messages, blend mode names, encoding settings and the
+// animation request.
+const rules = jpegXlRulesBinary.instantiate({}).exports;
+const ruleDecoder = new TextDecoder();
+const ruleTexts = new Map();
+
+// Calls rule `name` with host values `values` (or none) as its first two
+// arguments; throws the module's error; returns its output bytes.
+function callRules(name, values, ...rest) {
+  const leading = [];
+  if (values !== null) {
+    const bytes = encodeHostValues(values, { compositeJson: false });
+    const pointer = rules.input_buffer(bytes.length);
+    new Uint8Array(rules.memory.buffer, pointer, bytes.length).set(bytes);
+    leading.push(pointer, bytes.length);
+  }
+  const result = rules[name](...leading, ...rest);
+  if (rules.error_length() !== 0) {
+    throw new Error(ruleDecoder.decode(new Uint8Array(rules.memory.buffer, rules.error_address(), rules.error_length())));
+  }
+  return { result, output: new Uint8Array(rules.memory.buffer, rules.output_address(), rules.output_length()).slice() };
+}
+
+function ruleText(piece) {
+  if (!ruleTexts.has(piece)) ruleTexts.set(piece, ruleDecoder.decode(callRules('jxl_text', null, piece).output));
+  return ruleTexts.get(piece);
+}
+
+// Codec calls of jxl_check, and the operation name pieces of
+// jxl_decoded_color.
+const CALL = rulesConstants('JXL_CALL_', ['DECODE', 'DECODE_SEQUENCE', 'BOXES', 'ENCODE', 'SESSION_OPEN', 'SESSION_BOX',
+  'SESSION_FRAME', 'SESSION_FINISH']);
+const LABEL = rulesConstants('JXL_LABEL_', ['DECODE', 'DECODE_SEQUENCE']);
+
+function checkStatus(call, status, detail = 0) {
+  return callRules('jxl_check', null, call, status, detail).result;
+}
 
 export function createJpegXlCodec({
   jpegXlBytes,
@@ -69,85 +128,34 @@ async function ensureJxl() {
   return instance;
 }
 
-// JxlPrimaries / JxlTransferFunction / JxlWhitePoint enum values
-// (lib/include/jxl/color_encoding.h, libjxl v0.11.2).
-const JXL_PRIMARIES = { 1: 'srgb', 9: 'rec2020', 11: 'display-p3' };
-const JXL_TRANSFERS = {
-  1: 'rec2020', // BT.709 camera curve - the repository's "rec2020" family
-  8: 'linear',
-  13: 'srgb',
-  16: 'pq',
-  18: 'hlg',
-};
-const JXL_TRANSFER_GAMMA = 65535;
-const JXL_WHITE_POINT_D65 = 1;
-
-const DECODE_ERRORS = {
-  '1': 'not a JPEG XL stream',
-  '2': 'the codestream is corrupt or uses an unsupported feature',
-  '5': 'the decoder ran out of memory',
-};
-
 const SAMPLE_KINDS = [
   { sampleType: 'uint8', arrayConstructor: Uint8Array, bytesPerSample: 1 },
   { sampleType: 'uint16', arrayConstructor: Uint16Array, bytesPerSample: 2 },
   { sampleType: 'float32', arrayConstructor: Float32Array, bytesPerSample: 4 },
 ];
 
-// Builds the color record of the decoded stream: the encoded (enum)
-// profile when the stream carries a supported one, else the DATA-target
-// ICC profile bytes. Reads the module's memory, so it must run before
-// the matching release call.
+// Builds the color record of the decoded stream, as the rules module
+// selects it: the encoded (enum) profile when the stream carries a
+// supported one, else the DATA-target ICC profile bytes. Reads the
+// module's memory, so it must run before the matching release call.
 function readDecodedColor(e, label) {
   const iccSize = e.jxl_icc_size();
   const icc = iccSize > 0
     ? new Uint8Array(new Uint8Array(e.memory.buffer, e.jxl_icc_ptr(), iccSize))
     : null;
-  const haveEncoded = e.jxl_have_encoded_profile() === 1;
-  const encodedPrimaries = e.jxl_encoded_primaries();
-  const encodedTransfer = e.jxl_encoded_transfer();
-  const encodedWhitePoint = e.jxl_encoded_white_point();
-  const encodedGamma = e.jxl_encoded_gamma();
-
-  const base = {
-    transferFunctionParameters: null,
-    whitePoint: 'd65',
-    referenceWhiteLuminance: 203,
-    profile: null,
+  const { output } = callRules('jxl_decoded_color', null, label,
+    e.jxl_have_encoded_profile(), e.jxl_encoded_primaries(), e.jxl_encoded_transfer(),
+    e.jxl_encoded_white_point(), e.jxl_encoded_gamma(), icc === null ? 0 : 1);
+  const view = new DataView(output.buffer);
+  const parameter = view.getFloat64(DECODED_COLOR.PARAMETER, true);
+  const colorEncoding = {
+    transferFunctionParameters: Number.isNaN(parameter) ? null : [parameter],
+    whitePoint: ruleText(view.getUint32(DECODED_COLOR.WHITE_POINT, true)),
+    referenceWhiteLuminance: view.getFloat64(DECODED_COLOR.LUMINANCE, true),
+    profile: view.getUint32(DECODED_COLOR.PROFILE, true) === 1 ? icc : null,
+    primaries: ruleText(view.getUint32(DECODED_COLOR.PRIMARIES, true)),
+    transferFunction: ruleText(view.getUint32(DECODED_COLOR.TRANSFER, true)),
   };
-  let colorEncoding = null;
-  if (haveEncoded && encodedWhitePoint === JXL_WHITE_POINT_D65) {
-    const primaries = JXL_PRIMARIES[encodedPrimaries];
-    if (primaries !== undefined) {
-      if (encodedTransfer === JXL_TRANSFER_GAMMA && encodedGamma > 0) {
-        colorEncoding = {
-          ...base,
-          primaries,
-          transferFunction: 'gamma',
-          transferFunctionParameters: [1 / encodedGamma],
-        };
-      } else if (JXL_TRANSFERS[encodedTransfer] !== undefined) {
-        colorEncoding = {
-          ...base,
-          primaries,
-          transferFunction: JXL_TRANSFERS[encodedTransfer],
-        };
-      }
-    }
-  }
-  if (colorEncoding === null) {
-    if (icc === null) {
-      throw new Error(
-        `${label}: the stream carries neither a supported encoded color profile nor ICC profile bytes`,
-      );
-    }
-    colorEncoding = {
-      ...base,
-      primaries: 'srgb',
-      transferFunction: 'icc',
-      profile: icc,
-    };
-  }
   return { colorEncoding, icc };
 }
 
@@ -193,22 +201,7 @@ async function decodeJXL(bytes) {
   const inputPtr = e.jxl_alloc_input(bytes.length);
   new Uint8Array(e.memory.buffer, inputPtr, bytes.length).set(bytes);
   const status = e.jxl_decode(bytes.length);
-  if (status === 3) {
-    const frames = e.jxl_animation_frames();
-    throw new Error(
-      `decodeJXL: animated JPEG XL is not supported in a still-image decoder (the stream carries ${frames} frames)`,
-    );
-  }
-  if (status === 4) {
-    throw new Error(
-      'decodeJXL: extra channels beyond one alpha channel are not supported',
-    );
-  }
-  if (status !== 0) {
-    throw new Error(
-      `decodeJXL failed (${status}): ${DECODE_ERRORS[String(status)] ?? 'unknown decoder status'}`,
-    );
-  }
+  checkStatus(CALL.DECODE, status, e.jxl_animation_frames());
 
   const width = e.jxl_width();
   const height = e.jxl_height();
@@ -227,7 +220,7 @@ async function decodeJXL(bytes) {
   const alphaPremultiplied = e.jxl_alpha_premultiplied() === 1;
   let color;
   try {
-    color = readDecodedColor(e, 'decodeJXL');
+    color = readDecodedColor(e, LABEL.DECODE);
   } finally {
     e.jxl_release();
   }
@@ -242,11 +235,10 @@ async function decodeJXL(bytes) {
   });
 }
 
-// JxlBlendMode enum values (lib/include/jxl/codestream_header.h).
-const JXL_BLEND_MODES = ['replace', 'add', 'blend', 'muladd', 'mul'];
-
-const ticksToMilliseconds = (ticks, numerator, denominator) =>
-  ticks * 1000 * denominator / numerator;
+// The name of a frame's JxlBlendMode.
+function blendModeName(mode) {
+  return ruleDecoder.decode(callRules('jxl_blend_mode', null, mode).output);
+}
 
 /**
  * Decodes JPEG XL bytes as one sequence, with an explicit discriminant
@@ -267,17 +259,7 @@ async function decodeJXLSequence(bytes) {
   const inputPtr = e.jxl_alloc_input(bytes.length);
   new Uint8Array(e.memory.buffer, inputPtr, bytes.length).set(bytes);
   const status = e.jxl_decode_animation(bytes.length);
-  if (status === 6) return { kind: 'still', image: await decodeJXL(bytes) };
-  if (status === 4) {
-    throw new Error(
-      'decodeJXLSequence: extra channels beyond one alpha channel are not supported',
-    );
-  }
-  if (status !== 0) {
-    throw new Error(
-      `decodeJXLSequence failed (${status}): ${DECODE_ERRORS[String(status)] ?? 'unknown decoder status'}`,
-    );
-  }
+  if (checkStatus(CALL.DECODE_SEQUENCE, status) === 1) return { kind: 'still', image: await decodeJXL(bytes) };
 
   const width = e.jxl_width();
   const height = e.jxl_height();
@@ -290,8 +272,9 @@ async function decodeJXLSequence(bytes) {
   const frameSamples = width * height * 4;
   const stride = e.jxl_anim_meta_words();
   const frames = [];
+  let durationMilliseconds = 0;
   try {
-    const color = readDecodedColor(e, 'decodeJXLSequence');
+    const color = readDecodedColor(e, LABEL.DECODE_SEQUENCE);
     // Copied out before any descriptor is built: the pixel and metadata
     // allocations are released at the end of this call.
     const meta = new Uint32Array(
@@ -303,10 +286,13 @@ async function decodeJXLSequence(bytes) {
     );
     const signedMeta = new Int32Array(meta.buffer);
     const pixelsPtr = e.jxl_anim_pixels_ptr();
-    let presentationTicks = 0;
+    // The frames' times from their duration ticks (jxl_sequence_times).
+    const durations = Array.from({ length: frameCount }, (_, index) => meta[index * stride + FRAME_META.DURATION]);
+    const times = new Float64Array(
+      callRules('jxl_sequence_times', [durations], numerator, denominator).output.buffer,
+    );
     for (let index = 0; index < frameCount; index++) {
       const word = index * stride;
-      const durationTicks = meta[word];
       const pixels = new kind.arrayConstructor(
         new kind.arrayConstructor(
           e.memory.buffer,
@@ -316,18 +302,18 @@ async function decodeJXLSequence(bytes) {
       );
       frames.push({
         index,
-        durationTicks,
-        durationMilliseconds: ticksToMilliseconds(durationTicks, numerator, denominator),
-        presentationTimeMilliseconds: ticksToMilliseconds(presentationTicks, numerator, denominator),
+        durationTicks: durations[index],
+        durationMilliseconds: times[index * 2],
+        presentationTimeMilliseconds: times[index * 2 + 1],
         rectangle: {
-          x: signedMeta[word + 1],
-          y: signedMeta[word + 2],
-          width: meta[word + 3],
-          height: meta[word + 4],
+          x: signedMeta[word + FRAME_META.X],
+          y: signedMeta[word + FRAME_META.Y],
+          width: meta[word + FRAME_META.WIDTH],
+          height: meta[word + FRAME_META.HEIGHT],
         },
-        blendMode: JXL_BLEND_MODES[meta[word + 5]] ?? `unknown-${meta[word + 5]}`,
-        blendSource: meta[word + 6],
-        saveAsReference: meta[word + 7],
+        blendMode: blendModeName(meta[word + FRAME_META.BLEND_MODE]),
+        blendSource: meta[word + FRAME_META.BLEND_SOURCE],
+        saveAsReference: meta[word + FRAME_META.SAVE_AS_REFERENCE],
         descriptor: buildFrameDescriptor({
           width,
           height,
@@ -337,8 +323,8 @@ async function decodeJXLSequence(bytes) {
           ...color,
         }),
       });
-      presentationTicks += durationTicks;
     }
+    durationMilliseconds = times[frameCount * 2];
   } finally {
     e.jxl_release_animation();
   }
@@ -352,12 +338,10 @@ async function decodeJXLSequence(bytes) {
     // the complete sequence.
     timebase: { numerator, denominator },
     // A zero loop count means "repeat without a limit" in the
-    // codestream; the two cases stay distinct here.
-    repetitionCount: loops === 0 ? 'infinite' : loops,
-    durationMilliseconds: frames.reduce(
-      (total, frame) => total + frame.durationMilliseconds,
-      0,
-    ),
+    // codestream (jxl_repetition_infinite); the two cases stay distinct
+    // here.
+    repetitionCount: rules.jxl_repetition_infinite(loops) === 1 ? 'infinite' : loops,
+    durationMilliseconds,
     frames,
   };
 }
@@ -382,11 +366,7 @@ async function decodeJXLBoxes(bytes) {
   const inputPtr = e.jxl_alloc_input(bytes.length);
   new Uint8Array(e.memory.buffer, inputPtr, bytes.length).set(bytes);
   const status = e.jxl_walk_boxes(bytes.length);
-  if (status !== 0) {
-    throw new Error(
-      `decodeJXLBoxes failed (${status}): ${DECODE_ERRORS[String(status)] ?? 'unknown decoder status'}`,
-    );
-  }
+  checkStatus(CALL.BOXES, status);
 
   const boxes = [];
   try {
@@ -412,56 +392,32 @@ async function decodeJXLBoxes(bytes) {
   return boxes;
 }
 
-// Color-space enum shared with the shim (vendor/jpeg-xl-wasm/src/jxl_shim.c).
-const ENCODE_COLOR_SPACES = {
-  'srgb/srgb': 0,
-  'display-p3/srgb': 1,
-  'rec2020/pq': 2,
-  'rec2020/hlg': 3,
-};
-
-function resolveEncodeColorSpace(colorEncoding, label) {
-  const key = `${colorEncoding.primaries}/${colorEncoding.transferFunction}`;
-  const colorSpace = ENCODE_COLOR_SPACES[key];
-  if (colorSpace === undefined) {
-    throw new Error(`${label}: unsupported color encoding ${key}`);
-  }
-  return colorSpace;
+// The sample type a settings record reads: every array other than
+// Float32Array and Uint16Array reads as uint8.
+function sampleType(samples) {
+  return samples instanceof Float32Array ? SAMPLE_FLOAT32 : samples instanceof Uint16Array ? SAMPLE_UINT16 : SAMPLE_UINT8;
 }
 
-function resolveEncodeDepth(bitDepth) {
-  return bitDepth === 'float16'
-    ? { bits: 16, exponentBits: 5 }
-    : bitDepth === 'float32'
-    ? { bits: 32, exponentBits: 8 }
-    : { bits: bitDepth, exponentBits: 0 };
+// The encoding settings the rules module writes (jxl_encode_settings).
+function readSettings(view) {
+  return {
+    colorSpace: view.getInt32(SETTINGS.COLOR_SPACE, true),
+    exponentBits: view.getInt32(SETTINGS.EXPONENT_BITS, true),
+    bits: view.getFloat64(SETTINGS.BITS, true),
+    action: view.getInt32(SETTINGS.ACTION, true),
+    sampleKind: view.getInt32(SETTINGS.SAMPLE_KIND, true),
+  };
 }
 
-// The codec's input samples MUST match the declared depth class for
-// lossless coding: integer declarations take integer samples scaled
-// to the declared range, float declarations take float samples. A
-// float32 signal buffer (the central transform's output) converts
-// here - directly to the declared depth, never through eight bits.
-function prepareEncodeSamples(samples, depth) {
-  let input = samples;
-  let sampleKind = samples instanceof Float32Array
-    ? 2
-    : samples instanceof Uint16Array
-    ? 1
-    : 0;
-  if (depth.exponentBits === 0 && samples instanceof Float32Array) {
-    const packed = packSignal(samples, depth.bits);
-    input = depth.bits === 8 ? packed : new Uint16Array(packed.buffer, packed.byteOffset, packed.byteLength / 2);
-    sampleKind = depth.bits === 8 ? 0 : 1;
+// The codec's input samples in the settings' depth class: float samples
+// packed to the declared integer bits, rounded to binary16, or as given.
+function prepareEncodeSamples(samples, settings) {
+  if (settings.action === SETTINGS_ACTION.PACK) {
+    const packed = packSignal(samples, settings.bits);
+    return settings.sampleKind === SAMPLE_UINT8 ? packed : new Uint16Array(packed.buffer, packed.byteOffset, packed.byteLength / 2);
   }
-  if (depth.exponentBits === 5 && samples instanceof Float32Array) {
-    // A float16 declaration stores binary16 samples: round the float32
-    // input to binary16 precision first, so lossless coding is
-    // well-defined (libjxl rejects float16-lossless input it cannot
-    // represent exactly).
-    input = unpackHalf(packHalf(samples));
-  }
-  return { input, sampleKind };
+  if (settings.action === SETTINGS_ACTION.HALF) return unpackHalf(packHalf(samples));
+  return samples;
 }
 
 /**
@@ -483,9 +439,10 @@ async function encodeJXL(samples, width, height, {
   distance = 1,
   effort = 7,
 }) {
-  const colorSpace = resolveEncodeColorSpace(colorEncoding, 'encodeJXL');
-  const depth = resolveEncodeDepth(bitDepth);
-  const { input, sampleKind } = prepareEncodeSamples(samples, depth);
+  const { output: settingsBytes } = callRules('jxl_encode_settings',
+    [colorEncoding.primaries, colorEncoding.transferFunction, bitDepth], sampleType(samples));
+  const settings = readSettings(new DataView(settingsBytes.buffer));
+  const input = prepareEncodeSamples(samples, settings);
   const wasm = await ensureJxl();
   const e = wasm.exports;
   const inputPtr = e.jxl_alloc_input(input.byteLength);
@@ -495,19 +452,15 @@ async function encodeJXL(samples, width, height, {
   const status = e.jxl_encode(
     width,
     height,
-    sampleKind,
-    depth.bits,
-    depth.exponentBits,
-    colorSpace,
+    settings.sampleKind,
+    settings.bits,
+    settings.exponentBits,
+    settings.colorSpace,
     lossless ? 1 : 0,
-    Math.round(distance * 1000),
+    rules.jxl_distance_code(distance),
     effort,
   );
-  if (status !== 0) {
-    throw new Error(
-      `encodeJXL failed (${status}): ${status === 5 ? 'the encoder ran out of memory' : 'encoder error'}`,
-    );
-  }
+  checkStatus(CALL.ENCODE, status);
   const output = new Uint8Array(
     new Uint8Array(e.memory.buffer, e.jxl_output_ptr(), e.jxl_output_size()),
   );
@@ -515,215 +468,12 @@ async function encodeJXL(samples, width, height, {
   return output;
 }
 
-// Animation timing (`@sandom/jpeg-xl` plans/PLAN-jpeg-xl-animation-output.md, timing
-// model). One integer timebase carries the complete sequence. The
-// candidates are the millisecond grid and its decimal refinements down
-// to one microsecond; the codestream's own bound on the tick rate is
-// 2^30 ticks per second.
-const JXL_AUTO_TIMEBASES = [1000, 10000, 100000, 1000000];
-const JXL_MAX_TICKS_PER_SECOND = 1 << 30;
-const JXL_MAX_DURATION_TICKS = 0xFFFFFFFF;
-// The documented cumulative error limit: the coded presentation time of
-// every frame boundary stays within half a millisecond of the requested
-// presentation time.
-const JXL_TIMEBASE_ERROR_LIMIT_MS = 0.5;
-
-// Binary floating point cannot hold most decimal millisecond counts
-// exactly, so "lands on a tick" is a relative comparison, not ===.
-function isIntegerTicks(value) {
-  return Math.abs(value - Math.round(value)) <=
-    1e-9 * Math.max(1, Math.abs(value));
-}
-
-// Converts one millisecond schedule into integer tick counts at a fixed
-// tick rate. Rounds the CUMULATIVE presentation time rather than each
-// duration, so the coded timeline never drifts more than half a tick
-// from the requested timeline however long the sequence runs. A frame
-// that rounds to zero ticks is a rejection: an animation frame with a
-// zero duration is not displayed on its own, so coding one would drop
-// the frame silently.
-function scheduleTicks(frameDurations, ticksPerSecond) {
-  const ticks = new Array(frameDurations.length);
-  let cumulativeMilliseconds = 0;
-  let codedTicks = 0;
-  let exact = true;
-  let worstErrorMilliseconds = 0;
-  for (let index = 0; index < frameDurations.length; index++) {
-    cumulativeMilliseconds += frameDurations[index];
-    const exactTicks = cumulativeMilliseconds * ticksPerSecond / 1000;
-    const frameTicks = Math.round(exactTicks) - codedTicks;
-    if (!isIntegerTicks(exactTicks)) exact = false;
-    if (frameTicks < 1) {
-      return {
-        rejection:
-          `frame ${index} lasts ${frameDurations[index]} ms, which rounds to zero ticks at ${ticksPerSecond} ticks per second`,
-      };
-    }
-    if (frameTicks > JXL_MAX_DURATION_TICKS) {
-      return {
-        rejection:
-          `frame ${index} lasts ${frameDurations[index]} ms, which overflows the 32-bit tick field at ${ticksPerSecond} ticks per second`,
-      };
-    }
-    codedTicks += frameTicks;
-    ticks[index] = frameTicks;
-    const errorMilliseconds = Math.abs(codedTicks - exactTicks) * 1000 /
-      ticksPerSecond;
-    if (errorMilliseconds > worstErrorMilliseconds) {
-      worstErrorMilliseconds = errorMilliseconds;
-    }
-  }
-  return {
-    ticksPerSecond,
-    ticks,
-    exact,
-    worstErrorMilliseconds,
-    rejection: null,
-  };
-}
-
-// Selects the coarsest candidate tick rate that represents every
-// mandatory boundary exactly; failing that, the candidate with the
-// smallest boundary error, checked against the documented limit. An
-// explicit tick rate is used as given and checked the same way.
-function resolveAnimationTiming(frameDurations, timebase) {
-  if (!Array.isArray(frameDurations) || frameDurations.length === 0) {
-    throw new Error(
-      'encodeJXLAnimation: frameDurations must be a non-empty array of millisecond durations',
-    );
-  }
-  for (const duration of frameDurations) {
-    if (
-      typeof duration !== 'number' || !Number.isFinite(duration) ||
-      duration <= 0
-    ) {
-      throw new Error(
-        `encodeJXLAnimation: every frame duration must be a positive finite millisecond count, got ${JSON.stringify(duration)}`,
-      );
-    }
-  }
-  if (timebase !== 'auto') {
-    if (
-      !Number.isInteger(timebase) || timebase < 1 ||
-      timebase > JXL_MAX_TICKS_PER_SECOND
-    ) {
-      throw new Error(
-        `encodeJXLAnimation: timebase must be "auto" or an integer tick rate in 1..${JXL_MAX_TICKS_PER_SECOND}, got ${JSON.stringify(timebase)}`,
-      );
-    }
-    const schedule = scheduleTicks(frameDurations, timebase);
-    if (schedule.rejection !== null) {
-      throw new Error(`encodeJXLAnimation: ${schedule.rejection}`);
-    }
-    if (schedule.worstErrorMilliseconds > JXL_TIMEBASE_ERROR_LIMIT_MS) {
-      throw new Error(
-        `encodeJXLAnimation: timebase ${timebase} drifts ${schedule.worstErrorMilliseconds} ms from the requested schedule, past the ${JXL_TIMEBASE_ERROR_LIMIT_MS} ms limit`,
-      );
-    }
-    return schedule;
-  }
-  let best = null;
-  let rejection = null;
-  for (const candidate of JXL_AUTO_TIMEBASES) {
-    const schedule = scheduleTicks(frameDurations, candidate);
-    if (schedule.rejection !== null) {
-      rejection = schedule.rejection;
-      continue;
-    }
-    if (schedule.exact) return schedule;
-    if (
-      best === null ||
-      schedule.worstErrorMilliseconds < best.worstErrorMilliseconds
-    ) {
-      best = schedule;
-    }
-  }
-  if (best === null) {
-    throw new Error(
-      `encodeJXLAnimation: no timebase in ${JXL_AUTO_TIMEBASES.join(', ')} ticks per second can carry this schedule: ${rejection}`,
-    );
-  }
-  if (best.worstErrorMilliseconds > JXL_TIMEBASE_ERROR_LIMIT_MS) {
-    throw new Error(
-      `encodeJXLAnimation: the closest timebase (${best.ticksPerSecond} ticks per second) drifts ${best.worstErrorMilliseconds} ms from the requested schedule, past the ${JXL_TIMEBASE_ERROR_LIMIT_MS} ms limit`,
-    );
-  }
-  return best;
-}
-
-// A zero loop count means "repeat without a limit" in the codestream.
-// The field has no default: a finite non-returning animation must not
-// gain an implicit loop from a defaulted request.
-function resolveRepetition(repetitionCount) {
-  if (repetitionCount === 'infinite') return 0;
-  if (
-    Number.isInteger(repetitionCount) && repetitionCount >= 1 &&
-    repetitionCount <= JXL_MAX_DURATION_TICKS
-  ) {
-    return repetitionCount;
-  }
-  throw new Error(
-    `encodeJXLAnimation: repetitionCount must be "infinite" or a positive integer play count, got ${JSON.stringify(repetitionCount)}`,
-  );
-}
-
-// The closed metadata-box type set (`@sandom/jpeg-xl` plans/PLAN-jpeg-xl-animation-output.md).
-// "Exif", "xml ", and "jumb" are the container format's own metadata
-// types; "sdrr" carries Sandom's typed render receipt. Closing the set
-// keeps Sandom out of the jxl-prefixed types the format reserves and out
-// of unregistered application types.
-const JXL_METADATA_BOX_TYPES = ['Exif', 'xml ', 'jumb', 'sdrr'];
-const JXL_METADATA_BOX_KEYS = ['type', 'payload', 'compressed'];
-
-function validateMetadataBoxes(metadataBoxes) {
-  if (!Array.isArray(metadataBoxes)) {
-    throw new Error(
-      'encodeJXLAnimation: metadataBoxes must be an array of box records',
-    );
-  }
-  return metadataBoxes.map((box, index) => {
-    if (box === null || typeof box !== 'object') {
-      throw new Error(
-        `encodeJXLAnimation: metadata box ${index} must be an object`,
-      );
-    }
-    for (const key of Object.keys(box)) {
-      if (!JXL_METADATA_BOX_KEYS.includes(key)) {
-        throw new Error(
-          `encodeJXLAnimation: metadata box ${index} accepts only [${JXL_METADATA_BOX_KEYS.join(', ')}], got "${key}"`,
-        );
-      }
-    }
-    if (!JXL_METADATA_BOX_TYPES.includes(box.type)) {
-      throw new Error(
-        `encodeJXLAnimation: metadata box ${index} type ${JSON.stringify(box.type)} is outside the closed set ${JXL_METADATA_BOX_TYPES.map((type) => JSON.stringify(type)).join(', ')}`,
-      );
-    }
-    if (!(box.payload instanceof Uint8Array) || box.payload.length === 0) {
-      throw new Error(
-        `encodeJXLAnimation: metadata box ${index} requires a non-empty Uint8Array payload`,
-      );
-    }
-    const compressed = box.compressed ?? false;
-    if (typeof compressed !== 'boolean') {
-      throw new Error(
-        `encodeJXLAnimation: metadata box ${index} compressed must be a boolean`,
-      );
-    }
-    return { type: box.type, payload: box.payload, compressed };
-  });
-}
-
-const SESSION_ERRORS = {
-  '5': 'the encoder ran out of memory',
-  '6': 'the encode session was driven out of order',
-  '7': 'a frame of an animated sequence carries a zero duration',
-};
-
-function sessionError(operation, status) {
-  const reason = SESSION_ERRORS[String(status)] ??
-    (status >= 100 ? `libjxl encoder error ${status - 100}` : 'encoder error');
-  return new Error(`encodeJXLAnimation: ${operation} failed (${status}): ${reason}`);
+// A metadata box as the rules module reads it: an object's own fields
+// with its payload replaced by whether it is a non-empty Uint8Array.
+function boxFacts(box) {
+  if (box === null || typeof box !== 'object' || Array.isArray(box)) return box;
+  return Object.fromEntries(Object.keys(box).map((key) =>
+    [key, key === 'payload' ? box.payload instanceof Uint8Array && box.payload.length > 0 : box[key]]));
 }
 
 /**
@@ -756,36 +506,40 @@ async function encodeJXLAnimation({
   effort = 7,
   metadataBoxes = [],
 }) {
-  if (!Array.isArray(frames) || frames.length === 0) {
-    throw new Error('encodeJXLAnimation: frames must be a non-empty array of sample buffers');
-  }
-  if (frames.length !== frameDurations?.length) {
-    throw new Error(
-      `encodeJXLAnimation: ${frames.length} frames need ${frames.length} durations, got ${frameDurations?.length ?? 0}`,
-    );
-  }
-  const colorSpace = resolveEncodeColorSpace(colorEncoding, 'encodeJXLAnimation');
-  const depth = resolveEncodeDepth(bitDepth);
-  const timing = resolveAnimationTiming(frameDurations, timebase);
-  const loops = resolveRepetition(repetitionCount);
-  const boxes = validateMetadataBoxes(metadataBoxes);
-
-  // One sequence contract for every frame: same length, same sample
-  // type. A frame that disagrees is rejected before the encoder opens.
-  const expectedLength = width * height * 4;
-  for (let index = 0; index < frames.length; index++) {
-    if (frames[index].length !== expectedLength) {
-      throw new Error(
-        `encodeJXLAnimation: frame ${index} carries ${frames[index].length} samples, the sequence contract is ${expectedLength}`,
-      );
-    }
-    if (frames[index].constructor !== frames[0].constructor) {
-      throw new Error(
-        `encodeJXLAnimation: frame ${index} is a ${frames[index].constructor.name}, the sequence contract is ${frames[0].constructor.name}`,
-      );
-    }
-  }
-  const prepared = frames.map((samples) => prepareEncodeSamples(samples, depth));
+  const { output } = callRules('jxl_animation_request', [
+    Array.isArray(frames) ? frames.map((frame) => [frame.length, frame.constructor.name]) : null,
+    frameDurations,
+    frameDurations?.length,
+    repetitionCount,
+    timebase,
+    colorEncoding.primaries,
+    colorEncoding.transferFunction,
+    bitDepth,
+    Array.isArray(metadataBoxes) ? metadataBoxes.map(boxFacts) : metadataBoxes,
+    width,
+    height,
+  ], Array.isArray(frames) && frames.length > 0 ? sampleType(frames[0]) : SAMPLE_UINT8);
+  const view = new DataView(output.buffer);
+  const settings = readSettings(view);
+  const ticksPerSecond = view.getFloat64(ANIMATION.TICKS_PER_SECOND, true);
+  const exactTiming = view.getInt32(ANIMATION.EXACT, true) === 1;
+  const loops = view.getUint32(ANIMATION.LOOPS, true);
+  const worstErrorMilliseconds = view.getFloat64(ANIMATION.WORST_ERROR, true);
+  const boxCount = view.getUint32(ANIMATION.BOX_COUNT, true);
+  const boxes = Array.from({ length: boxCount }, (_, index) => {
+    const row = ANIMATION.BOXES + index * ANIMATION.BOX_SIZE;
+    const typeIndex = view.getInt32(row + ANIMATION.BOX_TYPE, true);
+    return {
+      typeIndex,
+      type: ruleText(BOX_TYPE_PIECE + typeIndex),
+      payload: metadataBoxes[index].payload,
+      compressed: view.getInt32(row + ANIMATION.BOX_COMPRESSED, true) === 1,
+    };
+  });
+  const ticksAt = ANIMATION.BOXES + boxCount * ANIMATION.BOX_SIZE;
+  const frameTicks = Array.from({ length: frames.length },
+    (_, index) => view.getUint32(ticksAt + index * Uint32Array.BYTES_PER_ELEMENT, true));
+  const prepared = frames.map((samples) => prepareEncodeSamples(samples, settings));
 
   const wasm = await ensureJxl();
   const e = wasm.exports;
@@ -794,19 +548,19 @@ async function encodeJXLAnimation({
     let status = e.jxl_encode_begin(
       width,
       height,
-      prepared[0].sampleKind,
-      depth.bits,
-      depth.exponentBits,
-      colorSpace,
+      settings.sampleKind,
+      settings.bits,
+      settings.exponentBits,
+      settings.colorSpace,
       lossless ? 1 : 0,
-      Math.round(distance * 1000),
+      rules.jxl_distance_code(distance),
       effort,
-      timing.ticksPerSecond,
+      ticksPerSecond,
       1,
       loops,
       boxes.length > 0 ? 1 : 0,
     );
-    if (status !== 0) throw sessionError('opening the sequence', status);
+    checkStatus(CALL.SESSION_OPEN, status);
     // Boxes first: libjxl writes frames and boxes in the one order they
     // were queued, so adding every box before the first frame puts them
     // ahead of the codestream.
@@ -819,19 +573,19 @@ async function encodeJXLAnimation({
       }
       staging.set(box.payload, 4);
       status = e.jxl_encode_add_box(box.payload.length, box.compressed ? 1 : 0);
-      if (status !== 0) throw sessionError(`adding the ${box.type} box`, status);
+      checkStatus(CALL.SESSION_BOX, status, box.typeIndex);
     }
     for (let index = 0; index < prepared.length; index++) {
-      const { input } = prepared[index];
+      const input = prepared[index];
       const framePtr = e.jxl_alloc_input(input.byteLength);
       new Uint8Array(e.memory.buffer, framePtr, input.byteLength).set(
         new Uint8Array(input.buffer, input.byteOffset, input.byteLength),
       );
-      status = e.jxl_encode_add_frame(timing.ticks[index]);
-      if (status !== 0) throw sessionError(`adding frame ${index}`, status);
+      status = e.jxl_encode_add_frame(frameTicks[index]);
+      checkStatus(CALL.SESSION_FRAME, status, index);
     }
     status = e.jxl_encode_finish();
-    if (status !== 0) throw sessionError('finishing the sequence', status);
+    checkStatus(CALL.SESSION_FINISH, status);
     bytes = new Uint8Array(
       new Uint8Array(e.memory.buffer, e.jxl_output_ptr(), e.jxl_output_size()),
     );
@@ -845,11 +599,11 @@ async function encodeJXLAnimation({
   return {
     bytes,
     frameCount: frames.length,
-    timebase: timing.ticksPerSecond,
-    frameTicks: timing.ticks,
+    timebase: ticksPerSecond,
+    frameTicks,
     repetitionCount,
-    exactTiming: timing.exact,
-    cumulativeErrorMilliseconds: timing.worstErrorMilliseconds,
+    exactTiming,
+    cumulativeErrorMilliseconds: worstErrorMilliseconds,
   };
 }
 

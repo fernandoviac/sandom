@@ -42,6 +42,7 @@
 import { FONT_SET } from "./font-set.js";
 import { readPackageAsset } from "./package-assets.js";
 import { sharedDomCore } from "./dom-wasm/core.js";
+import { layoutConstant } from "./wasm/layout-table.js";
 
 const faceSelectors = new WeakMap();
 const faceSelectorFinalizer = new FinalizationRegistry((handle) => {
@@ -53,30 +54,41 @@ const bundledFamilyFinalizer = new FinalizationRegistry((handle) => {
   sharedDomCore.status("font_bundled_release", handle);
 });
 
+// The bundled family and face selector records of
+// font-bundled-families.watpart and font-selection.watpart, by WAT name.
+const BUNDLED = Object.freeze(Object.fromEntries([
+  "FAMILY_SIZE", "FAMILY_NAME", "FAMILY_ALIASES", "SPAN_SIZE", "SPAN_POINTER", "SPAN_LENGTH",
+  "DESCRIPTION_SIZE", "DESCRIPTION_FALLBACK", "DESCRIPTION_IDENTITY", "DESCRIPTION_HAS_FALLBACK",
+  "FACE_INDEX", "FACE_IDENTITY",
+].map((name) => [name, layoutConstant(`BUNDLED_${name}`)])));
+const SELECTION_FACE = Object.freeze(Object.fromEntries(["SIZE", "STYLE", "STYLE_LENGTH", "MINIMUM", "MAXIMUM", "VARIABLE"]
+  .map((name) => [name, layoutConstant(`FONT_SELECTION_FACE_${name}`)])));
+
 function bundledFamilyCatalog(families) {
   const rows = families.map(family => ({
     name: fontTextEncoder.encode(family.family),
     aliases: family.generic.map(name => fontTextEncoder.encode(name)),
   }));
-  const length = rows.length * 16 + rows.reduce((total, row) =>
-    total + row.name.length + row.aliases.length * 8 + row.aliases.reduce((bytes, name) => bytes + name.length, 0), 0);
+  const length = rows.length * BUNDLED.FAMILY_SIZE + rows.reduce((total, row) =>
+    total + row.name.length + row.aliases.length * BUNDLED.SPAN_SIZE + row.aliases.reduce((bytes, name) => bytes + name.length, 0), 0);
   const pointer = sharedDomCore.exports.abi_allocate(length);
   const bytes = sharedDomCore.refreshBytes();
   const view = new DataView(bytes.buffer);
-  let cursor = pointer + rows.length * 16;
+  const writeSpan = (at, spanPointer, spanLength) => {
+    view.setUint32(at + BUNDLED.SPAN_POINTER, spanPointer, true);
+    view.setUint32(at + BUNDLED.SPAN_LENGTH, spanLength, true);
+  };
+  let cursor = pointer + rows.length * BUNDLED.FAMILY_SIZE;
   for (const [index, row] of rows.entries()) {
-    const offset = pointer + index * 16;
-    view.setUint32(offset, cursor, true);
-    view.setUint32(offset + 4, row.name.length, true);
+    const offset = pointer + index * BUNDLED.FAMILY_SIZE;
+    writeSpan(offset + BUNDLED.FAMILY_NAME, cursor, row.name.length);
     bytes.set(row.name, cursor);
     cursor += row.name.length;
     const aliases = cursor;
-    view.setUint32(offset + 8, aliases, true);
-    view.setUint32(offset + 12, row.aliases.length, true);
-    cursor += row.aliases.length * 8;
+    writeSpan(offset + BUNDLED.FAMILY_ALIASES, aliases, row.aliases.length);
+    cursor += row.aliases.length * BUNDLED.SPAN_SIZE;
     for (const [aliasIndex, name] of row.aliases.entries()) {
-      view.setUint32(aliases + aliasIndex * 8, cursor, true);
-      view.setUint32(aliases + aliasIndex * 8 + 4, name.length, true);
+      writeSpan(aliases + aliasIndex * BUNDLED.SPAN_SIZE, cursor, name.length);
       bytes.set(name, cursor);
       cursor += name.length;
     }
@@ -87,10 +99,15 @@ function bundledFamilyCatalog(families) {
 function bundledFamilyDescriptor(catalog, index) {
   sharedDomCore.status("font_bundled_describe", catalog, index);
   const bytes = sharedDomCore.refreshBytes();
-  const view = new DataView(bytes.buffer, sharedDomCore.exports.abi_output_pointer(), 20);
-  const text = offset => fontTextDecoder.decode(bytes.subarray(view.getUint32(offset, true),
-    view.getUint32(offset, true) + view.getUint32(offset + 4, true)));
-  return {fallback: view.getUint32(16, true) ? text(0) : undefined, familyIdentity: text(8)};
+  const view = new DataView(bytes.buffer, sharedDomCore.exports.abi_output_pointer(), BUNDLED.DESCRIPTION_SIZE);
+  const text = (field) => {
+    const start = view.getUint32(field + BUNDLED.SPAN_POINTER, true);
+    return fontTextDecoder.decode(bytes.subarray(start, start + view.getUint32(field + BUNDLED.SPAN_LENGTH, true)));
+  };
+  return {
+    fallback: view.getUint32(BUNDLED.DESCRIPTION_HAS_FALLBACK, true) ? text(BUNDLED.DESCRIPTION_FALLBACK) : undefined,
+    familyIdentity: text(BUNDLED.DESCRIPTION_IDENTITY),
+  };
 }
 
 function bundledFaceDescriptor(file) {
@@ -98,8 +115,8 @@ function bundledFaceDescriptor(file) {
   const bytes = sharedDomCore.refreshBytes();
   const pointer = sharedDomCore.exports.abi_output_pointer();
   return {
-    faceIndex: new DataView(bytes.buffer).getUint32(pointer, true),
-    faceIdentity: fontTextDecoder.decode(bytes.subarray(pointer + 4, pointer + sharedDomCore.exports.abi_output_length())),
+    faceIndex: new DataView(bytes.buffer).getUint32(pointer + BUNDLED.FACE_INDEX, true),
+    faceIdentity: fontTextDecoder.decode(bytes.subarray(pointer + BUNDLED.FACE_IDENTITY, pointer + sharedDomCore.exports.abi_output_length())),
   };
 }
 
@@ -111,20 +128,20 @@ function faceSelector(faces) {
     weights: Array.isArray(face.weight) ? face.weight : [face.weight, face.weight],
     variable: Number(Array.isArray(face.weight)),
   }));
-  const length = rows.length * 32 + rows.reduce((total, row) => total + row.style.length, 0);
+  const length = rows.length * SELECTION_FACE.SIZE + rows.reduce((total, row) => total + row.style.length, 0);
   const pointer = sharedDomCore.exports.abi_allocate(length);
   if (!pointer && length) sharedDomCore.throwIfError();
   const bytes = sharedDomCore.refreshBytes();
   const view = new DataView(bytes.buffer);
   bytes.fill(0, pointer, pointer + length);
-  let cursor = pointer + rows.length * 32;
+  let cursor = pointer + rows.length * SELECTION_FACE.SIZE;
   for (const [index, row] of rows.entries()) {
-    const at = pointer + index * 32;
-    view.setUint32(at, cursor, true);
-    view.setUint32(at + 4, row.style.length, true);
-    view.setFloat64(at + 8, Number(row.weights[0]), true);
-    view.setFloat64(at + 16, Number(row.weights[1]), true);
-    view.setUint32(at + 24, row.variable, true);
+    const at = pointer + index * SELECTION_FACE.SIZE;
+    view.setUint32(at + SELECTION_FACE.STYLE, cursor, true);
+    view.setUint32(at + SELECTION_FACE.STYLE_LENGTH, row.style.length, true);
+    view.setFloat64(at + SELECTION_FACE.MINIMUM, Number(row.weights[0]), true);
+    view.setFloat64(at + SELECTION_FACE.MAXIMUM, Number(row.weights[1]), true);
+    view.setUint32(at + SELECTION_FACE.VARIABLE, row.variable, true);
     bytes.set(row.style, cursor);
     cursor += row.style.length;
   }
@@ -136,7 +153,7 @@ function faceSelector(faces) {
 
 export const BUNDLED_SYSTEM_FONTS_SYMBOL = Symbol.for("sandom.bundledSystemFonts");
 export const FONT_SET_FALLBACK_FAMILIES_SYMBOL = Symbol.for("sandom.fontSetFallbackFamilies");
-export const FONT_SET_SPECIFIER = "https://cdn.urania-libs.com/set/4ac082ad6cf25238/sandom-fonts/";
+export const FONT_SET_SPECIFIER = "https://cdn.urania-libs.com/set/2621941e2c701e45/sandom-fonts/";
 
 // The location of the font set: the import-map target of
 // FONT_SET_SPECIFIER, else the published set of the pin.
@@ -261,14 +278,14 @@ async function readBundledFonts(location) {
     // The bundled family of a generic family name, or null.
     familyFor(genericName) {
       const index = sharedDomCore.status("font_bundled_find", catalog,
-        ...sharedDomCore.input(typeof genericName === "string" ? genericName : ""), 0, Number(typeof genericName === "string"));
+        ...sharedDomCore.input(typeof genericName === "string" ? genericName : ""), false, typeof genericName === "string");
       return index < 0 ? null : specification(index);
     },
     // The bundled family whose own name is `familyName`, compared with
     // Unicode lowercase mapping: a bundled
     // font is installed under its name as well as its generic family.
     familyNamed(familyName) {
-      const index = sharedDomCore.status("font_bundled_find", catalog, ...sharedDomCore.input(String(familyName)), 1, 1);
+      const index = sharedDomCore.status("font_bundled_find", catalog, ...sharedDomCore.input(String(familyName)), true, true);
       return index < 0 ? null : specification(index);
     },
     fallbackFamilies: fallback,

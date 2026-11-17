@@ -3,14 +3,6 @@ const descriptors = new WeakMap();
 const finalizer = new FinalizationRegistry(({ core, handle }) => core.status("scroll_timeline_release", handle));
 function applyTimelineRange(core, sample, token, value, end) {
   const progress = core.exports.scroll_timeline_range(sample, token, ...core.input(value || ""), end);
-  if (core.exports.abi_error_kind() === 18) {
-    const pointer = core.exports.abi_error_pointer();
-    const prefixLength = core.exports.abi_error_detail_b();
-    const prefix = core.decoder.decode(core.refreshBytes().subarray(pointer, pointer + prefixLength));
-    // Error construction coerces the original range again, after validation.
-    // Copy the native prefix before that user-observable coercion can reenter.
-    throw new Error(`${prefix}${value}"`);
-  }
   core.throwIfError();
   return progress;
 }

@@ -1,11 +1,29 @@
 import { sharedDomCore as core } from "./dom-wasm/core.js";
 import {
   GRID_TRACK_ENTRY_SIZE,
-  GRID_TRACK_OFFSET_MIN_TYPE, GRID_TRACK_OFFSET_MAX_TYPE,
+  GRID_TRACK_OFFSET_MIN_TYPE, GRID_TRACK_OFFSET_MAX_TYPE, GRID_TRACK_OFFSET_REPEAT_LENGTH,
   GRID_TRACK_OFFSET_MIN_VALUE, GRID_TRACK_OFFSET_MAX_VALUE,
   GRID_TRACK_OFFSET_MIN_PERCENTAGE, GRID_TRACK_OFFSET_MAX_PERCENTAGE,
   GRID_TRACK_AUTO_FILL, GRID_TRACK_AUTO_FIT,
 } from "./wasm/layout.js";
+import { layoutConstant } from "./wasm/layout-table.js";
+
+// The codes of scene_grid_tracks and scene_grid_text, by the names of
+// their WAT globals.
+const GRID_VALUE_ABSENT = layoutConstant("GRID_VALUE_ABSENT");
+const GRID_VALUE_NUMBER = layoutConstant("GRID_VALUE_NUMBER");
+const GRID_VALUE_STRING = layoutConstant("GRID_VALUE_STRING");
+const GRID_VALUE_OTHER = layoutConstant("GRID_VALUE_OTHER");
+const GRID_TRACKS_SINGLE = layoutConstant("GRID_TRACKS_SINGLE");
+const GRID_TRACKS_TEXT_LIST = layoutConstant("GRID_TRACKS_TEXT_LIST");
+const GRID_TRACKS_ARRAY = layoutConstant("GRID_TRACKS_ARRAY");
+const GRID_TEXT_CSS = layoutConstant("GRID_TEXT_CSS");
+const GRID_TEXT_SCALE = layoutConstant("GRID_TEXT_SCALE");
+// The input rows and scene_row_grid fields of grid-input.watpart.
+const GRID_INPUT = Object.freeze(Object.fromEntries(["SIZE", "KIND", "POINTER", "LENGTH", "NUMBER"]
+  .map((name) => [name, layoutConstant(`GRID_INPUT_${name}`)])));
+const GRID_PROJECTION = Object.freeze(Object.fromEntries(["SIZE", "KIND", "TEXT", "LENGTH", "NUMBER"]
+  .map((name) => [name, layoutConstant(`GRID_PROJECTION_${name}`)])));
 
 const breadthNames = [
   "length", "percent", "fraction", "auto", "min-content", "max-content",
@@ -14,20 +32,20 @@ const breadthNames = [
 ];
 
 function trackInput(values) {
-  const bytes = new Uint8Array(values.length * 24);
+  const bytes = new Uint8Array(values.length * GRID_INPUT.SIZE);
   const view = new DataView(bytes.buffer);
   values.forEach((value, index) => {
-    const offset = index * 24;
+    const offset = index * GRID_INPUT.SIZE;
     if (typeof value === "number") {
-      view.setUint32(offset, 1, true);
-      view.setFloat64(offset + 16, value, true);
+      view.setUint32(offset + GRID_INPUT.KIND, GRID_VALUE_NUMBER, true);
+      view.setFloat64(offset + GRID_INPUT.NUMBER, value, true);
     } else if (typeof value === "string") {
       const [pointer, length] = core.input(value);
-      view.setUint32(offset, 2, true);
-      view.setUint32(offset + 4, pointer, true);
-      view.setUint32(offset + 8, length, true);
+      view.setUint32(offset + GRID_INPUT.KIND, GRID_VALUE_STRING, true);
+      view.setUint32(offset + GRID_INPUT.POINTER, pointer, true);
+      view.setUint32(offset + GRID_INPUT.LENGTH, length, true);
     } else {
-      view.setUint32(offset, value == null ? 0 : 3, true);
+      view.setUint32(offset + GRID_INPUT.KIND, value == null ? GRID_VALUE_ABSENT : GRID_VALUE_OTHER, true);
     }
   });
   return core.byteInput(bytes)[0];
@@ -53,7 +71,7 @@ function readTracks(values, mode) {
     if (type === GRID_TRACK_AUTO_FILL || type === GRID_TRACK_AUTO_FIT) {
       return {
         automaticRepeat: type === GRID_TRACK_AUTO_FILL ? "auto-fill" : "auto-fit",
-        patternLength: view.getUint8(record + GRID_TRACK_OFFSET_MAX_TYPE),
+        patternLength: view.getUint16(record + GRID_TRACK_OFFSET_REPEAT_LENGTH, true),
       };
     }
     return {
@@ -64,29 +82,29 @@ function readTracks(values, mode) {
 }
 
 export function parseGridTrack(track) {
-  return readTracks([track], 0)[0];
+  return readTracks([track], GRID_TRACKS_SINGLE)[0];
 }
 
 // Native wire tracks, including repeat markers; named lines stay native.
 export function parseGridTracks(template) {
-  return Array.isArray(template) ? readTracks(template, 2) : readTracks([template], 1);
+  return Array.isArray(template) ? readTracks(template, GRID_TRACKS_ARRAY) : readTracks([template], GRID_TRACKS_TEXT_LIST);
 }
 
 function gridText(value, scale, mode) {
-  const kind = typeof value === "number" ? 1 : typeof value === "string" ? 2 : 0;
+  const kind = typeof value === "number" ? GRID_VALUE_NUMBER : typeof value === "string" ? GRID_VALUE_STRING : GRID_VALUE_ABSENT;
   const [pointer, length] = typeof value === "string" ? core.input(value) : [0, 0];
   const outputKind = core.status("scene_grid_text", pointer, length, typeof value === "number" ? value : 0, kind, scale, mode);
-  if (outputKind === 1) return new DataView(core.memory.buffer).getFloat64(core.exports.abi_output_pointer(), true);
-  if (outputKind === 2) return core.outputString();
+  if (outputKind === GRID_VALUE_NUMBER) return new DataView(core.memory.buffer).getFloat64(core.exports.abi_output_pointer(), true);
+  if (outputKind === GRID_VALUE_STRING) return core.outputString();
   throw new Error(`Unknown native grid text kind ${outputKind}`);
 }
 
 export function scaleGridTrack(track, scale) {
-  return gridText(track, scale, 1);
+  return gridText(track, scale, GRID_TEXT_SCALE);
 }
 
 export function gridTrackCss(track) {
-  return gridText(track, 1, 0);
+  return gridText(track, 1, GRID_TEXT_CSS);
 }
 
 const projectionFields = [
@@ -103,14 +121,14 @@ export function readSceneRowGrid(core, node) {
   const bytes = core.refreshBytes();
   const result = {};
   projectionFields.forEach((property, index) => {
-    const offset = pointer + index * 16;
-    const kind = view.getUint32(offset, true);
-    if (kind === 0) return;
-    if (kind === 1) {
-      result[property] = view.getFloat64(offset + 8, true);
-    } else if (kind === 2) {
-      const text = view.getUint32(offset + 4, true);
-      result[property] = core.decoder.decode(bytes.subarray(text, text + view.getUint32(offset + 8, true)));
+    const offset = pointer + index * GRID_PROJECTION.SIZE;
+    const kind = view.getUint32(offset + GRID_PROJECTION.KIND, true);
+    if (kind === GRID_VALUE_ABSENT) return;
+    if (kind === GRID_VALUE_NUMBER) {
+      result[property] = view.getFloat64(offset + GRID_PROJECTION.NUMBER, true);
+    } else if (kind === GRID_VALUE_STRING) {
+      const text = view.getUint32(offset + GRID_PROJECTION.TEXT, true);
+      result[property] = core.decoder.decode(bytes.subarray(text, text + view.getUint32(offset + GRID_PROJECTION.LENGTH, true)));
     } else {
       throw new Error(`Unknown native grid projection kind ${kind}`);
     }

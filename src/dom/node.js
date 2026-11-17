@@ -1,19 +1,20 @@
 // Standards-shaped wrappers for the Sandom DOM WebAssembly core. The core owns
 // tree, style, and layout state; serialize.js publishes its engine records.
 
+import { layoutConstant } from "../wasm/layout-table.js";
 import { createStyle } from "./style.js";
 import { createAdditionalElementInterfaces, createElementInterface } from "./element-interfaces.js";
 import { createFontRegistry, defaultFontRegistry } from "../font-registry.js";
 import { createDocumentResourceLoader } from "./document-resources.js";
 import { noResourceHost } from "../host/contract.js";
 import {
-  DomCoreAttributeMetadataMap,
   domCoreForWrapper,
   sharedDomCore,
 } from "../dom-wasm/core.js";
 import {
   createEvent,
   dispatchEvent as dispatchNativeEvent,
+  moveListenedNode,
   registerEventTargetWrapper,
   SDEventTarget,
 } from "./events.js";
@@ -78,29 +79,25 @@ import {
   installDocumentAnimationBindings,
   installParentNodeBindings, installChildNodeBindings, installElementSiblingBindings, installSlottableBindings,
   installElementInlineStyleBindings,
-  installNamedElementBindings, installHiddenBindings, installInputDefaultCheckedBindings,
+  installHiddenBindings, installInputDefaultCheckedBindings,
   installElementAttributeBindings, installElementCollectionBindings, installStylesheetElementBindings, installDatasetBindings,
-  installAutofocusBindings, installOpenElementBindings,
+  installAutofocusBindings, installOpenElementBindings, installRelListBindings, installAttributeReflections,
 } from "./dom-bindings.generated.js";
 import { documentAnimations, elementAnimationHost } from "./animation.js";
 import { documentTimeline } from "./document-clock.js";
 import {
+  adoptedStyleSheets,
   createDocumentStyleSystem,
-  CSS,
   setAdoptedStyleSheets,
 } from "./stylesheet.js";
 import {
-  adopted as customElementAdopted,
-  attributeChanged as customElementAttributeChanged,
   CustomElementRegistry,
   customElementState,
   ElementInternals,
-  treeChanged as customElementTreeChanged,
-  treeUpgrade as customElementTreeUpgrade,
   withCustomElementReactions,
 } from "./custom-elements.js";
+import { installEditingCommands } from "./editing-commands.js";
 import { queueSlotChange } from "./shadow.js";
-import { queueDetailsToggle } from "./details.js";
 import {
   SandomGPUCanvasContext,
 } from "./canvas.js";
@@ -112,11 +109,17 @@ import {
 } from "./canvas-2d.js";
 import { transferControlToOffscreen } from "./offscreen-canvas.js";
 import { SDRange, SDSelection } from "./selection.js";
-import { blurBeforeRemoval, focusAttributeChanged, requestSubmit, runInputActivation, scheduleFocusFixup, withFocusGeometry } from "./input-activation.js";
+import { cssNamespaceFor } from "./highlights.js";
+import { blurBeforeRemoval, focusAttributeChanged, queueTopLayerTask, requestSubmit, runInputActivation, scheduleFocusFixup, withFocusGeometry } from "./input-activation.js";
 import { withLiveGeometry } from "./live-geometry.js";
 import { copyControlIdentities, inputControlRuntime } from "./input-controls.js";
-import { HTMLCollection, installFormDomBindings, liveCollection, NodeList, reflectUnsigned } from "./form-dom.js";
+import { installConstraintValidationBindings, installElementInternalsFormBindings } from "./constraint-validation.js";
+import { elementLabels, elementWrapper, HTMLCollection, installFormDomBindings, liveCollection, NodeList } from "./form-dom.js";
+import { nodeMember } from "./node-members.js";
 import {
+  installDialogBindings,
+  installPopoverBindings,
+  installPopoverTargetBindings,
   installFormSubmissionBindings,
   installFocusBindings,
   installHTMLElementActivationBindings,
@@ -134,8 +137,9 @@ import {
   installInputTypeBindings,
 } from "./dom-bindings.generated.js";
 import { installMarkupBindings } from "./element-mutations.js";
+import { popoverAttributeChanged, topLayerBindingRuntime } from "./top-layer.js";
 import { installShadowBindings } from "./shadow-bindings.js";
-import { createTokenList, createClassTokenList, createDataset, createNamedNodeMap, attributeNodeCore } from "./node-collections.js";
+import { createTokenList, createDataset, createNamedNodeMap, attributeNodeCore } from "./node-collections.js";
 export { SDRange, SDSelection };
 
 const callLanguageFunction = Function.prototype.call.bind(Function.prototype.call);
@@ -173,6 +177,93 @@ function languageIteratorClose(record, throwing) {
 }
 const HTML_NS = "http://www.w3.org/1999/xhtml";
 const SVG_NS = "http://www.w3.org/2000/svg";
+// The codes that this file passes to or reads from WAT, by the names of
+// their WAT globals.
+const IMAGE_AXIS_WIDTH = layoutConstant("IMAGE_AXIS_WIDTH");
+const IMAGE_AXIS_HEIGHT = layoutConstant("IMAGE_AXIS_HEIGHT");
+const IMAGE_POSITION_X = layoutConstant("IMAGE_POSITION_X");
+const IMAGE_POSITION_Y = layoutConstant("IMAGE_POSITION_Y");
+const NODE_FLAG_SHADOW_ROOT = layoutConstant("NODE_FLAG_SHADOW_ROOT");
+const NODE_SEQUENCE_APPEND = layoutConstant("NODE_SEQUENCE_APPEND");
+const NODE_SEQUENCE_PREPEND = layoutConstant("NODE_SEQUENCE_PREPEND");
+const NODE_SEQUENCE_BEFORE = layoutConstant("NODE_SEQUENCE_BEFORE");
+const NODE_SEQUENCE_AFTER = layoutConstant("NODE_SEQUENCE_AFTER");
+const NODE_SEQUENCE_REPLACE_WITH = layoutConstant("NODE_SEQUENCE_REPLACE_WITH");
+const NODE_SEQUENCE_REPLACE_CHILDREN = layoutConstant("NODE_SEQUENCE_REPLACE_CHILDREN");
+const NODE_SEQUENCE_REMOVE = layoutConstant("NODE_SEQUENCE_REMOVE");
+const INPUT_FOCUS_FOCUSED = layoutConstant("INPUT_FOCUS_FOCUSED");
+const ATTRIBUTE_TOGGLE_PRESENT = layoutConstant("ATTRIBUTE_TOGGLE_PRESENT");
+const ATTRIBUTE_TOGGLE_SET = layoutConstant("ATTRIBUTE_TOGGLE_SET");
+const ATTRIBUTE_TOGGLE_REMOVE = layoutConstant("ATTRIBUTE_TOGGLE_REMOVE");
+const ATTRIBUTE_TOGGLE_UNFORCED = layoutConstant("ATTRIBUTE_TOGGLE_UNFORCED");
+const CUSTOM_ELEMENT_UNCUSTOMIZED = layoutConstant("CUSTOM_ELEMENT_UNCUSTOMIZED");
+const CUSTOM_ELEMENT_FAILED = layoutConstant("CUSTOM_ELEMENT_FAILED");
+const CALLBACK_EFFECT_RETAIN = layoutConstant("CALLBACK_EFFECT_RETAIN");
+const CALLBACK_EFFECT_CANVAS_ADOPT = layoutConstant("CALLBACK_EFFECT_CANVAS_ADOPT");
+const CALLBACK_EFFECT_IMAGE_ADOPT = layoutConstant("CALLBACK_EFFECT_IMAGE_ADOPT");
+const CALLBACK_EFFECT_STYLE_ATTRIBUTE = layoutConstant("CALLBACK_EFFECT_STYLE_ATTRIBUTE");
+const CALLBACK_EFFECT_CANVAS_BITMAP = layoutConstant("CALLBACK_EFFECT_CANVAS_BITMAP");
+const CALLBACK_EFFECT_CLONE = layoutConstant("CALLBACK_EFFECT_CLONE");
+const CALLBACK_EFFECT_SURFACE_DISCONNECT = layoutConstant("CALLBACK_EFFECT_SURFACE_DISCONNECT");
+const CALLBACK_EFFECT_SURFACE_CONNECT = layoutConstant("CALLBACK_EFFECT_SURFACE_CONNECT");
+const CALLBACK_EFFECT_SELECTION = layoutConstant("CALLBACK_EFFECT_SELECTION");
+const CALLBACK_EFFECT_RESTYLE = layoutConstant("CALLBACK_EFFECT_RESTYLE");
+const CALLBACK_EFFECT_SCRIPT_STEPS = layoutConstant("CALLBACK_EFFECT_SCRIPT_CHILDREN") |
+  layoutConstant("CALLBACK_EFFECT_SCRIPT_INSERTED") | layoutConstant("CALLBACK_EFFECT_SCRIPT_SRC") |
+  layoutConstant("CALLBACK_EFFECT_EVENT_HANDLER");
+const CALLBACK_EFFECT_IMAGE_ATTRIBUTE = layoutConstant("CALLBACK_EFFECT_IMAGE_ATTRIBUTE");
+const CALLBACK_EFFECT_FOCUS_ATTRIBUTE = layoutConstant("CALLBACK_EFFECT_FOCUS_ATTRIBUTE");
+const CALLBACK_EFFECT_POPOVER_ATTRIBUTE = layoutConstant("CALLBACK_EFFECT_POPOVER_ATTRIBUTE");
+const CALLBACK_NOTIFY_NONE = layoutConstant("CALLBACK_NOTIFY_NONE");
+const CALLBACK_NOTIFY_STRUCTURE = layoutConstant("CALLBACK_NOTIFY_STRUCTURE");
+const CALLBACK_NOTIFY_TEXT = layoutConstant("CALLBACK_NOTIFY_TEXT");
+// The mutation kinds of the render surface and the document session gate.
+const CALLBACK_NOTIFY_KINDS = new Map([
+  [CALLBACK_NOTIFY_STRUCTURE, "structure"],
+  [layoutConstant("CALLBACK_NOTIFY_ATTRIBUTE"), "attribute"],
+  [layoutConstant("CALLBACK_NOTIFY_CLASS"), "class"],
+  [CALLBACK_NOTIFY_TEXT, "text"],
+]);
+const NODE_SEQUENCE_ACTION_INPUT = layoutConstant("NODE_SEQUENCE_ACTION_INPUT");
+const NODE_SEQUENCE_ACTION_INSERT = layoutConstant("NODE_SEQUENCE_ACTION_INSERT");
+const NODE_SEQUENCE_ACTION_VALIDATE = layoutConstant("NODE_SEQUENCE_ACTION_VALIDATE");
+const NODE_SEQUENCE_ACTION_FRAGMENT = layoutConstant("NODE_SEQUENCE_ACTION_FRAGMENT");
+const NODE_SEQUENCE_ACTION_ASSEMBLE = layoutConstant("NODE_SEQUENCE_ACTION_ASSEMBLE");
+const NODE_SEQUENCE_ACTION_REPLACE = layoutConstant("NODE_SEQUENCE_ACTION_REPLACE");
+const NODE_SEQUENCE_ACTION_REMOVE = layoutConstant("NODE_SEQUENCE_ACTION_REMOVE");
+const NODE_SEQUENCE_ACTION_SHAPE = layoutConstant("NODE_SEQUENCE_ACTION_SHAPE");
+const TREE_WALK_ACTION_CHILDREN = layoutConstant("TREE_WALK_ACTION_CHILDREN");
+const TREE_WALK_ACTION_STEP = layoutConstant("TREE_WALK_ACTION_STEP");
+const TREE_WALK_ACTION_CLOSE = layoutConstant("TREE_WALK_ACTION_CLOSE");
+const SCROLL_REQUESTED_LEFT = layoutConstant("SCROLL_REQUESTED_LEFT");
+const SCROLL_REQUESTED_TOP = layoutConstant("SCROLL_REQUESTED_TOP");
+const SCROLL_ACCEPTED_LEFT = layoutConstant("SCROLL_ACCEPTED_LEFT");
+const SCROLL_ACCEPTED_TOP = layoutConstant("SCROLL_ACCEPTED_TOP");
+const SCROLL_REQUEST_GENERATION = layoutConstant("SCROLL_REQUEST_GENERATION");
+const CHARACTER_DATA_END = layoutConstant("CHARACTER_DATA_END");
+const MARKUP_FRAGMENT_INNER = layoutConstant("MARKUP_FRAGMENT_INNER");
+const MARKUP_FRAGMENT_OUTER = layoutConstant("MARKUP_FRAGMENT_OUTER");
+const MARKUP_FRAGMENT_ADJACENT = layoutConstant("MARKUP_FRAGMENT_ADJACENT");
+const INPUT_ACTIVATION_FOCUS = layoutConstant("INPUT_ACTIVATION_FOCUS");
+const INPUT_ACTIVATION_SELECT = layoutConstant("INPUT_ACTIVATION_SELECT");
+const TITLE_TARGET_NONE = layoutConstant("TITLE_TARGET_NONE");
+const TITLE_TARGET_ELEMENT = layoutConstant("TITLE_TARGET_ELEMENT");
+const TITLE_TARGET_SVG = layoutConstant("TITLE_TARGET_SVG");
+const COLLECTION_NAME_STRING = layoutConstant("COLLECTION_NAME_STRING");
+const COLLECTION_NAME_NULL = layoutConstant("COLLECTION_NAME_NULL");
+const COLLECTION_NAME_OTHER = layoutConstant("COLLECTION_NAME_OTHER");
+const COLLECTION_ANY_TAG = layoutConstant("COLLECTION_ANY_TAG");
+const COLLECTION_FILTER_NAMESPACE = layoutConstant("COLLECTION_FILTER_NAMESPACE");
+const COLLECTION_FILTER_CLASSES = layoutConstant("COLLECTION_FILTER_CLASSES");
+const COLLECTION_FILTER_NAME = layoutConstant("COLLECTION_FILTER_NAME");
+const COLLECTION_FILTER_HTML = layoutConstant("COLLECTION_FILTER_HTML");
+const COLLECTION_FILTER_TABLE_ROWS = layoutConstant("COLLECTION_FILTER_TABLE_ROWS");
+const COLLECTION_SCOPE_DESCENDANTS = layoutConstant("COLLECTION_SCOPE_DESCENDANTS");
+const COLLECTION_SCOPE_CHILDREN = layoutConstant("COLLECTION_SCOPE_CHILDREN");
+const CONTENT_EDITABLE_REMOVE = layoutConstant("CONTENT_EDITABLE_REMOVE");
+const TABLE_PART_CAPTION = layoutConstant("TABLE_PART_CAPTION");
+const TABLE_PART_HEAD = layoutConstant("TABLE_PART_HEAD");
+const TABLE_PART_FOOT = layoutConstant("TABLE_PART_FOOT");
 
 // A live NodeList over `items()`, or an HTMLCollection when it has `named`
 // (the DOM Standard's collection types). `count` and `at` answer length and
@@ -194,9 +285,9 @@ function staticNodeList(nodes) {
 
 function collectionNamed(root, tagName, name) {
   const core = root._domCore;
-  const tag = tagName === null ? [0, -1] : core.input(tagName);
-  const kind = typeof name === "string" ? 0 : name === null ? 1 : 2;
-  const requested = kind === 0 ? core.input(name) : [0, 0];
+  const tag = tagName === null ? [0, COLLECTION_ANY_TAG] : core.input(tagName);
+  const kind = typeof name === "string" ? COLLECTION_NAME_STRING : name === null ? COLLECTION_NAME_NULL : COLLECTION_NAME_OTHER;
+  const requested = kind === COLLECTION_NAME_STRING ? core.input(name) : [0, 0];
   return core.nodeHandle("node_collection_named", root._coreHandle, ...tag, kind, ...requested);
 }
 
@@ -223,75 +314,49 @@ function elementsByTagName(root, qualifiedName) {
   );
 }
 
-// The named property of an HTMLCollection over `items()`: the first
-// element whose id is the name or, for an HTML element, whose name
-// attribute is (DOM, HTMLCollection namedItem).
-function namedAmong(items) {
-  return (name) => {
-    const wanted = String(name);
-    if (wanted === "") return null;
-    return items().find((element) => element.getAttribute("id") === wanted ||
-      element.namespaceURI === HTML_NS && element.getAttribute("name") === wanted) ?? null;
-  };
+// A live collection of the nodes of `root` that a core collection filter
+// accepts (node_collection_list): `a` and `b` are its text arguments. An
+// HTMLCollection has the core's named item; `named: false` makes a
+// NodeList.
+function filteredCollection(root, scope, filter, a = "", b = "", { named = true } = {}) {
+  const core = root._domCore;
+  return collection(() => core.collectionList(root._coreHandle, scope, filter, a, b), {
+    named: named ? (name) => core.collectionListNamed(root._coreHandle, scope, filter, a, b, String(name)) : null,
+  });
 }
 
-// A live HTMLCollection of the elements that `filter` accepts among the
-// descendants of `root` in tree order.
-function descendantCollection(root, filter) {
-  const items = () => root._domCore.elementsByTagName(root._coreHandle, "*").filter(filter);
-  return collection(items, { named: namedAmong(items) });
+// The HTML descendants of `root` named in the comma-separated `names`
+// that carry the attribute `attribute`, if given.
+function descendantCollection(root, names, attribute = "") {
+  return filteredCollection(root, COLLECTION_SCOPE_DESCENDANTS, COLLECTION_FILTER_HTML, names, attribute);
 }
 
 function querySelectorAll(root, selector) {
   return staticNodeList(root._domCore.selectorQueryAll(root._coreHandle, selector));
 }
 
-// getElementsByTagNameNS (DOM): "*" matches every namespace or local name;
-// the empty namespace is no namespace.
+// getElementsByTagNameNS (DOM). The namespace is a nullable DOMString;
+// the core reads null as the empty string, no namespace.
 function elementsByTagNameNS(root, namespace, localName) {
-  const space = namespace === null || namespace === undefined || namespace === "" ? null : String(namespace);
-  const local = String(localName);
-  return descendantCollection(root, (element) =>
-    (space === "*" || element.namespaceURI === space) && (local === "*" || element.localName === local));
+  return filteredCollection(root, COLLECTION_SCOPE_DESCENDANTS, COLLECTION_FILTER_NAMESPACE,
+    namespace === null || namespace === undefined ? "" : String(namespace), String(localName));
 }
 
-// getElementsByClassName (DOM): the elements whose classes include every
-// token, ASCII case-insensitively in a quirks-mode document; none for no
-// token.
+// getElementsByClassName (DOM).
 function elementsByClassName(root, classNames) {
-  const tokens = String(classNames).split(/[\t\n\f\r ]+/).filter(Boolean);
-  const document = root.nodeType === 9 ? root : root.ownerDocument;
-  return descendantCollection(root, (element) => {
-    if (tokens.length === 0) return false;
-    const quirks = document.compatMode === "BackCompat";
-    const classes = (element.getAttribute("class") ?? "").split(/[\t\n\f\r ]+/).filter(Boolean)
-      .map((name) => quirks ? asciiLowercase(name) : name);
-    return tokens.every((token) => classes.includes(quirks ? asciiLowercase(token) : token));
-  });
+  return filteredCollection(root, COLLECTION_SCOPE_DESCENDANTS, COLLECTION_FILTER_CLASSES, String(classNames));
 }
 
-function asciiLowercase(value) {
-  return value.replace(/[A-Z]+/g, (letters) => letters.toLowerCase());
-}
-
-// getElementsByName (HTML): a live NodeList of the HTML elements of the
-// document whose name attribute is the name.
+// getElementsByName (HTML): a live NodeList.
 function elementsByName(document, elementName) {
-  const name = String(elementName);
-  return collection(() => document._domCore.elementsByTagName(document._coreHandle, "*").filter((element) =>
-    element.namespaceURI === HTML_NS && element.getAttribute("name") === name));
+  return filteredCollection(document, COLLECTION_SCOPE_DESCENDANTS, COLLECTION_FILTER_NAME, String(elementName), "",
+    { named: false });
 }
 
-function htmlElement(localName) {
-  const names = new Set(localName.split(","));
-  return (element) => element.namespaceURI === HTML_NS && names.has(element.localName);
-}
-
-// A live HTMLCollection of the HTML children of `parent` named in `names`.
+// A live HTMLCollection of the HTML children of `parent` named in the
+// comma-separated `names`.
 function childCollection(parent, names) {
-  const accept = htmlElement(names);
-  const items = () => [...parent.children].filter(accept);
-  return collection(items, { named: namedAmong(items) });
+  return filteredCollection(parent, COLLECTION_SCOPE_CHILDREN, COLLECTION_FILTER_HTML, names);
 }
 
 function ensureNode(value) {
@@ -299,6 +364,30 @@ function ensureNode(value) {
     throw new TypeError("The value is not a Sandom Node");
   }
   return value;
+}
+
+// The mutation record a callback record notifies, in the shape of a
+// MutationRecord (src/dom/document-session.js and src/dom/scripts.js read
+// it).
+function mutationRecordOf(core, record, target, relatedA, relatedB) {
+  if (record.notify === CALLBACK_NOTIFY_STRUCTURE) {
+    return {
+      type: "childList",
+      target,
+      addedNodes: relatedA ? [relatedA] : [],
+      removedNodes: relatedB ? [relatedB] : [],
+      previousSibling: core.wrapperFor(record.previous),
+      nextSibling: core.wrapperFor(record.next),
+    };
+  }
+  if (record.notify === CALLBACK_NOTIFY_TEXT) return { type: "characterData", target, oldValue: record.oldValue };
+  return {
+    type: "attributes",
+    target,
+    attributeName: record.name,
+    attributeNamespace: relatedA?.namespaceURI ?? null,
+    oldValue: record.oldValue,
+  };
 }
 
 // A stable order of DOM cores, for comparing nodes that share no tree.
@@ -338,19 +427,16 @@ function initializeNodeHostState(
     at: (index) => core.childAt(handle, index),
   });
   node._renderSurface = null;
-  if (register) core.registerWrapper(node, handle, true);
+  if (register) {
+    core.registerWrapper(node, handle, true,
+      ownerDocument === null ? core.handle("node_owner_document", handle) : ownerDocument._coreHandle);
+  }
 }
 
 function initializeElementHostState(element) {
   element._attributes = createNamedNodeMap(element);
-  element._attributeMetadata = new DomCoreAttributeMetadataMap(
-    element._domCore,
-    element._coreHandle,
-  );
   element._style = createStyle(element);
-  element._classList = createClassTokenList(element, {
-    withCustomElementReactions, customElementAttributeChanged,
-  });
+  element._classList = createTokenList(element, "class");
   element._part = createTokenList(element, "part");
   element._dataset = null;
   element._requestedScrollLeft = 0;
@@ -379,7 +465,7 @@ function wrapExistingNode(core, handle, document) {
     prototype = elementFamily.prototypeFor(localName, namespaceURI);
     if (prototype === additionalElementInterfaces.HTMLUnknownElement.prototype) {
       const state = core.status("custom_element_state", handle);
-      if (state !== 0 && state !== 3) prototype = SDHTMLElement.prototype;
+      if (state !== CUSTOM_ELEMENT_UNCUSTOMIZED && state !== CUSTOM_ELEMENT_FAILED) prototype = SDHTMLElement.prototype;
     }
   } else if (nodeType === 2) {
     prototype = Attr.prototype;
@@ -395,19 +481,20 @@ function wrapExistingNode(core, handle, document) {
     prototype = SDDocumentType.prototype;
   } else if (nodeType === 11) {
     const flags = core.status("node_flags", handle);
-    prototype = (flags & 0x100) !== 0
+    prototype = (flags & NODE_FLAG_SHADOW_ROOT) !== 0
       ? SDShadowRoot.prototype
       : SDDocumentFragment.prototype;
   } else {
     throw new Error(`Unsupported DOM core node type ${nodeType}`);
   }
-  const node = Object.create(prototype);
+  // A form's wrapper is a proxy for its named properties (form-dom.js).
+  const node = elementWrapper(Object.create(prototype));
   registerEventTargetWrapper(node);
   initializeNodeHostState(node, core, handle, document, { register: false });
   // Named-property access during host-state setup can ask the core for this
   // same wrapper. Publish its identity before those accesses; the caller
   // attaches the one retained-reference finalizer after materialization.
-  core.registerWrapper(node, handle, false);
+  core.registerWrapper(node, handle, false, document._coreHandle);
   if (nodeType === 1) {
     initializeElementHostState(node);
   } else if (
@@ -436,6 +523,20 @@ function copyClonedHostState(source, clone, deep) {
   }
 }
 
+// DOM "clone a node" creates each copy with "create an element" without
+// the synchronous custom elements flag: a copy that has a definition gets
+// an upgrade reaction (custom_upgrade), which runs before cloneNode or
+// importNode returns, after the whole copy exists.
+function cloneNodeInto(source, document, deep) {
+  const core = source._domCore;
+  return withCustomElementReactions(() => {
+    const clone = core.clone(source._coreHandle, document._coreHandle, deep);
+    copyClonedHostState(source, clone, deep);
+    core.status("custom_upgrade", clone._coreHandle);
+    return clone;
+  }, core);
+}
+
 export class SDNode extends SDEventTarget {
   constructor(_nodeType, _nodeName, ownerDocument, coreState) {
     if (!coreState?.core || typeof coreState.handle !== "bigint") {
@@ -448,6 +549,17 @@ export class SDNode extends SDEventTarget {
       coreState.handle,
       ownerDocument,
     );
+  }
+
+  // The owner document (node_owner_document), kept until the core's owner
+  // epoch changes (an adoption or a document disposal).
+  _bindingOwnerDocument() {
+    const epoch = this._domCore.ownerEpochRegister.value;
+    if (this._ownerDocumentEpoch !== epoch) {
+      this._ownerDocument = this._domCore.nodeHandle("node_owner_document", this._coreHandle);
+      this._ownerDocumentEpoch = epoch;
+    }
+    return this._ownerDocument;
   }
 
   _bindingChildren() {
@@ -463,7 +575,7 @@ export class SDNode extends SDEventTarget {
 
   // The Node members of the DOM Standard that read the tree.
   get baseURI() {
-    return this.ownerDocument.baseURI;
+    return nodeMember(this, "ownerDocument").baseURI;
   }
   get nodeValue() {
     return this._domCore.string("node_value", this._coreHandle);
@@ -472,26 +584,20 @@ export class SDNode extends SDEventTarget {
   get textContent() { return this._domCore.string("node_value", this._coreHandle); }
   set textContent(value) { this._transportNodeValue(`${value ?? ""}`); }
   _transportNodeValue(value) {
-    this._assertMutationAllowed();
     withCustomElementReactions(() => {
       this._domCore.status("node_value_set", this._coreHandle, ...this._domCore.input(value));
       this._deliverCoreTreeRecords();
     }, this._domCore);
   }
   hasChildNodes() {
-    return this.firstChild !== null;
+    return nodeMember(this, "firstChild") !== null;
   }
   isSameNode(otherNode) {
     return this === otherNode;
   }
   // normalize (DOM) runs in the core (nodes.watpart).
   normalize() {
-    this._assertMutationAllowed();
-    try {
-      this._domCore.status("node_normalize", this._coreHandle);
-    } finally {
-      this._dispatchCoreTreeRecords();
-    }
+    this._runTreeOperation(() => this._domCore.status("node_normalize", this._coreHandle));
   }
   // lookupPrefix, lookupNamespaceURI and isDefaultNamespace (DOM) locate
   // in the core (attributes.watpart); the empty string is null.
@@ -509,32 +615,14 @@ export class SDNode extends SDEventTarget {
   }
 
   get _focusedElement() {
-    return this._domCore.wrapperFor(this._domCore.handle("input_focus_get", this._coreHandle, 1));
-  }
-  set _focusedElement(value) {
-    this._domCore.status("input_focus_set", this._coreHandle, 1, value?._coreHandle ?? 0n);
+    return this._domCore.wrapperFor(this._domCore.handle("input_focus_get", this._coreHandle, INPUT_FOCUS_FOCUSED));
   }
   get _activeElement() {
     return this._domCore.wrapperFor(this._domCore.handle("input_active_element", this._coreHandle));
   }
-  set _activeElement(value) {
-    this._domCore.status("input_focus_set", this._coreHandle, 2, value?._coreHandle ?? 0n);
-  }
-  get _focusVisible() {
-    return this._domCore.handle("input_focus_get", this._coreHandle, 3) !== 0n;
-  }
-  set _focusVisible(value) {
-    this._domCore.status("input_focus_set", this._coreHandle, 3, value ? 1n : 0n);
-  }
-  get _focusModality() {
-    return ["none", "keyboard", "pointer"][Number(this._domCore.handle("input_focus_get", this._coreHandle, 4))];
-  }
-  set _focusModality(value) {
-    this._domCore.status("input_focus_set", this._coreHandle, 4, value === "keyboard" ? 1n : value === "pointer" ? 2n : 0n);
-  }
 
   get _childNodes() {
-    return [...this.childNodes];
+    return [...nodeMember(this, "childNodes")];
   }
 
   _transportContains(other) {
@@ -572,78 +660,32 @@ export class SDNode extends SDEventTarget {
   }
 
   _transportCloneNode(deep = false) {
-    const nodeType = this.nodeType;
+    const nodeType = nodeMember(this, "nodeType");
     sharedDomCore.status("node_clone_guard",
       typeof nodeType === "number" ? nodeType : NaN);
-    const clone = this._domCore.clone(
-      this._coreHandle,
-      this.ownerDocument._coreHandle,
-      Boolean(deep),
-    );
-    copyClonedHostState(this, clone, Boolean(deep));
-    return clone;
+    return cloneNodeInto(this, nodeMember(this, "ownerDocument"), Boolean(deep));
   }
 
-  _assertMutationAllowed() {
-    const document = this.nodeType === 9 ? this : this.ownerDocument;
-    document?._documentSessionMutationGate?.assert();
+  // The document whose session gate and style system see this node's
+  // mutations: the node itself for a document. A form's controls can shadow
+  // its members (node-members.js).
+  _mutationDocument() {
+    return nodeMember(this, "nodeType") === 9 ? this : nodeMember(this, "ownerDocument");
   }
 
-  // coreInvalidated: the core has already invalidated the style that a
-  // state or property change affects (an input run's state notification).
-  _notifyMutation(kind, detail, record = null, coreInvalidated = false) {
-    this._assertMutationAllowed();
-    if (kind === "style" && !this._parsingStyleAttribute) {
-      record = {
-        type: "attributes",
-        target: this,
-        attributeName: "style",
-        attributeNamespace: null,
-        oldValue: this._style._mutationOldValue ?? null,
-      };
-    }
-    const mutationDocument = this.nodeType === 9 ? this : this.ownerDocument;
-    mutationDocument?._documentSessionMutationGate?.record(
-      kind,
-      this,
-      detail,
-      record,
-    );
+  // A mutation notification: the render surface, the mutation observer
+  // checkpoint, and the host effects the core requested for it
+  // (CALLBACK_EFFECT_* bits of its callback record). The core gates and
+  // logs the change itself (core/dom/document-log.watpart).
+  _notifyMutation(kind, detail, record = null, effects = 0) {
+    const document = this._mutationDocument();
     this._renderSurface?._broadcastMutation(kind, this, detail);
-    // The core records its own invalidation for inline style, attribute,
-    // text and tree mutations (an attribute change reaches the element's
-    // subtree and, with sibling selectors, its following siblings; the
-    // rest the whole cascade); a host invalidation here would widen the
-    // scoped ones to every element. Pseudo-class state and control
-    // property changes are the host's to report, scoped to the element.
-    const document = this.nodeType === 9 ? this : this.ownerDocument;
-    if (kind === "state" || kind === "property") {
-      if (!coreInvalidated) this._invalidateState(detail);
-    } else if (kind !== "selection" && kind !== "style") document?._styleSystem?.reconcileSoon();
+    if (effects & CALLBACK_EFFECT_RESTYLE) document?._styleSystem?.reconcileSoon();
     scheduleMutationObservers(this._domCore);
-    // Script elements outside the parser: their insertion, children and
-    // src steps (src/dom/scripts.js).
-    document?._scriptProcessing?.mutation(this, kind, detail, record);
-    // An img whose src changes updates its image data (src/dom/images.js).
-    if (kind === "attribute") {
-      imageAttributeChanged(this, record?.attributeName ?? detail);
-      if ((record?.attributeNamespace ?? null) === null) focusAttributeChanged(this, record?.attributeName ?? detail);
-    }
-  }
-
-  // detail names the state that changed. "focus-within": an ancestor whose
-  // :focus-within changed - its own record, or its subtree and
-  // selector-reachable siblings when a selector puts :focus-within left of
-  // a combinator. Any other state: its subtree and selector-reachable
-  // siblings, or the whole cascade under :has(); for "hover" and "active"
-  // only when a :has() selector names a pointer state. A state is no input
-  // of the linked sheets and font rules, so it owes no reconcile.
-  _invalidateState(detail) {
-    this._domCore.stateInvalidate(
-      this._coreHandle,
-      detail === "focus-within",
-      detail === "hover" || detail === "active",
-    );
+    if (effects & CALLBACK_EFFECT_SCRIPT_STEPS) document?._scriptProcessing?.mutation(this, effects, record);
+    if (effects & CALLBACK_EFFECT_IMAGE_ATTRIBUTE) imageAttributeChanged(this, record.attributeName);
+    if (effects & CALLBACK_EFFECT_FOCUS_ATTRIBUTE) focusAttributeChanged(this, record.attributeName);
+    if (effects & CALLBACK_EFFECT_POPOVER_ATTRIBUTE) popoverAttributeChanged(this);
   }
 
   _adoptSubtree(document) {
@@ -653,9 +695,8 @@ export class SDNode extends SDEventTarget {
         "WrongDocumentError",
       );
     }
-    if (this.parentNode) blurBeforeRemoval(this);
-    this._domCore.adopt(document._coreHandle, this._coreHandle);
-    this._dispatchCoreTreeRecords();
+    if (nodeMember(this, "parentNode")) blurBeforeRemoval(this);
+    this._runTreeOperation(() => this._domCore.adopt(document._coreHandle, this._coreHandle));
   }
 
   _validateInsertion(node, referenceNode = null) {
@@ -680,131 +721,85 @@ export class SDNode extends SDEventTarget {
     withCustomElementReactions(() => this._deliverCoreTreeRecords(), this._domCore);
   }
 
-  _deliverCoreTreeRecords() {
-    const records = this._domCore.callbackRecords();
-    for (const record of records) {
-      if (record.kind === 4) {
-        const adoptedNode = this._domCore.wrapperFor(record.target);
-        const oldDocument = this._domCore.wrapperFor(record.relatedA);
-        const newDocument = this._domCore.wrapperFor(record.relatedB);
-        adoptedNode._documentRetention = newDocument;
-        if (adoptedNode instanceof SDHTMLCanvasElement) {
-          oldDocument?._canvasContexts?.delete(adoptedNode._canvasContext);
-          newDocument?._canvasContexts?.add(adoptedNode._canvasContext);
-        }
-        if (adoptedNode.nodeType === 1) {
-          customElementAdopted(adoptedNode, oldDocument, newDocument);
-          imageAdopted(adoptedNode, newDocument);
-        }
-        continue;
+  // A [CEReactions] tree operation: the core enqueues its reactions into a
+  // scope opened before it runs, and they run once its records are
+  // delivered, before the operation returns.
+  _runTreeOperation(operation) {
+    return withCustomElementReactions(() => {
+      try {
+        return operation();
+      } finally {
+        this._deliverCoreTreeRecords();
       }
-      if (record.kind === 2) {
-        const target = this._domCore.wrapperFor(record.target);
-        const attribute = this._domCore.wrapperFor(record.relatedA);
-        if (attribute) {
-          customElementAttributeChanged(target, attribute.localName, record.oldValue,
-            target.getAttributeNS(attribute.namespaceURI, attribute.localName));
-        }
-        target._notifyMutation("attribute", record.name, {
-          type: "attributes",
-          target,
-          attributeName: record.name,
-          attributeNamespace: attribute?.namespaceURI ?? null,
-          oldValue: record.oldValue,
-        });
-        continue;
+    }, this._domCore);
+  }
+
+  // Performs the host effects of the core's callback records
+  // (CALLBACK_EFFECT_* bits) and delivers their mutation notifications.
+  // Without a node at hand, a caller passes the core (the selectedcontent
+  // handler of SDDocument).
+  _deliverCoreTreeRecords(core = this._domCore) {
+    for (const record of core.callbackRecords()) {
+      const { effects } = record;
+      if (effects === 0 && record.notify === CALLBACK_NOTIFY_NONE) continue;
+      const target = core.wrapperFor(record.target);
+      const relatedA = core.wrapperFor(record.relatedA);
+      const relatedB = core.wrapperFor(record.relatedB);
+      if (effects & CALLBACK_EFFECT_RETAIN) {
+        moveListenedNode(target, target._documentRetention, relatedB);
+        target._documentRetention = relatedB;
       }
-      if (record.kind === 3) {
-        const target = this._domCore.wrapperFor(record.target);
-        target._notifyMutation("text", undefined, {
-          type: "characterData",
-          target,
-          oldValue: record.oldValue,
-          observers: record.observers ?? [],
-        });
-        continue;
+      if (effects & CALLBACK_EFFECT_CANVAS_ADOPT) {
+        relatedA?._canvasContexts?.delete(target._canvasContext);
+        relatedB?._canvasContexts?.add(target._canvasContext);
       }
-      // A clone a Range operation made in the core: its host state.
-      if (record.kind === 21) {
-        copyClonedHostState(
-          this._domCore.wrapperFor(record.relatedA),
-          this._domCore.wrapperFor(record.target),
-          record.previous === 1n,
-        );
-        continue;
+      if (effects & CALLBACK_EFFECT_IMAGE_ADOPT) imageAdopted(target);
+      if (effects & CALLBACK_EFFECT_CLONE) copyClonedHostState(relatedA, target, record.previous === 1n);
+      if (effects & CALLBACK_EFFECT_STYLE_ATTRIBUTE) target._style._parseAttribute(target.getAttributeNS(null, "style") ?? "");
+      if (effects & CALLBACK_EFFECT_CANVAS_BITMAP) {
+        target._canvasContext.attributeChanged(record.name, null, !target.hasAttribute(record.name), true);
       }
-      if (record.kind !== 1) continue;
-      const target = this._domCore.wrapperFor(record.target);
-      const addedNode = this._domCore.wrapperFor(record.relatedA);
-      const removedNode = this._domCore.wrapperFor(record.relatedB);
-      const previousSibling = this._domCore.wrapperFor(record.previous);
-      const nextSibling = this._domCore.wrapperFor(record.next);
       // A moved node stays connected to the same surface with its state;
       // the core queued its connectedMoveCallback reactions.
-      if (removedNode) {
-        if (!record.moved) target._renderSurface?._broadcastDisconnectSubtree(removedNode);
-        const document = target.nodeType === 9 ? target : target.ownerDocument;
-        document?.getSelection()?._takeRemoval();
-      }
-      if (addedNode && !record.moved) {
-        customElementTreeUpgrade(addedNode);
-        target._renderSurface?._connectSubtree(addedNode);
-      }
-      target._notifyMutation("structure", undefined, {
-        type: "childList",
-        target,
-        addedNodes: addedNode ? [addedNode] : [],
-        removedNodes: removedNode ? [removedNode] : [],
-        previousSibling,
-        nextSibling,
-      });
-      if (!record.moved) customElementTreeChanged(target, addedNode, removedNode);
+      if (effects & CALLBACK_EFFECT_SURFACE_DISCONNECT) target._renderSurface?._broadcastDisconnectSubtree(relatedB);
+      // The live range steps of a removal can move the Selection.
+      if (effects & CALLBACK_EFFECT_SELECTION) target._mutationDocument()?.getSelection()?._takeChange();
+      if (effects & CALLBACK_EFFECT_SURFACE_CONNECT) target._renderSurface?._connectSubtree(relatedA);
+      if (record.notify === CALLBACK_NOTIFY_NONE) continue;
+      const mutation = mutationRecordOf(core, record, target, relatedA, relatedB);
+      target._notifyMutation(CALLBACK_NOTIFY_KINDS.get(record.notify), mutation.attributeName, mutation, effects);
     }
   }
 
 
   _transportInsertBefore(node, referenceNode) {
-    this._assertMutationAllowed();
     const candidate = ensureNode(node);
     this._validateInsertion(candidate, referenceNode);
     if (referenceNode !== null) ensureNode(referenceNode);
     if (candidate.parentNode) blurBeforeRemoval(candidate);
-    this._domCore.insertBefore(
-      this._coreHandle,
-      candidate._coreHandle,
-      referenceNode?._coreHandle ?? 0n,
-    );
-    this._dispatchCoreTreeRecords();
+    this._runTreeOperation(() => this._domCore.insertBefore(this._coreHandle, candidate._coreHandle, referenceNode?._coreHandle ?? 0n));
     return candidate;
   }
 
   // moveBefore (ParentNode): the core validates and moves; the move keeps
-  // focus, so no blur runs. Reactions enqueued during the move run in the
-  // same scope as the delivered records.
+  // focus, so no blur runs.
   _transportMoveBefore(node, child) {
-    this._assertMutationAllowed();
     const candidate = ensureNode(node);
     if (child !== null) ensureNode(child);
     if (candidate._domCore !== this._domCore) {
       throw new DOMException("move crosses shadow-including roots", "HierarchyRequestError");
     }
-    withCustomElementReactions(() => {
-      this._domCore.moveBefore(this._coreHandle, candidate._coreHandle, child?._coreHandle ?? 0n);
-      this._deliverCoreTreeRecords();
-    }, this._domCore);
+    this._runTreeOperation(() => this._domCore.moveBefore(this._coreHandle, candidate._coreHandle, child?._coreHandle ?? 0n));
   }
 
   _transportRemoveChild(node) {
-    this._assertMutationAllowed();
     const candidate = ensureNode(node);
     if (candidate.parentNode === this) blurBeforeRemoval(candidate);
-    this._domCore.removeChild(this._coreHandle, candidate._coreHandle);
-    this._dispatchCoreTreeRecords();
+    this._runTreeOperation(() => this._domCore.removeChild(this._coreHandle, candidate._coreHandle));
     return candidate;
   }
 
   _transportReplaceChild(newChild, oldChild) {
-    this._assertMutationAllowed();
     const replacement = ensureNode(newChild);
     const replaced = ensureNode(oldChild);
     if (replacement._domCore !== this._domCore) {
@@ -815,13 +810,83 @@ export class SDNode extends SDEventTarget {
     }
     if (replaced.parentNode === this) blurBeforeRemoval(replaced);
     if (replacement.parentNode) blurBeforeRemoval(replacement);
-    this._domCore.replaceChild(
-      this._coreHandle,
-      replacement._coreHandle,
-      replaced._coreHandle,
-    );
-    this._dispatchCoreTreeRecords();
+    this._runTreeOperation(() => this._domCore.replaceChild(this._coreHandle, replacement._coreHandle, replaced._coreHandle));
     return replaced;
+  }
+
+  // The innerText and outerText setters (HTML) run in the core
+  // (dom-text.watpart): $exportName replaces the children ($replacesSelf
+  // false) or the element itself.
+  _transportSetText(exportName, value, replacesSelf) {
+    if (!replacesSelf) blurBeforeRemoval(this, true);
+    else if (nodeMember(this, "parentNode") !== null) blurBeforeRemoval(this);
+    this._runTreeOperation(() => this._domCore.status(exportName, this._coreHandle, ...this._domCore.input(value)));
+  }
+  // innerText and outerText ([LegacyNullToEmptyString]).
+  _transportSetInnerText(value) {
+    this._transportSetText("element_set_inner_text", value === null ? "" : String(value), false);
+  }
+  _transportSetOuterText(value) {
+    this._transportSetText("element_set_outer_text", value === null ? "" : String(value), true);
+  }
+  // The innerText and outerText getters (HTML): the core runs the rendered
+  // text collection steps. They update layout in Chrome, so they run the
+  // focus check.
+  _transportRenderedText() {
+    scheduleFocusFixup(this);
+    return this._domCore.string("element_rendered_text", this._coreHandle);
+  }
+
+  _transportTextContent() {
+    return this._domCore.textContent(this._coreHandle);
+  }
+  // textContent (DOMString?: null is the empty string): the core replaces
+  // all the children with one Text node.
+  _transportSetTextContent(value) {
+    const text = value === null ? "" : String(value);
+    blurBeforeRemoval(this, true);
+    this._runTreeOperation(() => this._domCore.status("node_set_text_content", this._coreHandle, ...this._domCore.input(text)));
+  }
+
+  // innerHTML and outerHTML getters: the XML serialization in an XML
+  // document, else the HTML serialization.
+  _transportInnerHTML() {
+    return nodeMember(this, "ownerDocument")?._xmlDocument ? serializeXMLNodeContents(this) : serializeHTMLNodeContents(this);
+  }
+  _transportOuterHTML() {
+    return nodeMember(this, "ownerDocument")?._xmlDocument ? serializeXMLNode(this) : serializeHTMLNode(this);
+  }
+  // The innerHTML and outerHTML setters ([LegacyNullToEmptyString]) and
+  // insertAdjacentHTML: the core chooses the context element of the parse
+  // and puts the parsed fragment in place.
+  _transportSetInnerHTML(value) {
+    this._setFragmentMarkup(MARKUP_FRAGMENT_INNER, "", value === null ? "" : String(value));
+  }
+  _transportSetOuterHTML(value) {
+    this._setFragmentMarkup(MARKUP_FRAGMENT_OUTER, "", value === null ? "" : String(value));
+  }
+  _transportInsertAdjacentHTML(position, text) {
+    this._setFragmentMarkup(MARKUP_FRAGMENT_ADJACENT, String(position), String(text));
+  }
+  _setFragmentMarkup(mode, position, markup) {
+    const core = this._domCore;
+    withCustomElementReactions(() => {
+      const context = core.wrapperFor(core.statusRaw("markup_fragment_context", this._coreHandle, mode, ...core.input(position)));
+      if (context === null) return;
+      const fragment = parseMarkupFragment(context, markup);
+      if (mode === MARKUP_FRAGMENT_INNER) blurBeforeRemoval(this, true);
+      else if (mode === MARKUP_FRAGMENT_OUTER) blurBeforeRemoval(this);
+      this._runTreeOperation(() =>
+        core.status("markup_fragment_insert", this._coreHandle, mode, ...core.input(position), fragment._coreHandle));
+    }, core);
+  }
+  _transportInsertAdjacentElement(position, element) {
+    const where = String(position);
+    const core = this._domCore;
+    if (domCoreForWrapper(element) !== core) throw new TypeError("insertAdjacentElement requires an Element");
+    if (element.parentNode) blurBeforeRemoval(element);
+    return core.wrapperFor(this._runTreeOperation(() =>
+      core.statusRaw("element_insert_adjacent", this._coreHandle, ...core.input(where), element._coreHandle)));
   }
 
   _bindingNodeSequence(mode, values) {
@@ -830,22 +895,21 @@ export class SDNode extends SDEventTarget {
     let present = true;
     let document;
     let removeMethod;
-    if (mode >= 2 && mode <= 4) {
-      present = !!this.parentNode;
-      if (present && mode === 3) reference = this.nextSibling;
-      if (present && mode === 4) parent = this.parentNode;
-    } else if (mode === 6) {
-      parent = this.parentNode;
+    if (mode === NODE_SEQUENCE_BEFORE || mode === NODE_SEQUENCE_AFTER || mode === NODE_SEQUENCE_REPLACE_WITH) {
+      present = !!nodeMember(this, "parentNode");
+      if (present && mode === NODE_SEQUENCE_AFTER) reference = nodeMember(this, "nextSibling");
+      if (present && mode === NODE_SEQUENCE_REPLACE_WITH) parent = nodeMember(this, "parentNode");
+    } else if (mode === NODE_SEQUENCE_REMOVE) {
+      parent = nodeMember(this, "parentNode");
       present = parent !== null && parent !== undefined;
-      if (present) removeMethod = parent.removeChild;
-    } else if (mode === 5) {
-      this._assertMutationAllowed();
-      document = this.ownerDocument ?? this;
+      if (present) removeMethod = nodeMember(parent, "removeChild");
+    } else if (mode === NODE_SEQUENCE_REPLACE_CHILDREN) {
+      document = nodeMember(this, "ownerDocument") ?? this;
       values = values.map((value) => nodeFrom(value, document));
     }
     const core = domCoreForWrapper(this) ?? sharedDomCore;
     const invocation = core.handle("node_sequence_begin", 0n,
-      mode, mode === 6 ? 0 : -1, present ? 1 : 0);
+      mode, mode === NODE_SEQUENCE_REMOVE ? 0 : -1, present ? 1 : 0);
     let input;
     let inputOpen = false;
     let failed = false;
@@ -859,10 +923,10 @@ export class SDNode extends SDEventTarget {
         const token = core.handle("node_sequence_next", invocation);
         if (token === 0n) return;
         const action = core.status("node_sequence_action", invocation);
-        if (action === 1) {
+        if (action === NODE_SEQUENCE_ACTION_INPUT) {
           inputOpen = false;
           if (!input) {
-            input = languageIterator(mode === 1 ? [...values].reverse() : values);
+            input = languageIterator(mode === NODE_SEQUENCE_PREPEND ? [...values].reverse() : values);
           }
           if (!languageIteratorStep(input)) {
             input = null;
@@ -870,24 +934,25 @@ export class SDNode extends SDEventTarget {
             continue;
           }
           inputOpen = true;
-          if (mode === 5) {
+          if (mode === NODE_SEQUENCE_REPLACE_CHILDREN) {
             candidate = input.value;
           } else {
-            receiver = mode < 2 ? this : mode === 4 ? parent : this.parentNode;
-            method = mode === 0 ? receiver.appendChild : receiver.insertBefore;
-            const owner = mode < 2 ? this.ownerDocument ?? this : this.ownerDocument;
+            const intoTarget = mode === NODE_SEQUENCE_APPEND || mode === NODE_SEQUENCE_PREPEND;
+            receiver = intoTarget ? this : mode === NODE_SEQUENCE_REPLACE_WITH ? parent : nodeMember(this, "parentNode");
+            method = nodeMember(receiver, mode === NODE_SEQUENCE_APPEND ? "appendChild" : "insertBefore");
+            const owner = intoTarget ? nodeMember(this, "ownerDocument") ?? this : nodeMember(this, "ownerDocument");
             candidate = nodeFrom(input.value, owner);
-            insertionReference = mode === 1 ? this.firstChild :
-              mode === 3 ? reference : this;
+            insertionReference = mode === NODE_SEQUENCE_PREPEND ? nodeMember(this, "firstChild") :
+              mode === NODE_SEQUENCE_AFTER ? reference : this;
           }
-        } else if (action === 2) {
-          if (mode === 0) callLanguageFunction(method, receiver, candidate);
+        } else if (action === NODE_SEQUENCE_ACTION_INSERT) {
+          if (mode === NODE_SEQUENCE_APPEND) callLanguageFunction(method, receiver, candidate);
           else callLanguageFunction(method, receiver, candidate, insertionReference);
-        } else if (action === 3) {
+        } else if (action === NODE_SEQUENCE_ACTION_VALIDATE) {
           this._domCore.validateInsertion(this._coreHandle, candidate._coreHandle, 0n);
-        } else if (action === 4) {
+        } else if (action === NODE_SEQUENCE_ACTION_FRAGMENT) {
           replacement = document.createDocumentFragment();
-        } else if (action === 5) {
+        } else if (action === NODE_SEQUENCE_ACTION_ASSEMBLE) {
           inputOpen = false;
           if (!input) input = languageIterator(values);
           if (!languageIteratorStep(input)) {
@@ -897,12 +962,12 @@ export class SDNode extends SDEventTarget {
           }
           inputOpen = true;
           replacement.appendChild(input.value);
-        } else if (action === 6) {
+        } else if (action === NODE_SEQUENCE_ACTION_REPLACE) {
           this._transportReplaceChildren(replacement);
-        } else if (action === 7) {
-          if (mode === 6) callLanguageFunction(removeMethod, parent, this);
-          else parent.removeChild(this);
-        } else if (action === 9) {
+        } else if (action === NODE_SEQUENCE_ACTION_REMOVE) {
+          if (mode === NODE_SEQUENCE_REMOVE) callLanguageFunction(removeMethod, parent, this);
+          else nodeMember(parent, "removeChild").call(parent, this);
+        } else if (action === NODE_SEQUENCE_ACTION_SHAPE) {
           replacement = values[0] ?? null;
           // Number preserves the relational threshold for every primitive,
           // including BigInt, while the native phase owns length > 1.
@@ -944,15 +1009,14 @@ export class SDNode extends SDEventTarget {
     }
     if (replacement?.parentNode) blurBeforeRemoval(replacement);
     blurBeforeRemoval(this, true);
-    this._domCore.replaceChildren(this._coreHandle, replacement?._coreHandle ?? 0n);
-    this._dispatchCoreTreeRecords();
+    this._runTreeOperation(() => this._domCore.replaceChildren(this._coreHandle, replacement?._coreHandle ?? 0n));
   }
 
 }
 
 export const Attr = createElementInterface(class SDAttr extends SDNode {
-  get namespaceURI() { return attributeNodeCore(this).nodeString("node_namespace", this._coreHandle) || null; }
-  get prefix() { return attributeNodeCore(this).nodeString("node_prefix", this._coreHandle) || null; }
+  get namespaceURI() { return attributeNodeCore(this).nodeString("node_namespace", this._coreHandle); }
+  get prefix() { return attributeNodeCore(this).nodeString("node_prefix", this._coreHandle); }
   get localName() { return attributeNodeCore(this).nodeString("node_local_name", this._coreHandle); }
   get name() { return attributeNodeCore(this).nodeString("node_name", this._coreHandle); }
   get value() { return attributeNodeCore(this).string("node_value", this._coreHandle); }
@@ -962,12 +1026,10 @@ export const Attr = createElementInterface(class SDAttr extends SDNode {
   }
   get ownerElement() { return attributeNodeCore(this).nodeHandle("attribute_node_owner", this._coreHandle); }
   get specified() { attributeNodeCore(this); return true; }
-  get [Symbol.toStringTag]() { return "Attr"; }
 });
 
 export const SDElement = createElementInterface(class SDElement extends SDNode {
   _transportSetAttributeNode(attribute) {
-    this._assertMutationAllowed();
     return withCustomElementReactions(() => {
       const previous = this._domCore.nodeHandle("attribute_node_attach", this._coreHandle, attribute._coreHandle);
       this._deliverCoreTreeRecords();
@@ -1007,177 +1069,67 @@ export const SDElement = createElementInterface(class SDElement extends SDNode {
     return customElementState(this);
   }
 
-  get _requestedScrollLeft() { return scrollRead(this, 0); }
-  set _requestedScrollLeft(value) { scrollStore(this, 0, value); }
-  get _requestedScrollTop() { return scrollRead(this, 1); }
-  set _requestedScrollTop(value) { scrollStore(this, 1, value); }
-  get _scrollLeft() { return scrollRead(this, 2); }
-  set _scrollLeft(value) { scrollStore(this, 2, value); }
-  get _scrollTop() { return scrollRead(this, 3); }
-  set _scrollTop(value) { scrollStore(this, 3, value); }
+  get _requestedScrollLeft() { return scrollRead(this, SCROLL_REQUESTED_LEFT); }
+  set _requestedScrollLeft(value) { scrollStore(this, SCROLL_REQUESTED_LEFT, value); }
+  get _requestedScrollTop() { return scrollRead(this, SCROLL_REQUESTED_TOP); }
+  set _requestedScrollTop(value) { scrollStore(this, SCROLL_REQUESTED_TOP, value); }
+  get _scrollLeft() { return scrollRead(this, SCROLL_ACCEPTED_LEFT); }
+  set _scrollLeft(value) { scrollStore(this, SCROLL_ACCEPTED_LEFT, value); }
+  get _scrollTop() { return scrollRead(this, SCROLL_ACCEPTED_TOP); }
+  set _scrollTop(value) { scrollStore(this, SCROLL_ACCEPTED_TOP, value); }
   // The public scroll bindings read these: the offsets of the scroller the
   // element's scroll position belongs to (elementScrollSource), which is the
   // viewport for the scrolling element. Each public scroll read and write
   // passes through one of them; it updates layout in Chrome, so it runs the
   // focus check (scheduleFocusFixup).
-  get _cssomRequestedScrollLeft() { scheduleFocusFixup(this); return elementScrollRead(this, 0); }
-  get _cssomRequestedScrollTop() { scheduleFocusFixup(this); return elementScrollRead(this, 1); }
+  get _cssomRequestedScrollLeft() { scheduleFocusFixup(this); return elementScrollRead(this, SCROLL_REQUESTED_LEFT); }
+  get _cssomRequestedScrollTop() { scheduleFocusFixup(this); return elementScrollRead(this, SCROLL_REQUESTED_TOP); }
   get _cssomScrollLeft() { scheduleFocusFixup(this); return layoutGetters.scrollLeft(this); }
   get _cssomScrollTop() { scheduleFocusFixup(this); return layoutGetters.scrollTop(this); }
 
-  _setParsedAttribute(localName, value, namespaceURI = null, prefix = null) {
-    const qualifiedName = prefix ? `${prefix}:${localName}` : String(localName);
-    const oldValue = namespaceURI === null
-      ? this.getAttribute(qualifiedName)
-      : this.getAttributeNS(namespaceURI, localName);
-    const normalizedValue = String(value);
-    this._domCore.setAttribute(
-      this._coreHandle,
-      namespaceURI,
-      qualifiedName,
-      normalizedValue,
-    );
-    const attributeRecord = this._domCore.callbackRecords().find((record) =>
-      record.kind === 2
-    );
-    const normalizedName = attributeRecord?.name ?? qualifiedName;
-    if (normalizedName === "style") this._style._parseAttribute(normalizedValue);
-    customElementAttributeChanged(
-      this,
-      normalizedName,
-      oldValue,
-      normalizedValue,
-    );
-    return {
-      normalizedName,
-      oldValue,
-      normalizedValue,
-      observers: attributeRecord?.observers ?? [],
-    };
-  }
   _transportSetAttribute(name, value) {
-    this._assertMutationAllowed();
     withCustomElementReactions(() => {
-      const result = this._setParsedAttribute(String(name), value);
-      this._notifyMutation(
-        result.normalizedName === "class" ? "class" : "attribute",
-        undefined,
-        {
-          type: "attributes",
-          target: this,
-          attributeName: result.normalizedName,
-          attributeNamespace: null,
-          oldValue: result.oldValue,
-          observers: result.observers,
-        },
-      );
+      this._domCore.setAttribute(this._coreHandle, String(name), String(value));
+      this._deliverCoreTreeRecords();
     }, this._domCore);
   }
   _transportRemoveAttribute(name) {
-    this._assertMutationAllowed();
-    withCustomElementReactions(() => this._removeAttribute(name), this._domCore);
-  }
-  _removeAttribute(name) {
-    const requestedName = String(name);
-    const oldValue = this.getAttribute(requestedName);
-    const removed = this._domCore.removeAttribute(
-      this._coreHandle,
-      requestedName,
-    );
-    const attributeRecord = this._domCore.callbackRecords().find((record) =>
-      record.kind === 2
-    );
-    if (!removed) return;
-    const normalizedName = attributeRecord?.name ?? requestedName;
-    if (normalizedName === "style") this._style._parseAttribute("");
-    this._notifyMutation(
-      normalizedName === "class" ? "class" : "attribute",
-      undefined,
-      {
-        type: "attributes",
-        target: this,
-        attributeName: normalizedName,
-        attributeNamespace: null,
-        oldValue,
-        observers: attributeRecord?.observers ?? [],
-      },
-    );
-    customElementAttributeChanged(this, normalizedName, oldValue, null);
+    withCustomElementReactions(() => {
+      this._domCore.removeAttribute(this._coreHandle, String(name));
+      this._deliverCoreTreeRecords();
+    }, this._domCore);
   }
   _transportRemoveAttributeNS(namespaceURI, localName) {
-    this._assertMutationAllowed();
-    withCustomElementReactions(
-      () => this._removeAttributeNS(namespaceURI, localName),
-      this._domCore,
-    );
+    withCustomElementReactions(() => {
+      this._domCore.removeAttributeNS(this._coreHandle, namespaceURI ?? null, String(localName));
+      this._deliverCoreTreeRecords();
+    }, this._domCore);
   }
-  _removeAttributeNS(namespaceURI, localName) {
-    const normalizedNamespace = namespaceURI ?? null;
-    const normalizedLocalName = String(localName);
-    const oldValue = this.getAttributeNS(
-      normalizedNamespace,
-      normalizedLocalName,
-    );
-    const removed = this._domCore.removeAttributeNS(
-      this._coreHandle,
-      normalizedNamespace,
-      normalizedLocalName,
-    );
-    const attributeRecord = this._domCore.callbackRecords().find((record) =>
-      record.kind === 2
-    );
-    if (!removed) return;
-    this._notifyMutation(
-      normalizedLocalName === "class" ? "class" : "attribute",
-      undefined,
-      {
-        type: "attributes",
-        target: this,
-        attributeName: normalizedLocalName,
-        attributeNamespace: normalizedNamespace,
-        oldValue,
-        observers: attributeRecord?.observers ?? [],
-      },
-    );
-    customElementAttributeChanged(
-      this,
-      normalizedLocalName,
-      oldValue,
-      null,
-    );
+  _transportSetAttributeNS(namespaceURI, qualifiedName, value) {
+    const namespace = namespaceURI === null || namespaceURI === undefined ? null : String(namespaceURI);
+    const name = String(qualifiedName);
+    withCustomElementReactions(() => {
+      this._domCore.setAttributeNS(this._coreHandle, namespace, name, String(value));
+      this._deliverCoreTreeRecords();
+    }, this._domCore);
   }
   _bindingToggleAttribute(name, force) {
-    const present = this.hasAttribute(name);
+    const present = nodeMember(this, "hasAttribute").call(this, name);
     const action = sharedDomCore.status("attribute_toggle_plan",
-      present ? 1 : 0, force === undefined ? -1 : force ? 1 : 0);
-    if (action & 2) this.setAttribute(name, "");
-    if (action & 4) this.removeAttribute(name);
-    return (action & 1) !== 0;
+      present ? 1 : 0, force === undefined ? ATTRIBUTE_TOGGLE_UNFORCED : force ? 1 : 0);
+    if (action & ATTRIBUTE_TOGGLE_SET) nodeMember(this, "setAttribute").call(this, name, "");
+    if (action & ATTRIBUTE_TOGGLE_REMOVE) nodeMember(this, "removeAttribute").call(this, name);
+    return (action & ATTRIBUTE_TOGGLE_PRESENT) !== 0;
   }
   // An input run toggled this element's boolean attribute in the core (the
-  // details disclosure, src/dom-wasm/input-run.watpart): its callback
+  // details disclosure, core/dom/input-run.watpart): its callback
   // records reach the facade as setAttribute's and removeAttribute's do.
-  _deliverToggledAttribute(added) {
-    this._assertMutationAllowed();
-    withCustomElementReactions(() => {
-      const attributeRecord = this._domCore.callbackRecords().find((record) => record.kind === 2);
-      const name = attributeRecord.name;
-      const oldValue = added ? null : attributeRecord.oldValue;
-      if (added) customElementAttributeChanged(this, name, oldValue, "");
-      this._notifyMutation("attribute", undefined, {
-        type: "attributes",
-        target: this,
-        attributeName: name,
-        attributeNamespace: null,
-        oldValue,
-        observers: [],
-      });
-      if (!added) customElementAttributeChanged(this, name, oldValue, null);
-    }, this._domCore);
+  _deliverToggledAttribute() {
+    this._dispatchCoreTreeRecords();
   }
 
   _bindingSheet() {
-    return this.ownerDocument?._styleSystem?.sheetForElement(this) ?? null;
+    return nodeMember(this, "ownerDocument")?._styleSystem?.sheetForElement(this) ?? null;
   }
 
 
@@ -1197,14 +1149,14 @@ export const SDElement = createElementInterface(class SDElement extends SDNode {
       return;
     }
     if (!scrollRequest(this, left, top, behavior, source)) return;
-    if (this._domCore.status("scroll_accept", scrollState(this), scrollRead(this, 7), left, top)) {
+    if (this._domCore.status("scroll_accept", scrollState(this), scrollRead(this, SCROLL_REQUEST_GENERATION), left, top)) {
       dispatchNativeEvent(this, createEvent("scroll"));
       dispatchNativeEvent(this, createEvent("scrollend"));
     }
   }
 
   _treeRoot() {
-    return this.getRootNode();
+    return nodeMember(this, "getRootNode").call(this);
   }
 
 
@@ -1238,7 +1190,7 @@ export const SDElement = createElementInterface(class SDElement extends SDNode {
   // (BUG-drone-cannot-measure-its-viewport, resolved; see
   // activity/reports/REPORT-2026-10-09-resolved-bug-records.md).
   get _resolvedLayoutOptions() {
-    return this._layoutOptions ?? this.ownerDocument?._layoutOptions;
+    return this._layoutOptions ?? nodeMember(this, "ownerDocument")?._layoutOptions;
   }
   // scrollIntoView(optional arg): length 0.
   scrollIntoView(options = undefined) {
@@ -1257,21 +1209,26 @@ export const SDElement = createElementInterface(class SDElement extends SDNode {
       this.scrollIntoView({ block: "nearest", inline: "nearest" });
       return;
     }
-    const rect = this.getBoundingClientRect();
-    const root = this.ownerDocument.documentElement;
-    const width = root?.clientWidth ?? 0;
-    const height = root?.clientHeight ?? 0;
-    if (rect.left >= 0 && rect.top >= 0 && rect.right <= width && rect.bottom <= height) return;
+    const inView = withLiveGeometry(this, this._resolvedLayoutOptions, ({ core, handle }) =>
+      core.status("geometry_in_root_client", handle, this._coreHandle));
+    if (inView === 1) return;
     this.scrollIntoView({ block: "center", inline: "center" });
   }
 });
+// HTMLImageElement x and y (geometry_image_position).
+function imagePosition(image, axis) {
+  const surface = image._renderSurface;
+  return withLiveGeometry(image, image._resolvedLayoutOptions, ({ core, handle }) =>
+    core.status("geometry_image_position", handle, image._coreHandle, axis, surface?._scrollOwner ?? 0n,
+      surface?.viewport.width ?? 0, surface?.viewport.height ?? 0));
+}
 installElementScrollBindings(scrollBindingRuntime, SDElement.prototype);
 installInputControlStateBindings(inputControlRuntime, SDElement.prototype);
 // focus() of an element that no other focusable kind covers updates layout
 // in Chrome: its focus check tests for a keyboard-focusable scroll container
 // over a synchronous layout (input_focus_scroller_candidate).
 function runElementActivation(element, operation) {
-  if (operation === 1 && element._domCore.status("input_focus_scroller_candidate", element._coreHandle)) {
+  if (operation === INPUT_ACTIVATION_FOCUS && element._domCore.status("input_focus_scroller_candidate", element._coreHandle)) {
     withLiveGeometry(element, undefined, ({ core, handle }) =>
       withFocusGeometry(core, handle, () => runInputActivation(element, operation)));
     return;
@@ -1280,19 +1237,19 @@ function runElementActivation(element, operation) {
 }
 
 export const SDHTMLElement = createElementInterface(class SDHTMLElement extends SDElement {
-  // contentEditable (HTML): the state of the contenteditable attribute.
+  // contentEditable (HTML): the keyword of the contenteditable state.
   get contentEditable() {
-    return ["inherit", "true", "false", "plaintext-only"][this._domCore.status("element_content_editable", this._coreHandle)];
+    return this._domCore.string("element_content_editable", this._coreHandle);
   }
   set contentEditable(value) {
-    const keyword = String(value).toLowerCase();
-    if (keyword === "inherit") this.removeAttribute("contenteditable");
-    else if (keyword === "true" || keyword === "false" || keyword === "plaintext-only") this.setAttribute("contenteditable", keyword);
-    else throw new DOMException(`The value provided ('${value}') is not one of 'true', 'false', 'plaintext-only', or 'inherit'.`, "SyntaxError");
+    const core = this._domCore;
+    const action = core.statusRaw("content_editable_keyword", ...core.input(String(value)));
+    if (action === CONTENT_EDITABLE_REMOVE) nodeMember(this, "removeAttribute").call(this, "contenteditable");
+    else nodeMember(this, "setAttribute").call(this, "contenteditable", core.outputString());
   }
   // isContentEditable (HTML), from the core (input-activation.watpart).
   get isContentEditable() {
-    return this._domCore.status("element_is_content_editable", this._coreHandle, this.ownerDocument?.designMode === "on" ? 1 : 0) === 1;
+    return this._domCore.status("element_is_content_editable", this._coreHandle) === 1;
   }
 }, "autonomous");
 
@@ -1328,15 +1285,8 @@ export class SDCharacterData extends SDNode {
     super(nodeType, nodeName, document, { core: document._domCore, handle });
   }
   _bindingSetData(normalized) {
-    if (!this._domCore.status("node_set_data_if_changed", this._coreHandle,
-      ...this._domCore.input(normalized))) return;
-    const dataRecord = this._domCore.callbackRecords().find((record) => record.kind === 3);
-    this._notifyMutation("text", undefined, {
-      type: "characterData",
-      target: this,
-      oldValue: dataRecord.oldValue,
-      observers: dataRecord.observers ?? [],
-    });
+    this._domCore.status("node_set_data", this._coreHandle, ...this._domCore.input(normalized));
+    this._deliverCoreTreeRecords();
   }
   // substringData, replaceData and its forms, and splitText run in the
   // core (nodes.watpart), with the live range steps.
@@ -1344,18 +1294,14 @@ export class SDCharacterData extends SDNode {
     return this._domCore.string("node_substring_data", this._coreHandle, offset, count);
   }
   _bindingReplaceDataAtEnd(text) {
-    this._replaceData(-1, 0, text);
+    this._replaceData(CHARACTER_DATA_END, 0, text);
   }
   _bindingReplaceData(offset, count, text) {
     this._replaceData(offset, count, text);
   }
   _replaceData(offset, count, text) {
-    this._assertMutationAllowed();
-    try {
-      this._domCore.status("node_replace_data", this._coreHandle, offset, count, ...this._domCore.input(text));
-    } finally {
-      this._dispatchCoreTreeRecords();
-    }
+    this._runTreeOperation(() =>
+      this._domCore.status("node_replace_data", this._coreHandle, offset, count, ...this._domCore.input(text)));
   }
 }
 
@@ -1365,13 +1311,7 @@ export class SDTextNode extends SDCharacterData {
   }
   // splitText(unsigned long offset) (DOM, "split a Text node").
   splitText(offset) {
-    this._assertMutationAllowed();
-    let handle;
-    try {
-      handle = this._domCore.handle("text_split", this._coreHandle, Number(offset) >>> 0);
-    } finally {
-      this._dispatchCoreTreeRecords();
-    }
+    const handle = this._runTreeOperation(() => this._domCore.handle("text_split", this._coreHandle, Number(offset) >>> 0));
     const node = this._domCore.wrapperFor(handle);
     this._domCore.status("node_release", handle);
     return node;
@@ -1423,10 +1363,9 @@ export class SDShadowRoot extends SDDocumentFragment {
   _invalidateStyles() {
     this.ownerDocument?._invalidateStyles();
   }
-  _notifyMutation(kind, detail) {
+  _notifyMutation(kind, detail, record = null, effects = 0) {
     this._renderSurface?._broadcastMutation(kind, this.host, detail);
-    if (kind === "state" || kind === "property") this.host._invalidateState(detail);
-    else if (kind !== "selection" && kind !== "style") this.ownerDocument?._styleSystem?.reconcileSoon();
+    if (effects & CALLBACK_EFFECT_RESTYLE) this.ownerDocument?._styleSystem?.reconcileSoon();
     scheduleMutationObservers(this._domCore);
   }
 }
@@ -1448,6 +1387,22 @@ export const SDHTMLInputElement = createElementInterface(class SDHTMLInputElemen
   }
   set value(value) {
     super.value = value;
+  }
+  // width and height (HTML §4.10.5.1.20): an image button's rendered
+  // image size, else its dimension attribute, else its image's natural
+  // size, as an img's; 0 for another type, which has no image. Setting
+  // reflects the attribute.
+  get width() {
+    return this.type === "image" ? imageDimension(this, IMAGE_AXIS_WIDTH) : 0;
+  }
+  set width(value) {
+    this.setAttribute("width", unsignedLongAttributeValue(this._domCore, value));
+  }
+  get height() {
+    return this.type === "image" ? imageDimension(this, IMAGE_AXIS_HEIGHT) : 0;
+  }
+  set height(value) {
+    this.setAttribute("height", unsignedLongAttributeValue(this._domCore, value));
   }
 }, "html");
 installInputTypeBindings(inputControlRuntime, SDHTMLInputElement.prototype);
@@ -1484,31 +1439,109 @@ export const SDHTMLLabelElement = createElementInterface(class SDHTMLLabelElemen
 // datalist.options (HTML): the option descendants.
 export const SDHTMLDataListElement = createElementInterface(class SDHTMLDataListElement extends SDHTMLElement {
   get options() {
-    return this._optionsCollection ??= descendantCollection(this, htmlElement("option"));
+    return this._optionsCollection ??= descendantCollection(this, "option");
   }
 }, "html");
 // table.rows and table.tBodies (HTML): the rows of its thead children
 // first, then its own and its tbody children's rows, then its tfoot
 // children's rows, each in tree order.
+// The caption, tHead and tFoot members and the create, delete and insert
+// methods follow HTML, "The table element".
 export const SDHTMLTableElement = createElementInterface(class SDHTMLTableElement extends SDHTMLElement {
   get rows() {
-    const isRow = htmlElement("tr");
-    const rowsOf = (sections) => [...this.children].flatMap((child) =>
-      sections.includes(child.localName) && child.namespaceURI === HTML_NS
-        ? [...child.children].filter(isRow)
-        : []);
-    const items = () => {
-      const head = rowsOf(["thead"]);
-      const body = [...this.children].flatMap((child) =>
-        isRow(child) ? [child] : htmlElement("tbody")(child) ? [...child.children].filter(isRow) : []);
-      return [...head, ...body, ...rowsOf(["tfoot"])];
-    };
-    return this._rowsCollection ??= collection(items, { named: namedAmong(items) });
+    return this._rowsCollection ??= filteredCollection(this, COLLECTION_SCOPE_CHILDREN, COLLECTION_FILTER_TABLE_ROWS);
   }
   get tBodies() {
     return this._bodiesCollection ??= childCollection(this, "tbody");
   }
+  get caption() {
+    return tablePart(this, TABLE_PART_CAPTION);
+  }
+  set caption(value) {
+    if (value != null && !(value instanceof additionalElementInterfaces.HTMLTableCaptionElement)) {
+      throw new TypeError("Failed to set the 'caption' property on 'HTMLTableElement': Failed to convert value to 'HTMLTableCaptionElement'.");
+    }
+    this.deleteCaption();
+    if (value != null) this.insertBefore(value, this.firstChild);
+  }
+  createCaption() {
+    return tablePart(this, TABLE_PART_CAPTION) ??
+      this.insertBefore(this.ownerDocument.createElementNS(HTML_NS, "caption"), this.firstChild);
+  }
+  deleteCaption() {
+    tablePart(this, TABLE_PART_CAPTION)?.remove();
+  }
+  get tHead() {
+    return tablePart(this, TABLE_PART_HEAD);
+  }
+  set tHead(value) {
+    tableSectionValue(value, "tHead", TABLE_PART_HEAD);
+    this.deleteTHead();
+    if (value != null) this.insertBefore(value, tableAnswer(this, "table_head_position"));
+  }
+  createTHead() {
+    return tablePart(this, TABLE_PART_HEAD) ??
+      this.insertBefore(this.ownerDocument.createElementNS(HTML_NS, "thead"), tableAnswer(this, "table_head_position"));
+  }
+  deleteTHead() {
+    tablePart(this, TABLE_PART_HEAD)?.remove();
+  }
+  get tFoot() {
+    return tablePart(this, TABLE_PART_FOOT);
+  }
+  set tFoot(value) {
+    tableSectionValue(value, "tFoot", TABLE_PART_FOOT);
+    this.deleteTFoot();
+    if (value != null) this.appendChild(value);
+  }
+  createTFoot() {
+    return tablePart(this, TABLE_PART_FOOT) ?? this.appendChild(this.ownerDocument.createElementNS(HTML_NS, "tfoot"));
+  }
+  deleteTFoot() {
+    tablePart(this, TABLE_PART_FOOT)?.remove();
+  }
+  createTBody() {
+    return this.insertBefore(this.ownerDocument.createElementNS(HTML_NS, "tbody"), tableAnswer(this, "table_body_position"));
+  }
+  // insertRow(): the core names the new row's parent (none: a new tbody at
+  // the end of the table) and the row it goes before.
+  insertRow(index = -1) {
+    const core = this._domCore;
+    const parent = core.wrapperFor(core.handle("table_row_insertion", this._coreHandle, toLong(index)));
+    const reference = core.wrapperFor(core.handle("table_row_reference"));
+    const row = this.ownerDocument.createElementNS(HTML_NS, "tr");
+    (parent ?? this.appendChild(this.ownerDocument.createElementNS(HTML_NS, "tbody"))).insertBefore(row, reference);
+    return row;
+  }
+  deleteRow(index) {
+    if (arguments.length === 0) {
+      throw new TypeError("Failed to execute 'deleteRow' on 'HTMLTableElement': 1 argument required, but only 0 present.");
+    }
+    const core = this._domCore;
+    core.wrapperFor(core.handle("table_row_at", this._coreHandle, toLong(index)))?.remove();
+  }
 }, "html");
+// A node that a table_* export answers for `table`.
+function tableAnswer(table, exportName, ...args) {
+  const core = table._domCore;
+  return core.wrapperFor(core.handle(exportName, table._coreHandle, ...args));
+}
+function tablePart(table, part) {
+  return tableAnswer(table, "table_part", part);
+}
+// The tHead and tFoot setters: the IDL type HTMLTableSectionElement, then
+// the core's part check (table_part_check).
+function tableSectionValue(value, member, part) {
+  if (value == null) return;
+  if (!(value instanceof additionalElementInterfaces.HTMLTableSectionElement)) {
+    throw new TypeError(`Failed to set the '${member}' property on 'HTMLTableElement': Failed to convert value to 'HTMLTableSectionElement'.`);
+  }
+  value._domCore.status("table_part_check", value._coreHandle, part);
+}
+// WebIDL `long`: ToNumber, then ToInt32.
+function toLong(value) {
+  return Number(value) | 0;
+}
 // tr.cells (HTML): its td and th children.
 export const SDHTMLTableRowElement = createElementInterface(class SDHTMLTableRowElement extends SDHTMLElement {
   get cells() {
@@ -1518,7 +1551,7 @@ export const SDHTMLTableRowElement = createElementInterface(class SDHTMLTableRow
 // map.areas (HTML): the area descendants.
 export const SDHTMLMapElement = createElementInterface(class SDHTMLMapElement extends SDHTMLElement {
   get areas() {
-    return this._areasCollection ??= descendantCollection(this, htmlElement("area"));
+    return this._areasCollection ??= descendantCollection(this, "area");
   }
 }, "html");
 // The a element (HTML, HTMLAnchorElement).
@@ -1567,29 +1600,6 @@ export const SDHTMLCanvasElement = createElementInterface(class SDHTMLCanvasElem
   transferControlToOffscreen() {
     return transferControlToOffscreen(this);
   }
-  _setParsedAttribute(localName, value, namespaceURI = null, prefix = null) {
-    const result = super._setParsedAttribute(
-      localName,
-      value,
-      namespaceURI,
-      prefix,
-    );
-    this._canvasContext?.attributeChanged(localName, namespaceURI, false, true);
-    return result;
-  }
-  removeAttribute(name) {
-    const normalizedName = String(name).toLowerCase();
-    const wasPresent = this._domCore.canvasBitmapAttributeMatches(normalizedName, null) &&
-      this.hasAttribute(normalizedName);
-    super.removeAttribute(name);
-    if (wasPresent) this._canvasContext.attributeChanged(normalizedName, null, true, true);
-  }
-  removeAttributeNS(namespaceURI, localName) {
-    const wasPresent = this._domCore.canvasBitmapAttributeMatches(localName, namespaceURI) &&
-      this.hasAttributeNS(namespaceURI, localName);
-    super.removeAttributeNS(namespaceURI, localName);
-    if (wasPresent) this._canvasContext.attributeChanged(localName, namespaceURI, true, true);
-  }
   _notifyCanvasPaint() {
     this._renderSurface?._broadcastMutation("canvas-paint", this);
   }
@@ -1605,76 +1615,13 @@ export const SDHTMLScriptElement = createElementInterface(class SDHTMLScriptElem
   set async(value) {
     setScriptElementAsync(this, Boolean(value));
   }
-  get defer() {
-    return this.hasAttribute("defer");
-  }
-  set defer(value) {
-    this.toggleAttribute("defer", Boolean(value));
-  }
-  get noModule() {
-    return this.hasAttribute("nomodule");
-  }
-  set noModule(value) {
-    this.toggleAttribute("nomodule", Boolean(value));
-  }
-  get type() {
-    return this.getAttribute("type") ?? "";
-  }
-  set type(value) {
-    this.setAttribute("type", String(value));
-  }
   get text() {
-    let text = "";
-    for (let child = this.firstChild; child !== null; child = child.nextSibling) {
-      if (child.nodeType === 3) text += child.data;
-    }
-    return text;
+    return this._domCore.string("node_child_text", this._coreHandle);
   }
   set text(value) {
     this.textContent = String(value);
   }
-  get crossOrigin() {
-    const value = this.getAttribute("crossorigin");
-    if (value === null) return null;
-    return value.toLowerCase() === "use-credentials" ? "use-credentials" : "anonymous";
-  }
-  set crossOrigin(value) {
-    if (value === null) this.removeAttribute("crossorigin");
-    else this.setAttribute("crossorigin", String(value));
-  }
-  get integrity() {
-    return this.getAttribute("integrity") ?? "";
-  }
-  set integrity(value) {
-    this.setAttribute("integrity", String(value));
-  }
-  get event() {
-    return this.getAttribute("event") ?? "";
-  }
-  set event(value) {
-    this.setAttribute("event", String(value));
-  }
-  get htmlFor() {
-    return this.getAttribute("for") ?? "";
-  }
-  set htmlFor(value) {
-    this.setAttribute("for", String(value));
-  }
 }, "html");
-
-// The string reflection of a content attribute.
-function reflectString(name) {
-  return {
-    get() {
-      return this.getAttribute(name) ?? "";
-    },
-    set(value) {
-      this.setAttribute(name, String(value));
-    },
-    enumerable: true,
-    configurable: true,
-  };
-}
 
 function webIDLLong(value) {
   return +value | 0;
@@ -1701,70 +1648,26 @@ function reflectNumericValue(kind, convert) {
   };
 }
 
-// An enumerated reflection limited to known values: the keyword in lower
-// case, else the invalid-value default, else (no attribute) the
-// missing-value default.
-function reflectEnumerated(name, keywords, missing, invalid = missing) {
-  return {
-    get() {
-      const value = this.getAttribute(name);
-      if (value === null) return missing;
-      const keyword = value.toLowerCase();
-      return keywords.includes(keyword) ? keyword : invalid;
-    },
-    set(value) {
-      this.setAttribute(name, String(value));
-    },
-    enumerable: true,
-    configurable: true,
-  };
-}
-
 export const SDHTMLImageElement = createElementInterface(class SDHTMLImageElement extends SDHTMLElement {
   // x and y (CSSOM View, HTMLImageElement): the box's position in the
   // document, truncated; 0 without a box.
   get x() {
-    const scroller = this.ownerDocument.scrollingElement;
-    return Math.trunc(this.getBoundingClientRect().left + (scroller?.scrollLeft ?? 0));
+    return imagePosition(this, IMAGE_POSITION_X);
   }
   get y() {
-    const scroller = this.ownerDocument.scrollingElement;
-    return Math.trunc(this.getBoundingClientRect().top + (scroller?.scrollTop ?? 0));
-  }
-  get src() {
-    const value = this.getAttribute("src");
-    if (value === null) return "";
-    return URL.parse(value, this.ownerDocument.baseURI)?.href ?? value;
-  }
-  set src(value) {
-    this.setAttribute("src", String(value));
-  }
-  get crossOrigin() {
-    const value = this.getAttribute("crossorigin");
-    if (value === null) return null;
-    return value.toLowerCase() === "use-credentials" ? "use-credentials" : "anonymous";
-  }
-  set crossOrigin(value) {
-    if (value === null) this.removeAttribute("crossorigin");
-    else this.setAttribute("crossorigin", String(value));
-  }
-  get isMap() {
-    return this.hasAttribute("ismap");
-  }
-  set isMap(value) {
-    this.toggleAttribute("ismap", Boolean(value));
+    return imagePosition(this, IMAGE_POSITION_Y);
   }
   get width() {
-    return imageDimension(this, 0);
+    return imageDimension(this, IMAGE_AXIS_WIDTH);
   }
   set width(value) {
-    this.setAttribute("width", unsignedLongAttributeValue(value));
+    this.setAttribute("width", unsignedLongAttributeValue(this._domCore, value));
   }
   get height() {
-    return imageDimension(this, 1);
+    return imageDimension(this, IMAGE_AXIS_HEIGHT);
   }
   set height(value) {
-    this.setAttribute("height", unsignedLongAttributeValue(value));
+    this.setAttribute("height", unsignedLongAttributeValue(this._domCore, value));
   }
   get naturalWidth() {
     return imageNaturalWidth(this);
@@ -1782,45 +1685,12 @@ export const SDHTMLImageElement = createElementInterface(class SDHTMLImageElemen
     return imageDecode(this);
   }
 }, "html");
-Object.defineProperties(SDHTMLImageElement.prototype, {
-  alt: reflectString("alt"),
-  srcset: reflectString("srcset"),
-  sizes: reflectString("sizes"),
-  useMap: reflectString("usemap"),
-  name: reflectString("name"),
-  align: reflectString("align"),
-  border: reflectString("border"),
-  referrerPolicy: reflectEnumerated("referrerpolicy", [
-    "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin",
-    "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url",
-  ], "", ""),
-  decoding: reflectEnumerated("decoding", ["sync", "async", "auto"], "auto"),
-  loading: reflectEnumerated("loading", ["lazy", "eager", "auto"], "auto"),
-  fetchPriority: reflectEnumerated("fetchpriority", ["high", "low", "auto"], "auto"),
-});
 
-export const SDHTMLSourceElement = createElementInterface(class SDHTMLSourceElement extends SDHTMLElement {
-  get src() {
-    const value = this.getAttribute("src");
-    if (value === null) return "";
-    return URL.parse(value, this.ownerDocument.baseURI)?.href ?? value;
-  }
-  set src(value) {
-    this.setAttribute("src", String(value));
-  }
-}, "html");
-Object.defineProperties(SDHTMLSourceElement.prototype, {
-  type: reflectString("type"),
-  srcset: reflectString("srcset"),
-  sizes: reflectString("sizes"),
-  media: reflectString("media"),
-  width: { ...reflectUnsigned("width", 0), enumerable: true },
-  height: { ...reflectUnsigned("height", 0), enumerable: true },
-});
+export const SDHTMLSourceElement = createElementInterface(class SDHTMLSourceElement extends SDHTMLElement {}, "html");
 
 export const SDHTMLIFrameElement = createElementInterface(class SDHTMLIFrameElement extends SDHTMLElement {}, "html");
 
-class SDTreeWalker {
+export class SDTreeWalker {
   constructor(root, whatToShow = 0xFFFFFFFF, filter = null) {
     this.root = root;
     this.whatToShow = Number(whatToShow);
@@ -1852,7 +1722,7 @@ class SDTreeWalker {
         if (token === 0n) break;
         const action = core.status("tree_walk_action", invocation, token);
         const target = core.handle("tree_walk_target", invocation, token);
-        if (action === 4) {
+        if (action === TREE_WALK_ACTION_CLOSE) {
           // IteratorClose preserves the original abrupt completion, including
           // when the return getter/call itself throws or returns a primitive.
           try {
@@ -1870,11 +1740,11 @@ class SDTreeWalker {
         let decision = 3;
         let thrown = false;
         try {
-          if (action === 1) {
+          if (action === TREE_WALK_ACTION_CHILDREN) {
             const record = languageIterator(values.get(target).childNodes ?? []);
             iteratorIdentity = ++nextIdentity;
             iterators.set(iteratorIdentity, record);
-          } else if (action === 2) {
+          } else if (action === TREE_WALK_ACTION_STEP) {
             const record = iterators.get(target);
             done = !languageIteratorStep(record);
             if (!done) nodeIdentity = identity(record.value);
@@ -1894,9 +1764,9 @@ class SDTreeWalker {
         }
         if (thrown) {
           core.status("tree_walk_throw", invocation, token);
-        } else if (action === 1) {
+        } else if (action === TREE_WALK_ACTION_CHILDREN) {
           core.status("tree_walk_iterator", invocation, token, iteratorIdentity);
-        } else if (action === 2) {
+        } else if (action === TREE_WALK_ACTION_STEP) {
           core.status("tree_walk_item", invocation, token, done ? 1 : 0, nodeIdentity);
           if (done) iterators.delete(target);
         } else {
@@ -1927,23 +1797,37 @@ class SDTreeWalker {
   }
 }
 
-function wrapOwnedNode(core, nodeHandle) {
-  const ownerHandle = core.handle("node_owner_document", nodeHandle);
+// Delivers the records of the selectedcontent updates of `core`, in a
+// custom element reaction scope as _dispatchCoreTreeRecords does.
+function dispatchSelectedContentRecords(core) {
+  withCustomElementReactions(() => SDNode.prototype._deliverCoreTreeRecords.call(null, core), core);
+}
+
+// The wrapper of a node of document `ownerHandle` (node_owner_document).
+function wrapOwnedNode(core, nodeHandle, ownerHandle) {
   if (ownerHandle === 0n) {
     throw new Error(`Missing document wrapper for handle ${nodeHandle}`);
   }
   const node = wrapExistingNode(core, nodeHandle, core.wrapperFor(ownerHandle));
   // A render surface connects every node of its subtree, but the link lives
-  // on the wrapper. A node without a box (an SVG `<stop>`) has no other
-  // holder, so its wrapper can be collected and recreated here. The surface
-  // root is retained by its surface, so the nearest parent (or shadow host)
-  // carries the surface this node belongs to.
-  const parent = node.parentNode ?? (node.nodeType === 11 ? node.host : null);
+  // on the wrapper. Under a surface root outside a document's tree, a node
+  // without a box (an SVG `<stop>`) has no other holder, so its wrapper can
+  // be collected and recreated here. The surface root is retained by its
+  // surface, so the nearest parent (or shadow host) carries the surface this
+  // node belongs to.
+  const parent = nodeMember(node, "parentNode") ?? (node.nodeType === 11 ? node.host : null);
   node._renderSurface = parent?._renderSurface ?? null;
   return node;
 }
 
 export class SDDocument extends SDNode {
+  // The document URL, which session history replaces (document_set_url).
+  get URL() {
+    return this._domCore.string("document_url", this._coreHandle);
+  }
+  get documentURI() {
+    return this._domCore.string("document_url", this._coreHandle);
+  }
   constructor({
     url = "about:blank",
     xmlDocument = false,
@@ -1955,6 +1839,7 @@ export class SDDocument extends SDNode {
     fontRegistry,
     enterRealm = null,
     clock = null,
+    browsingContext = true,
   } = {}) {
     const normalizedURL = new URL(url).href;
     if (fontRegistry && fontRegistry.core !== core) {
@@ -1967,14 +1852,26 @@ export class SDDocument extends SDNode {
     // its selection callback retains the document in that same context.
     core.wrapperFactory ??= wrapOwnedNode.bind(null, core);
     core.slotChangeHandler ??= queueSlotChange;
-    core.detailsToggleHandler ??= queueDetailsToggle;
+    core.detailsToggleHandler ??= queueTopLayerTask;
+    // A select's selectedcontent changed by a step without tree records of
+    // its own (core/dom/selected-content.watpart): its records reach the
+    // facade as a tree operation's do.
+    core.selectedContentHandler ??= dispatchSelectedContentRecords;
+    // Each change invalidates the selection at once; the event is
+    // scheduled (Selection API, "schedule a selectionchange event"): a
+    // change while one is scheduled queues none, and the queued task fires
+    // one event that does not bubble at the document.
+    this._selectionChangeScheduled = false;
     this._selection = new SDSelection(this, (changedNode) => {
       changedNode?._notifyMutation("selection");
-      dispatchNativeEvent(this, createEvent("selectionchange"));
+      if (this._selectionChangeScheduled) return;
+      this._selectionChangeScheduled = true;
+      documentScripts(this).queueTask(() => {
+        this._selectionChangeScheduled = false;
+        dispatchNativeEvent(this, createEvent("selectionchange"));
+      });
     });
     this._defaultView = null;
-    this.URL = normalizedURL;
-    this.documentURI = this.URL;
     // Every resource demand of this document goes to the host resource
     // session; a document without a host refuses its first demand. A demand
     // that names no base resolves against the document base URL at the time
@@ -1997,6 +1894,9 @@ export class SDDocument extends SDNode {
     // Diagnostics of images that failed to load or decode: render surfaces
     // record them, a prepared document gives them to the host.
     this._brokenImageDiagnostics = new Map();
+    // The file inputs activated without the host's file chooser
+    // (src/dom/host-picker.js), one diagnostic each.
+    this._fileChooserDiagnostics = new Map();
     // Diagnostics of properties a transition or an animation names that the
     // core does not animate, per element (src/dom/style.js).
     this._unanimatedPropertyDiagnostics = new Map();
@@ -2020,8 +1920,10 @@ export class SDDocument extends SDNode {
       ...(reportException ? { reportException } : {}),
     });
     this._canvasContexts = new Set();
-    this.customElements._registerDocument(this);
-    this.implementation = createDOMImplementation(this);
+    // HTML, "look up a custom element definition": a document without a
+    // browsing context (from DOMParser or DOMImplementation) finds no
+    // definition, so the core keeps no registry for it.
+    if (browsingContext) this.customElements._registerDocument(this);
     if (new.target === SDDocument) {
       Object.setPrototypeOf(this, xmlDocument ? SDXMLDocument.prototype : SDHTMLDocument.prototype);
     }
@@ -2043,12 +1945,6 @@ export class SDDocument extends SDNode {
     const attribute = carrier.attributes.item(0);
     return carrier.removeAttributeNode(attribute);
   }
-  // DocumentOrShadowRoot activeElement for a document: the retargeted
-  // focused element, else the body element, else the document element. A
-  // shadow root keeps null when focus is not in its tree.
-  get _activeElement() {
-    return super._activeElement ?? this.body ?? this.documentElement;
-  }
   get _xmlDocument() {
     return this._domCore.isXmlDocument(this._coreHandle);
   }
@@ -2059,13 +1955,19 @@ export class SDDocument extends SDNode {
       Object.setPrototypeOf(this, this._xmlDocument ? SDXMLDocument.prototype : SDHTMLDocument.prototype);
     }
   }
+  // A change of a registered highlight or of its ranges repaints the
+  // document's text as a selection change does (CSS Custom Highlight API 1
+  // §5.1).
+  _repaintHighlights() {
+    this.documentElement?._notifyMutation("selection");
+  }
   _bindingDefaultView(value) {
     this._defaultView = value;
     if (value) {
       value.getComputedStyle = (element, pseudoElement = null) =>
         this.getComputedStyle(element, pseudoElement);
       value.getSelection = () => this.getSelection();
-      value.CSS = CSS;
+      value.CSS = cssNamespaceFor(this);
       value.customElements = this.customElements;
     }
   }
@@ -2075,18 +1977,17 @@ export class SDDocument extends SDNode {
   // Page visibility (HTML "update the visibility state"): the host that
   // shows the document sets it; a document is visible until then.
   get visibilityState() {
-    return this._visibilityState ?? "visible";
+    return this.hidden ? "hidden" : "visible";
   }
   get hidden() {
-    return this.visibilityState === "hidden";
+    return this._domCore.status("document_hidden", this._coreHandle) === 1;
   }
   _setVisibilityState(state) {
     if (state !== "visible" && state !== "hidden") {
       throw new TypeError(`Unknown visibility state ${JSON.stringify(state)}; expected "visible" or "hidden"`);
     }
-    if (this.visibilityState === state) return;
-    this._visibilityState = state;
-    this.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
+    if (this._domCore.status("document_visibility_set", this._coreHandle, Number(state === "hidden")) === 0) return;
+    dispatchNativeEvent(this, createEvent("visibilitychange", { bubbles: true }));
   }
   get currentScript() {
     return documentCurrentScript(this);
@@ -2098,18 +1999,16 @@ export class SDDocument extends SDNode {
   // The document collections of HTML: links (a and area with href),
   // anchors (a with name), scripts, embeds and plugins (embed).
   get links() {
-    return this._linksCollection ??= descendantCollection(this, (element) =>
-      htmlElement("a,area")(element) && element.hasAttribute("href"));
+    return this._linksCollection ??= descendantCollection(this, "a,area", "href");
   }
   get anchors() {
-    return this._anchorsCollection ??= descendantCollection(this, (element) =>
-      htmlElement("a")(element) && element.hasAttribute("name"));
+    return this._anchorsCollection ??= descendantCollection(this, "a", "name");
   }
   get scripts() {
-    return this._scriptsCollection ??= descendantCollection(this, htmlElement("script"));
+    return this._scriptsCollection ??= descendantCollection(this, "script");
   }
   get embeds() {
-    return this._embedsCollection ??= descendantCollection(this, htmlElement("embed"));
+    return this._embedsCollection ??= descendantCollection(this, "embed");
   }
   get plugins() {
     return this.embeds;
@@ -2162,12 +2061,14 @@ export class SDDocument extends SDNode {
     }
   }
   // Sets the viewport of the document (`_viewport`) in the document and in
-  // its core record (document_viewport_set). A change makes every computed
-  // record of the document resolve again.
-  _setViewport(width, height, deviceScale = this._viewport?.deviceScale ?? globalThis.devicePixelRatio) {
+  // its core record (document_viewport_set). A change of the size makes
+  // every computed record of the document resolve again; a change of the
+  // scale alone snaps the records' line widths again. Without a scale it
+  // keeps the document's scale, else the host's devicePixelRatio, else 1.
+  _setViewport(width, height, deviceScale = this._viewport?.deviceScale ?? globalThis.devicePixelRatio ?? 1) {
     if (this._viewport?.width === width && this._viewport?.height === height && this._viewport?.deviceScale === deviceScale) return;
     this._viewport = { width, height, deviceScale };
-    this._domCore.documentViewport(this._coreHandle, width, height, deviceScale ?? 0);
+    this._domCore.documentViewport(this._coreHandle, width, height, deviceScale);
   }
   _validateInsertion(node, referenceNode = null) {
     super._validateInsertion(node, referenceNode);
@@ -2178,7 +2079,7 @@ export class SDDocument extends SDNode {
     const core = this._domCore;
     const handle = core.createElement(this._coreHandle, namespaceURI, String(tag));
     const element = wrapExistingNode(core, handle, this);
-    core.registerWrapper(element, handle, true);
+    core.registerWrapper(element, handle, true, this._coreHandle);
     return element;
   }
   _createPublicElement(namespaceURI, name, namespaceAware) {
@@ -2186,8 +2087,23 @@ export class SDDocument extends SDNode {
     const handle = core.createPublicElement(this._coreHandle, namespaceURI, name,
       this.contentType ?? "", namespaceAware);
     const element = wrapExistingNode(core, handle, this);
-    core.registerWrapper(element, handle, true);
+    core.registerWrapper(element, handle, true, this._coreHandle);
     return element;
+  }
+  // createElement and createElementNS: the core validates the name and
+  // creates the element; the registry constructs it with the is option.
+  _transportCreateElement(tag, options) {
+    const name = String(tag);
+    const is = elementCreationIs(options);
+    return withCustomElementReactions(
+      () => this.customElements._construct(this._createPublicElement(null, name, false), is), this._domCore);
+  }
+  _transportCreateElementNS(namespaceURI, tag, options) {
+    const namespace = namespaceURI === null || namespaceURI === undefined ? null : String(namespaceURI);
+    const name = String(tag);
+    const is = elementCreationIs(options);
+    return withCustomElementReactions(
+      () => this.customElements._construct(this._createPublicElement(namespace, name, true), is), this._domCore);
   }
   async _shutdownCanvasContexts() {
     const contexts = [...this._canvasContexts];
@@ -2202,13 +2118,7 @@ export class SDDocument extends SDNode {
         "WrongDocumentError",
       );
     }
-    const clone = this._domCore.clone(
-      source._coreHandle,
-      this._coreHandle,
-      Boolean(deep),
-    );
-    copyClonedHostState(source, clone, Boolean(deep));
-    return clone;
+    return cloneNodeInto(source, this, Boolean(deep));
   }
   _transportAdoptNode(node) {
     const adopted = ensureNode(node);
@@ -2217,21 +2127,77 @@ export class SDDocument extends SDNode {
   }
 }
 
+// The is member of an ElementCreationOptions dictionary; a string option
+// (the legacy form) gives none.
+function elementCreationIs(options) {
+  if (options === null || (typeof options !== "object" && typeof options !== "function")) return null;
+  const is = options.is;
+  return is === undefined ? null : String(is);
+}
+
 export class SDHTMLDocument extends SDDocument {}
 export class SDXMLDocument extends SDDocument {}
 
 export const DOMParser = createDOMParserClass({
-  createDocument: () => new SDDocument(),
+  createDocument: () => new SDDocument({ browsingContext: false }),
   parseHTMLDocument,
   parseXMLDocument,
 });
+Object.defineProperty(DOMParser.prototype, Symbol.toStringTag, { value: "DOMParser", configurable: true });
 
 export const additionalElementInterfaces = createAdditionalElementInterfaces(SDElement, SDHTMLElement, SDSVGElement);
 installSVGGraphicsBindings(svgGraphicsRuntime, additionalElementInterfaces.SVGGraphicsElement.prototype);
-Object.defineProperty(additionalElementInterfaces.HTMLDataElement.prototype, "value", reflectString("value"));
-Object.defineProperty(additionalElementInterfaces.HTMLLIElement.prototype, "value", reflectNumericValue(1, webIDLLong));
-Object.defineProperty(additionalElementInterfaces.HTMLMeterElement.prototype, "value", reflectNumericValue(2, webIDLDouble));
-Object.defineProperty(additionalElementInterfaces.HTMLProgressElement.prototype, "value", reflectNumericValue(3, webIDLDouble));
+Object.defineProperty(additionalElementInterfaces.HTMLLIElement.prototype, "value",
+  reflectNumericValue(layoutConstant("NUMERIC_VALUE_LIST_ITEM"), webIDLLong));
+Object.defineProperty(additionalElementInterfaces.HTMLMeterElement.prototype, "value",
+  reflectNumericValue(layoutConstant("NUMERIC_VALUE_METER"), webIDLDouble));
+Object.defineProperty(additionalElementInterfaces.HTMLProgressElement.prototype, "value",
+  reflectNumericValue(layoutConstant("NUMERIC_VALUE_PROGRESS"), webIDLDouble));
+// The values of a progress or meter (core/dom/gauge.watpart gauge_value,
+// design/interaction.md Q6) by field: 1 minimum, 2 maximum, 3 low boundary,
+// 4 high boundary, 5 optimum point, 6 position. Setting writes the
+// attribute as the shortest number text; a setter with `positive` ignores
+// a value of 0 or less, as progress.max does.
+function reflectGauge(field, attribute, { positive = false } = {}) {
+  return {
+    get() {
+      return this._domCore.status("gauge_value", this._coreHandle, field);
+    },
+    set(value) {
+      const number = webIDLDouble(value);
+      if (positive && !(number > 0)) return;
+      this.setAttribute(attribute, String(number));
+    },
+    enumerable: true,
+    configurable: true,
+  };
+}
+const gaugeLabels = {
+  get() {
+    return elementLabels(this);
+  },
+  enumerable: true,
+  configurable: true,
+};
+Object.defineProperties(additionalElementInterfaces.HTMLMeterElement.prototype, {
+  min: reflectGauge(1, "min"),
+  max: reflectGauge(2, "max"),
+  low: reflectGauge(3, "low"),
+  high: reflectGauge(4, "high"),
+  optimum: reflectGauge(5, "optimum"),
+  labels: gaugeLabels,
+});
+Object.defineProperties(additionalElementInterfaces.HTMLProgressElement.prototype, {
+  max: reflectGauge(2, "max", { positive: true }),
+  position: {
+    get() {
+      return this._domCore.status("gauge_value", this._coreHandle, 6);
+    },
+    enumerable: true,
+    configurable: true,
+  },
+  labels: gaugeLabels,
+});
 for (const constructor of [additionalElementInterfaces.HTMLStyleElement, additionalElementInterfaces.SVGStyleElement]) {
   Object.defineProperty(constructor.prototype, "disabled", {
     get() {
@@ -2249,15 +2215,15 @@ Object.defineProperty(SDHTMLSelectElement.prototype, "remove", {
     const hasIndex = arguments.length !== 0;
     const normalized = hasIndex ? webIDLLong(index) : 0;
     const target = this._domCore.nodeHandle("input_select_remove_target", this._coreHandle, hasIndex ? 1 : 0, normalized);
-    target?._bindingNodeSequence(6, []);
+    target?._bindingNodeSequence(NODE_SEQUENCE_REMOVE, []);
   },
   enumerable: true,
   configurable: true,
   writable: true,
 });
 for (const [name, interfaceObject] of Object.entries({
-  Node: SDNode, Element: SDElement, HTMLElement: SDHTMLElement, SVGElement: SDSVGElement,
-  Document: SDDocument, HTMLDocument: SDHTMLDocument, XMLDocument: SDXMLDocument,
+  Node: SDNode, Attr, Element: SDElement, HTMLElement: SDHTMLElement, SVGElement: SDSVGElement,
+  TreeWalker: SDTreeWalker, Document: SDDocument, HTMLDocument: SDHTMLDocument, XMLDocument: SDXMLDocument,
   CharacterData: SDCharacterData, Text: SDTextNode, Comment: SDComment, CDATASection: SDCDATASection,
   ProcessingInstruction: SDProcessingInstruction, DocumentType: SDDocumentType,
   DocumentFragment: SDDocumentFragment, ShadowRoot: SDShadowRoot,
@@ -2285,7 +2251,7 @@ const elementFamily = createElementFamily({
 });
 const textControlRuntime = {
   ...inputControlRuntime,
-  select(node) { runInputActivation(node, 6); },
+  select(node) { runInputActivation(node, INPUT_ACTIVATION_SELECT); },
 };
 for (const constructor of [SDHTMLInputElement, SDHTMLTextAreaElement, SDHTMLSelectElement]) {
   installControlValueBindings(inputControlRuntime, constructor.prototype);
@@ -2310,11 +2276,21 @@ for (const constructor of [
 }
 installInputCheckedBindings(inputControlRuntime, SDHTMLInputElement.prototype);
 installOptionSelectedBindings(inputControlRuntime, SDHTMLOptionElement.prototype);
-installSelectIndexBindings(inputControlRuntime, SDHTMLSelectElement.prototype);
+// A select's showPicker() places its picker over the current layout.
+installSelectIndexBindings({
+  ...inputControlRuntime,
+  showPicker: (node) => withLiveGeometry(node, undefined, (geometry) => inputControlRuntime.showPicker(node, geometry.handle)),
+}, SDHTMLSelectElement.prototype);
 installFormDomBindings({
   SDDocument, SDHTMLFormElement, SDHTMLInputElement, SDHTMLSelectElement, SDHTMLButtonElement,
   SDHTMLTextAreaElement, SDHTMLOptionElement, SDHTMLFieldSetElement, SDHTMLOutputElement, SDHTMLLabelElement,
 });
+installConstraintValidationBindings([
+  SDHTMLButtonElement.prototype, SDHTMLFieldSetElement.prototype, SDHTMLInputElement.prototype,
+  SDHTMLOutputElement.prototype, SDHTMLSelectElement.prototype, SDHTMLTextAreaElement.prototype,
+  additionalElementInterfaces.HTMLObjectElement.prototype,
+], SDHTMLFormElement.prototype);
+installElementInternalsFormBindings(ElementInternals.prototype);
 
 installNodeBindings({}, SDNode.prototype);
 for (const constructor of [SDElement, SDDocument, SDDocumentFragment]) {
@@ -2345,9 +2321,6 @@ const elementBindingRuntime = {
     if (!instance._dataset) instance._dataset = createDataset(instance);
     return instance._dataset;
   },
-  emptyToNull(value) {
-    return value || null;
-  },
   nonNull(value) {
     return value !== null;
   },
@@ -2357,16 +2330,6 @@ installElementAttributeBindings(elementBindingRuntime, SDElement.prototype);
 installElementCollectionBindings(elementBindingRuntime, SDElement.prototype);
 installHiddenBindings({}, SDHTMLElement.prototype);
 installInputDefaultCheckedBindings({}, SDHTMLInputElement.prototype);
-for (const constructor of [
-  SDHTMLAnchorElement, SDHTMLButtonElement, SDHTMLFieldSetElement, SDHTMLFormElement,
-  SDHTMLIFrameElement, SDHTMLImageElement, SDHTMLInputElement, SDHTMLMapElement,
-  SDHTMLOutputElement, SDHTMLSelectElement, SDHTMLTextAreaElement,
-  additionalElementInterfaces.HTMLDetailsElement, additionalElementInterfaces.HTMLEmbedElement,
-  additionalElementInterfaces.HTMLMetaElement, additionalElementInterfaces.HTMLObjectElement,
-  additionalElementInterfaces.HTMLSlotElement,
-]) {
-  installNamedElementBindings({}, constructor.prototype);
-}
 for (const constructor of [
   additionalElementInterfaces.HTMLLinkElement, additionalElementInterfaces.HTMLStyleElement,
   additionalElementInterfaces.SVGStyleElement,
@@ -2384,6 +2347,39 @@ for (const constructor of [SDHTMLElement, SDSVGElement, additionalElementInterfa
 for (const constructor of [additionalElementInterfaces.HTMLDetailsElement, additionalElementInterfaces.HTMLDialogElement]) {
   installOpenElementBindings({}, constructor.prototype);
 }
+installDialogBindings(topLayerBindingRuntime, additionalElementInterfaces.HTMLDialogElement.prototype);
+installPopoverBindings(topLayerBindingRuntime, SDHTMLElement.prototype);
+for (const constructor of [SDHTMLButtonElement, SDHTMLInputElement]) {
+  installPopoverTargetBindings(topLayerBindingRuntime, constructor.prototype);
+}
+// relList (HTML) of a, area, form and link: one native token list per
+// element over rel.
+const relLists = new WeakMap();
+const relListRuntime = {
+  relList(element) {
+    let list = relLists.get(element);
+    if (list === undefined) relLists.set(element, list = createTokenList(element, "rel"));
+    return list;
+  },
+  setRelList(element, value) {
+    relListRuntime.relList(element).value = value;
+  },
+};
+for (const constructor of [SDHTMLAnchorElement, additionalElementInterfaces.HTMLAreaElement, SDHTMLFormElement,
+  additionalElementInterfaces.HTMLLinkElement]) {
+  installRelListBindings(relListRuntime, constructor.prototype);
+}
+// The reflected IDL attributes of the "reflections" binding
+// (dom-interfaces.json).
+installAttributeReflections({
+  ...additionalElementInterfaces,
+  Element: SDElement, HTMLElement: SDHTMLElement, HTMLAnchorElement: SDHTMLAnchorElement, HTMLButtonElement: SDHTMLButtonElement,
+  HTMLFieldSetElement: SDHTMLFieldSetElement, HTMLMapElement: SDHTMLMapElement, HTMLOutputElement: SDHTMLOutputElement,
+  HTMLFormElement: SDHTMLFormElement, HTMLIFrameElement: SDHTMLIFrameElement, HTMLImageElement: SDHTMLImageElement,
+  HTMLInputElement: SDHTMLInputElement, HTMLScriptElement: SDHTMLScriptElement, HTMLSelectElement: SDHTMLSelectElement,
+  HTMLSourceElement: SDHTMLSourceElement, HTMLTemplateElement: SDHTMLTemplateElement,
+  HTMLTableElement: SDHTMLTableElement, HTMLTableRowElement: SDHTMLTableRowElement, HTMLTextAreaElement: SDHTMLTextAreaElement,
+});
 installHTMLElementActivationBindings(activationRuntime, SDHTMLElement.prototype);
 installTreeWalkerBindings({}, SDTreeWalker.prototype);
 installPrototypeEventHandlers(SDHTMLElement.prototype, GLOBAL_EVENT_HANDLER_TYPES);
@@ -2395,101 +2391,63 @@ installTemplateBindings({}, SDHTMLTemplateElement.prototype);
 installProcessingInstructionBindings({}, SDProcessingInstruction.prototype);
 installDocumentFragmentBindings({ querySelectorAll }, SDDocumentFragment.prototype);
 installDocumentTypeBindings({}, SDDocumentType.prototype);
-installShadowRootBindings({
-  setAdoptedStyleSheets,
-  shadowFlag(node, mask, enabled, disabled) {
-    return (node._domCore.status("node_flags", node._coreHandle) & mask) !== 0
-      ? enabled : disabled;
-  },
-}, SDShadowRoot.prototype);
-// HTML `Document.title` (HTML, "The title element of a document"). When the
-// document element is an SVG `svg`, the title is its first SVG `title`
-// child, created as the first child on assignment. Otherwise it is the first
-// HTML `title` element in tree order; assignment creates one in the head,
-// and does nothing unless the document element is an HTML element. The
-// value is the title's child text content, ASCII whitespace stripped and
-// collapsed; a document without a title has the empty title.
-const TITLE_WHITESPACE_EDGES = /^[\t\n\f\r ]+|[\t\n\f\r ]+$/g;
-const TITLE_WHITESPACE_RUNS = /[\t\n\f\r ]+/g;
-
-function isSvgRoot(element) {
-  return element !== null && element.namespaceURI === SVG_NS && element.localName === "svg";
-}
-
-function documentTitleElement(document) {
-  const root = document.documentElement;
-  if (isSvgRoot(root)) {
-    for (const child of root._childNodes) {
-      if (child.nodeType === 1 && child.namespaceURI === SVG_NS && child.localName === "title") return child;
-    }
-    return null;
-  }
-  const pending = root === null ? [] : [root];
-  while (pending.length > 0) {
-    const node = pending.pop();
-    if (node.namespaceURI === HTML_NS && node.localName === "title") return node;
-    for (let index = node._childNodes.length - 1; index >= 0; index--) {
-      if (node._childNodes[index].nodeType === 1) pending.push(node._childNodes[index]);
-    }
-  }
-  return null;
-}
-
+installShadowRootBindings({ adoptedStyleSheets, setAdoptedStyleSheets }, SDShadowRoot.prototype);
+// HTML `Document.title`: the core finds the title element, reads its text
+// and chooses where a write goes (document-title.watpart). An existing
+// title element keeps its identity and receives the value as its only
+// child.
 function documentTitleText(document) {
-  const element = documentTitleElement(document);
-  if (element === null) return "";
-  let text = "";
-  for (const child of element._childNodes) {
-    if (child.nodeType === 3) text += child.data;
-  }
-  return text.replace(TITLE_WHITESPACE_EDGES, "").replace(
-    TITLE_WHITESPACE_RUNS,
-    " ",
-  );
+  return document._domCore.string("document_title_text", document._coreHandle);
 }
 
-// An existing title element keeps its identity and receives the value as its
-// only child.
 function setDocumentTitleText(document, value) {
-  const root = document.documentElement;
-  let title = documentTitleElement(document);
-  if (title === null) {
-    if (isSvgRoot(root)) {
-      title = document.createElementNS(SVG_NS, "title");
-      root.insertBefore(title, root.firstChild);
-    } else {
-      if (root === null || root.namespaceURI !== HTML_NS) return;
-      const head = document.head;
-      if (head === null) return;
-      title = document.createElement("title");
-      head.appendChild(title);
-    }
-  } else if (!isSvgRoot(root) && root.namespaceURI !== HTML_NS) {
-    return;
+  const core = document._domCore;
+  const target = core.status("document_title_target", document._coreHandle);
+  let title;
+  if (target === TITLE_TARGET_NONE) return;
+  if (target === TITLE_TARGET_ELEMENT) {
+    title = core.wrapperFor(core.status("document_title_element", document._coreHandle));
+  } else if (target === TITLE_TARGET_SVG) {
+    const root = document.documentElement;
+    title = document.createElementNS(SVG_NS, "title");
+    root.insertBefore(title, root.firstChild);
+  } else {
+    title = document.createElement("title");
+    document.head.appendChild(title);
   }
-  title.replaceChildren(
-    ...(value === "" ? [] : [document.createTextNode(value)]),
-  );
+  // The DOM's "string replace all".
+  title.textContent = value;
 }
 
 installPrototypeEventHandlers(SDDocument.prototype, DOCUMENT_EVENT_HANDLER_TYPES);
+const documentImplementations = new WeakMap();
 installDocumentBindings({
   SDTextNode, SDComment, SDDocumentFragment, SDCDATASection,
-  SDProcessingInstruction, SDDocumentType,
-  SDRange, SDTreeWalker, ensureNode, setAdoptedStyleSheets,
+  SDProcessingInstruction,
+  SDRange, SDTreeWalker, ensureNode, adoptedStyleSheets, setAdoptedStyleSheets,
   elementsByTagName, elementsByTagNameNS, elementsByClassName, elementsByName, querySelectorAll, sharedDomCore,
-  hasHostEnvironment(document) {
-    return document._componentEnvironment != null;
-  },
-  compatibilityMode(mode) {
-    return mode === 1 ? "BackCompat" : "CSS1Compat";
+  // HTML "has focus steps": a document with a host environment while its
+  // host gives it system focus (input_document_system_focused).
+  documentHasFocus(document) {
+    return document._componentEnvironment != null &&
+      document._domCore.status("input_document_system_focused", document._coreHandle) === 1;
   },
   documentTitleText,
   setDocumentTitleText,
   documentScrollingElement,
+  // Document.implementation is [SameObject].
+  implementation(document) {
+    let implementation = documentImplementations.get(document);
+    if (implementation === undefined) {
+      implementation = createDOMImplementation(document);
+      documentImplementations.set(document, implementation);
+    }
+    return implementation;
+  },
 }, SDDocument.prototype);
 installDocumentGeometryBindings(layoutGetters, SDDocument.prototype);
 installDocumentAnimationBindings({ documentAnimations, documentTimeline }, SDDocument.prototype);
+installEditingCommands(SDDocument.prototype);
 installCanvasResourceBindings({}, SDHTMLCanvasElement.prototype);
 // A placeholder canvas (transferControlToOffscreen()) cannot be resized
 // through its width and height attributes, as in Chrome; setAttribute()
@@ -2510,6 +2468,21 @@ for (const name of ["width", "height"]) {
     },
   });
 }
+// Fragment parsing marks its scripts "already started": inserting the
+// fragment runs none of them. Its content attributes set handlers.
+function parseHTMLFragmentWithEffects(context, source) {
+  const fragment = parseHTMLFragment(context, source);
+  context.ownerDocument?._scriptProcessing?.activateParsedHandlers(fragment);
+  imagesParsed(fragment);
+  markScriptsAlreadyStarted(fragment);
+  return fragment;
+}
+// The fragment of markup parsed in the context element: XML in an XML
+// document, else HTML.
+function parseMarkupFragment(context, source) {
+  return context.ownerDocument?._xmlDocument ? parseXMLFragment(context, source) : parseHTMLFragmentWithEffects(context, source);
+}
+
 const createDOMImplementation = installMarkupBindings({
   element: SDElement.prototype,
   htmlElement: SDHTMLElement.prototype,
@@ -2517,22 +2490,7 @@ const createDOMImplementation = installMarkupBindings({
   shadow: SDShadowRoot.prototype,
   document: SDDocument.prototype,
   script: SDHTMLScriptElement.prototype,
-}, {
-  // Fragment parsing marks its scripts "already started": inserting the
-  // fragment runs none of them. Its content attributes set handlers.
-  parseHTMLFragment(context, source) {
-    const fragment = parseHTMLFragment(context, source);
-    context.ownerDocument?._scriptProcessing?.activateParsedHandlers(fragment);
-    imagesParsed(fragment);
-    markScriptsAlreadyStarted(fragment);
-    return fragment;
-  },
-  parseXMLFragment,
-  serializeXMLNode, serializeXMLNodeContents,
-  serializeHTMLNode, serializeHTMLNodeContents,
-  SDTextNode, SDElement, SDDocument,
-  withCustomElementReactions,
-});
+}, { SDDocument, SDDocumentType });
 installShadowBindings({
   element: SDElement.prototype,
   htmlElement: SDHTMLElement.prototype,

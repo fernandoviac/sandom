@@ -18,22 +18,26 @@
 // "Clocks", the monotonic clock). A frame or a capture sample at time t
 // holds it at t or later until the source passes t; a source that goes back
 // is a defect of the host and throws.
+//
+// The clock rules (the monotonic check, the hold, the frame and timeline
+// times, the options and the 60 Hz frame boundary) are in
+// core/dom/frame-clock.watpart; this binding keeps the clock's state
+// numbers and its source functions.
 import { hostClearTimeout, hostNow, hostSetTimeout, hostTimeOrigin } from "../host-clock.js";
+import { sharedDomCore as core } from "../dom-wasm/core.js";
 
 // Without a host requestAnimationFrame (Deno), the live loop paces itself
 // as a 60 Hz display does: a frame runs at the next frame boundary of the
 // clock `now`, and the boundary is the frame's time. A timer can fire just
 // before its boundary; it then waits out the rest, so that the next request
 // computes the following boundary and no interval gets two frames.
-const HOST_FRAME_INTERVAL_MILLISECONDS = 1000 / 60;
 export function createDisplayFrameSource({ now, setTimer, clearTimer }) {
   return {
     requestFrame(callback) {
-      const boundary = (Math.floor(now() / HOST_FRAME_INTERVAL_MILLISECONDS) + 1) *
-        HOST_FRAME_INTERVAL_MILLISECONDS;
+      const boundary = core.exports.frame_clock_boundary(now());
       const request = { timer: 0 };
       const wait = () => {
-        const remaining = boundary - now();
+        const remaining = core.exports.frame_clock_wait(boundary, now());
         if (remaining > 0) request.timer = setTimer(wait, remaining);
         else callback(boundary);
       };
@@ -70,18 +74,8 @@ export const realClockSource = Object.freeze({
 // come only together, as the defaults. `timeOrigin` declares the epoch of
 // a caller's clock, so it comes only with `now`.
 export function assertClockOptions(options, label) {
-  if ((options.now === undefined) !== (options.requestFrame === undefined)) {
-    throw new TypeError(
-      options.now === undefined
-        ? `${label}: requestFrame requires now, the clock its frames run on; supply now as well or omit both for the host's real clock`
-        : `${label}: now requires requestFrame, the frame source on that clock; supply requestFrame as well or omit both for the host's real clock`,
-    );
-  }
-  if (options.timeOrigin !== undefined && options.now === undefined) {
-    throw new TypeError(
-      `${label}: timeOrigin requires now; the host's real clock has the host's own time origin`,
-    );
-  }
+  core.statusRaw("frame_clock_options_check", options.now === undefined ? 0 : 1,
+    options.requestFrame === undefined ? 0 : 1, options.timeOrigin === undefined ? 0 : 1, ...core.input(label));
 }
 
 export class DocumentClock {
@@ -91,9 +85,8 @@ export class DocumentClock {
     if (typeof now !== "function" || typeof requestFrame !== "function") {
       throw new TypeError("A document clock needs now and requestFrame functions");
     }
-    if (!Number.isFinite(timeOrigin)) {
-      throw new RangeError(`A document clock's timeOrigin must be a finite number of milliseconds from the Unix epoch, not ${timeOrigin}`);
-    }
+    core.statusRaw("frame_clock_origin_check", typeof timeOrigin === "number" ? timeOrigin : NaN,
+      ...core.input(String(timeOrigin)));
     this.source = Object.freeze({ now, requestFrame, cancelFrame: cancelFrame ?? (() => {}) });
     this.timeOrigin = timeOrigin;
     this.real = real;
@@ -106,22 +99,16 @@ export class DocumentClock {
   // The document's time: milliseconds from the time origin.
   now() {
     const time = this.source.now();
-    if (typeof time !== "number" || Number.isNaN(time)) {
-      throw new TypeError(`The document clock's now() returned ${String(time)}, not a number of milliseconds`);
-    }
-    if (time < this.lastSourceTime) {
-      throw new RangeError(
-        `The document clock's now() went back from ${this.lastSourceTime} to ${time}; a document's clock never decreases (High Resolution Time, §2.1)`,
-      );
-    }
+    if (typeof time !== "number") core.statusRaw("frame_clock_type_error", ...core.input(String(time)));
+    const documentTime = core.statusRaw("frame_clock_now", time, this.lastSourceTime, this.held);
     this.lastSourceTime = time;
-    return time > this.held ? time : this.held;
+    return documentTime;
   }
 
   // A frame of the clock's source ran at `time`: the document's time is at
   // least `time` from now on.
   hold(time) {
-    if (time > this.held) this.held = time;
+    this.held = core.exports.frame_clock_hold(this.held, time);
   }
 
   // An animation frame or a capture sample of the surface that drives the
@@ -129,21 +116,20 @@ export class DocumentClock {
   // `time` is the time of the document's latest animation frame.
   frame(time) {
     this.hold(time);
-    if (this.lastFrameTime === null || time > this.lastFrameTime) this.lastFrameTime = time;
+    this.lastFrameTime = core.exports.frame_clock_frame(this.lastFrameTime === null ? 0 : 1, this.lastFrameTime ?? 0, time);
   }
 
   // The page's wall clock for an injected clock: the time origin plus the
   // document's time, in whole milliseconds, as an ECMAScript time value.
   epochNow() {
-    return Math.floor(this.timeOrigin + this.now());
+    return core.exports.frame_clock_epoch(this.timeOrigin, this.now());
   }
 
   // `document.timeline.currentTime` (Web Animations, §4.3.1): the time of
   // the latest animation frame, or before the first one the document's
   // time; monotonically increasing.
   timelineTime() {
-    const time = this.lastFrameTime ?? this.now();
-    if (time > this.lastTimelineTime) this.lastTimelineTime = time;
+    this.lastTimelineTime = core.exports.frame_clock_hold(this.lastTimelineTime, this.lastFrameTime ?? this.now());
     return this.lastTimelineTime;
   }
 
@@ -181,9 +167,7 @@ export function fixDocumentClock(document) {
   const surfaces = [...(document._liveRenderSurfaces ?? [])].filter((surface) => !surface._shutdown);
   const first = surfaces[0];
   if (first !== undefined && surfaces.some((surface) => surface._now !== first._now)) {
-    throw new Error(
-      `The page of ${document.URL} begins while the surfaces over its document run on different clocks; give the document its clock when you create it (now, requestFrame, cancelFrame, timeOrigin)`,
-    );
+    core.status("frame_clock_fix_error", ...core.input(document.URL));
   }
   document._clock = first === undefined ? realDocumentClock() : first._clockForDocument();
   return document._clock;
@@ -202,6 +186,14 @@ class DocumentTimeline {
   get currentTime() {
     return this.#document._clock?.timelineTime() ?? null;
   }
+  static {
+    Object.defineProperty(this.prototype, Symbol.toStringTag, { value: "DocumentTimeline", configurable: true });
+  }
+}
+
+// Whether `value` is a document timeline (Animation.timeline's setter).
+export function isDocumentTimeline(value) {
+  return value instanceof DocumentTimeline;
 }
 
 const documentTimelines = new WeakMap();

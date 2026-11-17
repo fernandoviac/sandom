@@ -1,6 +1,21 @@
 import { DomCore, sharedDomCore } from "./dom-wasm/core.js";
 import { acquireFontByteSource } from "./dom-wasm/font-byte-binding.js";
 import { loadEngine } from "./wasm/loader.js";
+import { layoutConstant } from "./wasm/layout-table.js";
+
+const OPTIONAL_ABSENT = layoutConstant("OPTIONAL_ABSENT");
+const OPTIONAL_PRESENT = layoutConstant("OPTIONAL_PRESENT");
+const OPTIONAL_OTHER = layoutConstant("OPTIONAL_OTHER");
+// The tag rows of font-shaping-input.watpart and the shape result of
+// glyph-outlines.watpart, by WAT name.
+const FONT_TAG = Object.freeze(Object.fromEntries(["SIZE", "UNITS", "LENGTH", "TYPES", "VALUE", "STRING", "NUMBER"]
+  .map((name) => [name, layoutConstant(`FONT_TAG_${name}`)])));
+const SHAPE = Object.freeze(Object.fromEntries([
+  "RESULT_COUNT", "RESULT_UPEM", "RESULT_GLYPHS", "GLYPH_SIZE", "GLYPH_ID", "GLYPH_CLUSTER", "GLYPH_X_ADVANCE",
+  "GLYPH_Y_ADVANCE", "GLYPH_X_OFFSET", "GLYPH_Y_OFFSET",
+].map((name) => [name, layoutConstant(`SHAPE_${name}`)])));
+const OUTLINE_METADATA = Object.freeze(Object.fromEntries(["SIZE", "UPEM", "HAS_OPSZ", "OPSZ_MINIMUM", "OPSZ_DEFAULT",
+  "OPSZ_MAXIMUM"].map((name) => [name, layoutConstant(`OUTLINE_METADATA_${name}`)])));
 
 const textEncoder = new TextEncoder();
 
@@ -36,26 +51,26 @@ export function createShapingRuntime({
     }
     return acquireFontByteSource(core, fontBytes, "font_outline_acquire", [
       typeof faceIndex === "number" ? faceIndex : 0,
-      faceIndex === undefined ? 0 : typeof faceIndex === "number" ? 1 : 2,
+      faceIndex === undefined ? OPTIONAL_ABSENT : typeof faceIndex === "number" ? OPTIONAL_PRESENT : OPTIONAL_OTHER,
       mode,
     ]);
   }
 
   function encodeTags(records, features = false) {
-    const pointer = allocate(records.length * 24);
+    const pointer = allocate(records.length * FONT_TAG.SIZE);
     try {
       const view = new DataView(engine.memory.buffer);
       for (let index = 0; index < records.length; index++) {
         const [tag, value] = records[index];
-        const offset = pointer + index * 24;
+        const offset = pointer + index * FONT_TAG.SIZE;
         const string = typeof tag === "string";
         const number = typeof value === "number";
         for (let unit = 0; unit < 4; unit++) {
-          view.setUint16(offset + unit * 2, string ? tag.charCodeAt(unit) : 0, true);
+          view.setUint16(offset + FONT_TAG.UNITS + unit * Uint16Array.BYTES_PER_ELEMENT, string ? tag.charCodeAt(unit) : 0, true);
         }
-        view.setUint32(offset + 8, string ? tag.length : 0, true);
-        view.setUint32(offset + 12, Number(string) | (Number(number) << 1), true);
-        view.setFloat64(offset + 16, number ? value : NaN, true);
+        view.setUint32(offset + FONT_TAG.LENGTH, string ? tag.length : 0, true);
+        view.setUint32(offset + FONT_TAG.TYPES, (string ? FONT_TAG.STRING : 0) | (number ? FONT_TAG.NUMBER : 0), true);
+        view.setFloat64(offset + FONT_TAG.VALUE, number ? value : NaN, true);
       }
       core.status("font_tags_encode", pointer, records.length, Number(features));
       return pointer;
@@ -69,7 +84,7 @@ export function createShapingRuntime({
     variations = [], features = [], unitScale, faceIndex,
   } = {}) {
     unitScale = core.status("font_shape_scale", typeof unitScale === "number" ? unitScale : 0,
-      unitScale === undefined ? 0 : typeof unitScale === "number" ? 1 : 2);
+      unitScale === undefined ? OPTIONAL_ABSENT : typeof unitScale === "number" ? OPTIONAL_PRESENT : OPTIONAL_OTHER);
     await preload();
     const fontIndex = fontIndexFor(fontBytes, faceIndex, 0);
     const encodedText = textEncoder.encode(text);
@@ -85,17 +100,17 @@ export function createShapingRuntime({
       outputPointer = engine.exports.font_shape_text(fontIndex, textPointer, encodedText.length,
         variationPointer, variations.length, featurePointer, features.length, unitScale, 0);
       const view = new DataView(engine.memory.buffer);
-      const count = view.getUint32(outputPointer, true);
+      const count = view.getUint32(outputPointer + SHAPE.RESULT_COUNT, true);
       const glyphs = new Array(count);
       for (let index = 0; index < count; index++) {
-        const row = outputPointer + 8 + index * 24;
+        const row = outputPointer + SHAPE.RESULT_GLYPHS + index * SHAPE.GLYPH_SIZE;
         glyphs[index] = {
-          g: view.getUint32(row, true), cl: view.getUint32(row + 4, true),
-          ax: view.getInt32(row + 8, true), ay: view.getInt32(row + 12, true),
-          dx: view.getInt32(row + 16, true), dy: view.getInt32(row + 20, true),
+          g: view.getUint32(row + SHAPE.GLYPH_ID, true), cl: view.getUint32(row + SHAPE.GLYPH_CLUSTER, true),
+          ax: view.getInt32(row + SHAPE.GLYPH_X_ADVANCE, true), ay: view.getInt32(row + SHAPE.GLYPH_Y_ADVANCE, true),
+          dx: view.getInt32(row + SHAPE.GLYPH_X_OFFSET, true), dy: view.getInt32(row + SHAPE.GLYPH_Y_OFFSET, true),
         };
       }
-      return { glyphs, upem: view.getUint32(outputPointer + 4, true) };
+      return { glyphs, upem: view.getUint32(outputPointer + SHAPE.RESULT_UPEM, true) };
     } finally {
       engine.exports.abi_free(outputPointer);
       engine.exports.abi_free(featurePointer);
@@ -116,8 +131,8 @@ export function createShapingRuntime({
       variationPointer = encodeTags(variations);
       outputPointer = engine.exports.font_shape_glyph_ids(fontIndex, textPointer, encodedText.length,
         variationPointer, variations.length);
-      const count = new DataView(engine.memory.buffer).getUint32(outputPointer, true);
-      return new Uint32Array(engine.memory.buffer, outputPointer + 8, count).slice();
+      const count = new DataView(engine.memory.buffer).getUint32(outputPointer + SHAPE.RESULT_COUNT, true);
+      return new Uint32Array(engine.memory.buffer, outputPointer + SHAPE.RESULT_GLYPHS, count).slice();
     } finally {
       engine.exports.abi_free(outputPointer);
       engine.exports.abi_free(variationPointer);
@@ -133,12 +148,14 @@ export function createShapingRuntime({
   function createGlyphOutlineSourceSync(fontBytes, { faceIndex } = {}) {
     if (!engine) throw new Error("Native glyph outlines require preload before synchronous use");
     const fontIndex = fontIndexFor(fontBytes, faceIndex, 1);
-    const metadataPointer = allocate(20);
+    const metadataPointer = allocate(OUTLINE_METADATA.SIZE);
     engine.exports.font_outline_metadata(fontIndex, metadataPointer);
-    const metadata = new DataView(engine.memory.buffer, metadataPointer, 20);
-    const upem = metadata.getUint32(0, true);
-    const opszAxis = metadata.getUint32(4, true) === 0 ? null : {
-      min: metadata.getFloat32(8, true), default: metadata.getFloat32(12, true), max: metadata.getFloat32(16, true),
+    const metadata = new DataView(engine.memory.buffer, metadataPointer, OUTLINE_METADATA.SIZE);
+    const upem = metadata.getUint32(OUTLINE_METADATA.UPEM, true);
+    const opszAxis = metadata.getUint32(OUTLINE_METADATA.HAS_OPSZ, true) === 0 ? null : {
+      min: metadata.getFloat32(OUTLINE_METADATA.OPSZ_MINIMUM, true),
+      default: metadata.getFloat32(OUTLINE_METADATA.OPSZ_DEFAULT, true),
+      max: metadata.getFloat32(OUTLINE_METADATA.OPSZ_MAXIMUM, true),
     };
     let active = true;
     return {
@@ -148,7 +165,7 @@ export function createShapingRuntime({
         const variationPointer = encodeTags(variations);
         let font;
         try {
-          font = engine.exports.glyph_outline_font_create(fontIndex, variationPointer, variations.length, 1);
+          font = engine.exports.glyph_outline_font_create(fontIndex, variationPointer, variations.length, true);
         } finally {
           engine.exports.abi_free(variationPointer);
         }
@@ -174,30 +191,7 @@ export function createShapingRuntime({
     };
   }
 
-  // The outlines of `glyphIds` of the registered font `fontIndex` at
-  // `variations`, as glyph_outline_extract's verb streams. Synchronous: it
-  // needs an engine that is already loaded, as the renderer's is when it
-  // has shaped the glyphs (Canvas 2D text, src/dom/canvas-2d-text.js).
-  function glyphOutlinesSync(fontIndex, variations, glyphIds) {
-    if (!engine) throw new Error("glyphOutlinesSync needs a loaded engine");
-    const variationPointer = encodeTags(variations);
-    let font;
-    try {
-      font = engine.exports.glyph_outline_font_create(fontIndex, variationPointer, variations.length, 1);
-    } finally {
-      engine.exports.abi_free(variationPointer);
-    }
-    try {
-      return glyphIds.map((glyphId) => {
-        const pointer = engine.exports.glyph_outline_extract(font, glyphId);
-        return new Uint8Array(engine.memory.buffer, pointer, engine.exports.glyph_outline_length()).slice();
-      });
-    } finally {
-      engine.exports.glyph_outline_font_destroy(font);
-    }
-  }
-
-  return Object.freeze({ preload, shapeFontText, shapeGlyphIds, createGlyphOutlineSource, createGlyphOutlineSourceSync, glyphOutlinesSync,
+  return Object.freeze({ preload, shapeFontText, shapeGlyphIds, createGlyphOutlineSource, createGlyphOutlineSourceSync,
     instanceIdentity: () => engine?.hb ?? null,
   });
 }

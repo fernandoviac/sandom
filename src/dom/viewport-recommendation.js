@@ -1,230 +1,155 @@
-// Automatic viewport recommendation.
-//
-// The algorithm is a fitting check, not a search. It trusts direct
-// measurement and verifies each candidate with one real layout:
-//
-//   1. A declared root size is the author's answer. Select it.
-//   2. One intrinsic-size visual root (an image or an SVG) names its own
-//      size. Select it when the content fits.
-//   3. Otherwise the measured content bounds at the initial viewport give
-//      the candidate size. Verify with one layout at that size; when the
-//      content moved (viewport-relative layout), follow the new bounds,
-//      at most three steps.
-//   4. When no fitted size verifies, keep the initial viewport if the
-//      content fits inside it.
-//
-// Every candidate the algorithm lays out becomes one trial in the
-// result, in attempt order, so a caller can render the decision.
+// Automatic viewport recommendation. The core decides
+// (output-viewport.watpart): it asks for each candidate layout, measures
+// the facts that come back as one trial, and selects a trial or rejects
+// them all. This binding performs the layouts and builds the result
+// records from the core's trials, in attempt order, so a caller can render
+// the decision.
 
 import { inspectPreparedInput } from "./render-animation.js";
 import { sharedDomCore as core } from "../dom-wasm/core.js";
+import { layoutConstant } from "../wasm/layout-table.js";
 
-const CONTROL_NAMES = new Set([
-  "BUTTON",
-  "INPUT",
-  "SELECT",
-  "TEXTAREA",
-  "PROGRESS",
-  "METER",
-]);
-const VECTOR_DISPLAYS = new Set([
-  "svg",
-  "svg-path",
-  "svg-rect",
-  "svg-circle",
-  "svg-ellipse",
-  "svg-line",
-  "svg-polyline",
-  "svg-polygon",
-  "svg-text",
-]);
-const MAXIMUM_FIT_STEPS = 3;
+// The records of output-viewport.watpart, by WAT name without the
+// VIEWPORT_ prefix.
+const VIEWPORT = Object.freeze(Object.fromEntries([
+  "ROW_SIZE", "ROW_NODE", "ROW_FLAGS", "ROW_X", "ROW_Y", "ROW_WIDTH", "ROW_HEIGHT", "ROW_DECLARED_WIDTH",
+  "ROW_DECLARED_HEIGHT", "ROW_INTRINSIC_WIDTH", "ROW_INTRINSIC_HEIGHT", "ROW_NAME_POINTER", "ROW_NAME_LENGTH",
+  "ROW_DISPLAY_POINTER", "ROW_DISPLAY_LENGTH", "ROW_LAYS_OUT", "ROW_TEXT", "ROW_IMAGE", "ROW_BACKGROUND",
+  "ROW_VIEWPORT_SIZED", "ROW_NO_PARENT", "ROW_INTRINSIC",
+  "REQUEST_WIDTH", "REQUEST_HEIGHT",
+  "RESULT_SELECTED", "RESULT_CONFIDENCE", "RESULT_FIRST_REASON", "RESULT_REASON_COUNT",
+  "TRIAL_BOUNDS", "TRIAL_OUTER_SPACE", "TRIAL_OCCUPANCY", "TRIAL_SOURCE", "TRIAL_FLAGS", "TRIAL_LINE_COUNT",
+  "TRIAL_CONSTRAINT_COUNT", "TRIAL_CONSTRAINTS", "TRIAL_VALID", "TRIAL_OVERFLOW", "TRIAL_WRAPPING",
+  "TRIAL_CONTROL_OVERLAP", "CONSTRAINT_CODE", "CONSTRAINT_MESSAGE", "CONSTRAINT_NODE_COUNT", "CONSTRAINT_NODES",
+].map((name) => [name, layoutConstant(`VIEWPORT_${name}`)])));
+const F64 = Float64Array.BYTES_PER_ELEMENT;
+const U32 = Uint32Array.BYTES_PER_ELEMENT;
+const VIEWPORT_SESSION_LAYOUT = layoutConstant("VIEWPORT_SESSION_LAYOUT");
+const VIEWPORT_SESSION_SELECTED = layoutConstant("VIEWPORT_SESSION_SELECTED");
 
-function measureTrial(inspection, baselineTextLines) {
-  const { layout } = inspection;
-  const nodes = layout.nodes.filter((node) =>
-    node.participatesInLayout &&
-    (node.hasText || node.hasImage || CONTROL_NAMES.has(node.nodeName) ||
-      VECTOR_DISPLAYS.has(node.display) ||
-      (node.hasBackground && !node.viewportSizedBackground))
-  );
-  const boxes = nodes
-    .map((node) => node.borderBox)
-    .filter((box) => box.width > 0 && box.height > 0);
-  const bounds = boxes.length === 0
-    ? { x: 0, y: 0, width: 0, height: 0, right: 0, bottom: 0 }
-    : {
-      x: Math.min(...boxes.map((box) => box.x)),
-      y: Math.min(...boxes.map((box) => box.y)),
-      right: Math.max(...boxes.map((box) => box.x + box.width)),
-      bottom: Math.max(...boxes.map((box) => box.y + box.height)),
-    };
-  bounds.width = Math.max(0, bounds.right - bounds.x);
-  bounds.height = Math.max(0, bounds.bottom - bounds.y);
-  const viewport = layout.viewport;
-  const outerSpace = {
-    left: bounds.x,
-    top: bounds.y,
-    right: viewport.width - bounds.right,
-    bottom: viewport.height - bounds.bottom,
+function viewportText(id) {
+  core.status("output_viewport_text", id);
+  return core.outputString();
+}
+
+// The facts of one inspected layout as the core's submission rows.
+function submitInspection(session, layout) {
+  const encoder = new TextEncoder();
+  const names = layout.nodes.map((node) => encoder.encode(node.nodeName ?? ""));
+  const displays = layout.nodes.map((node) => encoder.encode(node.display ?? ""));
+  const textBytes = names.reduce((sum, bytes) => sum + bytes.byteLength, 0) +
+    displays.reduce((sum, bytes) => sum + bytes.byteLength, 0);
+  const rowBytes = layout.nodes.length * VIEWPORT.ROW_SIZE;
+  const lineBytes = layout.textLineBoxes.length * U32;
+  const byteLength = Math.max(8, rowBytes + lineBytes + textBytes);
+  const pointer = core.exports.abi_allocate(byteLength);
+  if (!pointer) core.throwIfError();
+  const bytes = core.refreshBytes();
+  const view = new DataView(bytes.buffer);
+  let text = pointer + rowBytes + lineBytes;
+  const place = (encoded) => {
+    bytes.set(encoded, text);
+    const at = text;
+    text += encoded.byteLength;
+    return at;
   };
-  const controlOverlapNodeIndices = new Set();
-  const controls = nodes.filter((node) => CONTROL_NAMES.has(node.nodeName));
-  for (let firstIndex = 0; firstIndex < controls.length; firstIndex++) {
-    const first = controls[firstIndex].borderBox;
-    for (
-      let secondIndex = firstIndex + 1;
-      secondIndex < controls.length;
-      secondIndex++
-    ) {
-      const second = controls[secondIndex].borderBox;
-      if (
-        first.x < second.x + second.width &&
-        first.x + first.width > second.x &&
-        first.y < second.y + second.height &&
-        first.y + first.height > second.y
-      ) {
-        controlOverlapNodeIndices.add(controls[firstIndex].nodeIndex);
-        controlOverlapNodeIndices.add(controls[secondIndex].nodeIndex);
-      }
-    }
+  layout.nodes.forEach((node, index) => {
+    const row = pointer + index * VIEWPORT.ROW_SIZE;
+    const box = node.borderBox;
+    view.setUint32(row + VIEWPORT.ROW_NODE, node.nodeIndex, true);
+    view.setUint32(row + VIEWPORT.ROW_FLAGS,
+      (node.participatesInLayout ? VIEWPORT.ROW_LAYS_OUT : 0) | (node.hasText ? VIEWPORT.ROW_TEXT : 0) |
+      (node.hasImage ? VIEWPORT.ROW_IMAGE : 0) | (node.hasBackground ? VIEWPORT.ROW_BACKGROUND : 0) |
+      (node.viewportSizedBackground ? VIEWPORT.ROW_VIEWPORT_SIZED : 0) |
+      (node.parentIndex === null ? VIEWPORT.ROW_NO_PARENT : 0) | (node.intrinsicDimensions ? VIEWPORT.ROW_INTRINSIC : 0),
+      true);
+    view.setFloat64(row + VIEWPORT.ROW_X, box?.x ?? 0, true);
+    view.setFloat64(row + VIEWPORT.ROW_Y, box?.y ?? 0, true);
+    view.setFloat64(row + VIEWPORT.ROW_WIDTH, box?.width ?? 0, true);
+    view.setFloat64(row + VIEWPORT.ROW_HEIGHT, box?.height ?? 0, true);
+    view.setFloat64(row + VIEWPORT.ROW_DECLARED_WIDTH, node.declaredWidth ?? NaN, true);
+    view.setFloat64(row + VIEWPORT.ROW_DECLARED_HEIGHT, node.declaredHeight ?? NaN, true);
+    view.setFloat64(row + VIEWPORT.ROW_INTRINSIC_WIDTH, node.intrinsicDimensions?.width ?? NaN, true);
+    view.setFloat64(row + VIEWPORT.ROW_INTRINSIC_HEIGHT, node.intrinsicDimensions?.height ?? NaN, true);
+    view.setUint32(row + VIEWPORT.ROW_NAME_POINTER, place(names[index]), true);
+    view.setUint32(row + VIEWPORT.ROW_NAME_LENGTH, names[index].byteLength, true);
+    view.setUint32(row + VIEWPORT.ROW_DISPLAY_POINTER, place(displays[index]), true);
+    view.setUint32(row + VIEWPORT.ROW_DISPLAY_LENGTH, displays[index].byteLength, true);
+  });
+  layout.textLineBoxes.forEach((line, index) =>
+    view.setUint32(pointer + rowBytes + index * U32, line.nodeIndex, true));
+  core.status("output_viewport_session_submit", session,
+    pointer, layout.nodes.length, pointer + rowBytes, layout.textLineBoxes.length,
+    layout.viewport.width, layout.viewport.height,
+    layout.overflow.left, layout.overflow.top, layout.overflow.right, layout.overflow.bottom,
+    layout.documentScrollBounds.width, layout.documentScrollBounds.height);
+}
+
+// The core's record of trial `sequence`, with the failed constraints that
+// name nodes of its layout.
+function readTrial(session, sequence, inspection) {
+  core.status("output_viewport_session_trial", session, sequence);
+  const output = core.exports.abi_output_pointer();
+  const view = new DataView(core.refreshBytes().buffer);
+  const numbers = (field, count) =>
+    Array.from({ length: count }, (_, index) => view.getFloat64(output + field + index * F64, true));
+  const word = (field) => view.getUint32(output + field, true);
+  const record = {
+    bounds: numbers(VIEWPORT.TRIAL_BOUNDS, 4),
+    outerSpace: numbers(VIEWPORT.TRIAL_OUTER_SPACE, 4),
+    occupancy: numbers(VIEWPORT.TRIAL_OCCUPANCY, 3),
+    source: word(VIEWPORT.TRIAL_SOURCE),
+    flags: word(VIEWPORT.TRIAL_FLAGS),
+    lineCount: word(VIEWPORT.TRIAL_LINE_COUNT),
+    constraints: [],
+  };
+  let cursor = output + VIEWPORT.TRIAL_CONSTRAINTS;
+  for (let index = word(VIEWPORT.TRIAL_CONSTRAINT_COUNT); index > 0; index--) {
+    const nodeCount = view.getUint32(cursor + VIEWPORT.CONSTRAINT_NODE_COUNT, true);
+    const nodes = cursor + VIEWPORT.CONSTRAINT_NODES;
+    record.constraints.push({
+      code: view.getUint32(cursor + VIEWPORT.CONSTRAINT_CODE, true),
+      message: view.getUint32(cursor + VIEWPORT.CONSTRAINT_MESSAGE, true),
+      nodeIndices: Array.from({ length: nodeCount }, (_, node) => view.getUint32(nodes + node * U32, true)),
+    });
+    cursor = nodes + nodeCount * U32;
   }
-  const lineCountByNode = new Map();
-  for (const line of layout.textLineBoxes) {
-    lineCountByNode.set(
-      line.nodeIndex,
-      (lineCountByNode.get(line.nodeIndex) ?? 0) + 1,
-    );
-  }
-  const lineCount = layout.textLineBoxes.length;
-  // Fit is judged by meaningful content only: the nodes measured for the
-  // bounds. Whitespace-only text runs and decorative full-bleed
-  // backgrounds lay out real boxes but show nothing; they must not fail
-  // a fitting trial.
-  const overflowNodeIndices = nodes.filter((node) =>
-    node.borderBox.width > 0 && node.borderBox.height > 0 &&
-    (node.borderBox.x < -0.5 || node.borderBox.y < -0.5 ||
-      node.borderBox.x + node.borderBox.width > viewport.width + 0.5 ||
-      node.borderBox.y + node.borderBox.height > viewport.height + 0.5)
-  ).map((node) => node.nodeIndex);
-  const documentOverflow = layout.overflow.left > 0.5 ||
-    layout.overflow.top > 0.5 ||
-    layout.overflow.right > 0.5 ||
-    layout.overflow.bottom > 0.5;
-  const overflow = documentOverflow || overflowNodeIndices.length > 0;
-  const avoidableWrapping = baselineTextLines !== null &&
-    lineCount > baselineTextLines.lineCount;
-  const avoidableWrappingNodeIndices = avoidableWrapping
-    ? [...lineCountByNode].filter(([nodeIndex, count]) =>
-      count > (baselineTextLines.lineCountByNode.get(nodeIndex) ?? 0)
-    ).map(([nodeIndex]) => nodeIndex)
-    : [];
-  const controlOverlap = controlOverlapNodeIndices.size > 0;
-  const valid = !overflow && !avoidableWrapping && !controlOverlap;
-  const area = viewport.width * viewport.height;
+  const factsByIndex = new Map(inspection.layout.nodes.map((node) => [node.nodeIndex, node]));
+  const viewport = inspection.layout.viewport;
+  const [x, y, width, height] = record.bounds;
+  const [left, top, right, bottom] = record.outerSpace;
   return {
-    inspection,
-    nodes,
-    bounds,
-    outerSpace,
-    lineCount,
-    lineCountByNode,
-    overflow,
-    documentOverflow,
-    overflowNodeIndices,
-    avoidableWrapping,
-    avoidableWrappingNodeIndices,
-    valid,
-    controlOverlap,
-    controlOverlapNodeIndices: [...controlOverlapNodeIndices],
-    occupiedWidthRatio: bounds.width / viewport.width,
-    occupiedHeightRatio: bounds.height / viewport.height,
-    occupiedAreaRatio: area === 0 ? 0 : bounds.width * bounds.height / area,
+    viewport: Object.freeze({ width: viewport.width, height: viewport.height }),
+    constraints: Object.freeze(record.constraints.map(({ code, message, nodeIndices }) =>
+      Object.freeze({
+        code: viewportText(code),
+        message: viewportText(message),
+        nodes: Object.freeze(nodeIndices.map((nodeIndex) => {
+          const node = factsByIndex.get(nodeIndex);
+          return Object.freeze({ nodeIndex, nodeName: node?.nodeName ?? null, id: node?.id ?? null });
+        })),
+      })
+    )),
+    trial: Object.freeze({
+      sequence,
+      viewport: Object.freeze({ width: viewport.width, height: viewport.height }),
+      source: viewportText(record.source),
+      valid: (record.flags & VIEWPORT.TRIAL_VALID) !== 0,
+      contentBounds: Object.freeze({ x, y, width, height }),
+      outerSpace: Object.freeze({ left, top, right, bottom }),
+      occupancy: Object.freeze({
+        horizontal: record.occupancy[0],
+        vertical: record.occupancy[1],
+        area: record.occupancy[2],
+      }),
+      controlOverlap: (record.flags & VIEWPORT.TRIAL_CONTROL_OVERLAP) !== 0,
+      documentScrollBounds: Object.freeze({ ...inspection.layout.documentScrollBounds }),
+      overflow: (record.flags & VIEWPORT.TRIAL_OVERFLOW) !== 0,
+      avoidableWrapping: (record.flags & VIEWPORT.TRIAL_WRAPPING) !== 0,
+      textLineCount: record.lineCount,
+      failedConstraints: null,
+    }),
   };
-}
-
-function rejectionConstraint(trial, code, message, nodeIndices = []) {
-  const factsByIndex = new Map(
-    trial.inspection.layout.nodes.map((node) => [node.nodeIndex, node]),
-  );
-  return Object.freeze({
-    code,
-    message,
-    nodes: Object.freeze(nodeIndices.map((nodeIndex) => {
-      const node = factsByIndex.get(nodeIndex);
-      return Object.freeze({
-        nodeIndex,
-        nodeName: node?.nodeName ?? null,
-        id: node?.id ?? null,
-      });
-    })),
-  });
-}
-
-function failedConstraints(trial) {
-  const constraints = [];
-  if (trial.overflow) {
-    constraints.push(rejectionConstraint(
-      trial,
-      trial.documentOverflow ? "document-scroll-overflow" : "document-overflow",
-      trial.documentOverflow
-        ? "The document scroll extent exceeds the viewport"
-        : "Content extends beyond the viewport",
-      trial.overflowNodeIndices,
-    ));
-  }
-  if (trial.avoidableWrapping) {
-    constraints.push(rejectionConstraint(
-      trial,
-      "avoidable-text-wrapping",
-      "Text wraps into more lines than the initial layout",
-      trial.avoidableWrappingNodeIndices,
-    ));
-  }
-  if (trial.controlOverlap) {
-    constraints.push(rejectionConstraint(
-      trial,
-      "control-overlap",
-      "Interactive controls overlap",
-      trial.controlOverlapNodeIndices,
-    ));
-  }
-  return Object.freeze(constraints);
-}
-
-function publicTrial(trial, sequence) {
-  const viewport = trial.inspection.layout.viewport;
-  return Object.freeze({
-    sequence,
-    viewport: Object.freeze({
-      width: viewport.width,
-      height: viewport.height,
-    }),
-    source: trial.source,
-    valid: trial.valid,
-    contentBounds: Object.freeze({
-      x: trial.bounds.x,
-      y: trial.bounds.y,
-      width: trial.bounds.width,
-      height: trial.bounds.height,
-    }),
-    outerSpace: Object.freeze({ ...trial.outerSpace }),
-    occupancy: Object.freeze({
-      horizontal: trial.occupiedWidthRatio,
-      vertical: trial.occupiedHeightRatio,
-      area: trial.occupiedAreaRatio,
-    }),
-    controlOverlap: trial.controlOverlap,
-    documentScrollBounds: Object.freeze({
-      ...trial.inspection.layout.documentScrollBounds,
-    }),
-    overflow: trial.overflow,
-    avoidableWrapping: trial.avoidableWrapping,
-    textLineCount: trial.lineCount,
-    failedConstraints: Object.freeze(
-      failedConstraints(trial).map((constraint) => constraint.code),
-    ),
-  });
 }
 
 export async function recommendViewportFromInspection(
@@ -238,178 +163,58 @@ export async function recommendViewportFromInspection(
     { width: 1280, height: 720 };
   const limits = options.limits ?? {};
   const limitValues = [limits.minimumWidth, limits.minimumHeight, limits.maximumWidth, limits.maximumHeight];
-  const output = core.status("output_viewport_limits",
+  const session = core.handle("output_viewport_session_create",
     limitValues.reduce((present, value, index) => present | (value == null ? 0 : 1 << index), 0),
     ...limitValues.map((value) => value == null ? NaN : Number(value)),
     Number(initialViewport.width), Number(initialViewport.height));
-  const limitView = new DataView(core.refreshBytes().buffer, output, 48);
-  const [minimumWidth, minimumHeight, maximumWidth, maximumHeight, initialWidth, initialHeight] =
-    [0, 1, 2, 3, 4, 5].map((index) => limitView.getFloat64(index * 8, true));
-  const clampWidth = (value) => core.exports.output_viewport_clamp(minimumWidth, maximumWidth, value);
-  const clampHeight = (value) => core.exports.output_viewport_clamp(minimumHeight, maximumHeight, value);
-
-  const trials = [];
-  const trialByKey = new Map();
-  const layoutAt = async (width, height, source) => {
-    const key = `${width}x${height}`;
-    const existing = trialByKey.get(key);
-    if (existing) return existing;
-    const inspection = await inspectLayout({ width, height });
-    const trial = measureTrial(
-      inspection,
-      trials.length === 0 ? null : {
-        lineCount: trials[0].lineCount,
-        lineCountByNode: trials[0].lineCountByNode,
-      },
-    );
-    trial.source = source;
-    trialByKey.set(key, trial);
-    trials.push(trial);
-    return trial;
-  };
-  const selected = (trial, confidence, reasons) =>
-    Object.freeze({
+  try {
+    const inspections = [];
+    let action;
+    while ((action = core.status("output_viewport_session_next", session)) === VIEWPORT_SESSION_LAYOUT) {
+      const output = core.exports.abi_output_pointer();
+      const view = new DataView(core.refreshBytes().buffer);
+      const width = view.getFloat64(output + VIEWPORT.REQUEST_WIDTH, true);
+      const height = view.getFloat64(output + VIEWPORT.REQUEST_HEIGHT, true);
+      const inspection = await inspectLayout({ width, height });
+      inspections.push(inspection);
+      submitInspection(session, inspection.layout);
+    }
+    core.status("output_viewport_session_result", session);
+    const output = core.exports.abi_output_pointer();
+    const resultView = new DataView(core.refreshBytes().buffer);
+    const [selectedIndex, confidenceText, firstReason, reasonCount] =
+      [VIEWPORT.RESULT_SELECTED, VIEWPORT.RESULT_CONFIDENCE, VIEWPORT.RESULT_FIRST_REASON, VIEWPORT.RESULT_REASON_COUNT]
+        .map((field) => resultView.getUint32(output + field, true));
+    const records = inspections.map((inspection, sequence) => readTrial(session, sequence, inspection));
+    const trials = Object.freeze(records.map(({ trial, constraints }) =>
+      Object.freeze({ ...trial, failedConstraints: Object.freeze(constraints.map(({ code }) => code)) })
+    ));
+    const reasons = Array.from({ length: reasonCount }, (_, index) => viewportText(firstReason + index));
+    if (action === VIEWPORT_SESSION_SELECTED) {
+      return Object.freeze({
+        kind: "viewport-recommendation",
+        version: 1,
+        classification: "selected",
+        viewport: records[selectedIndex].viewport,
+        confidence: viewportText(confidenceText),
+        trials,
+        reasons: Object.freeze(reasons),
+      });
+    }
+    return Object.freeze({
       kind: "viewport-recommendation",
       version: 1,
-      classification: "selected",
-      viewport: Object.freeze({
-        width: trial.inspection.layout.viewport.width,
-        height: trial.inspection.layout.viewport.height,
-      }),
-      confidence,
-      trials: Object.freeze(
-        trials.map((entry, sequence) => publicTrial(entry, sequence)),
-      ),
-      reasons: Object.freeze(reasons),
+      classification: "none-valid",
+      viewport: null,
+      confidence: "unavailable",
+      rejections: Object.freeze(records.map(({ viewport, constraints }) =>
+        Object.freeze({ viewport, constraints }))),
+      trials,
+      reason: reasons[0],
     });
-
-  const initialTrial = await layoutAt(initialWidth, initialHeight, "initial");
-
-  // 1. A declared root size is the author's answer.
-  const documentRoot = initialTrial.inspection.layout.nodes.find((node) =>
-    node.nodeName === "HTML" && node.parentIndex === null
-  );
-  if (documentRoot?.declaredWidth && documentRoot?.declaredHeight) {
-    const declaredTrial = await layoutAt(
-      clampWidth(documentRoot.declaredWidth),
-      clampHeight(documentRoot.declaredHeight),
-      "declared-root-size",
-    );
-    return selected(declaredTrial, "high", [
-      "The document declares a complete root size",
-    ]);
+  } finally {
+    core.status("output_viewport_session_release", session);
   }
-
-  // 2. One intrinsic-size visual root names its own size.
-  const intrinsicContent = initialTrial.nodes.filter((node) =>
-    node.hasImage || node.nodeName?.toLowerCase() === "svg"
-  );
-  if (intrinsicContent.length === 1) {
-    const node = intrinsicContent[0];
-    const width = node.intrinsicDimensions?.width ?? node.declaredWidth;
-    const height = node.intrinsicDimensions?.height ?? node.declaredHeight;
-    if (width && height) {
-      const intrinsicTrial = await layoutAt(
-        clampWidth(width),
-        clampHeight(height),
-        "intrinsic-content-size",
-      );
-      if (intrinsicTrial.valid) {
-        return selected(intrinsicTrial, "high", [
-          "The document has one intrinsic-size visual root",
-          "The content fits that size without clipping or overflow",
-        ]);
-      }
-    }
-  }
-
-  // 3. The measured content bounds give the candidate. Follow the bounds
-  //    when the content moves under the new viewport.
-  let bounds = initialTrial.bounds;
-  let extentTrial = initialTrial;
-  for (
-    let step = 0;
-    step < MAXIMUM_FIT_STEPS && bounds.width > 0 && bounds.height > 0;
-    step++
-  ) {
-    const width = clampWidth(Math.max(
-      bounds.right,
-      extentTrial.inspection.layout.overflow.right > 0.5
-        ? extentTrial.inspection.layout.documentScrollBounds.width
-        : 0,
-    ));
-    const height = clampHeight(Math.max(
-      bounds.bottom,
-      extentTrial.inspection.layout.overflow.bottom > 0.5
-        ? extentTrial.inspection.layout.documentScrollBounds.height
-        : 0,
-    ));
-    const fittedTrial = await layoutAt(width, height, "fitted-bounds");
-    if (fittedTrial.valid) {
-      const responsiveToViewport =
-        Math.abs(fittedTrial.bounds.width - initialTrial.bounds.width) > 0.5 ||
-        Math.abs(fittedTrial.bounds.height - initialTrial.bounds.height) > 0.5;
-      if (initialTrial.valid && responsiveToViewport) {
-        return selected(initialTrial, "medium", [
-          "The content changes size with the viewport",
-          "The initial viewport is the stable caller policy for responsive content",
-        ]);
-      }
-      const anchored = bounds.x <= 0.5 && bounds.y <= 0.5;
-      return selected(fittedTrial, anchored ? "high" : "medium", [
-        "The viewport is the measured content extent",
-        "The content fits without clipping or unintended overflow",
-      ]);
-    }
-    const nextBounds = fittedTrial.bounds;
-    const nextWidth = clampWidth(Math.max(
-      nextBounds.right,
-      fittedTrial.inspection.layout.overflow.right > 0.5
-        ? fittedTrial.inspection.layout.documentScrollBounds.width
-        : 0,
-    ));
-    const nextHeight = clampHeight(Math.max(
-      nextBounds.bottom,
-      fittedTrial.inspection.layout.overflow.bottom > 0.5
-        ? fittedTrial.inspection.layout.documentScrollBounds.height
-        : 0,
-    ));
-    if (nextWidth === width && nextHeight === height) {
-      break;
-    }
-    bounds = nextBounds;
-    extentTrial = fittedTrial;
-  }
-
-  // 4. The initial viewport itself, when the content already fits there.
-  if (initialTrial.valid) {
-    return selected(initialTrial, "medium", [
-      "No fitted size verifies; the content fits the initial viewport",
-    ]);
-  }
-
-  const rejections = trials.map((trial) =>
-    Object.freeze({
-      viewport: Object.freeze({
-        width: trial.inspection.layout.viewport.width,
-        height: trial.inspection.layout.viewport.height,
-      }),
-      constraints: failedConstraints(trial),
-    })
-  );
-  return Object.freeze({
-    kind: "viewport-recommendation",
-    version: 1,
-    classification: "none-valid",
-    viewport: null,
-    confidence: "unavailable",
-    rejections: Object.freeze(rejections),
-    trials: Object.freeze(
-      trials.map((entry, sequence) => publicTrial(entry, sequence)),
-    ),
-    reason:
-      "No candidate satisfies the viewport constraints within the configured limits",
-  });
 }
 
 // `scrollbarStyle` selects the scrollbar style of every analytical trial

@@ -1,5 +1,5 @@
 // The same-device compositor binding (docs/specifications/gpu-command-stream.md).
-// Renderer-core (src/wasm/gpu-compositor.watpart) owns layer
+// Renderer-core (core/engine/gpu-compositor.watpart) owns layer
 // uniforms, instance packing, glyph quads, buffer capacity, bind groups, and
 // the composition pass. This module validates the public records, shapes
 // text, leases glyph atlases, and transports their values.
@@ -10,6 +10,25 @@ import { createGpuPipelineLibrary } from "./gpu-pipeline-library.js";
 import { shapeFontText } from "./shaping.js";
 import { decodeWebFont } from "./web-font.js";
 import { instantiateRendererCore } from "./wasm/renderer-core-binary.js";
+import { layoutConstant } from "./wasm/layout-table.js";
+
+const COMPOSITOR_LAYER_TEXTURE = layoutConstant("COMPOSITOR_LAYER_TEXTURE");
+const COMPOSITOR_LAYER_TEXT = layoutConstant("COMPOSITOR_LAYER_TEXT");
+// The compositor input fields (gpu-compositor.watpart COMPOSITOR_*), keyed
+// by their name without the prefix.
+const FIELD = Object.freeze(Object.fromEntries([
+  "TRANSFORM_A", "TRANSFORM_B", "TRANSFORM_C", "TRANSFORM_D", "TRANSFORM_E", "TRANSFORM_F",
+  "CLIP_FLAG", "CLIP_X", "CLIP_Y", "CLIP_WIDTH", "CLIP_HEIGHT",
+  "TEXTURE_SIZE", "TEXTURE_X", "TEXTURE_Y", "TEXTURE_WIDTH", "TEXTURE_HEIGHT", "TEXTURE_OPACITY",
+  "TEXTURE_TRANSFORM", "TEXTURE_CLIP",
+  "TEXT_SIZE", "TEXT_FONT_SIZE", "TEXT_UNITS_PER_EM", "TEXT_BASELINE_X", "TEXT_BASELINE_Y",
+  "TEXT_LETTER_SPACING", "TEXT_COLOR", "TEXT_OPACITY", "TEXT_TRANSFORM", "TEXT_CLIP",
+  "GLYPH_SIZE", "GLYPH_PRESENT", "GLYPH_WIDTH", "GLYPH_HEIGHT", "GLYPH_U", "GLYPH_V", "GLYPH_U_EXTENT",
+  "GLYPH_V_EXTENT", "GLYPH_X_MINIMUM", "GLYPH_X_MAXIMUM", "GLYPH_Y_MINIMUM", "GLYPH_Y_MAXIMUM",
+  "GLYPH_OFFSET_X", "GLYPH_OFFSET_Y", "GLYPH_ADVANCE_X", "GLYPH_ADVANCE_Y",
+  "COMPOSE_TARGET", "COMPOSE_WIDTH", "COMPOSE_HEIGHT", "COMPOSE_LAYER_COUNT", "COMPOSE_QUAD_BUFFER",
+  "COMPOSE_CLEAR_COLOR", "COMPOSE_LAYERS", "COMPOSE_LAYER_SIZE", "COMPOSE_LAYER_HANDLE", "COMPOSE_LAYER_SOURCE",
+].map((name) => [name, layoutConstant(`COMPOSITOR_${name}`)])));
 
 let compositorCore;
 
@@ -215,20 +234,20 @@ function normalizeTextRecord(record, previous = null) {
 }
 
 function writeTransform(view, offset, transform) {
-  view.setFloat64(offset, transform.a, true);
-  view.setFloat64(offset + 8, transform.b, true);
-  view.setFloat64(offset + 16, transform.c, true);
-  view.setFloat64(offset + 24, transform.d, true);
-  view.setFloat64(offset + 32, transform.e, true);
-  view.setFloat64(offset + 40, transform.f, true);
+  view.setFloat64(offset + FIELD.TRANSFORM_A, transform.a, true);
+  view.setFloat64(offset + FIELD.TRANSFORM_B, transform.b, true);
+  view.setFloat64(offset + FIELD.TRANSFORM_C, transform.c, true);
+  view.setFloat64(offset + FIELD.TRANSFORM_D, transform.d, true);
+  view.setFloat64(offset + FIELD.TRANSFORM_E, transform.e, true);
+  view.setFloat64(offset + FIELD.TRANSFORM_F, transform.f, true);
 }
 
 function writeClip(view, offset, clipRectangle) {
-  view.setFloat64(offset, clipRectangle === null ? 0 : 1, true);
-  view.setFloat64(offset + 8, clipRectangle?.x ?? 0, true);
-  view.setFloat64(offset + 16, clipRectangle?.y ?? 0, true);
-  view.setFloat64(offset + 24, clipRectangle?.width ?? 0, true);
-  view.setFloat64(offset + 32, clipRectangle?.height ?? 0, true);
+  view.setFloat64(offset + FIELD.CLIP_FLAG, clipRectangle === null ? 0 : 1, true);
+  view.setFloat64(offset + FIELD.CLIP_X, clipRectangle?.x ?? 0, true);
+  view.setFloat64(offset + FIELD.CLIP_Y, clipRectangle?.y ?? 0, true);
+  view.setFloat64(offset + FIELD.CLIP_WIDTH, clipRectangle?.width ?? 0, true);
+  view.setFloat64(offset + FIELD.CLIP_HEIGHT, clipRectangle?.height ?? 0, true);
 }
 
 export async function createGpuCompositor(options) {
@@ -270,15 +289,15 @@ export async function createGpuCompositor(options) {
   }
 
   function writeTextureLayer(handle, record) {
-    const view = gpu.input(128);
+    const view = gpu.input(FIELD.TEXTURE_SIZE);
     const rectangle = record.destinationRectangle;
-    view.setFloat64(0, rectangle.x, true);
-    view.setFloat64(8, rectangle.y, true);
-    view.setFloat64(16, rectangle.width, true);
-    view.setFloat64(24, rectangle.height, true);
-    view.setFloat64(32, record.opacity, true);
-    writeTransform(view, 40, record.transform);
-    writeClip(view, 88, record.clipRectangle);
+    view.setFloat64(FIELD.TEXTURE_X, rectangle.x, true);
+    view.setFloat64(FIELD.TEXTURE_Y, rectangle.y, true);
+    view.setFloat64(FIELD.TEXTURE_WIDTH, rectangle.width, true);
+    view.setFloat64(FIELD.TEXTURE_HEIGHT, rectangle.height, true);
+    view.setFloat64(FIELD.TEXTURE_OPACITY, record.opacity, true);
+    writeTransform(view, FIELD.TEXTURE_TRANSFORM, record.transform);
+    writeClip(view, FIELD.TEXTURE_CLIP, record.clipRectangle);
     core.gpu_compositor_texture_layer_set(handle, view.byteOffset);
   }
 
@@ -286,7 +305,7 @@ export async function createGpuCompositor(options) {
     requireActive();
     let current = normalizeTextureRecord(record);
     let layerDisposed = false;
-    const handle = core.gpu_compositor_layer_create(compositorState, 0);
+    const handle = core.gpu_compositor_layer_create(compositorState, COMPOSITOR_LAYER_TEXTURE);
     gpu.execute();
     writeTextureLayer(handle, current);
 
@@ -353,21 +372,21 @@ export async function createGpuCompositor(options) {
     }
     const record = state.current;
     const glyphs = state.shaped.glyphs;
-    const view = gpu.input(168 + glyphs.length * 120);
-    view.setFloat64(0, record.fontSize, true);
-    view.setFloat64(8, state.shaped.upem, true);
-    view.setFloat64(16, record.baselinePosition.x, true);
-    view.setFloat64(24, record.baselinePosition.y, true);
-    view.setFloat64(32, record.letterSpacing, true);
+    const view = gpu.input(FIELD.TEXT_SIZE + glyphs.length * FIELD.GLYPH_SIZE);
+    view.setFloat64(FIELD.TEXT_FONT_SIZE, record.fontSize, true);
+    view.setFloat64(FIELD.TEXT_UNITS_PER_EM, state.shaped.upem, true);
+    view.setFloat64(FIELD.TEXT_BASELINE_X, record.baselinePosition.x, true);
+    view.setFloat64(FIELD.TEXT_BASELINE_Y, record.baselinePosition.y, true);
+    view.setFloat64(FIELD.TEXT_LETTER_SPACING, record.letterSpacing, true);
     for (let channel = 0; channel < 4; channel++) {
-      view.setFloat64(40 + channel * 8, record.color[channel], true);
+      view.setFloat64(FIELD.TEXT_COLOR + channel * Float64Array.BYTES_PER_ELEMENT, record.color[channel], true);
     }
-    view.setFloat64(72, record.opacity, true);
-    writeTransform(view, 80, record.transform);
-    writeClip(view, 128, record.clipRectangle);
+    view.setFloat64(FIELD.TEXT_OPACITY, record.opacity, true);
+    writeTransform(view, FIELD.TEXT_TRANSFORM, record.transform);
+    writeClip(view, FIELD.TEXT_CLIP, record.clipRectangle);
     for (let index = 0; index < glyphs.length; index++) {
       const glyph = glyphs[index];
-      const offset = 168 + index * 120;
+      const offset = FIELD.TEXT_SIZE + index * FIELD.GLYPH_SIZE;
       const information = state.atlas.glyphInfo(
         glyph.g,
         record.weight,
@@ -375,23 +394,23 @@ export async function createGpuCompositor(options) {
         record.fontSize,
       );
       const present = Boolean(information && information.w > 0 && information.h > 0);
-      view.setFloat64(offset, present ? 1 : 0, true);
+      view.setFloat64(offset + FIELD.GLYPH_PRESENT, present ? 1 : 0, true);
       if (present) {
-        view.setFloat64(offset + 8, information.w, true);
-        view.setFloat64(offset + 16, information.h, true);
-        view.setFloat64(offset + 24, information.u, true);
-        view.setFloat64(offset + 32, information.v, true);
-        view.setFloat64(offset + 40, information.uW, true);
-        view.setFloat64(offset + 48, information.vH, true);
-        view.setFloat64(offset + 56, information.metrics.bboxXMin, true);
-        view.setFloat64(offset + 64, information.metrics.bboxXMax, true);
-        view.setFloat64(offset + 72, information.metrics.bboxYMin, true);
-        view.setFloat64(offset + 80, information.metrics.bboxYMax, true);
+        view.setFloat64(offset + FIELD.GLYPH_WIDTH, information.w, true);
+        view.setFloat64(offset + FIELD.GLYPH_HEIGHT, information.h, true);
+        view.setFloat64(offset + FIELD.GLYPH_U, information.u, true);
+        view.setFloat64(offset + FIELD.GLYPH_V, information.v, true);
+        view.setFloat64(offset + FIELD.GLYPH_U_EXTENT, information.uW, true);
+        view.setFloat64(offset + FIELD.GLYPH_V_EXTENT, information.vH, true);
+        view.setFloat64(offset + FIELD.GLYPH_X_MINIMUM, information.metrics.bboxXMin, true);
+        view.setFloat64(offset + FIELD.GLYPH_X_MAXIMUM, information.metrics.bboxXMax, true);
+        view.setFloat64(offset + FIELD.GLYPH_Y_MINIMUM, information.metrics.bboxYMin, true);
+        view.setFloat64(offset + FIELD.GLYPH_Y_MAXIMUM, information.metrics.bboxYMax, true);
       }
-      view.setFloat64(offset + 88, glyph.dx, true);
-      view.setFloat64(offset + 96, glyph.dy, true);
-      view.setFloat64(offset + 104, glyph.ax, true);
-      view.setFloat64(offset + 112, glyph.ay, true);
+      view.setFloat64(offset + FIELD.GLYPH_OFFSET_X, glyph.dx, true);
+      view.setFloat64(offset + FIELD.GLYPH_OFFSET_Y, glyph.dy, true);
+      view.setFloat64(offset + FIELD.GLYPH_ADVANCE_X, glyph.ax, true);
+      view.setFloat64(offset + FIELD.GLYPH_ADVANCE_Y, glyph.ay, true);
     }
     core.gpu_compositor_text_layer_set(state.handle, view.byteOffset, glyphs.length);
     gpu.execute();
@@ -472,7 +491,7 @@ export async function createGpuCompositor(options) {
       shaped: shapedRecord.shaped,
       atlas: null,
       atlasTexture: null,
-      handle: core.gpu_compositor_layer_create(compositorState, 1),
+      handle: core.gpu_compositor_layer_create(compositorState, COMPOSITOR_LAYER_TEXT),
       disposed: false,
       settledUpdate: Promise.resolve(),
     };
@@ -575,19 +594,20 @@ export async function createGpuCompositor(options) {
       let synchronousError = null;
       try {
         gpu.beginFrame();
-        const view = gpu.input(56 + record.layers.length * 8);
-        view.setUint32(0, gpu.importResource(record.targetView), true);
-        view.setUint32(4, record.width, true);
-        view.setUint32(8, record.height, true);
-        view.setUint32(12, record.layers.length, true);
-        view.setUint32(16, gpu.importResource(library.quadBuffer), true);
+        const view = gpu.input(FIELD.COMPOSE_LAYERS + record.layers.length * FIELD.COMPOSE_LAYER_SIZE);
+        view.setUint32(FIELD.COMPOSE_TARGET, gpu.importResource(record.targetView), true);
+        view.setUint32(FIELD.COMPOSE_WIDTH, record.width, true);
+        view.setUint32(FIELD.COMPOSE_HEIGHT, record.height, true);
+        view.setUint32(FIELD.COMPOSE_LAYER_COUNT, record.layers.length, true);
+        view.setUint32(FIELD.COMPOSE_QUAD_BUFFER, gpu.importResource(library.quadBuffer), true);
         for (let channel = 0; channel < 4; channel++) {
-          view.setFloat64(24 + channel * 8, clearColor[channel], true);
+          view.setFloat64(FIELD.COMPOSE_CLEAR_COLOR + channel * Float64Array.BYTES_PER_ELEMENT, clearColor[channel], true);
         }
         for (let index = 0; index < record.layers.length; index++) {
           const [layerHandle, sourceHandle] = layerSources.get(record.layers[index])();
-          view.setUint32(56 + index * 8, layerHandle, true);
-          view.setUint32(60 + index * 8, sourceHandle, true);
+          const layer = FIELD.COMPOSE_LAYERS + index * FIELD.COMPOSE_LAYER_SIZE;
+          view.setUint32(layer + FIELD.COMPOSE_LAYER_HANDLE, layerHandle, true);
+          view.setUint32(layer + FIELD.COMPOSE_LAYER_SOURCE, sourceHandle, true);
         }
         core.gpu_compositor_compose(compositorState, view.byteOffset);
         gpu.execute();

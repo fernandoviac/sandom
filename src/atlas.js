@@ -8,6 +8,25 @@ import { hostNow } from "./host-clock.js";
 import { createShapingRuntime } from "./shaping.js";
 import * as GlyphPolicy from "./wasm/glyph-policy-atlas-interface.js";
 import { createGpuBinding } from "./gpu-binding.js";
+import { layoutConstant } from "./wasm/layout-table.js";
+
+// The retirement events, outline variation records and prepared glyph
+// header of the atlas watparts, by WAT name.
+const ATLAS_RETIREMENT = Object.freeze(Object.fromEntries(["SIZE", "CONSUMER", "TEXTURE"]
+  .map((name) => [name, layoutConstant(`ATLAS_RETIREMENT_${name}`)])));
+const OUTLINE_VARIATION = Object.freeze(Object.fromEntries(["SIZE", "TAG", "VALUE", "BASE_COUNT"]
+  .map((name) => [name, layoutConstant(`OUTLINE_VARIATION_${name}`)])));
+const VARIATION_CONTROL_COUNT = layoutConstant("VARIATION_CONTROL_COUNT");
+const GLYPH_PREPARED_WIDTH = layoutConstant("GLYPH_PREPARED_WIDTH");
+const GLYPH_PREPARED_HEIGHT = layoutConstant("GLYPH_PREPARED_HEIGHT");
+
+const ATLAS_KIND_GLYPH = layoutConstant("ATLAS_KIND_GLYPH");
+const ATLAS_KIND_PATH = layoutConstant("ATLAS_KIND_PATH");
+const ATLAS_ENTRY_LIMIT = layoutConstant("ATLAS_ENTRY_LIMIT");
+const ATLAS_CHANGE = Object.freeze(Object.fromEntries(["SIZE", "X", "Y", "WIDTH", "HEIGHT"]
+  .map((name) => [name, layoutConstant(`ATLAS_CHANGE_${name}`)])));
+const GPU_ATLAS_KEY = Object.freeze(Object.fromEntries(["SIZE", "GLYPH", "WEIGHT", "OPTICAL", "SIZE_PX", "X", "Y"]
+  .map((name) => [name, layoutConstant(`GPU_ATLAS_KEY_${name}`)])));
 
 
 export function transportNativePacket(source, destination, packet, consume) {
@@ -71,12 +90,12 @@ function nativeGlyphTiming(Module) {
   const timingView = new DataView(
     Module.generator.HEAPU8.buffer,
     timingPointer,
-    NATIVE_GLYPH_TIMING_FIELDS.length * 8,
+    NATIVE_GLYPH_TIMING_FIELDS.length * Float64Array.BYTES_PER_ELEMENT,
   );
   return Object.fromEntries(
     NATIVE_GLYPH_TIMING_FIELDS.map((field, index) => [
       field,
-      timingView.getFloat64(index * 8, true),
+      timingView.getFloat64(index * Float64Array.BYTES_PER_ELEMENT, true),
     ]),
   );
 }
@@ -129,9 +148,9 @@ export function createAtlasRuntime({
     if (!wasmModule) return;
     let event;
     while ((event = wasmModule.exports.atlas_retirement_next()) !== 0) {
-      const view = new DataView(wasmModule.memory.buffer, event, 16);
-      const consumer = view.getUint32(4, true);
-      const texture = view.getUint32(8, true);
+      const view = new DataView(wasmModule.memory.buffer, event, ATLAS_RETIREMENT.SIZE);
+      const consumer = view.getUint32(ATLAS_RETIREMENT.CONSUMER, true);
+      const texture = view.getUint32(ATLAS_RETIREMENT.TEXTURE, true);
       wasmModule.exports.atlas_retirement_acknowledge(event);
       const recipient = retirementRecipients.get(consumer);
       if (!recipient) throw new Error(`Native atlas retirement consumer ${consumer} is unregistered; complete its retirement effects before closing it`);
@@ -323,10 +342,14 @@ export function createAtlasRuntime({
       const replace = native.atlas_consumer_replace(consumer) !== 0;
       const pointer = native.atlas_consumer_changes(consumer);
       const count = native.atlas_consumer_change_count(consumer);
-      const rows = new Uint32Array(wasmModule.memory.buffer, pointer, count * 4);
-      const rectangles = Array.from({ length: count }, (_, index) => ({
-        x: rows[index * 4], y: rows[index * 4 + 1], width: rows[index * 4 + 2], height: rows[index * 4 + 3],
-      }));
+      const view = new DataView(wasmModule.memory.buffer, pointer, count * ATLAS_CHANGE.SIZE);
+      const rectangles = Array.from({ length: count }, (_, index) => {
+        const row = index * ATLAS_CHANGE.SIZE;
+        return {
+          x: view.getUint32(row + ATLAS_CHANGE.X, true), y: view.getUint32(row + ATLAS_CHANGE.Y, true),
+          width: view.getUint32(row + ATLAS_CHANGE.WIDTH, true), height: view.getUint32(row + ATLAS_CHANGE.HEIGHT, true),
+        };
+      });
       return { replace, rectangles };
     }
 
@@ -395,14 +418,14 @@ export function createAtlasRuntime({
     }
 
     _gpuKeys(state, descriptors) {
-      const input = state.binding.input(descriptors.length * 32);
+      const input = state.binding.input(descriptors.length * GPU_ATLAS_KEY.SIZE);
       for (let index = 0; index < descriptors.length; index++) {
         const glyph = descriptors[index];
-        const offset = index * 32;
-        input.setUint32(offset, glyph.glyphId, true);
-        input.setFloat32(offset + 4, glyph.weight, true);
-        input.setFloat64(offset + 8, glyph.opticalSize ?? Number.NaN, true);
-        input.setFloat64(offset + 16, glyph.devicePixelSize ?? 0, true);
+        const offset = index * GPU_ATLAS_KEY.SIZE;
+        input.setUint32(offset + GPU_ATLAS_KEY.GLYPH, glyph.glyphId, true);
+        input.setFloat32(offset + GPU_ATLAS_KEY.WEIGHT, glyph.weight, true);
+        input.setFloat64(offset + GPU_ATLAS_KEY.OPTICAL, glyph.opticalSize ?? Number.NaN, true);
+        input.setFloat64(offset + GPU_ATLAS_KEY.SIZE_PX, glyph.devicePixelSize ?? 0, true);
       }
       return input.byteOffset;
     }
@@ -436,8 +459,8 @@ export function createAtlasRuntime({
       native.gpu_atlas_placements(state.handle, pointer, generatedGlyphs.length);
       const view = new DataView(wasmModule.memory.buffer);
       const placements = generatedGlyphs.map((_, index) => ({
-        x: view.getUint32(pointer + index * 32 + 24, true),
-        y: view.getUint32(pointer + index * 32 + 28, true),
+        x: view.getUint32(pointer + index * GPU_ATLAS_KEY.SIZE + GPU_ATLAS_KEY.X, true),
+        y: view.getUint32(pointer + index * GPU_ATLAS_KEY.SIZE + GPU_ATLAS_KEY.Y, true),
       }));
       const copyMilliseconds = hostNow() - startedAt;
       try {
@@ -529,16 +552,19 @@ export function createAtlasRuntime({
 
   /**
    * Font-level glyph atlas — one wasm atlas handle per font instance: the
-   * font file and the 'wdth' coordinate (variationWidth; 0 for none) and
-   * 'slnt' coordinate (variationSlant; 0 for upright) every glyph is
+   * font file, the 'wdth' coordinate (variationWidth; 0 for none), the
+   * 'slnt' coordinate (variationSlant; 0 for upright) and the variation
+   * control (variationControl: a pointer to the font record's owned
+   * control in the atlas module's memory, 0 for none) every glyph is
    * outlined at.
    */
   class GlyphAtlas extends WasmAtlas {
-    constructor(fontBytes, variationWidth = 0, variationSlant = 0, faceIndex = 0) {
-      super(0);
+    constructor(fontBytes, variationWidth = 0, variationSlant = 0, faceIndex = 0, variationControl = 0) {
+      super(ATLAS_KIND_GLYPH);
       this.fontBytes = fontBytes;
       this.variationWidth = variationWidth;
       this.variationSlant = variationSlant;
+      this.variationControl = variationControl;
       this.faceIndex = faceIndex;
       this.unitsPerEm = 0;
       // Registered HarfBuzz face in fused renderer memory. The native
@@ -547,21 +573,27 @@ export function createAtlasRuntime({
       this._outlineSource = null;
     }
 
-    // The variation instance a glyph is outlined at: the requested weight,
-    // the atlas's width and slant (a font without a 'slnt' axis ignores
-    // it), and the clamped optical size (opsz-less fonts take none).
+    // The variation instance a glyph is outlined at, as
+    // glyph_outline_variations composes it: the requested weight, the
+    // atlas's width, slant and variation control, and the clamped optical
+    // size.
     _outlineVariations(Module, weight, opszCss) {
-      const variations = [["wght", weight], ["slnt", this.variationSlant]];
-      if (this.variationWidth !== 0) {
-        variations.push(["wdth", this.variationWidth]);
+      const pairs = this.variationControl === 0
+        ? 0 : new DataView(Module.memory.buffer).getUint32(this.variationControl + VARIATION_CONTROL_COUNT, true);
+      const pointer = Module.exports.abi_malloc((OUTLINE_VARIATION.BASE_COUNT + pairs) * OUTLINE_VARIATION.SIZE);
+      try {
+        const count = Module.exports.glyph_outline_variations(this.id, weight, opszCss ?? Number.NaN,
+          this.variationWidth, this.variationSlant, this.variationControl, pointer);
+        const view = new DataView(Module.memory.buffer, pointer, count * OUTLINE_VARIATION.SIZE);
+        return Array.from({ length: count }, (_, index) => {
+          const row = index * OUTLINE_VARIATION.SIZE;
+          const tag = view.getUint32(row + OUTLINE_VARIATION.TAG, true);
+          return [String.fromCharCode(tag >>> 24, (tag >>> 16) & 0xff, (tag >>> 8) & 0xff, tag & 0xff),
+            view.getFloat32(row + OUTLINE_VARIATION.VALUE, true)];
+        });
+      } finally {
+        Module.exports.abi_free(pointer);
       }
-      if (this._outlineSource.opszAxis) {
-        variations.push([
-          "opsz",
-          Module.exports.atlas_resolve_opsz(this.id, opszCss ?? Number.NaN),
-        ]);
-      }
-      return variations;
     }
 
     async _ensureCreated() {
@@ -691,7 +723,7 @@ export function createAtlasRuntime({
 
             if (slot < 0) {
               throw new Error(
-                `glyph atlas insert failed for glyphId ${glyphId}; the native entry limit is 4096; release unused atlas resources`,
+                `glyph atlas insert failed for glyphId ${glyphId}; the native entry limit is ${ATLAS_ENTRY_LIMIT}; release unused atlas resources`,
               );
             }
             const info = this._infoFloats(slot);
@@ -841,8 +873,8 @@ export function createAtlasRuntime({
                 preparedGeometry.byteOffset,
                 preparedGeometry.byteLength,
               );
-              const width = view.getUint32(8, true);
-              const height = view.getUint32(12, true);
+              const width = view.getUint32(GLYPH_PREPARED_WIDTH, true);
+              const height = view.getUint32(GLYPH_PREPARED_HEIGHT, true);
               generatedGlyphs.push(Object.freeze({
                 glyphId,
                 weight,
@@ -1146,20 +1178,29 @@ export function createAtlasRuntime({
    */
   class SvgPathAtlas extends WasmAtlas {
     constructor({ coverageMode = false } = {}) {
-      super(1);
+      super(ATLAS_KIND_PATH);
       this._pathBoundsByKey = new Map();
       this.coverageMode = coverageMode;
       // pathIndex -> the entry its alias was last ensured from, with the
-      // atlas handle. The atlas never evicts an entry, so a path index
-      // ensured again from the same definition and screen size names the
-      // same slot: ensurePaths skips it instead of encoding its `d` string
-      // and probing the atlas every frame.
+      // atlas handle and slot. A path index ensured again from the same
+      // definition and screen size names the same slot while that entry
+      // stays: ensurePaths touches it instead of encoding its `d` string and
+      // probing the atlas every frame, and ensures it again once the atlas
+      // has evicted it.
       this._ensuredByPathIndex = new Map();
     }
 
     destroy() {
       this._ensuredByPathIndex.clear();
       super.destroy();
+    }
+
+    // Begins a rendered frame: the entries that the frame does not ensure
+    // before the next rebuildAtlas count as unused, and the atlas frees them
+    // once they outweigh the used ones (core/engine/glyph-atlas.watpart,
+    // $atlasPathEvict). Synchronous: the frame's own timing stays as it was.
+    beginFrame() {
+      this._ensureCreatedSync().exports.atlas_path_frame_begin(this.id);
     }
 
     get generationCount() {
@@ -1211,11 +1252,13 @@ export function createAtlasRuntime({
     }
 
     /**
-     * Ensure MSDFs exist for the given { pathDef, fillRule, screenSize,
-     * pathIndex?, stroke? } combinations — same entry shape as before (see
+     * Ensure entries exist for the given { pathDef, fillRule, screenSize,
+     * pathIndex?, stroke?, coverage?, device? } combinations (see
      * render-scene.js's callers). stroke selects the stroke-outline shape
-     * (stroke-outline shapes get their own atlas entry); pathIndex registers the CMD_SVG_PATH alias resolved
-     * by getPathByIndex.
+     * (stroke-outline shapes get their own atlas entry); coverage a coverage
+     * entry at the screen size; device a device coverage raster, whose path
+     * index names it (core/dom/path-device-coverage.watpart); pathIndex
+     * registers the CMD_SVG_PATH alias resolved by getPathByIndex.
      */
     async ensurePaths(entries) {
       const Module = await this._ensureCreated();
@@ -1236,44 +1279,85 @@ export function createAtlasRuntime({
           continue;
         }
         const ensured = this._ensuredByPathIndex.get(entry.pathIndex);
-        if (
-          ensured !== undefined && ensured.id === this.id &&
+        const same = ensured !== undefined && ensured.id === this.id && ensured.generation === entry.generation &&
           ensured.pathDef === entry.pathDef && ensured.fillRule === entry.fillRule &&
-          ensured.stroke === entry.stroke && ensured.screenSize === entry.screenSize
-        ) continue;
+          ensured.stroke === entry.stroke && ensured.screenSize === entry.screenSize &&
+          ensured.coverage === entry.coverage && ensured.device === entry.device;
+        // A device raster is its covered tiles (core/dom/path-device-coverage
+        // .watpart). The core clears their list when the raster's definition
+        // changes, so it stays current while the core holds the list and the
+        // atlas holds every tile; each frame that draws it keeps them.
+        if (entry.device) {
+          const ready = Module.exports.svg_path_device_tiles_ready(entry.pathIndex);
+          if (ready < 0) throw new Error(`Device coverage index ${entry.pathIndex} has no device record; request it before ensuring it`);
+          if (
+            ready === 1 && ensured !== undefined && ensured.id === this.id &&
+            ensured.slots.every((slot) => Module.exports.atlas_entry_touch(this.id, slot) === 1)
+          ) continue;
+          const slots = this._devicePathCall(Module, entry.pathIndex, entry.pathDef, entry.fillRule, entry.stroke, entry.device);
+          this._ensuredByPathIndex.set(entry.pathIndex, { id: this.id, slots });
+          continue;
+        }
+        if (same && Module.exports.atlas_entry_touch(this.id, ensured.slot) === 1) continue;
         const slot = this._ensurePath(Module, entry);
         Module.exports.atlas_alias_path_index(this.id, entry.pathIndex, slot);
         this._ensuredByPathIndex.set(entry.pathIndex, {
           id: this.id,
+          generation: entry.generation,
+          slot,
           pathDef: entry.pathDef,
           fillRule: entry.fillRule,
           stroke: entry.stroke,
           screenSize: entry.screenSize,
+          coverage: entry.coverage,
+          device: entry.device,
         });
       }
     }
 
-    _ensurePath(Module, { pathDef, fillRule, screenSize, stroke }) {
-      const slot = this._pathCall(
-        Module.ensurePath,
-        pathDef,
-        fillRule,
-        screenSize,
-        stroke,
-      );
+    _ensurePath(Module, { pathDef, fillRule, screenSize, stroke, coverage = false }) {
+      const slot = this._pathCall(Module.ensurePath, pathDef, fillRule, screenSize, stroke, coverage);
       if (slot < 0) {
         throw new Error(
-          `SVG path atlas reached its 4096-entry limit; release unused atlas resources`,
+          `SVG path atlas reached its ${ATLAS_ENTRY_LIMIT}-entry limit; release unused atlas resources`,
         );
       }
       return slot;
+    }
+
+    // A device coverage entry: the stroke of `pathDef`, or its fill without
+    // a stroke, in the raster of device index `pathIndex`; the slots of its
+    // covered tiles.
+    _devicePathCall(Module, pathIndex, pathDef, fillRule, stroke, device) {
+      const pathBytes = textEncoder.encode(pathDef);
+      const pathPtr = Module.exports.abi_malloc(pathBytes.length || 1);
+      new Uint8Array(Module.memory.buffer).set(pathBytes, pathPtr);
+      if (stroke === null) {
+        try {
+          return Module.ensureDeviceFill(this.id, pathIndex, pathPtr, pathBytes.length, fillRule === "evenodd" ? 1 : 0,
+            device.matrix, device.width, device.height);
+        } finally {
+          Module.exports.abi_free(pathPtr);
+        }
+      }
+      const dashArray = stroke.dashArray;
+      const dashPtr = dashArray.length ? Module.exports.abi_malloc(dashArray.length * 4) : 0;
+      if (dashPtr) new Float32Array(Module.memory.buffer, dashPtr, dashArray.length).set(dashArray);
+      try {
+        return Module.ensureDevicePath(this.id, pathIndex, pathPtr, pathBytes.length, stroke.width, stroke.cap,
+          stroke.join, stroke.miterLimit, dashPtr, dashArray.length, stroke.dashPhase, device.matrix, device.width, device.height,
+          device.nonScalingStrokeScale);
+      } finally {
+        if (dashPtr) Module.exports.abi_free(dashPtr);
+        Module.exports.abi_free(pathPtr);
+      }
     }
 
     // Shared marshalling for ensure and lookup — the path bytes and the
     // normalized stroke params (cap/join default 0, miterLimit default 4,
     // dash by value) must be IDENTICAL between the two, or lookups silently
     // miss entries ensure just created.
-    _pathCall(wasmFunction, pathDef, fillRule, screenSize, stroke) {
+    _pathCall(wasmFunction, pathDef, fillRule, screenSize, stroke, coverage = false) {
       const Module = wasmModule;
       const pathBytes = textEncoder.encode(pathDef);
       const pathPtr = Module.exports.abi_malloc(pathBytes.length);
@@ -1301,7 +1385,7 @@ export function createAtlasRuntime({
         dashPtr,
         dashArray.length,
         stroke?.dashPhase ?? 0,
-        this.coverageMode ? 1 : 0,
+        coverage || this.coverageMode ? 1 : 0,
       );
       if (dashPtr) Module.exports.abi_free(dashPtr);
       Module.exports.abi_free(pathPtr);
@@ -1363,9 +1447,9 @@ export function createAtlasRuntime({
     initializeAtlasRuntime,
     GlyphAtlas,
     SvgPathAtlas,
-    glyphAtlasFromHandle(handle, fontIndex, variationWidth, variationSlant) {
+    glyphAtlasFromHandle(handle, fontIndex, variationWidth, variationSlant, variationControl = 0) {
       if (!wasmModule) throw new Error("Initialize the atlas runtime before adopting a native atlas handle");
-      const atlas = new GlyphAtlas(fontIndex, variationWidth, variationSlant);
+      const atlas = new GlyphAtlas(fontIndex, variationWidth, variationSlant, 0, variationControl);
       atlas._adoptNativeHandle(handle);
       atlas.unitsPerEm = wasmModule.exports.atlas_units_per_em(handle);
       return atlas;

@@ -1,40 +1,55 @@
-import { serializeToScene } from "./serialize.js";
+import { elementTransform, serializeToScene } from "./serialize.js";
 import { SandomHostError } from "../host/contract.js";
 import { validateClosedRecord } from "../closed-record.js";
-import { hostNow, hostTimeOrigin } from "../host-clock.js";
+import { microtaskCheckpoint } from "./microtask-checkpoint.js";
+import { hostClearTimeout, hostNow, hostSetTimeout, hostTimeOrigin } from "../host-clock.js";
+import { sharedDomCore } from "../dom-wasm/core.js";
+import { createFrameComparisonSession } from "../gpu-frame-comparison.js";
+import { readDocumentOutline } from "./document-outline.js";
+import { findNext, findText, setErrorRanges, setTargetText } from "./highlights.js";
 import { assertClockOptions, DocumentClock, documentTimeline, realClockSource } from "./document-clock.js";
 import {
-  createSceneRenderer,
+  openSceneRenderer,
   engineCounters,
+  hostGraphicsDevice,
   layoutTreeBoxes,
 } from "../scene-renderer.js";
 import {
   deliverRenderingObservers,
   documentHasRenderingObservers,
+  observerLayout,
 } from "./rendering-observers.js";
 import {
   animationsForElement,
   createDOMAnimation,
+  cssAnimationTiming,
   CSSAnimation,
   CSSTransition,
   removeReplacedAnimations,
   takePendingAnimations,
 } from "./animation.js";
-import { createEvent, dispatchEvent, SDAnimationPlaybackEvent } from "./events.js";
+import { isPseudoElementTarget, pseudoElementTarget } from "./pseudo-element-target.js";
+import { sendSpellcheckRequests } from "./spellcheck.js";
+import { sendPickerRequest } from "./host-picker.js";
+import { createEvent, createEventUsing, dispatchEvent, SDAnimationPlaybackEvent } from "./events.js";
 import { scheduleFocusFixup } from "./input-activation.js";
+import { computeLayoutBoxes } from "./live-geometry.js";
 import { SandomViewport } from "./viewport.js";
-import { computeScrollbars, snapshotScrollbars } from "./scrollbars.js";
+import { snapshotScrollbars } from "./scrollbars.js";
 import { paintScrollbars } from "./scrollbar-paint.js";
 import { assertScrollbarStyle, ScrollbarVisibility } from "./scrollbar-visibility.js";
 import { sampleScrollTimeline } from "./scroll-timeline.js";
 import { pageBox, pageCounters, pageMarginBoxes, parsePageRules, releasePageRules } from "./page-rules.js";
-import { PAGE_MARGIN_BOXES } from "../wasm/layout.js";
+import { pageOfPoint, pointOfPage } from "./page-stack.js";
 import {
   NativeScrollCapture,
   NativeScrollCollection,
+  SCROLL_COLLECTION,
+  SCROLL_SUPPRESS,
   NativeScrollMotions,
   NativeScrollSuppression,
   scrollCore,
+  elementScrollRead,
   scrollRead,
   scrollRequest,
   scrollState,
@@ -42,29 +57,143 @@ import {
 } from "./scroll-core.js";
 import {
   BOX_SNAPSHOT,
+  boxesEqual,
   boxesReadOnly,
   freezeBoxes,
   releaseBoxSnapshot,
 } from "../dom-wasm/geometry-wire.js";
-import { buildInteractionSnapshot } from "./presented-frame.js";
+import { buildInteractionSnapshot, deriveRestyleBasis } from "./presented-frame.js";
+import { buildGeometryFrameSuccessor, selectionRectangles } from "./geometry.js";
+import { recordUnanimatedProperty } from "./style.js";
 import {
-  keptTextGeometryFor,
-  sameTextGeometryValues,
-  selectionRectangles,
-  TextGeometryView,
-  uniqueCaretStops,
-} from "./geometry.js";
-import { recordUnanimatedProperty, resolvedElementFields, resolvedOverflowAxes } from "./style.js";
-import {
-  animationCSSInsertion,
+  cssAnimationSlots,
+  CSS_PLAN_KEEP,
+  CSS_PLAN_UPDATE,
+  AnimationValue,
   deferAnimationBinding,
+  animationFillMode,
+  keyframeMember,
+  KEYFRAME_MEMBER,
+  keyframePropertyNames,
+  placeCSSAnimation,
+  planCSSAnimations,
   reconcileAnimationDefinitions,
-  sampleAnimationContent as pseudoContentAt,
+  contentAnimationFrameStart,
+  contentAnimationTimes,
+  stackedAnimationContent,
+  setAnimationDependencyTime,
+  transitionCoversAnimationDependency,
 } from "../dom-wasm/animation.js";
 import { normalizeOffsets } from "../animations.js";
-import { instantiate as instantiateMotionCapture } from "../wasm/motion-capture-binary.js";
+import * as motionCaptureBinary from "../wasm/motion-capture-binary.js";
 import { createFrameBindings } from "./dom-bindings.generated.js";
-import { shadowIncludingParent } from "./shadow.js";
+import { layoutConstant, moduleLayoutConstants } from "../wasm/layout-table.js";
+import { nodeMember } from "./node-members.js";
+
+const instantiateMotionCapture = motionCaptureBinary.instantiate;
+const motionCaptureConstant = moduleLayoutConstants(motionCaptureBinary, "motion capture");
+
+// The codes that this file passes to or reads from WAT, by the names of
+// their WAT globals.
+const ANIMATION_RENDERED_CHANGE_CHANGES = layoutConstant("ANIMATION_RENDERED_CHANGE_CHANGES");
+const ANIMATION_RENDERED_CHANGE_UNKNOWN = layoutConstant("ANIMATION_RENDERED_CHANGE_UNKNOWN");
+const ANIMATION_VALUE_CURRENT_TIME = layoutConstant("ANIMATION_VALUE_CURRENT_TIME");
+const ANIMATION_VALUE_TRACK_GENERATION = layoutConstant("ANIMATION_VALUE_TRACK_GENERATION");
+const ANIMATION_VALUE_ENGINE_START_TIME = layoutConstant("ANIMATION_VALUE_ENGINE_START_TIME");
+const ANIMATION_VALUE_DURATION = layoutConstant("ANIMATION_VALUE_DURATION");
+const ANIMATION_VALUE_DELAY = layoutConstant("ANIMATION_VALUE_DELAY");
+const ANIMATION_VALUE_REVERSED = layoutConstant("ANIMATION_VALUE_REVERSED");
+const FRAME_ROOT_NULL = layoutConstant("FRAME_ROOT_NULL");
+const FRAME_ROOT_UNDEFINED = layoutConstant("FRAME_ROOT_UNDEFINED");
+const FRAME_ROOT_PRIMITIVE = layoutConstant("FRAME_ROOT_PRIMITIVE");
+const FRAME_ROOT_OBJECT = layoutConstant("FRAME_ROOT_OBJECT");
+const FRAME_ROOT_NODE = layoutConstant("FRAME_ROOT_NODE");
+const FRAME_ROOT_DOCUMENT_ELEMENT = layoutConstant("FRAME_ROOT_DOCUMENT_ELEMENT");
+const FRAME_BOX_X = layoutConstant("FRAME_BOX_X");
+const FRAME_BOX_Y = layoutConstant("FRAME_BOX_Y");
+const FRAME_BOX_WIDTH = layoutConstant("FRAME_BOX_WIDTH");
+const FRAME_BOX_HEIGHT = layoutConstant("FRAME_BOX_HEIGHT");
+const FRAME_OUTCOME_DONE = layoutConstant("FRAME_OUTCOME_DONE");
+const FRAME_FACT_GEOMETRY_CHANGED = layoutConstant("FRAME_FACT_GEOMETRY_CHANGED");
+const FRAME_FACT_OBSERVER_MUTATION = layoutConstant("FRAME_FACT_OBSERVER_MUTATION");
+const FRAME_FACT_RESIZE_SKIPPED = layoutConstant("FRAME_FACT_RESIZE_SKIPPED");
+const FRAME_FACT_PREPARATION_CHANGED = layoutConstant("FRAME_FACT_PREPARATION_CHANGED");
+const SCROLL_MOTION_MOMENTUM = layoutConstant("SCROLL_MOTION_MOMENTUM");
+const SCROLL_MOTION_INTERACTION = layoutConstant("SCROLL_MOTION_INTERACTION");
+const SCROLL_SMOOTH_PENDING = layoutConstant("SCROLL_SMOOTH_PENDING");
+const GEOMETRY_SCROLL_MIN_LEFT = layoutConstant("GEOMETRY_SCROLL_MIN_LEFT");
+const GEOMETRY_SCROLL_MAX_LEFT = layoutConstant("GEOMETRY_SCROLL_MAX_LEFT");
+const GEOMETRY_SCROLL_MIN_TOP = layoutConstant("GEOMETRY_SCROLL_MIN_TOP");
+const GEOMETRY_SCROLL_MAX_TOP = layoutConstant("GEOMETRY_SCROLL_MAX_TOP");
+const SCROLL_SCROLLED_DIRECTION = layoutConstant("SCROLL_SCROLLED_DIRECTION");
+const CONTAINER_SCROLLABLE_LEFT = layoutConstant("CONTAINER_SCROLLABLE_LEFT");
+const CONTAINER_STUCK_LEFT = layoutConstant("CONTAINER_STUCK_LEFT");
+const CONTAINER_SNAPPED_X = layoutConstant("CONTAINER_SNAPPED_X");
+const CONTAINER_SNAPPED_Y = layoutConstant("CONTAINER_SNAPPED_Y");
+const CONTAINER_SCROLLED_LEFT = layoutConstant("CONTAINER_SCROLLED_LEFT");
+const GEOMETRY_SCROLL_WIDTH = layoutConstant("GEOMETRY_SCROLL_WIDTH");
+const GEOMETRY_SCROLL_HEIGHT = layoutConstant("GEOMETRY_SCROLL_HEIGHT");
+const SCENE_BOX_TEXT = layoutConstant("SCENE_BOX_TEXT");
+const SYNC_LAYOUT_OFFER = layoutConstant("SYNC_LAYOUT_OFFER");
+const SYNC_LAYOUT_PEEK = layoutConstant("SYNC_LAYOUT_PEEK");
+const SYNC_LAYOUT_TAKE = layoutConstant("SYNC_LAYOUT_TAKE");
+// The restyle counters a frame reports, in the order of its counts.
+const FRAME_RESTYLE_COUNTS = Object.freeze(["RESTYLE_COUNT_ELEMENTS", "RESTYLE_COUNT_PSEUDO_ELEMENTS",
+  "RESTYLE_COUNT_PUBLICATION_ROWS", "RESTYLE_COUNT_SCENE_ELEMENTS", "RESTYLE_COUNT_SCENE_BOXES",
+  "RESTYLE_COUNT_ELEMENTS_UNCHANGED", "RESTYLE_COUNT_SCENE_SUBTREES_REPLAYED"].map((name) => layoutConstant(name)));
+const SCROLL_INPUT_EFFECT_SNAP_CHECK = layoutConstant("SCROLL_INPUT_EFFECT_SNAP_CHECK");
+const SCROLL_INPUT_EFFECT_DIRTY = layoutConstant("SCROLL_INPUT_EFFECT_DIRTY");
+const SCROLL_INPUT_EFFECT_SCHEDULE = layoutConstant("SCROLL_INPUT_EFFECT_SCHEDULE");
+const FRAME_CARET_ACTIVE = layoutConstant("FRAME_CARET_ACTIVE");
+const FRAME_CARET_PHASE_CHANGED = layoutConstant("FRAME_CARET_PHASE_CHANGED");
+const FRAME_LOOP_GATES = layoutConstant("FRAME_LOOP_GATES");
+const FRAME_LOOP_WORK = layoutConstant("FRAME_LOOP_WORK");
+const FRAME_GATE_TRANSACTION = layoutConstant("FRAME_GATE_TRANSACTION");
+const FRAME_GATE_STOPPED = layoutConstant("FRAME_GATE_STOPPED");
+const FRAME_GATE_SHUTDOWN = layoutConstant("FRAME_GATE_SHUTDOWN");
+const FRAME_GATE_RENDERING = layoutConstant("FRAME_GATE_RENDERING");
+const FRAME_GATE_CLOCK_ADVANCING = layoutConstant("FRAME_GATE_CLOCK_ADVANCING");
+const FRAME_GATE_REQUESTED = layoutConstant("FRAME_GATE_REQUESTED");
+const FRAME_WORK_ANIMATION_FRAME = layoutConstant("FRAME_WORK_ANIMATION_FRAME");
+const FRAME_WORK_DIRTY = layoutConstant("FRAME_WORK_DIRTY");
+const FRAME_WORK_CARET = layoutConstant("FRAME_WORK_CARET");
+const FRAME_WORK_SCROLLBAR = layoutConstant("FRAME_WORK_SCROLLBAR");
+const FRAME_WORK_SCROLL_END = layoutConstant("FRAME_WORK_SCROLL_END");
+const FRAME_WORK_SNAP_CHECK = layoutConstant("FRAME_WORK_SNAP_CHECK");
+const FRAME_WORK_SCROLL_INTERACTION = layoutConstant("FRAME_WORK_SCROLL_INTERACTION");
+const FRAME_WORK_TIMERS = layoutConstant("FRAME_WORK_TIMERS");
+const FRAME_WORK_FOLLOW = layoutConstant("FRAME_WORK_FOLLOW");
+const FRAME_CLOCK_FRAMES_NOW = layoutConstant("FRAME_CLOCK_FRAMES_NOW");
+const FRAME_CLOCK_TIMERS_AWAIT_FRAME = layoutConstant("FRAME_CLOCK_TIMERS_AWAIT_FRAME");
+const FRAME_RETAINED_CLEAN_SCENE_REUSE = layoutConstant("FRAME_RETAINED_CLEAN_SCENE_REUSE");
+const FRAME_RETAINED_PIXEL_READBACK = layoutConstant("FRAME_RETAINED_PIXEL_READBACK");
+const FRAME_RETAINED_CURRENT_PAGE = layoutConstant("FRAME_RETAINED_CURRENT_PAGE");
+const FRAME_RETAINED_PAGE_TARGET_STALE = layoutConstant("FRAME_RETAINED_PAGE_TARGET_STALE");
+const FRAME_RETAINED_CURRENT_TOOL_HIGHLIGHTS = layoutConstant("FRAME_RETAINED_CURRENT_TOOL_HIGHLIGHTS");
+const FRAME_RETAINED_NO_TRANSACTION = layoutConstant("FRAME_RETAINED_NO_TRANSACTION");
+const FRAME_RETAINED_RENDERED = layoutConstant("FRAME_RETAINED_RENDERED");
+const FRAME_RETAINED_PRESENTED = layoutConstant("FRAME_RETAINED_PRESENTED");
+const FRAME_RETAINED_DELIVERED = layoutConstant("FRAME_RETAINED_DELIVERED");
+const FRAME_RETAINED_UNCHANGED_INPUTS = layoutConstant("FRAME_RETAINED_UNCHANGED_INPUTS");
+const FRAME_RETAINED_ANIMATION_WORK = layoutConstant("FRAME_RETAINED_ANIMATION_WORK");
+const FRAME_RETAINED_MOMENTUM = layoutConstant("FRAME_RETAINED_MOMENTUM");
+const FRAME_RETAINED_RESULT_ANIMATES = layoutConstant("FRAME_RETAINED_RESULT_ANIMATES");
+const FRAME_RETAINED_NO_PENDING_DECLARATIONS = layoutConstant("FRAME_RETAINED_NO_PENDING_DECLARATIONS");
+const FRAME_RETAINED_RESULT_ARTIFACT = layoutConstant("FRAME_RETAINED_RESULT_ARTIFACT");
+const FRAME_RETAINED_WANTS_ARTIFACT = layoutConstant("FRAME_RETAINED_WANTS_ARTIFACT");
+const FRAME_RETAINED_RESULT_PIXELS = layoutConstant("FRAME_RETAINED_RESULT_PIXELS");
+const FRAME_RETAINED_WEBGL2 = layoutConstant("FRAME_RETAINED_WEBGL2");
+const FRAME_CAPTURE_SURFACE = layoutConstant("FRAME_CAPTURE_SURFACE");
+const FRAME_CAPTURE_MOTION = layoutConstant("FRAME_CAPTURE_MOTION");
+const FRAME_CAPTURE_SCHEDULE = layoutConstant("FRAME_CAPTURE_SCHEDULE");
+const MOTION_SCHEDULE_PREPARE = layoutConstant("MOTION_SCHEDULE_PREPARE");
+const MOTION_SCHEDULE_EFFECT = layoutConstant("MOTION_SCHEDULE_EFFECT");
+const MOTION_SCHEDULE_KEYFRAME = layoutConstant("MOTION_SCHEDULE_KEYFRAME");
+// The text geometry capture and store of geometry-text-capture.watpart and
+// geometry-text-store.watpart, by WAT name.
+const TEXT_CAPTURE_OPERATION_COUNT = layoutConstant("TEXT_CAPTURE_OPERATION_COUNT");
+const TEXT_STORE = Object.freeze(Object.fromEntries(["COUNT", "ENTRIES", "ENTRY_SIZE", "ENTRY_OWNER", "ENTRY_KIND",
+  "KIND_CONTROL"].map((name) => [name, layoutConstant(`TEXT_STORE_${name}`)])));
 
 // A page of a page frame as surface.page describes it.
 function describePage({ index, name, side, blank, groups, box }) {
@@ -81,29 +210,6 @@ function describePage({ index, name, side, blank, groups, box }) {
   };
 }
 
-// Root membership for many nodes: a walk stops at the
-// first node an earlier walk passed, and every node it passes takes the
-// answer, so a frame's text owners cost one walk per distinct ancestor
-// rather than one per text operation.
-function shadowIncludingInclusiveDescendantTest(ancestor) {
-  const verdicts = new Map([[ancestor, true]]);
-  const walked = [];
-  return (node) => {
-    let verdict = false;
-    for (let current = node; current !== null; current = shadowIncludingParent(current)) {
-      const known = verdicts.get(current);
-      if (known !== undefined) {
-        verdict = known;
-        break;
-      }
-      walked.push(current);
-    }
-    for (const passed of walked) verdicts.set(passed, verdict);
-    walked.length = 0;
-    return verdict;
-  };
-}
-
 // The stage counter of each reason a restyled frame's geometry was built
 // instead of derived from the presented frame's (presented-frame.js).
 const restyleRefusalCounters = Object.freeze({
@@ -114,8 +220,12 @@ const restyleRefusalCounters = Object.freeze({
   fragments: "geometryRestyleRefusedFragments",
 });
 
-const MOTION_CLASSIFICATIONS = ["static", "finite", "unbounded", "external"];
+// The inspection keywords of the motion capture codes.
+const MOTION_CLASSIFICATIONS = new Map(["STATIC", "FINITE", "UNBOUNDED", "EXTERNAL"]
+  .map((name) => [motionCaptureConstant(`MOTION_${name}`), name.toLowerCase()]));
+// A motion value: a canonical animation value reports its CSS text.
 function freezeMotionValue(value) {
+  if (value instanceof AnimationValue) return value.text;
   if (Array.isArray(value)) {
     return Object.freeze(value.map((entry) => freezeMotionValue(entry)));
   }
@@ -132,29 +242,43 @@ function freezeMotionValue(value) {
   return value;
 }
 
-// The pseudo-class states whose change only restyles: the scene build
-// reads no other state of them. Checkedness and selectedness are not
-// among them (a menulist's label is its selected option's), nor are
-// custom states and definedness.
-const RESTYLE_STATES = new Set([
-  "hover",
-  "active",
-  "focus",
-  "focus-within",
-]);
+// The mutation kinds of the surface (frame_surface_mutation) and the
+// effects the core answers.
+const FRAME_MUTATION_KINDS = new Map([
+  ["structure", "STRUCTURE"], ["attribute", "ATTRIBUTE"], ["class", "CLASS"], ["text", "TEXT"], ["state", "STATE"],
+  ["property", "PROPERTY"], ["selection", "SELECTION"], ["style", "STYLE"], ["canvas-paint", "CANVAS_PAINT"],
+  ["canvas-size", "CANVAS_SIZE"], ["font", "FONT"], ["stylesheet", "STYLESHEET"],
+].map(([kind, name]) => [kind, layoutConstant(`FRAME_MUTATION_${name}`)]));
+const FRAME_MUTATION_EFFECT = Object.freeze(Object.fromEntries(["MARK_NODE", "TRANSFORM_ONLY", "NOT_TRANSFORM",
+  "NOT_RESTYLE_STATE", "SELECTION", "DELIVER_STATE", "FORCE_GENERATION", "FULL_INVALIDATION", "SNAP_CHECK",
+  "SCROLL_SUPPRESS"].map((name) => [name, layoutConstant(`FRAME_MUTATION_EFFECT_${name}`)])));
 
-// The frameStageCounters counter of each engine_record_restyle refusal,
-// by its result.
-const SCENE_RESTYLE_REFUSALS = [
-  undefined,
-  "sceneRestyleRefusedBuild",
-  "sceneRestyleRefusedList",
-  "sceneRestyleRefusedGeneration",
-  "sceneRestyleRefusedOverflow",
-  "sceneRestyleRefusedRoot",
-  "sceneRestyleRefusedContents",
-  "sceneRestyleRefusedStructure",
-];
+// The frameStageCounters counter of each frame_restyle_retained refusal.
+const ENGINE_RESTYLE_DONE = layoutConstant("ENGINE_RESTYLE_DONE");
+const SCENE_RESTYLE_REFUSALS = new Map([
+  ["MUTATION", "sceneRestyleRefusedMutation"],
+  ["VIEWPORT", "sceneRestyleRefusedViewport"],
+  ["BUILD", "sceneRestyleRefusedBuild"],
+  ["LIST", "sceneRestyleRefusedList"],
+  ["GENERATION", "sceneRestyleRefusedGeneration"],
+  ["OVERFLOW", "sceneRestyleRefusedOverflow"],
+  ["ROOT", "sceneRestyleRefusedRoot"],
+  ["CONTENTS", "sceneRestyleRefusedContents"],
+  ["STRUCTURE", "sceneRestyleRefusedStructure"],
+].map(([name, counter]) => [layoutConstant(`ENGINE_RESTYLE_REFUSED_${name}`), counter]));
+const FRAME_MODE = Object.freeze(Object.fromEntries(["FULL", "PURE_SCROLL", "TRANSFORM", "CLEAN", "RESTYLE"]
+  .map((name) => [name, layoutConstant(`FRAME_MODE_${name}`)])));
+const FRAME_DAMAGE_FULL = layoutConstant("FRAME_DAMAGE_FULL");
+const FRAME_STAGE = Object.freeze(Object.fromEntries(["PREPARE", "SCENE", "LAYOUT", "SCROLL_ANCHORING",
+  "SCROLL_TIMELINES", "OBSERVERS", "DAMAGE", "RENDER", "OBSERVER_LIMIT"]
+  .map((name) => [name, layoutConstant(`FRAME_STAGE_${name}`)])));
+const FRAME_INVALIDATE_VIEWPORT = layoutConstant("FRAME_INVALIDATE_VIEWPORT");
+const FRAME_DAMAGE_PURE_SCROLL = layoutConstant("FRAME_DAMAGE_PURE_SCROLL");
+const FRAME_PAGE_REQUEST_FULL = layoutConstant("FRAME_PAGE_REQUEST_FULL");
+const FRAME_LOOP_STOP = layoutConstant("FRAME_LOOP_STOP");
+const ACTIVE_OWNER_SMOOTH = layoutConstant("SCROLL_ACTIVE_OWNER_SMOOTH");
+const ACTIVE_OWNER_REQUEST = layoutConstant("SCROLL_ACTIVE_OWNER_REQUEST");
+const FRAME_VISIBLE_RECTANGLE_SAME = layoutConstant("FRAME_VISIBLE_RECTANGLE_SAME");
 
 // Each presented frame's reading of the engine's layout work
 // (layout_compute_total) when its boxes were read; absent for a frame
@@ -178,9 +302,8 @@ function motionValueSignature(value) {
 function normalizeMotionKeyframes(keyframes) {
   return Object.freeze(keyframes.map((keyframe) => {
     const values = Object.fromEntries(
-      Object.entries(keyframe).filter(([name]) =>
-        name !== "offset" && name !== "easing" && name !== "composite"
-      ).map(([name, value]) => [name, freezeMotionValue(value)]),
+      Object.entries(keyframe).filter(([name]) => keyframeMember(name) === KEYFRAME_MEMBER.PROPERTY)
+        .map(([name, value]) => [name, freezeMotionValue(value)]),
     );
     return Object.freeze({
       offset: keyframe.offset,
@@ -199,18 +322,42 @@ function normalizeMotionKeyframes(keyframes) {
   }));
 }
 
+// Whether keyframes change the rendered output: true, false, or null when
+// a property has fewer than two values (animation_rendered_change).
 function renderedChangeFromKeyframes(propertyNames, keyframes) {
-  let hasUnknownProperty = false;
+  const values = [];
   for (const propertyName of propertyNames) {
     const signatures = keyframes.flatMap((keyframe) =>
-      propertyName in keyframe.valueSignatures
-        ? [keyframe.valueSignatures[propertyName]]
-        : []
+      propertyName in keyframe.valueSignatures ? [keyframe.valueSignatures[propertyName]] : []
     );
-    if (new Set(signatures).size > 1) return true;
-    if (signatures.length < 2) hasUnknownProperty = true;
+    values.push(signatures.length, ...signatures);
   }
-  return hasUnknownProperty ? null : false;
+  const change = sharedDomCore.status("animation_rendered_change", ...sharedDomCore.valueListInput(values));
+  return change === ANIMATION_RENDERED_CHANGE_UNKNOWN ? null : change === ANIMATION_RENDERED_CHANGE_CHANGES;
+}
+
+// The phase, membership and iteration of an effect at an inspection
+// (motion_effect_phase); NaN reads are null.
+const MOTION_PHASES = new Map(["BEFORE", "ACTIVE", "AFTER", "EXTERNAL"]
+  .map((name) => [motionCaptureConstant(`MOTION_PHASE_${name}`), name.toLowerCase()]));
+const MOTION_PHASE_VALUE = Object.freeze(Object.fromEntries(["MEMBERSHIP", "ITERATION_INDEX", "ITERATION_PROGRESS"]
+  .map((name) => [name, motionCaptureConstant(`MOTION_PHASE_VALUE_${name}`)])));
+function effectPhase(exports, external, activeTimeMilliseconds, durationMilliseconds, iterationCount, fill) {
+  const phase = exports.motion_effect_phase(
+    external ? 1 : 0,
+    activeTimeMilliseconds,
+    durationMilliseconds,
+    iterationCount,
+    animationFillMode(fill),
+  );
+  const iterationIndex = exports.motion_phase_value(MOTION_PHASE_VALUE.ITERATION_INDEX);
+  const iterationProgress = exports.motion_phase_value(MOTION_PHASE_VALUE.ITERATION_PROGRESS);
+  return {
+    phase: MOTION_PHASES.get(phase),
+    effectMembershipAtInspection: exports.motion_phase_value(MOTION_PHASE_VALUE.MEMBERSHIP) === 1,
+    iterationIndex: Number.isNaN(iterationIndex) ? null : iterationIndex,
+    iterationProgress: Number.isNaN(iterationProgress) ? null : iterationProgress,
+  };
 }
 
 function createMotionModel(surface) {
@@ -228,51 +375,34 @@ function createMotionModel(surface) {
     }
     const timing = animation.effect.getComputedTiming();
     const keyframes = normalizeOffsets(animation._canonicalKeyframes);
-    const propertyNames = [
-      ...new Set(
-        keyframes.flatMap((keyframe) =>
-          Object.keys(keyframe).filter((name) =>
-            name !== "offset" && name !== "easing" && name !== "composite"
-          )
-        ),
-      ),
-    ];
+    const propertyNames = [...new Set(keyframes.flatMap(keyframePropertyNames))];
     const normalizedKeyframes = normalizeMotionKeyframes(keyframes);
     const changesRenderedOutput = renderedChangeFromKeyframes(
       propertyNames,
       normalizedKeyframes,
     );
     const external = animation._isScrollDriven();
-    const progressing = animation.playState === "running" &&
-      animation.playbackRate !== 0 && changesRenderedOutput !== false;
-    const startTimeMilliseconds = animation.startTime ??
-      surface.currentTime -
-        (animation.currentTime ?? 0) / (Math.abs(animation.playbackRate) || 1);
+    const progressing = exports.motion_effect_progressing(
+      animation.playState === "running" ? 1 : 0,
+      animation.playbackRate,
+      changesRenderedOutput === false ? 1 : 0,
+    ) === 1;
+    const startTimeMilliseconds = exports.motion_effect_start_time(
+      animation.startTime == null ? 0 : 1,
+      animation.startTime ?? 0,
+      surface.currentTime,
+      animation.currentTime ?? 0,
+      animation.playbackRate,
+    );
     const delayMilliseconds = Number(timing.delay ?? 0);
     const durationMilliseconds = Number(timing.duration ?? 0);
     const iterationCount = Number(timing.iterations ?? 1);
     const localTimeMilliseconds =
       (surface.currentTime - startTimeMilliseconds) * animation.playbackRate;
     const activeTimeMilliseconds = localTimeMilliseconds - delayMilliseconds;
-    const activeDurationMilliseconds = durationMilliseconds * iterationCount;
-    const phase = external
-      ? "external"
-      : activeTimeMilliseconds < 0
-      ? "before"
-      : activeTimeMilliseconds < activeDurationMilliseconds
-      ? "active"
-      : "after";
     const fill = timing.fill ?? "none";
-    const effectMembershipAtInspection = phase === "active" ||
-      (phase === "before" && (fill === "backwards" || fill === "both")) ||
-      (phase === "after" && (fill === "forwards" || fill === "both"));
-    const iterationIndex = phase === "active" && durationMilliseconds > 0
-      ? Math.floor(activeTimeMilliseconds / durationMilliseconds)
-      : null;
-    const iterationProgress = iterationIndex === null
-      ? null
-      : (activeTimeMilliseconds -
-        iterationIndex * durationMilliseconds) / durationMilliseconds;
+    const { phase, effectMembershipAtInspection, iterationIndex, iterationProgress } =
+      effectPhase(exports, external, activeTimeMilliseconds, durationMilliseconds, iterationCount, fill);
     const effectIndex = exports.motion_add_effect(
       (progressing ? 1 : 0) | (external ? 2 : 0),
       startTimeMilliseconds,
@@ -341,26 +471,11 @@ function createMotionModel(surface) {
         const delayMilliseconds = Number(timing.delay ?? 0);
         const durationMilliseconds = Number(timing.duration ?? 0);
         const iterationCount = Number(timing.iterations ?? 1);
-        const activeTimeMilliseconds = surface.currentTime -
-          record.startTimeMilliseconds - delayMilliseconds;
-        const activeDurationMilliseconds = durationMilliseconds *
-          iterationCount;
-        const phase = activeTimeMilliseconds < 0
-          ? "before"
-          : activeTimeMilliseconds < activeDurationMilliseconds
-          ? "active"
-          : "after";
+        const localTimeMilliseconds = surface.currentTime - record.startTimeMilliseconds;
+        const activeTimeMilliseconds = localTimeMilliseconds - delayMilliseconds;
         const fill = timing.fill ?? "none";
-        const effectMembershipAtInspection = phase === "active" ||
-          (phase === "before" && (fill === "backwards" || fill === "both")) ||
-          (phase === "after" && (fill === "forwards" || fill === "both"));
-        const iterationIndex = phase === "active" && durationMilliseconds > 0
-          ? Math.floor(activeTimeMilliseconds / durationMilliseconds)
-          : null;
-        const iterationProgress = iterationIndex === null
-          ? null
-          : (activeTimeMilliseconds -
-            iterationIndex * durationMilliseconds) / durationMilliseconds;
+        const { phase, effectMembershipAtInspection, iterationIndex, iterationProgress } =
+          effectPhase(exports, false, activeTimeMilliseconds, durationMilliseconds, iterationCount, fill);
         const effectIndex = exports.motion_add_effect(
           changesRenderedOutput === false ? 0 : 1,
           record.startTimeMilliseconds,
@@ -399,15 +514,13 @@ function createMotionModel(surface) {
           timeline: "time",
           pseudoElement: record.pseudoElement,
           phase,
-          localTimeMilliseconds: surface.currentTime -
-            record.startTimeMilliseconds,
+          localTimeMilliseconds,
           activeTimeMilliseconds,
           iterationIndex,
           iterationProgress,
           effectMembershipAtInspection,
           changesRenderedOutput,
           changesUnderlyingState: false,
-          initialGeneratedContent: freezeMotionValue(record.initialContent),
         }));
         scheduleEffects.push({
           effectIndex,
@@ -420,14 +533,14 @@ function createMotionModel(surface) {
     }
   }
 
-  for (const [element, timings] of surface._transitionRecords) {
+  for (const timings of surface._transitionRecords.values()) {
     for (const [propertyName, timing] of timings) {
       // The track's timing at inspection: a paused transition's start
       // follows the clock, so its local time holds.
       const animation = timing.animation;
-      const startTimeMilliseconds = animation._value(6);
-      const delayMilliseconds = animation._value(8);
-      const durationMilliseconds = animation._value(7);
+      const startTimeMilliseconds = animation._value(ANIMATION_VALUE_ENGINE_START_TIME);
+      const delayMilliseconds = animation._value(ANIMATION_VALUE_DELAY);
+      const durationMilliseconds = animation._value(ANIMATION_VALUE_DURATION);
       const progressing = animation._trackAdvances();
       const effectIndex = exports.motion_add_effect(
         progressing ? 1 : 0,
@@ -443,16 +556,13 @@ function createMotionModel(surface) {
         );
       }
       const endTime = exports.motion_effect_end(effectIndex);
-      const activeTimeMilliseconds = surface.currentTime -
-        startTimeMilliseconds - delayMilliseconds;
-      const phase = activeTimeMilliseconds < 0
-        ? "before"
-        : activeTimeMilliseconds < durationMilliseconds
-        ? "active"
-        : "after";
+      const localTimeMilliseconds = surface.currentTime - startTimeMilliseconds;
+      const activeTimeMilliseconds = localTimeMilliseconds - delayMilliseconds;
+      const { phase, effectMembershipAtInspection, iterationIndex, iterationProgress } =
+        effectPhase(exports, false, activeTimeMilliseconds, durationMilliseconds, 1, "none");
       effects.push(Object.freeze({
         kind: "transition",
-        element,
+        element: timing.animation._element,
         propertyNames: Object.freeze([propertyName]),
         animationName: "",
         effectOrder: effects.length,
@@ -473,14 +583,13 @@ function createMotionModel(surface) {
         playState: animation.playState,
         playbackRate: animation.playbackRate,
         timeline: "time",
+        pseudoElement: timing.animation._pseudoElement,
         phase,
-        localTimeMilliseconds: surface.currentTime - startTimeMilliseconds,
+        localTimeMilliseconds,
         activeTimeMilliseconds,
-        iterationIndex: phase === "active" ? 0 : null,
-        iterationProgress: phase === "active" && durationMilliseconds > 0
-          ? activeTimeMilliseconds / durationMilliseconds
-          : null,
-        effectMembershipAtInspection: phase === "active",
+        iterationIndex,
+        iterationProgress,
+        effectMembershipAtInspection,
         changesRenderedOutput: true,
         changesUnderlyingState: true,
       }));
@@ -495,40 +604,29 @@ function createMotionModel(surface) {
   }
 
   const classification =
-    MOTION_CLASSIFICATIONS[exports.motion_classification()];
-  const finiteEnd = exports.motion_finite_end();
+    MOTION_CLASSIFICATIONS.get(exports.motion_classification());
+  const finiteDuration = exports.motion_finite_duration(surface.currentTime);
   const inspection = Object.freeze({
     classification,
     inspectedAtMilliseconds: surface.currentTime,
-    finiteDurationMilliseconds: classification === "finite"
-      ? Math.max(0, finiteEnd - surface.currentTime)
-      : null,
+    finiteDurationMilliseconds: Number.isNaN(finiteDuration) ? null : finiteDuration,
     effects: Object.freeze(effects),
   });
   return { exports, inspection, scheduleEffects };
 }
-const NODE_DESCRIPTIONS = {
-  1: "an element",
-  3: "a text node",
-  4: "a CDATA section",
-  7: "a processing instruction",
-  8: "a comment node",
-  9: "a document",
-  10: "a document type",
-  11: "a document fragment",
-};
-function describeRoot(root) {
-  if (root === null || root === undefined) return String(root);
-  if (typeof root !== "object") return `a ${typeof root}`;
-  if (!root._domCore) return "an object that is not a DOM node";
-  return NODE_DESCRIPTIONS[root.nodeType] ?? `a node of type ${root.nodeType}`;
+// The kind of a value offered as a surface root (frame_surface_root).
+function rootKind(root) {
+  if (root === null) return FRAME_ROOT_NULL;
+  if (root === undefined) return FRAME_ROOT_UNDEFINED;
+  if (typeof root !== "object") return FRAME_ROOT_PRIMITIVE;
+  return root._domCore ? FRAME_ROOT_NODE : FRAME_ROOT_OBJECT;
 }
 // The document whose stylesheets style a surface root: the root itself for a
 // document, else its owner document, whether or not the root is attached.
 function surfaceDocument(root) {
-  const document = root.nodeType === 9 ? root : root.ownerDocument;
+  const document = nodeMember(root, "nodeType") === 9 ? root : nodeMember(root, "ownerDocument");
   if (!document) {
-    throw new Error(`render surface: root <${root.nodeName}> has no owner document, so no stylesheet can reach it`);
+    throw new Error(`render surface: root <${nodeMember(root, "nodeName")}> has no owner document, so no stylesheet can reach it`);
   }
   return document;
 }
@@ -536,38 +634,33 @@ function surfaceDocument(root) {
 // A surface renders one element's box tree. A document is the root a host
 // rendering a whole page has, so it resolves to its document element — which
 // is also what makes a host-owned top element unnecessary. Anything else is
-// refused here, by type, rather than by a statistic from the first frame's
-// animation-candidate scan.
+// refused here, by type (frame_surface_root), rather than by a statistic
+// from the first frame's animation-candidate scan.
 function resolveSurfaceRoot(root, operation) {
-  const nodeType = root?._domCore ? root.nodeType : 0;
-  if (nodeType === 9) {
-    const documentElement = root.documentElement;
-    if (!documentElement) {
-      throw new TypeError(
-        `${operation}: root must be an element or a document with a document ` +
-          `element, received a document with no document element`,
-      );
-    }
-    return documentElement;
-  }
-  if (nodeType !== 1) {
-    throw new TypeError(
-      `${operation}: root must be an element or a document, received ${
-        describeRoot(root)
-      }`,
-    );
-  }
-  return root;
+  const kind = rootKind(root);
+  const resolved = sharedDomCore.statusRaw(
+    "frame_surface_root",
+    kind,
+    kind === FRAME_ROOT_NODE ? nodeMember(root, "nodeType") : 0,
+    kind === FRAME_ROOT_NODE && nodeMember(root, "nodeType") === 9 && root.documentElement ? 1 : 0,
+    ...sharedDomCore.valueListInput([operation, typeof root]),
+  );
+  return resolved === FRAME_ROOT_DOCUMENT_ELEMENT ? root.documentElement : root;
 }
 
 // A broken image paints nothing, as in Chrome. The document keeps one
 // recoverable diagnostic for each URL, owner and property; a prepared
 // document gives it to the host with its font diagnostics.
-const GENERATED_BOX_PSEUDO_ELEMENTS = { 14: "::before", 15: "::after" };
+const GENERATED_BOX_PSEUDO_ELEMENTS = {
+  [layoutConstant("SCENE_BOX_BEFORE")]: "::before",
+  [layoutConstant("SCENE_BOX_AFTER")]: "::after",
+  [layoutConstant("SCENE_BOX_FIRST_LETTER")]: "::first-letter",
+};
 function recordBrokenImageDiagnostic(element, node, property, requestedURL, failure, error) {
-  const document = element.ownerDocument;
+  const document = nodeMember(element, "ownerDocument");
   const pseudoElement = GENERATED_BOX_PSEUDO_ELEMENTS[node._coreBox & 0xff] ?? "";
-  const ownerElement = `${element.localName}${element.id ? `#${element.id}` : ""}${pseudoElement}`;
+  const id = nodeMember(element, "id");
+  const ownerElement = `${nodeMember(element, "localName")}${id ? `#${id}` : ""}${pseudoElement}`;
   const requestedFinalURL = URL.parse(requestedURL, document.baseURI)?.href ?? requestedURL;
   const key = `${requestedFinalURL} ${ownerElement} ${property}`;
   if (document._brokenImageDiagnostics.has(key)) return;
@@ -585,6 +678,22 @@ function recordBrokenImageDiagnostic(element, node, property, requestedURL, fail
     resource: Object.freeze({ kind: "image", requestedFinalURL }),
     cause: Object.freeze({ name: cause?.name ?? "Error", message: causeMessage }),
   }));
+}
+
+// A raster backdrop: a frozen { r, g, b, a }, or undefined for the
+// renderer's default. `label` names the caller in the error.
+function surfaceBackground(background, label) {
+  if (background === undefined) return undefined;
+  const { r, g, b, a } = background ?? {};
+  if (
+    !Number.isFinite(r) || !Number.isFinite(g) ||
+    !Number.isFinite(b) || !Number.isFinite(a) || a < 0 || a > 1
+  ) {
+    throw new TypeError(
+      `${label}: background requires finite r, g, b, a components with alpha between 0 and 1`,
+    );
+  }
+  return Object.freeze({ r, g, b, a });
 }
 
 export function createRenderSurface(root, options = {}) {
@@ -711,18 +820,38 @@ export async function abortFrameTransaction(transaction) {
   for (const surface of transaction.surfaces) surface._schedule();
 }
 
+// The device-pixel rectangle of a box, or null (frame_box_rectangle).
 function boxRectangle(box, deviceScale) {
-  if (!box || box.w <= 0 || box.h <= 0) return null;
+  if (!box) return null;
+  const exports = sharedDomCore.exports;
+  if (!exports.frame_box_rectangle(box.x, box.y, box.w, box.h, deviceScale)) return null;
   return {
-    x: Math.floor(box.x * deviceScale),
-    y: Math.floor(box.y * deviceScale),
-    width: Math.ceil(box.w * deviceScale),
-    height: Math.ceil(box.h * deviceScale),
+    x: exports.frame_box_value(FRAME_BOX_X),
+    y: exports.frame_box_value(FRAME_BOX_Y),
+    width: exports.frame_box_value(FRAME_BOX_WIDTH),
+    height: exports.frame_box_value(FRAME_BOX_HEIGHT),
   };
 }
 
+// A frame of another sample type always differs. Uint8 frames compare one
+// pixel per 32-bit word.
 function pixelsDifferInRectangles(previous, current, width, rectangles) {
-  if (!previous || previous.length !== current.length) return true;
+  if (!previous || previous.length !== current.length || previous.constructor !== current.constructor) return true;
+  if (current instanceof Uint8Array && current.byteOffset % 4 === 0 && previous.byteOffset % 4 === 0) {
+    previous = new Uint32Array(previous.buffer, previous.byteOffset, previous.length / 4);
+    current = new Uint32Array(current.buffer, current.byteOffset, current.length / 4);
+    for (const rectangle of rectangles) {
+      const right = Math.min(width, rectangle.x + rectangle.width);
+      const bottom = Math.min(current.length / width, rectangle.y + rectangle.height);
+      for (let y = Math.max(0, rectangle.y); y < bottom; y++) {
+        const end = y * width + right;
+        for (let offset = y * width + Math.max(0, rectangle.x); offset < end; offset++) {
+          if (previous[offset] !== current[offset]) return true;
+        }
+      }
+    }
+    return false;
+  }
   for (const rectangle of rectangles) {
     const right = Math.min(width, rectangle.x + rectangle.width);
     const bottom = Math.min(
@@ -740,25 +869,55 @@ function pixelsDifferInRectangles(previous, current, width, rectangles) {
   return false;
 }
 
-// Layout box kinds by the scene's box kind code (scene-build.watpart).
-const LAYOUT_BOX_KINDS = Object.freeze([
-  undefined, "element", "text", "anonymous inline", "::before text", "::after text",
-  "line feed", "form value", "placeholder", "list marker", "marker wrapper",
-  "contents root", "anonymous table box", "viewport", "::before", "::after",
-  "alternative text container", "broken image icon",
-  ...Array(14),
-  // Page boxes (32-48) and their text (64-80): the page-margin boxes in
-  // PAGE_MARGIN_BOXES order, then the page background.
-  ...PAGE_MARGIN_BOXES.map((name) => `@${name}`), "@page",
-  ...Array(15),
-  ...PAGE_MARGIN_BOXES.map((name) => `@${name} text`), "@page text",
-]);
+// Layout box kind names by the scene's box kind code, from the core
+// (scene_box_kind_name). The names are fixed, so one map serves every core.
+const layoutBoxKindNames = new Map();
+function layoutBoxKindName(core, kind) {
+  let name = layoutBoxKindNames.get(kind);
+  if (name === undefined) {
+    name = core.status("scene_box_kind_name", kind) ? core.outputString() : null;
+    layoutBoxKindNames.set(kind, name);
+  }
+  return name;
+}
 
 // What identifies a planned transition across reads: its endpoints and
 // timing. A read that plans the same transition again keeps its pending
 // CSSTransition.
 function transitionPlanKey({ definition, startValue, endValue }) {
   return JSON.stringify([definition.duration, definition.delay, definition.easing, startValue, endValue]);
+}
+
+// The before-change style a read keeps of a target the last frame did not
+// render (an element, or a ::before or ::after): the node's record copy
+// and the CSS transform list, what transition planning reads of a previous
+// node. A node that declares transitions carries both; another's are
+// copied from its publication.
+function readBaseline(node, target) {
+  if (node._coreRecord !== undefined) return { _coreRecord: node._coreRecord, transform: node.transform };
+  const publication = node._corePublication;
+  const box = publication.boxes[node._corePublicationIndex];
+  return {
+    _coreRecord: publication.core.engineRecordAfterChange(box.stableId, box.sourceRevision),
+    transform: isPseudoElementTarget(target) ? elementTransform(target.element, target.kind) : elementTransform(target),
+  };
+}
+
+// The animation target at each scene row of a serialization's maps: the
+// element of an element's row, and the pseudo-element-target.js identity
+// of a ::before or ::after row. Built once per pair of maps, as
+// nodesAtRow is.
+const targetsAtRowByPseudoIndexMap = new WeakMap();
+function targetsAtRow(indexOf, pseudoIndexOf) {
+  let targets = targetsAtRowByPseudoIndexMap.get(pseudoIndexOf);
+  if (targets === undefined) {
+    targets = [];
+    for (const [node, index] of indexOf) if (index !== null) targets[index] = node;
+    for (const [target, index] of pseudoIndexOf) targets[index] = target;
+    Object.freeze(targets);
+    targetsAtRowByPseudoIndexMap.set(pseudoIndexOf, targets);
+  }
+  return targets;
 }
 
 // The node at each scene row of a serialization, built once per index map:
@@ -781,6 +940,7 @@ const SURFACE_OPTION_NAMES = new Set([
   "viewportWidth",
   "viewportHeight",
   "deviceScale",
+  "density",
   "viewport",
   "now",
   "requestFrame",
@@ -802,21 +962,34 @@ const SURFACE_OPTION_NAMES = new Set([
   "scrollbarStyle",
 ]);
 
+// scroll_surface_active_owner and scroll_surface_snap_plan results.
+const ACTIVE_OWNER_KINDS = new Map([["SMOOTH", "smooth"], ["MOMENTUM", "momentum"], ["INTERACTION", "interaction"],
+  ["REQUEST", "request"]].map(([name, kind]) => [layoutConstant(`SCROLL_ACTIVE_OWNER_${name}`), kind]));
+const ACTIVE_OWNER_NONE = layoutConstant("SCROLL_ACTIVE_OWNER_NONE");
+const SNAP_PLAN_NONE = layoutConstant("SCROLL_SNAP_PLAN_NONE");
+const SNAP_PLAN_WALK = layoutConstant("SCROLL_SNAP_PLAN_WALK");
+const SNAP_PLAN_NEEDS_CONTAINERS = layoutConstant("SCROLL_SNAP_PLAN_NEEDS_CONTAINERS");
+
+// frame_clock_surface_source results.
+const CLOCK_SOURCE_REAL = layoutConstant("SURFACE_CLOCK_REAL");
+const CLOCK_SOURCE_OPTIONS = layoutConstant("SURFACE_CLOCK_OPTIONS");
+
 // `now` and `requestFrame` are one clock (assertClockOptions). A surface
 // over a document whose clock is fixed runs on that clock: it takes it when
 // the caller supplies none, and refuses another one, so a page never reads
-// one clock while its surface renders on another.
+// one clock while its surface renders on another (frame_clock_surface_source).
 function surfaceClockSource(options, ownerDocument) {
   const documentClock = ownerDocument?._clock ?? null;
-  if (documentClock === null) {
-    return options.now === undefined
-      ? { ...realClockSource, real: true }
-      : { now: options.now, requestFrame: options.requestFrame, cancelFrame: options.cancelFrame ?? (() => {}), real: false };
-  }
-  if (options.now !== undefined && options.now !== documentClock.source.now) {
-    throw new TypeError(
-      `render surface options: the document of this root runs on the ${documentClock.real ? "host's real clock" : "clock its host injected"}, and a surface over it runs on that clock; omit now, requestFrame and cancelFrame, or give the clock to the document when you create it (renderComponent, prepareRenderInput or createSandomDOM: now, requestFrame, cancelFrame, timeOrigin)`,
-    );
+  const source = sharedDomCore.statusRaw(
+    "frame_clock_surface_source",
+    documentClock === null ? 0 : 1,
+    options.now === undefined ? 0 : 1,
+    options.now === documentClock?.source.now ? 1 : 0,
+    documentClock?.real ? 1 : 0,
+  );
+  if (source === CLOCK_SOURCE_REAL) return { ...realClockSource, real: true };
+  if (source === CLOCK_SOURCE_OPTIONS) {
+    return { now: options.now, requestFrame: options.requestFrame, cancelFrame: options.cancelFrame ?? (() => {}), real: false };
   }
   return { ...documentClock.source, real: documentClock.real };
 }
@@ -829,12 +1002,16 @@ class DOMRenderSurface {
       viewportWidth = 1280,
       viewportHeight = 720,
       deviceScale = 1,
+      // The device pixel ratio the document sees (SandomViewport); null
+      // follows deviceScale, the raster scale.
+      density = null,
       viewport = null,
       // The persistent renderer shares the document runtime's scene
       // renderer (one WASM engine, glyph manager, and WebGPU device across
       // every surface of that runtime) with a per-surface renderer and
-      // render context. Callers needing full isolation (fresh engine and
-      // device) pass createPersistentSceneRenderer here explicitly.
+      // render context. A caller-supplied factory returns a renderer at
+      // once, as openSceneRenderer does: its engine side works before its
+      // graphics context is `ready`.
       createPersistentRenderer = null,
       initializePersistentRenderer = true,
       renderMode = undefined,
@@ -874,19 +1051,7 @@ class DOMRenderSurface {
     }
     // The raster backdrop belongs to the surface, not the root's box.
     // Keep one snapshot for every frame, including dirty-tile and resize frames.
-    this._background = undefined;
-    if (background !== undefined) {
-      const { r, g, b, a } = background ?? {};
-      if (
-        !Number.isFinite(r) || !Number.isFinite(g) ||
-        !Number.isFinite(b) || !Number.isFinite(a) || a < 0 || a > 1
-      ) {
-        throw new TypeError(
-          "render surface options: background requires finite r, g, b, a components with alpha between 0 and 1",
-        );
-      }
-      this._background = Object.freeze({ r, g, b, a });
-    }
+    this._background = surfaceBackground(background, "render surface options");
     this._textThickening = undefined;
     if (textThickening !== undefined) {
       const { darkInk, lightInk } = textThickening ?? {};
@@ -898,8 +1063,8 @@ class DOMRenderSurface {
       this._textThickening = Object.freeze({ darkInk, lightInk });
     }
     root = resolveSurfaceRoot(root, "createRenderSurface");
-    if (root.parentElement) {
-      const documentElement = root.ownerDocument?.documentElement;
+    if (nodeMember(root, "parentElement")) {
+      const documentElement = nodeMember(root, "ownerDocument")?.documentElement;
       if (!documentElement?.contains(root)) {
         throw new Error(
           "createRenderSurface: root must be a detached DOM tree root or belong to a document",
@@ -907,11 +1072,12 @@ class DOMRenderSurface {
       }
       root = documentElement;
     }
-    const clock = surfaceClockSource(options, root.ownerDocument);
+    const clock = surfaceClockSource(options, nodeMember(root, "ownerDocument"));
     this.viewport = viewport ?? new SandomViewport({
       width: viewportWidth,
       height: viewportHeight,
       deviceScale,
+      density,
     });
     if (!(this.viewport instanceof SandomViewport) || this.viewport._surface) {
       throw new Error(
@@ -920,7 +1086,7 @@ class DOMRenderSurface {
     }
     this.viewport._surface = this;
     this.viewport.root = root;
-    const ownerDocument = root.ownerDocument;
+    const ownerDocument = nodeMember(root, "ownerDocument");
     // The scrollbar style is part of the style environment: a classic bar
     // takes layout space, so a change re-lowers every record.
     ownerDocument?._styleSystem?.setEnvironment({
@@ -928,6 +1094,13 @@ class DOMRenderSurface {
       viewportHeight: this.viewport.height,
       scrollbarStyle: this.scrollbarStyle,
     });
+    // An environment change outside the surface (forced colors, the media
+    // type) owes a frame.
+    this._environmentListener = () => {
+      this._dirty = true;
+      this._schedule();
+    };
+    ownerDocument?._styleSystem?.environmentListeners.add(this._environmentListener);
     if (ownerDocument?._reevaluateMediaQueryLists) {
       // Component documents keep single-valued window semantics
       // (window.innerWidth, requestAnimationFrame, visualViewport) bound to
@@ -985,20 +1158,24 @@ class DOMRenderSurface {
     this._glyphResourceManager = glyphResourceManager;
     const sceneRendererRuntime = ownerDocument?._sandomSceneRendererRuntime ??
       null;
-    // A caller-supplied factory chooses its own device. Otherwise the
-    // renderer adopts the device the document's canvases already use (a
-    // WebGPU context's configured device, or the one a Canvas 2D toBlob()
-    // requested before the first paint), read when the renderer is created,
-    // as render-component does, so a canvas bitmap and the renderer that
-    // paints it are on one device. A document without one adopts the
-    // renderer's (_startPersistentRenderer).
-    const sceneRendererFactory = sceneRendererRuntime?.createSceneRenderer ??
-      createSceneRenderer;
+    // A caller-supplied factory chooses its own device. Otherwise a device
+    // the host gave the runtime (useGraphicsDevice) renders: the host owns
+    // the realm's device, and the renderer draws the document's canvases
+    // from theirs. Without one, the renderer adopts the device the
+    // document's canvases already use (a WebGPU context's configured device,
+    // or the one a Canvas 2D toBlob() requested before the first paint),
+    // read when the renderer is created, as render-component does, so a
+    // canvas bitmap and the renderer that paints it are on one device. A
+    // document without one adopts the renderer's (_startPersistentRenderer).
+    const sceneRendererFactory = sceneRendererRuntime?.openSceneRenderer ??
+      openSceneRenderer;
+    const runtimeHostDevice = sceneRendererRuntime?.hostGraphicsDevice ??
+      hostGraphicsDevice;
     const persistentRendererFactory = createPersistentRenderer ??
       ((rendererOptions) =>
         sceneRendererFactory({
           ...rendererOptions,
-          graphicsDevice: this._document._preferredCanvasDevice ?? undefined,
+          graphicsDevice: runtimeHostDevice() ?? this._document._preferredCanvasDevice ?? undefined,
         }));
     const layoutScene = sceneRendererRuntime?.layoutTreeBoxes ??
       layoutTreeBoxes;
@@ -1022,7 +1199,7 @@ class DOMRenderSurface {
     // The surface demands images through its document's host resource
     // session; it has no provider of its own.
     this._resolveResource =
-      (root.nodeType === 9 ? root : ownerDocument)?._resolveResource ?? null;
+      (nodeMember(root, "nodeType") === 9 ? root : ownerDocument)?._resolveResource ?? null;
     // A broken image is a diagnostic of the render. Its error event is the
     // DOM image loading's (src/dom/images.js), not the render's.
     this._onImageLoadError = ({ node, property, requestedURL, failure, error }) => {
@@ -1077,6 +1254,20 @@ class DOMRenderSurface {
       // Scroll-only frames whose presented geometry was derived from the
       // previous frame's instead of walking the tree again.
       geometrySuccessorFrames: 0,
+      // The geometries a frame built from its boxes (geometry_build): its
+      // observer checkpoint's, its scrollbars' when no restyle basis or
+      // checkpoint geometry gives them, and its interaction snapshot's when
+      // it derived none. A derived geometry is not counted.
+      geometryBuilds: 0,
+      // Frames whose interaction snapshot was derived from the geometry the
+      // frame built for its observer checkpoint (geometry_frame_successor),
+      // and the frames whose checkpoint geometry was refused, by cause.
+      geometryFrameSuccessorFrames: 0,
+      geometryFrameRefusedEnvelope: 0,
+      geometryFrameRefusedRevisions: 0,
+      // Frames whose frame geometry derived from a synchronous layout
+      // read's live geometry (geometry_frame_successor) instead of a build.
+      geometryReadSuccessorFrames: 0,
       // Frames whose presented geometry was derived from the previous
       // frame's after a restyle that inserted, removed and laid out no row
       // (geometry_restyle_successor), the element records whose facts
@@ -1109,7 +1300,8 @@ class DOMRenderSurface {
       // Frames that restyled the retained publication in place instead of
       // building the scene (frame mode 4, engine_record_restyle), and the
       // mode 4 frames that built it, by reason. Mutation: a mutation since
-      // the last frame other than a RESTYLE_STATES state change. Viewport:
+      // the last frame other than a state change that only restyles
+      // (FRAME_MUTATION_EFFECT_NOT_RESTYLE_STATE). Viewport:
       // another viewport size or scale than the retained scene's. The
       // others are the core's refusals: build (the publication is not the
       // last scene build's), list (the restyle list describes another
@@ -1163,6 +1355,15 @@ class DOMRenderSurface {
       // raster painted, damage selections the frames whose raster replayed
       // the plan's damage selection (raster_plan_select).
       elementsRestyled: 0,
+      // Of elementsRestyled, the records that came out identical to the
+      // record they replaced.
+      elementsRestyledUnchanged: 0,
+      // The elements the frame's scene builds walked, the boxes they made
+      // and the subtrees they took from the subtree cache
+      // (computed_restyle_counts).
+      sceneElementsVisited: 0,
+      sceneBoxesMade: 0,
+      sceneSubtreesReplayed: 0,
       pseudoElementsRestyled: 0,
       sceneRowsBuilt: 0,
       rowsLowered: 0,
@@ -1186,13 +1387,24 @@ class DOMRenderSurface {
     };
     this._frameListeners = [];
     this._frameRequest = null;
+    this._caretTimer = null;
+    // The host timeout that wakes the loop for a held spin half's next step.
+    this._spinTimer = null;
     this._frameTransaction = frameTransaction;
     this._stagedFrame = null;
     this._frameSequence = 0;
     this._viewportRevision = 0n;
     this._eventElementAtIndex = null;
+    // The animation target at each row of the frame (targetsAtRow).
+    this._eventTargetAtIndex = null;
     this._dirty = true;
     this._rendering = false;
+    // The frame's animation microtask checkpoint runs (_render).
+    this._animationCheckpoint = false;
+    this._animationPromisesSettled = false;
+    // Synchronous layout and DOM removal defer engine events until a frame.
+    this._animationEventDeferralDepth = 0;
+    this._deferredAnimationEvents = [];
     this._running = true;
     this._idleWaiters = [];
     this._shutdown = false;
@@ -1200,6 +1412,13 @@ class DOMRenderSurface {
     this._lastDeliveredFrame = null;
     this._lastRendered = null;
     this._indexOfElement = new Map();
+    this._indexOfPseudoTarget = new Map();
+    // The rows a synchronous layout moved the tracks from, by its rows
+    // (_moveTracksToLayoutRows), until _runSyncLayout moves them back.
+    this._layoutRowsReturn = null;
+    // Script animations whose targets a remap left without a row
+    // (_parkHiddenAnimations), until the next frame sets the rows.
+    this._parkedAnimations = null;
     this._elementAtIndex = [];
     this._computedSamples = root._domCore.status("computed_samples_create");
     this._lastBoxes = [];
@@ -1225,6 +1444,13 @@ class DOMRenderSurface {
     this._layoutTree = null;
     this._layoutTreeFor = null;
     this._syncLayout = null;
+    // The serialization of the last transition planning, for the layout
+    // read that follows it (_takePlannedSerialization), or null.
+    this._plannedSerialization = null;
+    // A synchronous getter's layout of the page this surface shows
+    // (_offerSyncPageLayout): another getter reads it; frames do not, as
+    // its boxes lie in the space of the pages.
+    this._syncPageLayout = null;
     // Style-generation checkpoints (frame-incrementality): the style system
     // bumps its generation on EVERY DOM mutation and on stylesheet, font,
     // and environment changes - the same key its per-element resolution
@@ -1250,24 +1476,19 @@ class DOMRenderSurface {
     this._selectionChanged = false;
     this._transformOnlyMutations = new Set();
     this._hasNonTransformMutation = false;
-    // Whether a mutation since the last frame was anything but a change of
-    // one of RESTYLE_STATES; only a frame without one may restyle the
-    // retained scene (frame mode 4).
+    // Whether a mutation since the last frame was anything but a state
+    // change that only restyles (FRAME_MUTATION_EFFECT_NOT_RESTYLE_STATE);
+    // only a frame without one may restyle the retained scene (frame mode 4).
     this._hasNonStateMutation = false;
-    // Tree mutations recorded under the root (insertions, removals, shadow
-    // roots attached). The text geometry grouping keeps its owner
-    // classification (_textOwnerKinds) until the next one.
-    this._structureMutations = 0;
-    this._textOwnerKinds = null;
     this._scrollOwner = root._domCore.status("scroll_owner_create");
     root._domCore.status(
       "scroll_owner_bind",
       this._scrollOwner,
       root._coreHandle,
     );
-    this._scrollAnchors = new NativeScrollCollection(this, 4);
-    this._anchoringSuppressionProperties = new NativeScrollSuppression(this, 1);
-    this._positionSuppressionNodes = new NativeScrollSuppression(this, 2);
+    this._scrollAnchors = new NativeScrollCollection(this, SCROLL_COLLECTION.ANCHORS);
+    this._anchoringSuppressionProperties = new NativeScrollSuppression(this, SCROLL_SUPPRESS.ANCHORING);
+    this._positionSuppressionNodes = new NativeScrollSuppression(this, SCROLL_SUPPRESS.POSITION);
     this._forceFullInvalidation = false;
     // A forced rebuild that also repaints the whole target. A structural
     // mutation rebuilds the scene and owes only the damage the engine
@@ -1279,6 +1500,8 @@ class DOMRenderSurface {
     // CSS-px rectangle of the scene the raster target covers; null
     // covers the full scene.
     this._visibleRectangle = null;
+    this._selectedRoot = null;
+    this._selectedLayer = null;
     this._forceStateDelivery = false;
     this._currentTime = 0;
     this._activeTransitionCount = 0;
@@ -1295,7 +1518,15 @@ class DOMRenderSurface {
     // its place. The key holds the frame sequence and style generation
     // that the transitions were planned for.
     this._pendingTransitions = new Map();
+    // The before-change style of each element that a read saw and the last
+    // frame did not render (_planPendingTransitions), and the ones the
+    // frame in progress plans from.
+    this._readBaselines = new Map();
+    this._frameReadBaselines = null;
     this._pendingTransitionsKey = null;
+    this._styleChangeAnimationsKey = null;
+    // The provisional tracks by animation identity (_setProvisionalTrack).
+    this._provisionalTracks = new Map();
     // The pending transitions of the frame in progress.
     this._frameHeldTransitions = null;
     this._animations = [];
@@ -1303,15 +1534,17 @@ class DOMRenderSurface {
     // (element.animate() before any surface existed). They hold until the
     // first frame gives them a time to start from.
     this._animationsAwaitingTimeline = new Set();
+    // Pause-pending animations: the next frame commits their pauses.
+    this._animationsPausePending = new Set();
     this._animationCancelingThroughEngine = null;
     this._cssAnimations = new Map();
     this._pseudoContentAnimations = new Map();
-    this._pendingScrollSources = new NativeScrollCollection(this, 0);
-    this._pendingScrollEndTargets = new NativeScrollCollection(this, 1);
+    this._pendingScrollSources = new NativeScrollCollection(this, SCROLL_COLLECTION.SOURCES);
+    this._pendingScrollEndTargets = new NativeScrollCollection(this, SCROLL_COLLECTION.END_TARGETS);
     this._capturingFrames = false;
     this._advancingDocumentClock = false;
-    this._pendingSnapOrigins = new NativeScrollCollection(this, 2);
-    this._snappedTargets = new NativeScrollCollection(this, 3);
+    this._pendingSnapOrigins = new NativeScrollCollection(this, SCROLL_COLLECTION.SNAP_ORIGINS);
+    this._snappedTargets = new NativeScrollCollection(this, SCROLL_COLLECTION.SNAPPED);
     this._snapCheckPending = false;
     // A layout consequence owes a snap-container check; the frame that
     // renders it asks the core, which resolved every box element, and only
@@ -1374,20 +1607,33 @@ class DOMRenderSurface {
     return this._elementAtIndex;
   }
 
+  // The generation of the document's styles: it changes when a computed
+  // style of the document may have changed (a style sheet, an attribute, a
+  // state such as :hover), so a tool that reads computed styles reads them
+  // again only then.
+  get styleGeneration() {
+    return this._root.ownerDocument?._styleSystem?.generation ?? 0;
+  }
+
   // The box tree of the last prepared frame, for inspection: one entry per
   // layout box in tree order, as laid out. Each entry is { index, parent
   // (an index, or -1), children (indices), kind, display, node (the DOM
   // node the box comes from, the originating element of a ::before or
   // ::after box, or null for an anonymous box), text (a text box's text),
-  // rect, content }. `kind` names the box: "element", "text", "anonymous
+  // rect, content, page, fragments }. `kind` names the box: "element", "text", "anonymous
   // inline", "::before", "::after", "::before text", "::after text", "line
   // feed", "form value", "placeholder", "list marker", "marker wrapper",
   // "contents root", "anonymous table box" or "viewport". `rect` and
   // `content` are the border and content boxes in viewport CSS pixels of
   // the frame as scrolled, without transforms. A text node's box takes the
   // union of its glyph runs in the presented frame; generated text, which
-  // has no node of its own, has a null rect. The same frame returns the same
-  // frozen array.
+  // has no node of its own, has a null rect. In a paged frame, `fragments`
+  // lists the box's fragment on each page that holds part of it, in page
+  // order, each { page, rect, content }; the fragment on the page shown is
+  // the entry's own rect and content, and a box off the shown page has a
+  // null rect. `page` is the first fragment's page, null for a box on no
+  // page. A continuous frame has null `fragments` and `page`. The same
+  // frame returns the same frozen array.
   layoutTree() {
     const prepared = this._preparedState;
     if (prepared === null) return Object.freeze([]);
@@ -1402,14 +1648,18 @@ class DOMRenderSurface {
     const frame = this._presentedFrame;
     // Nodes on other pages have no geometry on this one.
     const offPage = new Set(this._pageFrame?.offPageNodes ?? []);
+    const nodeFragments = this._pageFrame?.nodeFragments ?? null;
+    const shownPage = this._pageFrame?.index ?? null;
     for (let index = 0; index < nodes.length; index++) {
       const node = nodes[index];
       const box = offPage.has(index) ? null : boxes[index];
       const parent = parents[index];
-      const kindCode = (node._coreBox ?? (node.display === "text" ? 2 : 0)) & 0xff;
-      const kind = LAYOUT_BOX_KINDS[kindCode];
-      if (kind === undefined) {
-        throw new Error(`layoutTree: box ${index} has kind ${kindCode}, which has no name; add it to LAYOUT_BOX_KINDS`);
+      // A scene node without a core box (a hand-authored scene) is a text
+      // box by its display, else it has no box kind (0).
+      const kindCode = (node._coreBox ?? (node.display === "text" ? SCENE_BOX_TEXT : 0)) & 0xff;
+      const kind = layoutBoxKindName(this._frameCore, kindCode);
+      if (kind === null) {
+        throw new Error(`layoutTree: box ${index} has kind ${kindCode}, which has no name; name it in scene_box_kind_name`);
       }
       let domNode = this._elementAtIndex[index] ?? null;
       if (domNode === null && node.generatedOwnerIndex !== undefined) {
@@ -1433,6 +1683,15 @@ class DOMRenderSurface {
           rect = content = rectangle(left, top, right - left, bottom - top);
         }
       }
+      // The engine's computed box of a text node is not its glyph runs:
+      // the fragment on the page shown takes the entry's own geometry.
+      let fragments = nodeFragments?.[index] ?? null;
+      if (fragments !== null && rect !== null) {
+        fragments = Object.freeze(fragments.map((fragment) =>
+          fragment.page === shownPage ? Object.freeze({ page: fragment.page, rect, content }) : fragment
+        ));
+      }
+      if (nodeFragments !== null && fragments === null) fragments = Object.freeze([]);
       entries[index] = Object.freeze({
         index,
         parent,
@@ -1443,11 +1702,61 @@ class DOMRenderSurface {
         text: node.display === "text" ? node.text : null,
         rect,
         content,
+        page: fragments?.[0]?.page ?? null,
+        fragments,
       });
     }
     this._layoutTreeFor = prepared;
     this._layoutTree = Object.freeze(entries);
     return this._layoutTree;
+  }
+
+  // The document outline of the surface's root (document-outline.js), with
+  // each bookmark-label resolved to text (its counters, attr(), content()
+  // and target functions) and the state "open" or "closed". The outline
+  // reads the current styles; read it again after a change. In a paged
+  // frame each entry also has `page`, the first page that holds its
+  // element's box (layoutTree()), null for an element on no page; in a
+  // continuous frame `page` is null.
+  documentOutline() {
+    const outline = readDocumentOutline(this._root);
+    const pages = new Map();
+    for (const box of this.layoutTree()) {
+      if (box.kind === "element" && box.page !== null && !pages.has(box.node)) pages.set(box.node, box.page);
+    }
+    const paginate = (entries) => {
+      for (const entry of entries) {
+        entry.page = pages.get(entry.element) ?? null;
+        paginate(entry.children);
+      }
+    };
+    paginate(outline);
+    return outline;
+  }
+
+  // The ranges of the highlight overlays that the program supplies (CSS
+  // Pseudo 4 §3.1, src/dom/highlights.js). setTargetText(directive)
+  // highlights the first match of a text directive as ::target-text and
+  // returns its Range (null clears it, or when nothing matches).
+  // find(text, { caseSensitive }) highlights every match as ::search-text,
+  // the first as the current match (::search-text:current), and returns
+  // them; findNext({ backwards }) moves the current match. Ranges given to
+  // setSpellingErrors() and setGrammarErrors() become ::spelling-error and
+  // ::grammar-error.
+  setTargetText(directive) {
+    return setTargetText(this._root.ownerDocument, directive);
+  }
+  find(text, options = {}) {
+    return findText(this._root.ownerDocument, text, options);
+  }
+  findNext(options = {}) {
+    return findNext(this._root.ownerDocument, options);
+  }
+  setSpellingErrors(ranges) {
+    setErrorRanges(this._root.ownerDocument, "spelling", ranges, "setSpellingErrors");
+  }
+  setGrammarErrors(ranges) {
+    setErrorRanges(this._root.ownerDocument, "grammar", ranges, "setGrammarErrors");
   }
 
   // The immutable presented-frame interaction snapshot for the last
@@ -1513,20 +1822,20 @@ class DOMRenderSurface {
           field,
         )
         : 0;
-    const smoothMotion = this._smoothScrolls.get(target);
-    const activeOwner = smoothMotion
-      ? Object.freeze({ kind: "smooth", source: smoothMotion.source })
-      : this._scrollMomentum && this._scrollMomentumTarget === target
-      ? Object.freeze({ kind: "momentum", source: "pointer" })
-      : this._scrollInteractionActive &&
-          this._scrollInteractionTarget === target
-      ? Object.freeze({ kind: "interaction", source: "pointer" })
-      : this._pendingScrollSources.has(target)
-      ? Object.freeze({
-        kind: "request",
-        source: this._pendingScrollSources.get(target),
-      })
-      : null;
+    const owner = this._root._domCore.exports.scroll_surface_active_owner(
+      this._smoothScrolls.has(target) ? 1 : 0,
+      this._scrollMomentum && this._scrollMomentumTarget === target ? 1 : 0,
+      this._scrollInteractionActive && this._scrollInteractionTarget === target ? 1 : 0,
+      this._pendingScrollSources.has(target) ? 1 : 0,
+    );
+    const activeOwner = owner === ACTIVE_OWNER_NONE ? null : Object.freeze({
+      kind: ACTIVE_OWNER_KINDS.get(owner),
+      source: owner === ACTIVE_OWNER_SMOOTH
+        ? this._smoothScrolls.get(target).source
+        : owner === ACTIVE_OWNER_REQUEST
+        ? this._pendingScrollSources.get(target)
+        : "pointer",
+    });
     return Object.freeze({
       requestedLeft: target === this.viewport
         ? target._requestedLeft
@@ -1540,18 +1849,58 @@ class DOMRenderSurface {
       effectiveTop: target === this.viewport
         ? target.scrollY
         : target._scrollTop,
-      minimumLeft: fact(16),
-      maximumLeft: fact(17),
-      minimumTop: fact(18),
-      maximumTop: fact(19),
-      scrollWidth: fact(10),
-      scrollHeight: fact(11),
+      minimumLeft: fact(GEOMETRY_SCROLL_MIN_LEFT),
+      maximumLeft: fact(GEOMETRY_SCROLL_MAX_LEFT),
+      minimumTop: fact(GEOMETRY_SCROLL_MIN_TOP),
+      maximumTop: fact(GEOMETRY_SCROLL_MAX_TOP),
+      scrollWidth: fact(GEOMETRY_SCROLL_WIDTH),
+      scrollHeight: fact(GEOMETRY_SCROLL_HEIGHT),
       activeOwner,
       pendingScroll: this._pendingScrollSources.has(target),
       pendingScrollEnd: this._pendingScrollEndTargets.has(target),
     });
   }
 
+  // Attaches a GPU frame comparison (README.md, "Frame comparison"):
+  // each rendered frame is compared on the GPU with the latest accepted
+  // image. `result(record)` receives each frame's record and
+  // `failure(error)` the error that ends the comparison. `operation`
+  // replies with the comparison, once its first owner exists, or throws its
+  // creation error. Options: budget (GPU bytes), historySlots, ringDepth,
+  // policy ("wait" or "drop"), tileSize (physical pixels).
+  attachFrameComparison(options, operation) {
+    if (this._shutdown) throw new Error("render surface is shut down");
+    if (this._frameComparison !== undefined && this._frameComparison !== null) {
+      throw new Error("render surface already has a frame comparison; detach it first");
+    }
+    let comparison = null;
+    const session = createFrameComparisonSession({
+      ...options,
+      ready: { reply: () => operation.reply(comparison), throw: (error) => operation.throw(error) },
+    });
+    comparison = Object.freeze({
+      readImage: (request, readOperation) => session.readImage(request, readOperation),
+      readMask: (request, readOperation) => session.readMask(request, readOperation),
+      gpuResources: () => session.gpuResources(),
+      statistics: () => session.statistics(),
+      detach: (detachOperation) => {
+        if (this._frameComparison !== session) throw new Error("the frame comparison is detached");
+        this._frameComparison = null;
+        this._persistentRenderer.detachFrameComparison().then(() => detachOperation.reply(), (error) => detachOperation.throw(error));
+      },
+    });
+    this._frameComparison = session;
+    if (!this._persistentRendererPromise) this._startPersistentRenderer(this.viewport);
+    // The baseline: the next frame renders, with full damage, even when
+    // nothing changed; a retained frame would re-deliver the presented one
+    // and render nothing.
+    this._forceFullInvalidation = true;
+    this._forceFullDamage = true;
+    this._dirty = true;
+    this._persistentRendererPromise
+      .then((renderer) => renderer.attachFrameComparison(session))
+      .then(() => this._schedule(), (error) => operation.throw(error));
+  }
   onFrame(callback) {
     if (typeof callback !== "function") {
       throw new TypeError("onFrame callback must be a function");
@@ -1565,13 +1914,18 @@ class DOMRenderSurface {
   }
   _connectSubtree(node) {
     if (this._shutdown) throw new Error("render surface is shut down");
-    if (node._renderSurface && node._renderSurface !== this) {
-      throw new Error("node belongs to another live render surface");
+    const pendingNodes = [node];
+    while (pendingNodes.length > 0) {
+      const current = pendingNodes.pop();
+      if (current._renderSurface && current._renderSurface !== this) {
+        throw new Error("node belongs to another live render surface");
+      }
+      current._renderSurface = this;
+      this._adoptPendingAnimations(current);
+      if (current._shadowRoot) pendingNodes.push(current._shadowRoot);
+      const children = current.childNodes;
+      for (let index = children.length - 1; index >= 0; index--) pendingNodes.push(children[index]);
     }
-    node._renderSurface = this;
-    this._adoptPendingAnimations(node);
-    for (const child of node.childNodes) this._connectSubtree(child);
-    if (node._shadowRoot) this._connectSubtree(node._shadowRoot);
   }
   // The animations `node` collected while it had no surface become this
   // surface's, in creation order, the moment it claims the node. Their start
@@ -1583,24 +1937,71 @@ class DOMRenderSurface {
     for (const animation of pending) {
       animation._surface = this;
       this._animations.push(animation);
-      this._animationsAwaitingTimeline.add(animation);
+      if (animation._timelinePending && !animation._timelineCleared) this._animationsAwaitingTimeline.add(animation);
+      else animation._restoreEngineBinding();
     }
     this._scheduleAnimationFrame(node);
   }
   _disconnectSubtree(node) {
-    if (node._renderSurface !== this) return;
-    this._forgetNodeState(node);
-    if (node._scrollState) {
-      node._domCore.status("scroll_detach", node._scrollState);
+    const pendingNodes = [node];
+    while (pendingNodes.length > 0) {
+      const current = pendingNodes.pop();
+      if (current._renderSurface !== this) continue;
+      this._forgetNodeState(current);
+      if (current._scrollState) {
+        current._domCore.status("scroll_detach", current._scrollState);
+      }
+      current._renderSurface = null;
+      if (current._shadowRoot) pendingNodes.push(current._shadowRoot);
+      const children = current.childNodes;
+      for (let index = children.length - 1; index >= 0; index--) pendingNodes.push(children[index]);
     }
-    node._renderSurface = null;
-    for (const child of node.childNodes) this._disconnectSubtree(child);
-    if (node._shadowRoot) this._disconnectSubtree(node._shadowRoot);
   }
   // Per-surface bookkeeping cleanup for one removed node — shared between
   // the primary's slot-releasing disconnect above and the follower fanout
   // below, which must never touch the primary's _renderSurface slots.
   _forgetNodeState(node) {
+    // A synchronous layout can reuse this node's row before another frame.
+    // Release both provisional and bound effects while the row still belongs
+    // to this node; script animation state keeps its document timeline.
+    // An element's ::before and ::after transitions go with it.
+    const targets = node.nodeType === 1
+      ? [node, pseudoElementTarget(node, "::before"), pseudoElementTarget(node, "::after")]
+      : [node];
+    this._animationEventDeferralDepth++;
+    try {
+      for (let index = this._animations.length - 1; index >= 0; index--) {
+        const animation = this._animations[index];
+        if (animation._element !== node) continue;
+        this._dropProvisionalTrack(animation._animationId);
+        if (animation instanceof CSSAnimation) animation._cancelByUserAgent();
+        else {
+          animation._detachFromSurface();
+          this._removeAnimation(animation);
+        }
+      }
+      // Reconnection must reconcile fresh CSS effects, not reuse cancelled records.
+      this._cssAnimations.delete(node);
+      for (const target of targets) {
+        const transitions = this._transitionRecords.get(target);
+        if (transitions) for (const record of [...transitions.values()]) record.animation.cancel();
+        const pendingTransitions = this._pendingTransitions.get(target);
+        if (pendingTransitions) for (const animation of [...pendingTransitions.values()]) animation.cancel();
+      }
+    } finally {
+      this._animationEventDeferralDepth--;
+    }
+    for (const target of targets) {
+      this._pendingTransitions.delete(target);
+      this._indexOfPseudoTarget.delete(target);
+    }
+    this._indexOfElement.delete(node);
+    for (let index = this._pendingAnimationDeclarations.length - 1; index >= 0; index--) {
+      const declaration = this._pendingAnimationDeclarations[index];
+      if (!targets.includes(declaration.target)) continue;
+      declaration.release?.();
+      this._pendingAnimationDeclarations.splice(index, 1);
+    }
     if (this._computedSamples) {
       node._domCore.status("computed_samples_remove_node", this._computedSamples, node._coreHandle);
     }
@@ -1624,9 +2025,14 @@ class DOMRenderSurface {
     }
   }
   _forgetSubtreeState(node) {
-    this._forgetNodeState(node);
-    for (const child of node.childNodes) this._forgetSubtreeState(child);
-    if (node._shadowRoot) this._forgetSubtreeState(node._shadowRoot);
+    const pendingNodes = [node];
+    while (pendingNodes.length > 0) {
+      const current = pendingNodes.pop();
+      this._forgetNodeState(current);
+      if (current._shadowRoot) pendingNodes.push(current._shadowRoot);
+      const children = current.childNodes;
+      for (let index = children.length - 1; index >= 0; index--) pendingNodes.push(children[index]);
+    }
   }
   // Mutation fanout: the DOM layer holds one _renderSurface pointer per
   // node (the primary); these broadcasts deliver the notification to every
@@ -1667,56 +2073,44 @@ class DOMRenderSurface {
     );
   }
 
+  // The frame flags are frame_loop_flags of these facts.
   _frameFlags(rasterize, deliverObservers, pixelReadback) {
     const document = this._root.ownerDocument;
     const style = document?._styleSystem;
-    return 1 |
-      (this._preparedState !== null && this._presentedFrame !== null ? 2 : 0) |
-      (this._pendingScrollSources.size > 0 ? 4 : 0) |
-      (this._animations.length + this._cssAnimations.size +
-            this._pseudoContentAnimations.size + this._activeTransitionCount +
-            this._pendingAnimationDeclarations.length > 0
-        ? 8
-        : 0) |
-      // An animation sample the retained scene cannot carry, and only that,
-      // owes a re-serialization. Every declared animation and transition is
-      // an engine track sampled natively from the retained rows, so a frame
-      // whose only change is such a sample reuses the scene; animated
-      // generated content is authored INTO the serialized rows here
-      // (_animatedGeneratedContent), and an unbound declaration still needs
-      // a scene to take its node index from.
-      (this._pseudoContentAnimations.size > 0 ||
-          this._pendingAnimationDeclarations.length > 0
-        ? 131072
-        : 0) |
-      (documentHasRenderingObservers(document) ? 16 : 0) |
-      (this._pendingObserverDelivery ? 32 : 0) |
-      (this._forceFullInvalidation ? 64 : 0) |
-      (this._forceFullDamage ? 262144 : 0) |
-      (style !== undefined &&
-          this._serializedStyleGeneration === style.generation &&
-          this._serializedViewportWidth === this.viewport.width &&
-          this._serializedViewportHeight === this.viewport.height &&
-          this._serializedViewportScale === this.viewport.deviceScale
-        ? 128
-        : 0) |
-      (rasterize ? 256 : 0) |
-      // A pixel capture after a texture delivery cannot merge into the
-      // retained pixel snapshot (the texture frames changed tiles it never
-      // saw), so it reads the whole target back; consecutive pixel frames
-      // stay incremental.
-      (pixelReadback &&
-          this._persistentRenderer?.graphicsBackend !== "webgl2" &&
-          !this._lastRendered?.pixels
-        ? 512
-        : 0) |
-      (this._scrollAnchors.size > 0 ? 2048 : 0) |
-      (this._animations.some((animation) => animation._isScrollDriven())
-        ? 4096
-        : 0) |
-      (deliverObservers ? 8192 : 0) |
-      (this._lastBoxes.length > 0 ? 16384 : 0) |
-      (this._lastPixels !== null || this._frameSequence > 0 ? 65536 : 0);
+    const core = this._frameCore;
+    return core.status("frame_loop_flags", ...core.valueListInput([
+      this._preparedState !== null ? 1 : 0,
+      this._presentedFrame !== null ? 1 : 0,
+      this._pendingScrollSources.size,
+      this._animations.length,
+      this._cssAnimations.size,
+      this._pseudoContentAnimations.size,
+      this._activeTransitionCount,
+      this._pendingAnimationDeclarations.length,
+      documentHasRenderingObservers(document) ? 1 : 0,
+      this._pendingObserverDelivery ? 1 : 0,
+      this._forceFullInvalidation ? 1 : 0,
+      this._forceFullDamage ? 1 : 0,
+      style !== undefined ? 1 : 0,
+      this._serializedStyleGeneration ?? NaN,
+      style?.generation ?? NaN,
+      this._serializedViewportWidth ?? NaN,
+      this.viewport.width,
+      this._serializedViewportHeight ?? NaN,
+      this.viewport.height,
+      this._serializedViewportScale ?? NaN,
+      this.viewport.deviceScale,
+      rasterize ? 1 : 0,
+      pixelReadback ? 1 : 0,
+      this._persistentRenderer?.graphicsBackend === "webgl2" ? 1 : 0,
+      this._lastRendered?.pixels ? 1 : 0,
+      this._scrollAnchors.size,
+      this._animations.some((animation) => animation._isScrollDriven()) ? 1 : 0,
+      deliverObservers ? 1 : 0,
+      this._lastBoxes.length,
+      this._lastPixels !== null ? 1 : 0,
+      this._frameSequence,
+    ]));
   }
 
   // Frame mode 4: restyles the retained publication in place
@@ -1725,32 +2119,27 @@ class DOMRenderSurface {
   // by its reason.
   _restyleRetainedPublication(core, frameViewport, styleSystem) {
     const counters = this._stageCounters;
-    if (this._hasNonStateMutation) {
-      counters.sceneRestyleRefusedMutation++;
-      return false;
-    }
-    if (
-      this._serializedViewportWidth !== frameViewport.width ||
-      this._serializedViewportHeight !== frameViewport.height ||
-      this._serializedViewportScale !== frameViewport.deviceScale
-    ) {
-      counters.sceneRestyleRefusedViewport++;
-      return false;
-    }
     // Sampled before the restyle, as a serialization samples it before its
     // walk.
     const styleGeneration = styleSystem === undefined
       ? -1
       : styleSystem.generation;
     const refusal = core.status(
-      "engine_record_restyle",
+      "frame_restyle_retained",
       this._preparedState.serialized.publication,
       this._root._coreHandle,
+      this._hasNonStateMutation ? 1 : 0,
+      this._serializedViewportWidth ?? NaN,
+      this._serializedViewportHeight ?? NaN,
+      this._serializedViewportScale ?? NaN,
+      frameViewport.width,
+      frameViewport.height,
+      frameViewport.deviceScale,
     );
-    if (refusal !== 0) {
-      const counter = SCENE_RESTYLE_REFUSALS[refusal];
+    if (refusal !== ENGINE_RESTYLE_DONE) {
+      const counter = SCENE_RESTYLE_REFUSALS.get(refusal);
       if (counter === undefined) {
-        throw new Error(`engine_record_restyle answered ${refusal}`);
+        throw new Error(`frame_restyle_retained answered ${refusal}`);
       }
       counters[counter]++;
       return false;
@@ -1773,10 +2162,7 @@ class DOMRenderSurface {
       const node = { ...nodes[index] };
       if (node._coreRecord !== undefined) {
         const box = previous.geometryBoxes[index];
-        node._coreRecord = core.engineRecordCopy(
-          box.stableId,
-          box.sourceRevision,
-        );
+        node._coreRecord = core.engineRecordAfterChange(box.stableId, box.sourceRevision);
       }
       nodes[index] = node;
     }
@@ -1806,50 +2192,31 @@ class DOMRenderSurface {
     depth = -1,
     bindings = this._frameBindings,
   ) {
-    return bindings.frame_resume(frame, token, 0, facts, depth);
+    return bindings.frame_resume(frame, token, FRAME_OUTCOME_DONE, facts, depth);
   }
 
+  // The core classifies the mutation and invalidates the surface
+  // (frame_surface_mutation); the surface keeps the per-node sets and
+  // performs the effects.
   _recordMutation(kind, node, detail) {
     if (this._shutdown) throw new Error("render surface is shut down");
-    if (node && kind !== "selection") this._mutatedNodes.add(node);
-    if (kind === "style" && detail === "transform" && node) {
-      this._transformOnlyMutations.add(node);
-    } else {
-      this._hasNonTransformMutation = true;
+    const core = this._frameCore;
+    const effects = core.status("frame_surface_mutation", this._frameOwner, FRAME_MUTATION_KINDS.get(kind),
+      ...core.input(detail ?? ""));
+    if (node && (effects & FRAME_MUTATION_EFFECT.MARK_NODE)) this._mutatedNodes.add(node);
+    if (node && (effects & FRAME_MUTATION_EFFECT.TRANSFORM_ONLY)) this._transformOnlyMutations.add(node);
+    else this._hasNonTransformMutation = true;
+    if (effects & FRAME_MUTATION_EFFECT.NOT_RESTYLE_STATE) this._hasNonStateMutation = true;
+    if (effects & FRAME_MUTATION_EFFECT.SELECTION) this._selectionChanged = true;
+    if (effects & FRAME_MUTATION_EFFECT.FULL_INVALIDATION) this._forceFullInvalidation = true;
+    if (effects & FRAME_MUTATION_EFFECT.SCROLL_SUPPRESS) {
+      node._domCore.status("scroll_suppress", this._scrollOwner, node._coreHandle, ...node._domCore.input(detail));
     }
-    if (kind !== "state" || !RESTYLE_STATES.has(detail)) {
-      this._hasNonStateMutation = true;
-    }
-    if (kind === "structure") this._structureMutations++;
-    if (kind === "selection") this._selectionChanged = true;
-    // Native records classify DOM fields before callback delivery. Only
-    // host-owned bitmap and interaction changes enter as normalized facts.
-    if (kind === "state" || kind === "selection" || kind === "canvas-paint") {
-      this._frameCore.status("frame_surface_invalidate", this._frameOwner, 1);
-    } else if (kind === "canvas-size") {
-      this._frameCore.status("frame_surface_invalidate", this._frameOwner, 2);
-    }
-    const consequence = this._mutationConsequence;
-    if (consequence === 3) this._forceFullInvalidation = true;
-    if (kind === "style") {
-      node._domCore.status(
-        "scroll_suppress",
-        this._scrollOwner,
-        node._coreHandle,
-        ...node._domCore.input(detail),
-      );
-    }
-    // Frame listeners observe interaction state as well as pixels. Preserve
-    // a state-only checkpoint even when focus does not change the raster.
-    if (kind === "state") this._forceStateDelivery = true;
-    if (kind === "canvas-paint" || kind === "canvas-size") {
-      this._forcedGenerationNodes.add(node);
-    }
+    // Frame listeners observe interaction state as well as pixels.
+    if (effects & FRAME_MUTATION_EFFECT.DELIVER_STATE) this._forceStateDelivery = true;
+    if (effects & FRAME_MUTATION_EFFECT.FORCE_GENERATION) this._forcedGenerationNodes.add(node);
     this._dirty = true;
-    // A paint-only mutation cannot move boxes, so it cannot owe a snap
-    // re-check; a layout or structural consequence owes one, which the
-    // frame answers from the core's snap-container list.
-    if (consequence >= 2) {
+    if (effects & FRAME_MUTATION_EFFECT.SNAP_CHECK) {
       this._preservedScrollMetrics = null;
       this._snapCheckOwed = true;
     }
@@ -1872,6 +2239,42 @@ class DOMRenderSurface {
     return new NativeScrollCapture(this);
   }
 
+  // CSS Conditional 5 §7: each accepted frame snapshots the scroll state
+  // of its query containers (container_scroll_state_set) in physical
+  // directions, 1 left, 2 right, 4 top, 8 bottom, at the bit of each
+  // state: whether it can scroll there, where its sticky offset holds it,
+  // which axes snap to it, and its last relative scroll on each axis. A
+  // changed state restyles the document in the next frame.
+  _snapshotScrollStates(serialized, boxes, geometryHandle) {
+    if (serialized.scrollStateContainers.length === 0) return;
+    const core = this._root._domCore;
+    const snapped = new Map();
+    for (const [, { horizontal, vertical }] of this._snappedTargets) {
+      if (horizontal) snapped.set(horizontal, (snapped.get(horizontal) ?? 0) | CONTAINER_SNAPPED_X);
+      if (vertical) snapped.set(vertical, (snapped.get(vertical) ?? 0) | CONTAINER_SNAPPED_Y);
+    }
+    let changed = false;
+    for (const { row, handle } of serialized.scrollStateContainers) {
+      const box = boxes[row];
+      if (box === undefined) continue;
+      const element = core.wrapperFor(handle);
+      const range = (field) => geometryHandle ? core.status("geometry_value", geometryHandle, handle, field) : 0;
+      let scrollable = 0;
+      if (box.scrollLeft > range(GEOMETRY_SCROLL_MIN_LEFT)) scrollable |= 1;
+      if (box.scrollLeft < range(GEOMETRY_SCROLL_MAX_LEFT)) scrollable |= 2;
+      if (box.scrollTop > range(GEOMETRY_SCROLL_MIN_TOP)) scrollable |= 4;
+      if (box.scrollTop < range(GEOMETRY_SCROLL_MAX_TOP)) scrollable |= 8;
+      const stuck = (box.stickyLeft > 0 ? 1 : box.stickyLeft < 0 ? 2 : 0) | (box.stickyTop > 0 ? 4 : box.stickyTop < 0 ? 8 : 0);
+      const flags = scrollable * CONTAINER_SCROLLABLE_LEFT | stuck * CONTAINER_STUCK_LEFT | (snapped.get(element) ?? 0) |
+        elementScrollRead(element, SCROLL_SCROLLED_DIRECTION) * CONTAINER_SCROLLED_LEFT;
+      if (core.status("container_scroll_state_set", handle, flags) === 1) changed = true;
+    }
+    if (changed) {
+      this._dirty = true;
+      this._schedule();
+    }
+  }
+
   _acceptScrollFeedback(serialized, effectiveBoxes, requestGenerations) {
     const changed = [];
     for (const [target, { generation }] of requestGenerations) {
@@ -1889,7 +2292,7 @@ class DOMRenderSurface {
           box.scrollTop,
         )
       ) changed.push(target);
-      if (!scrollRead(target, 5)) this._pendingScrollSources.delete(target);
+      if (!scrollRead(target, SCROLL_SMOOTH_PENDING)) this._pendingScrollSources.delete(target);
     }
     // A viewport no request moved this frame can still lose scroll range:
     // new content, a resize. Its presented box carries the engine's
@@ -1903,12 +2306,9 @@ class DOMRenderSurface {
       : effectiveBoxes[serialized.viewportIndex];
     if (
       viewportBox && viewport._scrollState &&
-      (viewportBox.scrollLeft !== scrollRead(viewport, 2) ||
-        viewportBox.scrollTop !== scrollRead(viewport, 3)) &&
       scrollCore(viewport).status(
-        "scroll_accept",
+        "scroll_surface_viewport_accept",
         scrollState(viewport),
-        scrollRead(viewport, 7),
         viewportBox.scrollLeft,
         viewportBox.scrollTop,
       )
@@ -1923,6 +2323,29 @@ class DOMRenderSurface {
       this._schedule();
     }
     return changed;
+  }
+
+  // The focused text control's pending caret reveal runs over the presented
+  // geometry (core/dom/text-control-scroll.watpart); the scroll it requests
+  // paints in the next frame.
+  _revealFocusedCaret(geometryHandle) {
+    if (!geometryHandle) return;
+    if (this._root._domCore.status("scroll_text_control_reveal", this._scrollOwner, geometryHandle, this._root._coreHandle)) {
+      this._dirty = true;
+      this._schedule();
+    }
+  }
+
+  // The open suggestion popup of a text field takes its place over the
+  // presented geometry (core/dom/datalist-popup.watpart): under or over its
+  // field. A new place, or the end of the popup's measuring frame, paints
+  // in the next frame.
+  _placeSuggestionPopup(geometryHandle) {
+    if (!geometryHandle) return;
+    if (this._root._domCore.status("datalist_popup_place", this._scrollOwner, geometryHandle, this._root._coreHandle)) {
+      this._dirty = true;
+      this._schedule();
+    }
   }
 
   _requestElementScroll(element, left, top, source, behavior = "instant") {
@@ -1985,17 +2408,25 @@ class DOMRenderSurface {
   }
 
   // "Update animations and send events" (HTML, the rendering steps of a
-  // frame, before its animation frame callbacks): the replaced script
-  // animations leave the effect stack, and each fires `remove` (Web
-  // Animations 1, section 5.5), in composite order.
+  // frame, before its animation frame callbacks): the document timeline
+  // takes the frame's time, so that the animations' current times follow
+  // it in the animation frame callbacks (Web Animations 1, section 4.4.4),
+  // and the replaced script animations leave the effect stack, each firing
+  // `remove` (section 5.5), in composite order.
   _updateAnimationsAndSendEvents(timeMilliseconds) {
     if (this._shutdown) return;
+    this._currentTime = timeMilliseconds;
+    // The document's log keeps the time of a frame that follows its
+    // entries, so a replay renders its frames at the same times
+    // (core/dom/document-log.watpart document_log_frame).
+    const document = this._root.nodeType === 9 ? this._root : this._root.ownerDocument;
+    if (document) document._domCore.status("document_log_frame", document._coreHandle, timeMilliseconds);
     const removed = removeReplacedAnimations(this._animations, timeMilliseconds);
     if (removed.length === 0) return;
     const timelineTime = documentTimeline(this._root.ownerDocument)?.currentTime ?? null;
     const events = removed.map((animation) => {
-      const currentTime = animation._core.status("animation_value", animation._animationId, 0, timeMilliseconds);
-      return new SDAnimationPlaybackEvent("remove", {
+      const currentTime = animation._core.status("animation_value", animation._animationId, ANIMATION_VALUE_CURRENT_TIME, timeMilliseconds);
+      return createEventUsing(SDAnimationPlaybackEvent, "remove", {
         currentTime: Number.isNaN(currentTime) ? null : currentTime,
         timelineTime,
       });
@@ -2009,7 +2440,12 @@ class DOMRenderSurface {
     }
   }
 
-  _runDocumentAnimationFrameCheckpoint(timeMilliseconds) {
+  // The animation frame callbacks of the frame, each followed by a microtask
+  // checkpoint (HTML, "clean up after running script"): the promise
+  // continuations of a callback run before the next callback and before the
+  // frame's style update, so that they see and change the style that frame
+  // renders.
+  async _runDocumentAnimationFrameCheckpoint(timeMilliseconds) {
     const core = this._animationFrameCore;
     const owner = this._animationFrameOwner;
     const checkpoint = core.status("animation_frame_checkpoint_begin", owner);
@@ -2042,6 +2478,7 @@ class DOMRenderSurface {
             token,
           );
         }
+        await microtaskCheckpoint();
       }
     } finally {
       this._releaseDocumentAnimationFrameCheckpoint(checkpoint);
@@ -2051,7 +2488,7 @@ class DOMRenderSurface {
   _recordViewportResize(previousEnvironment = null) {
     if (this._shutdown) throw new Error("render surface is shut down");
     this._viewportRevision++;
-    this._frameCore.status("frame_surface_invalidate", this._frameOwner, 2);
+    this._frameCore.status("frame_surface_invalidate", this._frameOwner, FRAME_INVALIDATE_VIEWPORT);
     const registry = this._root._renderSurfaces;
     const nextEnvironmentKey =
       `${this.viewport.width}x${this.viewport.height}@${this.viewport.deviceScale}`;
@@ -2067,10 +2504,14 @@ class DOMRenderSurface {
       registry?.set(nextEnvironmentKey, this);
       this._environmentKey = nextEnvironmentKey;
     }
-    const densityOnlyResize = previousEnvironment !== null &&
-      previousEnvironment.width === this.viewport.width &&
-      previousEnvironment.height === this.viewport.height &&
-      previousEnvironment.deviceScale !== this.viewport.deviceScale;
+    const densityOnlyResize = this._frameCore.exports.frame_resize_density_only(
+      previousEnvironment?.width ?? NaN,
+      previousEnvironment?.height ?? NaN,
+      previousEnvironment?.deviceScale ?? NaN,
+      this.viewport.width,
+      this.viewport.height,
+      this.viewport.deviceScale,
+    ) !== 0;
     if (
       densityOnlyResize &&
       this._preservedScrollMetrics === null &&
@@ -2120,25 +2561,13 @@ class DOMRenderSurface {
    */
   setVisibleRectangle(rectangle) {
     if (this._shutdown) throw new Error("render surface is shut down");
-    if (rectangle !== null) {
-      const { x, y, width, height } = rectangle;
-      if (
-        !(width > 0) || !(height > 0) || !Number.isFinite(x) ||
-        !Number.isFinite(y)
-      ) {
-        throw new RangeError(
-          "visibleRectangle requires finite x/y and positive width/height",
-        );
-      }
-    }
+    const core = this._root._domCore;
     const previous = this._visibleRectangle;
-    if (
-      previous === rectangle ||
-      (previous !== null && rectangle !== null &&
-        previous.x === rectangle.x && previous.y === rectangle.y &&
-        previous.width === rectangle.width &&
-        previous.height === rectangle.height)
-    ) return;
+    const request = core.statusRaw("frame_visible_rectangle_request", ...core.valueListInput([
+      previous?.x ?? null, previous?.y ?? null, previous?.width ?? null, previous?.height ?? null,
+      ...(rectangle === null ? [null, null, null, null] : [rectangle?.x ?? NaN, rectangle?.y ?? NaN, rectangle?.width ?? NaN, rectangle?.height ?? NaN]),
+    ]));
+    if (request === FRAME_VISIBLE_RECTANGLE_SAME) return;
     this._visibleRectangle = rectangle === null ? null : {
       x: Number(rectangle.x),
       y: Number(rectangle.y),
@@ -2151,21 +2580,90 @@ class DOMRenderSurface {
     this._schedule();
   }
 
+  /** Selects the node whose subtree the raster draws, as it draws in place
+   * with its ancestors' clips, transforms, and group effects, or the whole
+   * document with null. Raster-only: layout and the paint walk still cover
+   * the document. A node with no scene row fails the next frame.
+   */
+  setSelectedRoot(node) {
+    if (this._shutdown) throw new Error("render surface is shut down");
+    if (node === this._selectedRoot) return;
+    this._selectedRoot = node;
+    if (node !== null) this._selectedLayer = null;
+    this._forceFullInvalidation = true;
+    this._forceFullDamage = true;
+    this._dirty = true;
+    this._schedule();
+  }
+
+  /** Selects the compositing layer that the raster draws, by its paint
+   * group index in the frame's paint record, with all it holds and the
+   * clips and groups around it, or none with null. It replaces a selected
+   * root. A layer past the frame's groups fails the next frame.
+   */
+  setSelectedLayer(layer) {
+    if (this._shutdown) throw new Error("render surface is shut down");
+    if (layer !== null && !(Number.isInteger(layer) && layer >= 0)) {
+      throw new RangeError(`setSelectedLayer: a layer is a paint group index from 0, or null; received ${layer}`);
+    }
+    if (layer === this._selectedLayer) return;
+    this._selectedLayer = layer;
+    if (layer !== null) this._selectedRoot = null;
+    this._forceFullInvalidation = true;
+    this._forceFullDamage = true;
+    this._dirty = true;
+    this._schedule();
+  }
+
+  // The selected root (setSelectedRoot) and layer (setSelectedLayer), the
+  // visible rectangle (setVisibleRectangle), and the raster backdrop
+  // (background; undefined for the renderer's default).
+  get selectedRoot() {
+    return this._selectedRoot;
+  }
+
+  get selectedLayer() {
+    return this._selectedLayer;
+  }
+
+  get visibleRectangle() {
+    return this._visibleRectangle;
+  }
+
+  get background() {
+    return this._background;
+  }
+
+  /** Sets the raster backdrop: { r, g, b, a }, or undefined for the
+   * renderer's default. The next frame rasters every tile. */
+  setBackground(background) {
+    if (this._shutdown) throw new Error("render surface is shut down");
+    const next = surfaceBackground(background, "setBackground");
+    const previous = this._background;
+    if (
+      next?.r === previous?.r && next?.g === previous?.g &&
+      next?.b === previous?.b && next?.a === previous?.a
+    ) return;
+    this._background = next;
+    this._forceFullInvalidation = true;
+    this._forceFullDamage = true;
+    this._dirty = true;
+    this._schedule();
+  }
+
   /** Tool overlay: paints `rectangles` above the document and its
    * scrollbars, as a browser's developer tools paint their highlight. Each
    * is { x, y, width, height, color: { r, g, b, a } } in viewport CSS
    * pixels, colour channels 0 to 1. An empty list paints none.
    */
   setToolHighlights(rectangles) {
-    if (!Array.isArray(rectangles)) {
-      throw new TypeError(`setToolHighlights takes an array of rectangles, not ${typeof rectangles}`);
-    }
+    const core = this._root._domCore;
+    core.statusRaw("frame_tool_highlights_check", Array.isArray(rectangles) ? 1 : 0, ...core.valueListInput([typeof rectangles]));
     this._toolHighlights = Object.freeze(rectangles.map((rectangle, index) => {
       const { x, y, width, height, color } = rectangle ?? {};
-      if (![x, y, width, height, color?.r, color?.g, color?.b, color?.a].every(Number.isFinite)) {
-        throw new TypeError(
-          `setToolHighlights rectangle ${index} needs finite x, y, width, height and color { r, g, b, a }: ${JSON.stringify(rectangle)}`,
-        );
+      const fields = [x, y, width, height, color?.r, color?.g, color?.b, color?.a];
+      if (core.status("frame_tool_highlight_valid", ...core.valueListInput(fields)) !== 1) {
+        core.statusRaw("frame_tool_highlight_error", index, ...core.valueListInput([String(JSON.stringify(rectangle))]));
       }
       return Object.freeze({ x, y, width, height, color: Object.freeze({ r: color.r, g: color.g, b: color.b, a: color.a }) });
     }));
@@ -2180,17 +2678,16 @@ class DOMRenderSurface {
    */
   setPage(index) {
     if (this._shutdown) throw new Error("render surface is shut down");
-    if (index !== null && !(Number.isInteger(index) && index >= 0)) {
-      throw new RangeError(`setPage needs a page index of 0 or more, or null; got ${index}`);
-    }
-    if (index === this._page) return;
+    const core = this._root._domCore;
     // Entering or leaving paged media changes how the viewport scrolls and
-    // takes a full frame. Another page of a paged document reuses the
-    // retained scene (frame mode 3): the renderer keeps the rows the engine
-    // holds and seeks the page from the starts it recorded while it counted
-    // the pages. The presented frame shows another page, so it is not
-    // delivered again (_retainedDeliveryPossible).
-    if ((index === null) !== (this._page === null)) {
+    // takes a full frame (frame_page_request). Another page of a paged
+    // document reuses the retained scene (frame mode 3): the renderer keeps
+    // the rows the engine holds and seeks the page from the starts it
+    // recorded while it counted the pages. The presented frame shows
+    // another page, so it is not delivered again (_retainedDeliveryPossible).
+    const request = core.statusRaw("frame_page_request", ...core.valueListInput([index, String(index), this._page]));
+    if (request === 0) return;
+    if (request & FRAME_PAGE_REQUEST_FULL) {
       this._forceFullInvalidation = true;
       this._forceFullDamage = true;
     }
@@ -2224,6 +2721,40 @@ class DOMRenderSurface {
     return Object.freeze(this._pageFrame.pages.map((page) => Object.freeze(describePage(page))));
   }
 
+  /** The page of a point of a paged surface and the point on it: the
+   * surface's coordinate space holds the page boxes one below the other,
+   * their left edges aligned, with the page area of the page shown at
+   * (0, 0), and every geometry operation answers in it
+   * (src/dom/page-stack.js). Returns { page, x, y }, the point from that
+   * page's page box top left corner in CSS pixels; a point above the first
+   * page or below the last takes that page. null for a continuous frame. */
+  pagePoint(x, y) {
+    if (this._pageFrame === null) return null;
+    return Object.freeze(pageOfPoint(this._pageFrame.pages, this._pageFrame.index, x, y));
+  }
+
+  /** pagePoint, inverted: the surface point of the point (x, y) on page
+   * `page`, from its page box's top left corner, as { x, y }; null for a
+   * continuous frame. */
+  surfacePoint(page, x, y) {
+    if (this._pageFrame === null) return null;
+    return Object.freeze(pointOfPage(this._pageFrame.pages, this._pageFrame.index, page, x, y));
+  }
+
+  // The page option of a synchronous layout of the page this surface
+  // shows, as a page frame's (renderOptions.page), for a viewport of
+  // `viewport`'s size; null when it shows the continuous document.
+  _syncPageOption(viewport) {
+    if (this._page === null) return null;
+    const rules = this._pageRules({ width: viewport.width, height: viewport.height });
+    return {
+      height: viewport.height,
+      index: this._page,
+      rulesKey: rules.key,
+      box: (page) => pageBox(rules.rules, page, rules.defaultSize),
+    };
+  }
+
   // The document's @page rules for a page frame: parsed rules, a key that
   // changes with them and with the default page size, and that size (the
   // viewport's).
@@ -2250,7 +2781,7 @@ class DOMRenderSurface {
     const box = counted ?? pageBox(pageRules.rules, {
       index,
       name: "",
-      side: index % 2 === 0 ? "right" : "left",
+      side: this._root._domCore.string("frame_page_side", index),
       blank: false,
     }, pageRules.defaultSize);
     return { x: -box.margin.left, y: -box.margin.top, width: box.width, height: box.height };
@@ -2270,7 +2801,7 @@ class DOMRenderSurface {
       : Array.from({ length: index + 1 }, (_, pageIndex) => ({
         index: pageIndex,
         name: "",
-        side: pageIndex % 2 === 0 ? "right" : "left",
+        side: this._root._domCore.string("frame_page_side", pageIndex),
         blank: false,
       }));
     const page = pages[Math.min(index, pages.length - 1)];
@@ -2302,7 +2833,7 @@ class DOMRenderSurface {
     const node = this._root._domCore.status(
       "scroll_motion_target",
       this._scrollOwner,
-      0,
+      SCROLL_MOTION_MOMENTUM,
     );
     return node ? this._root._domCore.wrapperFor(node) : this.viewport;
   }
@@ -2320,27 +2851,20 @@ class DOMRenderSurface {
     const node = this._root._domCore.status(
       "scroll_motion_target",
       this._scrollOwner,
-      1,
+      SCROLL_MOTION_INTERACTION,
     );
     return node ? this._root._domCore.wrapperFor(node) : this.viewport;
   }
 
   // An input run executed scroll action `action` on this surface's scroll
-  // owner (src/dom-wasm/input-run.watpart state 9): 7 chain and 11
+  // owner (core/dom/input-run.watpart state 9): 7 chain and 11
   // scrollbar, which owe a frame and a snap check when they moved; 9 the
   // end of an interaction; 10 momentum, which owes frames while it runs.
   _inputScrolled(action, changed) {
-    if (action === 7 || action === 11) {
-      if (!changed) return;
-      this._snapCheckPending = true;
-      this._dirty = true;
-      this._schedule();
-    } else if (action === 9) {
-      this._schedule();
-    } else if (action === 10) {
-      this._dirty ||= changed;
-      this._schedule();
-    }
+    const effects = this._root._domCore.exports.scroll_surface_input_effect(action, changed ? 1 : 0);
+    if (effects & SCROLL_INPUT_EFFECT_SNAP_CHECK) this._snapCheckPending = true;
+    if (effects & SCROLL_INPUT_EFFECT_DIRTY) this._dirty = true;
+    if (effects & SCROLL_INPUT_EFFECT_SCHEDULE) this._schedule();
   }
 
   _interruptScrolling() {
@@ -2395,10 +2919,10 @@ class DOMRenderSurface {
   _refreshScrollAnchors(serialized, boxes, geometryHandle) {
     const core = this._root._domCore;
     const focused = this._root._activeElement;
-    const focusedHandle =
-      focused && (focused.localName === "input" || focused.localName === "textarea")
-        ? focused._coreHandle
-        : 0n;
+    const focusedHandle = focused &&
+        core.status("scroll_surface_anchor_focus", ...core.valueListInput([nodeMember(focused, "localName")])) === 1
+      ? focused._coreHandle
+      : 0n;
     if (geometryHandle) {
       core.status(
         "scroll_anchor_refresh",
@@ -2452,18 +2976,24 @@ class DOMRenderSurface {
   }
 
   _applyScrollSnapping() {
-    if (
-      this._scrollInteractionActive || this._scrollMomentum ||
-      !this._presentedFrame?.geometryHandle
-    ) return false;
     // A pending check re-snaps every snap container of the tree, which is a
-    // walk of every element. A tree whose last build had none owes no walk,
-    // unless styles changed since that build. Scrollers already snapped or
-    // owing a snap take theirs either way.
-    const walkTree = this._snapCheckPending &&
-      (this._snapContainersInLastBuild() ||
-        this._root.ownerDocument?._styleSystem?.generation !==
-          this._serializedStyleGeneration);
+    // walk of every element; scroll_surface_snap_plan decides whether a
+    // frame owes it. Scrollers already snapped or owing a snap take theirs
+    // either way.
+    const exports = this._root._domCore.exports;
+    const facts = [
+      this._scrollInteractionActive ? 1 : 0,
+      this._scrollMomentum ? 1 : 0,
+      this._presentedFrame?.geometryHandle ? 1 : 0,
+      this._snapCheckPending ? 1 : 0,
+    ];
+    const stylesChanged = this._root.ownerDocument?._styleSystem?.generation !== this._serializedStyleGeneration ? 1 : 0;
+    let plan = exports.scroll_surface_snap_plan(...facts, -1, stylesChanged);
+    if (plan === SNAP_PLAN_NEEDS_CONTAINERS) {
+      plan = exports.scroll_surface_snap_plan(...facts, this._snapContainersInLastBuild() ? 1 : 0, stylesChanged);
+    }
+    if (plan === SNAP_PLAN_NONE) return false;
+    const walkTree = plan === SNAP_PLAN_WALK;
     if (walkTree) this._stageCounters.snapTreeWalks++;
     const changed = !!this._root._domCore.status(
       "scroll_snap_apply",
@@ -2477,6 +3007,10 @@ class DOMRenderSurface {
     if (changed) {
       this._dirty = true;
       this._schedule();
+    } else if (this._preparedState !== null) {
+      // A snap that only changes the snapped targets renders nothing: the
+      // presented frame's scroll state takes them now.
+      this._snapshotScrollStates(this._preparedState.serialized, this._preparedState.boxes, this._presentedFrame.geometryHandle);
     }
     return changed;
   }
@@ -2516,18 +3050,71 @@ class DOMRenderSurface {
     }
   }
 
-  // A caret is on screen when the presented frame carries one. The surface
-  // then keeps asking for frames, the way a running animation does, so the
-  // blink phase can flip; the frame that flips it changes nothing that
+  // A caret is on screen when the presented frame carries one. On an
+  // injected clock the surface keeps asking for frames, the way a running
+  // animation does, so the blink phase can flip. On the host's real clock
+  // it asks for no frame until the phase flips: a host timer waits for
+  // that moment (_caretWork). The frame that flips it changes nothing that
   // feeds serialization, so it reuses the retained scene.
   _caretBlinkActive() {
-    return (this._frameCore.status("frame_caret_state", this._frameOwner, 0) & 1) !== 0;
+    return (this._frameCore.status("frame_caret_state", this._frameOwner, 0) & FRAME_CARET_ACTIVE) !== 0;
+  }
+
+  // The caret's share of the work a frame owes: FRAME_WORK_CARET while the
+  // blink needs a frame now. On the real clock a caret whose phase flips
+  // later arms one host timer for the flip, which schedules again.
+  _caretWork() {
+    if (!this._nowIsHostTime) return this._caretBlinkActive() ? FRAME_WORK_CARET : 0;
+    const delay = this._frameCore.status("frame_caret_flip_delay", this._frameOwner, this._now());
+    if (delay === 0) return FRAME_WORK_CARET;
+    if (delay > 0 && this._caretTimer === null) {
+      this._caretTimer = hostSetTimeout(() => {
+        this._caretTimer = null;
+        this._schedule();
+      }, delay);
+    }
+    return 0;
+  }
+
+  _cancelCaretTimer() {
+    if (this._caretTimer === null) return;
+    hostClearTimeout(this._caretTimer);
+    this._caretTimer = null;
+  }
+
+  // A held spin half of a number field steps again after a delay
+  // (core/dom/input-number.watpart): its step is a task of the frame that
+  // is due by then (_runSpinRepeat). With a host clock a timeout wakes the
+  // loop for it; under a caller's clock each frame checks it.
+  _spinWork() {
+    const input = this._root.ownerDocument?._editingCommands;
+    if (!input?.spinRepeatDelay || this._root._domCore.exports.input_spin_held() === 0) return 0;
+    const delay = input.spinRepeatDelay(this._root, this._now());
+    if (delay < 0) return 0;
+    if (delay === 0 || !this._nowIsHostTime) return FRAME_WORK_TIMERS;
+    if (this._spinTimer === null) {
+      this._spinTimer = hostSetTimeout(() => {
+        this._spinTimer = null;
+        this._schedule();
+      }, delay);
+    }
+    return 0;
+  }
+
+  _runSpinRepeat(timeMilliseconds) {
+    this._root.ownerDocument?._editingCommands?.spinRepeat?.(this._root, timeMilliseconds);
+  }
+
+  _cancelSpinTimer() {
+    if (this._spinTimer === null) return;
+    hostClearTimeout(this._spinTimer);
+    this._spinTimer = null;
   }
 
   _caretBlinkDue(timeMilliseconds) {
     return (this._frameCore.status(
       "frame_caret_state", this._frameOwner, timeMilliseconds,
-    ) & 2) !== 0;
+    ) & FRAME_CARET_PHASE_CHANGED) !== 0;
   }
 
   // The CSS cursor the engine resolves at a document point, written to the
@@ -2536,19 +3123,12 @@ class DOMRenderSurface {
   _applyCursor(x, y) {
     const target = this._cursorTarget;
     if (!target || this._shutdown || !this._presentedFrame) return;
-    let cursor;
-    try {
-      cursor = this._presentedFrame.geometryCore.string(
-        "input_pointer_cursor",
-        this._presentedFrame.geometryHandle,
-        x,
-        y,
-      );
-    } catch {
-      // A cursor query against geometry that has just been released is not
-      // a host error; the next pointer event asks again.
-      return;
-    }
+    const cursor = this._presentedFrame.geometryCore.string(
+      "input_pointer_cursor",
+      this._presentedFrame.geometryHandle,
+      x,
+      y,
+    );
     if (cursor === this._appliedCursor) return;
     this._appliedCursor = cursor;
     if (target.style) target.style.cursor = cursor;
@@ -2567,27 +3147,31 @@ class DOMRenderSurface {
     }
   }
 
+  // Whether the loop requests a frame is frame_loop_schedule: the gates
+  // first, then the work a frame owes. The frame's animation microtask
+  // checkpoint belongs to the frame in flight.
   _schedule() {
-    if (
-      this._frameTransaction ||
-      !this._running || this._shutdown || this._rendering ||
-      this._advancingDocumentClock ||
-      (!this._animationFrameCore.status(
-        "animation_frame_pending",
-        this._animationFrameOwner,
-      ) &&
-        !this._dirty &&
-        !this._caretBlinkActive() &&
-        !this._scrollbarVisibility.active &&
-        ((this._pendingScrollEndTargets.size === 0 &&
-          !this._snapCheckPending) ||
-          this._scrollInteractionActive) &&
-        !this._documentTimersAwaitFrame()) ||
-      this._frameRequest !== null
-    ) return;
-    this._frameRequest = this._requestFrame((timeMilliseconds) => {
-      this._frameRequest = null;
-      const frameTimeMilliseconds = timeMilliseconds ?? this._now();
+    const exports = this._root._domCore.exports;
+    const gates = (this._frameTransaction ? FRAME_GATE_TRANSACTION : 0) | (this._running ? 0 : FRAME_GATE_STOPPED) |
+      (this._shutdown ? FRAME_GATE_SHUTDOWN : 0) |
+      // The frame held after a presented change is requested while that
+      // frame finishes: the host's next change lands in the next frame's
+      // callbacks, which the request must already be in.
+      ((this._rendering && !this._followFrame) || this._animationCheckpoint ? FRAME_GATE_RENDERING : 0) |
+      (this._advancingDocumentClock ? FRAME_GATE_CLOCK_ADVANCING : 0) | (this._frameRequest !== null ? FRAME_GATE_REQUESTED : 0);
+    if (exports.frame_loop_schedule(FRAME_LOOP_GATES, gates) === 0) return;
+    const work =
+      (this._animationFrameCore.status("animation_frame_pending", this._animationFrameOwner) ? FRAME_WORK_ANIMATION_FRAME : 0) |
+      (this._dirty ? FRAME_WORK_DIRTY : 0) | this._caretWork() | this._spinWork() |
+      (this._scrollbarVisibility.active ? FRAME_WORK_SCROLLBAR : 0) |
+      (this._pendingScrollEndTargets.size > 0 ? FRAME_WORK_SCROLL_END : 0) | (this._snapCheckPending ? FRAME_WORK_SNAP_CHECK : 0) |
+      (this._scrollInteractionActive ? FRAME_WORK_SCROLL_INTERACTION : 0) | (this._documentTimersAwaitFrame() ? FRAME_WORK_TIMERS : 0) |
+      (this._followFrame ? FRAME_WORK_FOLLOW : 0);
+    if (!exports.frame_loop_schedule(FRAME_LOOP_WORK, work)) return;
+    const runFrame = (frameTimeMilliseconds) => {
+      if (this._shutdown) return null;
+      // A held spin half's due step is a task before the frame's rendering.
+      this._runSpinRepeat(frameTimeMilliseconds);
       // The page timers that are due by the frame's time are tasks, and
       // tasks run before the frame's rendering steps.
       const advancing = this._advanceDocumentClock(frameTimeMilliseconds);
@@ -2599,29 +3183,60 @@ class DOMRenderSurface {
         })
         .then(() => this._shutdown ? null : this._frame(frameTimeMilliseconds))
         .catch((error) => this._reportBackgroundException(error));
+    };
+    this._frameRequest = this._requestFrame((timeMilliseconds) => {
+      this._frameRequest = null;
+      const frameTimeMilliseconds = timeMilliseconds ?? this._now();
+      // A held frame that arrives while the frame before it finishes runs
+      // when that frame is done.
+      if (this._rendering || this._animationCheckpoint) {
+        return this.whenIdle().then(() => runFrame(frameTimeMilliseconds));
+      }
+      return runFrame(frameTimeMilliseconds);
     });
   }
 
+  // The overlays that change with time alone: a caret whose blink phase
+  // flips, and an overlay bar that starts or continues to fade or that a
+  // pointer entered or left. Each makes the frame at `timeMilliseconds`
+  // differ from the presented one without a DOM change.
+  _markOverlaysDue(timeMilliseconds) {
+    if (this._caretBlinkDue(timeMilliseconds)) this._dirty = true;
+    if (this._scrollbarVisibility.due(timeMilliseconds)) this._dirty = true;
+  }
+
   // The rendering steps of one loop-scheduled frame.
-  _frame(frameTimeMilliseconds) {
+  async _frame(frameTimeMilliseconds) {
     // The style update at the start of a frame checks the focus (focus
     // fixup, input-activation.js), before the animation frame callbacks.
     scheduleFocusFixup(this._root);
     // Native snapshots detach before invoking. Exceptions still reach the
     // realm sink without preventing the remaining callbacks or the render.
     this._updateAnimationsAndSendEvents(frameTimeMilliseconds);
-    this._runDocumentAnimationFrameCheckpoint(frameTimeMilliseconds);
-    if (this._caretBlinkDue(frameTimeMilliseconds)) {
-      this._dirty = true;
+    // The callbacks and their microtask checkpoints belong to this
+    // rendering update, a task of its own: the document's queued tasks
+    // (timers among them) wait until it is done.
+    const scripts = this._root.ownerDocument?._scriptProcessing ?? null;
+    scripts?.enterTask();
+    try {
+      await this._runDocumentAnimationFrameCheckpoint(frameTimeMilliseconds);
+    } finally {
+      scripts?.leaveTask();
     }
-    // An overlay bar that starts or continues to fade, or a pointer that
-    // entered or left a bar, changes the overlay without a DOM change.
-    if (
-      this._scrollbarVisibility.due(this._scrollbars, frameTimeMilliseconds)
-    ) {
-      this._dirty = true;
+    if (this._shutdown) return null;
+    this._markOverlaysDue(frameTimeMilliseconds);
+    // A frame held after a presented change (_followFrame) may run before
+    // the host's own animation frame callback of the same frame, where the
+    // host makes its next change: it looks again after one task, which
+    // runs after all of this frame's callbacks.
+    if (!this._dirty && this._followFrame) {
+      await microtaskCheckpoint();
+      if (this._shutdown) return null;
     }
     if (!this._dirty) {
+      // A held frame that found no change releases the hold: the loop
+      // idles until the next one.
+      this._followFrame = false;
       if (this._applyScrollSnapping()) return null;
       this._flushScrollEndEvents();
       this._schedule();
@@ -2636,23 +3251,31 @@ class DOMRenderSurface {
     // A frame that fails leaves the surface dirty, so the loop would render
     // and fail again every frame. After three failures in a row the loop
     // stops and reports why; start() resumes it.
+    // The frame the loop renders: only its presentation holds the next
+    // frame (FRAME_WORK_FOLLOW); a host that calls renderNow drives its
+    // own frames.
+    this._loopFrameRendering = true;
     return this._renderOpportunity(
       frameTimeMilliseconds,
       forceStateDelivery,
-    ).then((result) => {
+    ).finally(() => {
+      this._loopFrameRendering = false;
+    }).then((result) => {
       this._failedLoopFrames = 0;
       return result;
     }, (error) => {
-      this._failedLoopFrames = (this._failedLoopFrames ?? 0) + 1;
-      if (this._failedLoopFrames >= 3) {
+      const failures = this._root._domCore.exports.frame_loop_failure(this._failedLoopFrames ?? 0);
+      if (failures === FRAME_LOOP_STOP) {
         this._failedLoopFrames = 0;
         this.stop();
+        const core = this._root._domCore;
         this._reportBackgroundException(new Error(
-          `The render surface stopped its frame loop after 3 failed frames in a row; call start() after fixing the cause. Last failure: ${error?.message ?? error}`,
+          core.string("frame_loop_stop_message", ...core.valueListInput([String(error?.message ?? error)])),
           { cause: error },
         ));
         return;
       }
+      this._failedLoopFrames = failures;
       this._reportBackgroundException(error);
     });
   }
@@ -2664,7 +3287,7 @@ class DOMRenderSurface {
       now: this._now,
       requestFrame: this._requestFrame,
       cancelFrame: this._cancelFrame,
-      timeOrigin: this._nowIsHostTime ? hostTimeOrigin : 0,
+      timeOrigin: sharedDomCore.exports.frame_clock_surface_origin(this._nowIsHostTime ? 1 : 0, hostTimeOrigin),
       real: this._nowIsHostTime,
     });
   }
@@ -2677,11 +3300,12 @@ class DOMRenderSurface {
       (!document._clock || document._clock.source.now === this._now);
   }
 
-  // Whether this surface's frames come now: its loop runs, or a capture
-  // samples. While they do not, the document's page timers ask the
-  // document clock's frame source for frames themselves.
+  // Whether this surface's frames come now (frame_clock_surface_frames).
+  // While they do not, the document's page timers ask the document
+  // clock's frame source for frames themselves.
   _framesAdvanceDocumentClock() {
-    return !this._shutdown && (this._running || this._capturingFrames);
+    return !!sharedDomCore.exports.frame_clock_surface_frames(FRAME_CLOCK_FRAMES_NOW, this._shutdown ? 1 : 0, this._running ? 1 : 0,
+      this._capturingFrames ? 1 : 0, 0, 0, 0);
   }
 
   // A frame or capture sample of this surface at `timeMilliseconds`: when it
@@ -2696,11 +3320,13 @@ class DOMRenderSurface {
   }
 
   // An injected clock advances only through frames, so while this surface
-  // drives the document, a pending page timer keeps a frame requested.
+  // drives the document, a pending page timer keeps a frame requested
+  // (frame_clock_surface_frames).
   _documentTimersAwaitFrame() {
     const document = this._root.ownerDocument;
-    return document?._clock?.real === false && this._drivesDocumentClock() &&
-      (document._documentTimers?.hasPending ?? false);
+    return !!sharedDomCore.exports.frame_clock_surface_frames(FRAME_CLOCK_TIMERS_AWAIT_FRAME, 0, 0, 0,
+      document?._clock?.real === false ? 1 : 0, this._drivesDocumentClock() ? 1 : 0,
+      document?._documentTimers?.hasPending ? 1 : 0);
   }
 
   // Background exceptions (animation-frame callbacks, loop-scheduled
@@ -2749,31 +3375,31 @@ class DOMRenderSurface {
   ) {
     const rendered = this._lastRendered;
     const presented = this._presentedFrame;
-    return cleanSceneReuse && !pixelReadback &&
-      this._renderedPage === this._page &&
-      !this._pageTargetStale &&
-      this._toolHighlightsRendered === this._toolHighlights &&
-      this._frameTransaction === null &&
-      rendered !== null && presented !== null &&
-      this._lastDeliveredFrame !== null &&
-      this._frameCore.status("frame_consequence", continuation) === 0 &&
-      mutatedNodes.size === 0 && forcedGenerationNodes.size === 0 &&
-      capturedScrollRequests.size === 0 &&
-      !this._hasActiveAnimationWork() && !this._scrollMomentum &&
-      !rendered.animationActive &&
-      this._pendingAnimationDeclarations.length === 0 &&
-      this._frameCore.status(
-          "geometry_revision",
-          presented.geometryHandle,
-          2,
-        ) === sourceRevisions.resource &&
-      (rendered.paintArtifact !== undefined ||
-          rendered.textGeometryArtifact !== undefined) ===
-        (this._capturePaintArtifact ||
-          (this._textSelectionEnabled &&
-            this._preparedState.serialized.textBoxes > 0)) &&
-      (rendered.pixels !== undefined) ===
-        (this._persistentRenderer?.graphicsBackend === "webgl2");
+    const facts = (cleanSceneReuse ? FRAME_RETAINED_CLEAN_SCENE_REUSE : 0) | (pixelReadback ? FRAME_RETAINED_PIXEL_READBACK : 0) |
+      (this._renderedPage === this._page ? FRAME_RETAINED_CURRENT_PAGE : 0) |
+      (this._pageTargetStale ? FRAME_RETAINED_PAGE_TARGET_STALE : 0) |
+      (this._toolHighlightsRendered === this._toolHighlights ? FRAME_RETAINED_CURRENT_TOOL_HIGHLIGHTS : 0) |
+      (this._frameTransaction === null ? FRAME_RETAINED_NO_TRANSACTION : 0) |
+      (rendered !== null ? FRAME_RETAINED_RENDERED : 0) | (presented !== null ? FRAME_RETAINED_PRESENTED : 0) |
+      (this._lastDeliveredFrame !== null ? FRAME_RETAINED_DELIVERED : 0) |
+      (mutatedNodes.size === 0 && forcedGenerationNodes.size === 0 && capturedScrollRequests.size === 0
+        ? FRAME_RETAINED_UNCHANGED_INPUTS : 0) |
+      (this._hasActiveAnimationWork() ? FRAME_RETAINED_ANIMATION_WORK : 0) | (this._scrollMomentum ? FRAME_RETAINED_MOMENTUM : 0) |
+      (rendered?.animationActive ? FRAME_RETAINED_RESULT_ANIMATES : 0) |
+      (this._pendingAnimationDeclarations.length === 0 ? FRAME_RETAINED_NO_PENDING_DECLARATIONS : 0) |
+      (rendered !== null && (rendered.paintArtifact !== undefined || rendered.textCapture !== undefined)
+        ? FRAME_RETAINED_RESULT_ARTIFACT : 0) |
+      (this._capturePaintArtifact || (this._textSelectionEnabled && this._preparedState?.serialized.textBoxes > 0)
+        ? FRAME_RETAINED_WANTS_ARTIFACT : 0) |
+      (rendered?.pixels !== undefined ? FRAME_RETAINED_RESULT_PIXELS : 0) |
+      (this._persistentRenderer?.graphicsBackend === "webgl2" ? FRAME_RETAINED_WEBGL2 : 0);
+    return !!this._frameCore.status(
+      "frame_retained_delivery",
+      continuation,
+      presented?.geometryHandle ?? 0n,
+      sourceRevisions.resource,
+      facts,
+    );
   }
 
   _notifyFrameListeners(frame, resizeObserverLoopError) {
@@ -2807,12 +3433,13 @@ class DOMRenderSurface {
   // pending CSSTransition that a read created for the same change is that
   // object; when a script cancelled it, the change starts no transition.
   _registerStartedTransition(transition) {
-    const element = this._eventElementAtIndex[transition.nodeIndex];
-    if (!element) return;
-    this._transitionTimings.get(element)?.get(transition.propertyName)?.animation
+    const target = this._eventTargetAtIndex[transition.nodeIndex];
+    if (!target) return;
+    const element = isPseudoElementTarget(target) ? target.element : target;
+    this._transitionTimings.get(target)?.get(transition.propertyName)?.animation
       ?._settleReplaced();
-    const held = this._frameHeldTransitions?.get(element)?.get(transition.propertyName);
-    this._frameHeldTransitions?.get(element)?.delete(transition.propertyName);
+    const held = this._frameHeldTransitions?.get(target)?.get(transition.propertyName);
+    this._frameHeldTransitions?.get(target)?.delete(transition.propertyName);
     if (held?.playState === "idle") {
       transition.engineHandle.cancelSilently();
       return;
@@ -2831,7 +3458,7 @@ class DOMRenderSurface {
     if (held === undefined) {
       timing.animation = new CSSTransition(
         this,
-        element,
+        target,
         transition.propertyName,
         timing,
         this._frameSequence,
@@ -2847,7 +3474,7 @@ class DOMRenderSurface {
       bubbles: true,
       propertyName: transition.propertyName,
       elapsedTime: Math.min(Math.max(-transition.delay, 0), transition.duration) / 1000,
-      pseudoElement: "",
+      pseudoElement: isPseudoElementTarget(target) ? target.pseudoElement : "",
     }));
   }
 
@@ -2857,33 +3484,48 @@ class DOMRenderSurface {
   // start time, playback rate and generation that the object then holds.
   // Null when no running pending transition holds the change.
   _heldTransitionDeclaration(nodeIndex, propertyName) {
-    const element = this._eventElementAtIndex[nodeIndex];
-    const animation = element ? this._frameHeldTransitions?.get(element)?.get(propertyName) : undefined;
+    const target = this._eventTargetAtIndex[nodeIndex];
+    const animation = target ? this._frameHeldTransitions?.get(target)?.get(propertyName) : undefined;
     if (animation === undefined || animation.playState === "idle") return null;
     animation._resolveTimeline();
     return {
       animationId: animation._animationId,
-      trackGeneration: animation._value(5),
+      trackGeneration: animation._value(ANIMATION_VALUE_TRACK_GENERATION),
       timing: {
-        startTime: animation._value(6),
-        duration: animation._value(7),
-        delay: animation._value(8),
-        direction: animation._value(9) ? "reverse" : "normal",
+        startTime: animation._value(ANIMATION_VALUE_ENGINE_START_TIME),
+        duration: animation._value(ANIMATION_VALUE_DURATION),
+        delay: animation._value(ANIMATION_VALUE_DELAY),
+        direction: animation._value(ANIMATION_VALUE_REVERSED) ? "reverse" : "normal",
       },
     };
   }
 
-  // A read between frames that reports animations (getAnimations())
-  // updates the style first, as Chrome does: the CSS animations and the
-  // transitions that the style change since the last frame starts exist
-  // from then on, and stay pending until the next frame starts them.
+  // Whether an element of the presented scene declares a transition that
+  // starts in computed resolution (transitionCoversAnimationDependency).
+  _declaresDependencyTransitions() {
+    const nodes = this._preparedState?.serialized?.nodes;
+    if (!nodes) return false;
+    return nodes.some((node) => node.transitionDefinitions?.some(({ propertyName }) =>
+      transitionCoversAnimationDependency(propertyName)));
+  }
+
+  // A read between frames that updates the style (getComputedStyle, a
+  // geometry read, getAnimations()) runs the style change event of that
+  // update (CSS Animations 1, CSS Transitions 1): the CSS animations and
+  // the transitions that the style change since the last frame starts
+  // exist from then on, and stay pending until the next frame starts
+  // them. A read under the style generation and frame of the last update
+  // has nothing new to start.
   _startStyleChangeAnimations() {
     if (this._shutdown || this._rendering) return;
     const styleSystem = this._root.ownerDocument?._styleSystem;
     if (!styleSystem) return;
+    const key = this._styleChangeAnimationsKey;
+    if (key?.frameSequence === this._frameSequence && key.styleGeneration === styleSystem.generation) return;
     this._prepareStyleSystem(styleSystem);
     this._synchronizeCSSAnimations(this._frameCore, styleSystem, null);
     this._planPendingTransitions(styleSystem);
+    this._styleChangeAnimationsKey = { frameSequence: this._frameSequence, styleGeneration: styleSystem.generation };
   }
 
   // Multi-environment coexistence: serialization and style-driven
@@ -2911,7 +3553,8 @@ class DOMRenderSurface {
   // (animation_candidates: a native walk over its resolved records); an
   // element that stopped being one has its animations cancelled here,
   // exactly as an empty definition list would. Without a @keyframes rule
-  // in the root's scope no element has a definition, so the walk, which
+  // in a scope of the root's tree (the document's or a shadow root's) no
+  // element has a definition, so the walk, which
   // resolves every element, is skipped and every element counts as a
   // non-candidate. A frame passes its time; a read between frames passes
   // null: its CSS animations are pending (_createAnimation), and its
@@ -2920,7 +3563,9 @@ class DOMRenderSurface {
     if (this._animationSyncStyleGeneration === styleSystem.generation) return;
     this._animationSyncStyleGeneration = styleSystem.generation;
     core.mediaEnvironmentSet(styleSystem.environment);
-    const declaresKeyframes = styleSystem.declaresKeyframes(this._root);
+    // Keyframes that follow their element follow the style change.
+    for (const animation of this._animations) animation._refreshElementDependentKeyframes();
+    const declaresKeyframes = styleSystem.treeDeclaresKeyframes(this._root);
     const activeElements = new Set(
       declaresKeyframes
         ? core.animationCandidates(this._root._coreHandle, 0)
@@ -2932,129 +3577,72 @@ class DOMRenderSurface {
     styleSystem.answerFontFamilyRequests();
     for (const [element, records] of this._cssAnimations) {
       if (activeElements.has(element)) continue;
-      for (const record of records) record.animation.cancel();
+      for (const record of records) record.animation._cancelByUserAgent();
       this._cssAnimations.delete(element);
     }
     for (const element of activeElements) {
       const previousRecords = this._cssAnimations.get(element) ?? [];
-      const desiredDefinitions = reconcileAnimationDefinitions(
+      // The core plans which previous animations continue, are updated in
+      // place or are cancelled, and which definitions create one
+      // (animation_css_plan).
+      const { desired, cancelled } = planCSSAnimations(
+        element,
         styleSystem.animationDefinitions(element),
         previousRecords,
       );
-      const previousAnimationIndices = new Map(
-        previousRecords.map((record) => [
-          record.identity,
-          this._animations.indexOf(record.animation),
-        ]),
-      );
-      const reusableByIdentity = new Map();
-      for (const desired of desiredDefinitions) {
-        if (desired.reusable) {
-          reusableByIdentity.set(desired.identity, desired.reusable);
-        }
-      }
-      for (const previous of previousRecords) {
-        if (reusableByIdentity.get(previous.identity) !== previous) {
-          previous.animation.cancel();
-        }
-      }
+      // The places of the previous animations in the surface's list before
+      // the cancellations; an idle one has none.
+      const previousPositions = previousRecords.map((record) => this._animations.indexOf(record.animation));
+      for (const record of cancelled) record.animation._cancelByUserAgent();
 
-      const nextRecords = [];
-      for (
-        let definitionIndex = 0;
-        definitionIndex < desiredDefinitions.length;
-        definitionIndex++
-      ) {
-        const desired = desiredDefinitions[definitionIndex];
-        const reusable = reusableByIdentity.get(desired.identity);
-        if (reusable) {
-          nextRecords.push(reusable);
+      const nextRecords = desired.map((record) =>
+        record.retained < 0 ? null : { ...record, animation: previousRecords[record.retained].animation }
+      );
+      for (let definitionIndex = 0; definitionIndex < desired.length; definitionIndex++) {
+        const record = desired[definitionIndex];
+        if (record.kind === CSS_PLAN_KEEP) {
+          nextRecords[definitionIndex] = previousRecords[record.retained];
           continue;
         }
-        const followingReusableRecords = desiredDefinitions.slice(
-          definitionIndex + 1,
-        ).map((following) => reusableByIdentity.get(following.identity))
-          .filter(Boolean);
-        const followingAnimationIndex = followingReusableRecords.length > 0
-          ? this._animations.indexOf(
-            followingReusableRecords[0].animation,
-          )
-          : -1;
-        const precedingAnimationIndex = nextRecords.length > 0
-          ? this._animations.indexOf(nextRecords.at(-1).animation)
-          : -1;
-        const previousAnimationIndex = previousAnimationIndices.get(
-          desired.identity,
-        );
-        const firstPreviousAnimationIndex = previousAnimationIndices.size >
-            0
-          ? Math.min(...previousAnimationIndices.values())
-          : this._animations.length;
-        const insertionIndex = animationCSSInsertion(
-          followingAnimationIndex,
-          precedingAnimationIndex,
-          previousAnimationIndex,
-          firstPreviousAnimationIndex,
+        if (record.kind === CSS_PLAN_UPDATE) {
+          const retained = previousRecords[record.retained];
+          retained.animation._updateFromStyle(record.definition, retained.definition);
+          continue;
+        }
+        const { insertionIndex, before } = placeCSSAnimation(
+          definitionIndex,
+          desired,
+          nextRecords.map((next) => next ? this._animations.indexOf(next.animation) : -1),
+          previousPositions,
           this._animations.length,
         );
         const animation = this._createAnimation(
           element,
-          desired.definition.keyframes,
-          {
-            ...desired.definition.timing,
-            composite: desired.definition.composition,
-          },
+          record.definition.keyframes,
+          cssAnimationTiming(record.definition),
           {
             insertionIndex,
-            beforeEngineHandles: followingReusableRecords.map((record) =>
-              record.animation._engineHandle
-            ),
-            diagnosticAnimationName: desired.definition.name,
-            implicitKeyframe: desired.definition.implicitKeyframe,
+            beforeEngineHandles: before.map((index) => nextRecords[index].animation._engineHandle),
+            diagnosticAnimationName: record.definition.name,
+            implicitKeyframe: record.definition.implicitKeyframe,
           },
         );
-        animation._cascadingStyleSheetsAnimationIdentity = desired.identity;
-        if (desired.definition.paused) animation.pause();
-        nextRecords.push({
-          ...desired,
-          animation,
-        });
+        animation._followPlayState(false, record.definition.paused);
+        nextRecords[definitionIndex] = { ...record, animation };
       }
-      for (
-        let recordIndex = 0;
-        recordIndex < nextRecords.length;
-        recordIndex++
-      ) {
-        nextRecords[recordIndex].animation._engineDeclarationOptions
-          .beforeEngineHandles = nextRecords.slice(recordIndex + 1).map(
-            (record) => record.animation._engineHandle,
-          );
+      for (let recordIndex = 0; recordIndex < nextRecords.length; recordIndex++) {
+        nextRecords[recordIndex].animation._engineDeclarationOptions.beforeEngineHandles = nextRecords
+          .slice(recordIndex + 1).map((record) => record.animation._engineHandle);
       }
       if (nextRecords.length === 0) {
         this._cssAnimations.delete(element);
         continue;
       }
-      const cascadingStyleSheetsAnimationSlots = [];
-      for (
-        let animationIndex = 0;
-        animationIndex < this._animations.length;
-        animationIndex++
-      ) {
-        const animation = this._animations[animationIndex];
-        if (
-          animation._element === element &&
-          animation._cascadingStyleSheetsAnimationIdentity !== undefined
-        ) {
-          cascadingStyleSheetsAnimationSlots.push(animationIndex);
-        }
-      }
-      for (
-        let recordIndex = 0;
-        recordIndex < nextRecords.length;
-        recordIndex++
-      ) {
-        this._animations[cascadingStyleSheetsAnimationSlots[recordIndex]] =
-          nextRecords[recordIndex].animation;
+      // The core gives the element's live CSS animations their places in
+      // the surface's list (animation_css_slots).
+      const slots = cssAnimationSlots(nextRecords.map((record) => this._animations.indexOf(record.animation)));
+      for (let recordIndex = 0; recordIndex < nextRecords.length; recordIndex++) {
+        if (slots[recordIndex] >= 0) this._animations[slots[recordIndex]] = nextRecords[recordIndex].animation;
       }
       this._cssAnimations.set(element, nextRecords);
     }
@@ -3072,14 +3660,7 @@ class DOMRenderSurface {
           element,
           pseudoElement,
         ).filter((definition) => {
-          const propertyNames = new Set(
-            definition.keyframes.flatMap((keyframe) =>
-              Object.keys(keyframe).filter((name) =>
-                name !== "offset" && name !== "easing" &&
-                name !== "composite"
-              )
-            ),
-          );
+          const propertyNames = new Set(definition.keyframes.flatMap(keyframePropertyNames));
           return propertyNames.size === 1 && propertyNames.has("content");
         });
         if (contentDefinitions.length === 0) continue;
@@ -3102,15 +3683,14 @@ class DOMRenderSurface {
           contentDefinitions,
           previousContentRecords,
         );
+        // The core gives each record its start time and held time
+        // (animation_content_times): a record of the same name and
+        // occurrence continues with the new definition.
         const nextRecords = desiredRecords.map((desired) => {
           if (desired.reusable) return desired.reusable;
-          return {
-            ...desired,
-            element,
-            pseudoElement,
-            startTimeMilliseconds: timeMilliseconds,
-            initialContent: desired.definition.keyframes[0]?.content,
-          };
+          const { previous, reusable: _reusable, ...retained } = desired;
+          const times = contentAnimationTimes(previous, desired.definition.paused, timeMilliseconds, this._currentTime);
+          return { ...retained, element, pseudoElement, ...times };
         });
         let pseudoElements = nextPseudoContentAnimations.get(element);
         if (!pseudoElements) {
@@ -3130,15 +3710,24 @@ class DOMRenderSurface {
   // change no longer starts is cancelled. The read serializes the tree
   // only: it lays nothing out, so the geometry that later reads answer
   // from stays the frame's.
+  //
+  // A read is a style change event (CSS Transitions 1, "before-change
+  // style"): an element that the last frame did not render keeps, in
+  // _readBaselines, its style at the last read that started none of its
+  // transitions, whether or not it declared transitions then. Once a read
+  // starts transitions the baseline stays until the next frame renders the
+  // element: later reads plan the same transitions, and the frame plans
+  // from the same baseline, so it declares the transitions the reads held.
   _planPendingTransitions(styleSystem) {
     const renderer = this._persistentRenderer;
-    if (!renderer || this._presentedFrame === null) return;
+    if (!renderer) return;
     const core = this._frameCore;
     const generation = styleSystem.generation;
     if (generation === this._serializedStyleGeneration) return;
     const key = this._pendingTransitionsKey;
     if (key?.frameSequence === this._frameSequence && key.styleGeneration === generation) return;
     this._pendingTransitionsKey = { frameSequence: this._frameSequence, styleGeneration: generation };
+    this._dropPlannedSerialization();
     const viewport = this.viewport;
     const serialized = serializeToScene(this._root, {
       viewportWidth: viewport.width,
@@ -3147,27 +3736,56 @@ class DOMRenderSurface {
         width: viewport.width,
         height: viewport.height,
         deviceScale: viewport.deviceScale ?? 1,
+        density: viewport.density,
         _requestedLeft: viewport._requestedLeft,
         _requestedTop: viewport._requestedTop,
       },
     });
     const planned = new Map();
+    let planningComplete = false;
     try {
-      const elementAtRow = nodesAtRow(serialized);
+      const targetAtRow = targetsAtRow(serialized.indexOf, serialized.pseudoIndexOf);
       const nodes = serialized.nodes;
       for (let index = 0; index < nodes.length; index++) {
-        if (!nodes[index].transitionDefinitions?.length) continue;
-        const element = elementAtRow[index];
-        const previousIndex = this._indexOfElement.get(element);
-        if (previousIndex === undefined) continue;
-        const transitions = renderer.planStyleChangeTransitions(previousIndex, nodes[index]);
+        const target = targetAtRow[index];
+        if (target === undefined || (!isPseudoElementTarget(target) && target.nodeType !== 1)) continue;
+        const node = nodes[index];
+        const previousIndex = this._targetIndex(target);
+        let transitions = [];
+        if (previousIndex !== undefined) {
+          if (!node.transitionDefinitions?.length) continue;
+          transitions = renderer.planStyleChangeTransitions(previousIndex, node);
+        } else {
+          const baseline = this._readBaselines.get(target);
+          if (baseline !== undefined && node.transitionDefinitions?.length) {
+            transitions = renderer.planTransitionsFrom(baseline, node);
+          }
+          if (baseline === undefined || (transitions.length === 0 && !this._pendingTransitions.has(target))) {
+            this._readBaselines.set(target, readBaseline(node, target));
+          }
+        }
         if (transitions.length > 0) {
-          planned.set(element, new Map(transitions.map((transition) => [transition.propertyName, transition])));
+          planned.set(target, new Map(transitions.map((transition) => [transition.propertyName, transition])));
         }
       }
+      planningComplete = true;
     } finally {
-      serialized.release();
-      core.releaseSceneResources(serialized.nodes);
+      // The layout read that started this planning lays out the same tree
+      // next (computeLayoutBoxes): it takes this serialization while the
+      // document's revisions hold (_takePlannedSerialization).
+      if (planningComplete && this._page === null && this._pseudoContentAnimations.size === 0) {
+        const domCore = this._root._domCore;
+        this._plannedSerialization = {
+          serialized,
+          styleGeneration: domCore.status("document_style_generation", this._root.ownerDocument._coreHandle) >>> 0,
+          resourceRevision: domCore.status("resource_revision") >>> 0,
+          width: viewport.width, height: viewport.height, deviceScale: viewport.deviceScale ?? 1,
+          requestedLeft: viewport._requestedLeft, requestedTop: viewport._requestedTop,
+        };
+      } else {
+        serialized.release();
+        core.releaseSceneResources(serialized.nodes);
+      }
     }
     for (const [element, transitions] of this._pendingTransitions) {
       for (const [propertyName, animation] of transitions) {
@@ -3181,7 +3799,7 @@ class DOMRenderSurface {
       }
       if (transitions.size === 0) this._pendingTransitions.delete(element);
     }
-    for (const [element, transitions] of planned) {
+    for (const [target, transitions] of planned) {
       for (const [propertyName, transition] of transitions) {
         const record = {
           duration: transition.definition.duration,
@@ -3192,15 +3810,15 @@ class DOMRenderSurface {
           endValue: transition.endValue,
           trackStartValue: transition.startValue,
         };
-        record.animation = new CSSTransition(this, element, propertyName, record, this._frameSequence);
+        record.animation = new CSSTransition(this, target, propertyName, record, this._frameSequence);
         record.animation._styleChangePlan = transitionPlanKey(transition);
-        let held = this._pendingTransitions.get(element);
+        let held = this._pendingTransitions.get(target);
         if (held === undefined) {
           held = new Map();
-          this._pendingTransitions.set(element, held);
+          this._pendingTransitions.set(target, held);
         }
         held.set(propertyName, record.animation);
-        this._scheduleAnimationFrame(element);
+        this._scheduleAnimationFrame(record.animation._element);
       }
     }
   }
@@ -3215,36 +3833,44 @@ class DOMRenderSurface {
     }
   }
 
+  // Whether an animation, a CSS animation, an animated ::before or ::after
+  // content, a transition or a declared animation that awaits its first
+  // frame runs on this surface.
+  _animating() {
+    return this._animations.length + this._cssAnimations.size + this._pseudoContentAnimations.size +
+      this._activeTransitionCount + this._pendingAnimationDeclarations.length > 0;
+  }
+
   // The registry holds each running or paused transition of an element
   // under its property; one whose property a newer transition took stays
   // out.
   _registerTransitionAnimation(animation) {
-    const element = animation._element;
+    const target = animation._target;
     const propertyName = animation._transitionProperty;
-    let timings = this._transitionTimings.get(element);
+    let timings = this._transitionTimings.get(target);
     if (!timings) {
       timings = new Map();
-      this._transitionTimings.set(element, timings);
+      this._transitionTimings.set(target, timings);
     }
     if (timings.has(propertyName)) return;
     timings.set(propertyName, animation._transitionRecord);
-    let records = this._transitionRecords.get(element);
+    let records = this._transitionRecords.get(target);
     if (!records) {
       records = new Map();
-      this._transitionRecords.set(element, records);
+      this._transitionRecords.set(target, records);
     }
     records.set(propertyName, animation._transitionRecord);
     this._activeTransitionCount++;
   }
 
   _unregisterTransition(animation) {
-    const element = animation._element;
-    const timings = this._transitionTimings.get(element);
+    const target = animation._target;
+    const timings = this._transitionTimings.get(target);
     if (timings?.get(animation._transitionProperty)?.animation !== animation) return;
     timings.delete(animation._transitionProperty);
-    const records = this._transitionRecords.get(element);
+    const records = this._transitionRecords.get(target);
     records?.delete(animation._transitionProperty);
-    if (records?.size === 0) this._transitionRecords.delete(element);
+    if (records?.size === 0) this._transitionRecords.delete(target);
     if (this._activeTransitionCount > 0) this._activeTransitionCount--;
   }
 
@@ -3271,18 +3897,25 @@ class DOMRenderSurface {
   // while the renderer starts waits for it (_preferredCanvasDevicePending)
   // instead of requesting a second device.
   _startPersistentRenderer({ width, height, deviceScale }) {
-    const promise = this._createPersistentRenderer({
+    const renderer = this._createPersistentRenderer({
       width,
       height,
       deviceScale,
       ...this._persistentRendererOptions,
-    }).then((renderer) => {
-      this._persistentRenderer = renderer;
-      this._animationEventUnsubscribe = renderer.onAnimationEvent(
-        (record) => this._dispatchEngineAnimationEvent(record),
-      );
-      return renderer;
     });
+    if (typeof renderer?.then === "function" || typeof renderer?.ready?.then !== "function") {
+      throw new TypeError(
+        "createPersistentRenderer must return a renderer at once with a `ready` promise, as openSceneRenderer does; " +
+          "an async factory such as createSceneRenderer or createPersistentSceneRenderer returns a promise",
+      );
+    }
+    // The engine side serves reads and animation declarations before the
+    // first frame; frames wait for the graphics context.
+    this._persistentRenderer = renderer;
+    this._animationEventUnsubscribe = renderer.onAnimationEvent(
+      (record) => this._dispatchEngineAnimationEvent(record),
+    );
+    const promise = renderer.ready.then(() => renderer);
     this._persistentRendererPromise = promise;
     const document = this._document;
     if (document._preferredCanvasDevice || document._preferredCanvasDevicePending) return;
@@ -3304,15 +3937,21 @@ class DOMRenderSurface {
   // element of its node; the animation or transition that owns the track
   // acknowledges it.
   _dispatchEngineAnimationEvent(record) {
-    const element = (this._eventElementAtIndex ?? this._elementAtIndex)[
+    // A provisional track reports no lifecycle (_setProvisionalTrack): the
+    // frame that declares its animation's own track starts it.
+    if (this._provisionalTracks.has(record.animationId)) return;
+    const target = (this._eventTargetAtIndex ?? targetsAtRow(this._indexOfElement, this._indexOfPseudoTarget))[
       record.nodeIndex
     ];
-    if (!element) {
+    if (!target) {
       throw new RangeError(
         `No DOM element for animated layout index ${record.nodeIndex}`,
       );
     }
-    const transitionAnimation = this._transitionTimings.get(element)
+    // A ::before or ::after reports its events at its element.
+    const pseudoElement = isPseudoElementTarget(target) ? target.pseudoElement : "";
+    const element = pseudoElement ? target.element : target;
+    const transitionAnimation = this._transitionTimings.get(target)
       ?.get(record.propertyName)?.animation;
     const matchingAnimation =
       this._animationCancelingThroughEngine?._ownsEngineAnimationId(record.animationId)
@@ -3333,18 +3972,27 @@ class DOMRenderSurface {
       !(matchingAnimation instanceof CSSAnimation) && !(matchingAnimation instanceof CSSTransition);
     if (!matchingAnimation || feedback) {
       try {
-        if (!scriptAnimation) dispatchEvent(
-          element,
-          createEvent(record.type, {
+        if (!scriptAnimation) {
+          const event = createEvent(record.type, {
             bubbles: true,
             propertyName: record.propertyName,
             animationName: matchingAnimation?._cssAnimationName ?? "",
             elapsedTime: matchingAnimation
               ? matchingAnimation._elapsedTimeForEvent(record.type)
               : 0,
-            pseudoElement: "",
-          }),
-        );
+            pseudoElement,
+          });
+          // Synchronous layout and DOM removal defer events until the next
+          // animation update. An event of the frame in progress waits for
+          // its end (_render's finally block): its listeners run as script
+          // after the frame, never inside it.
+          if (this._animationEventDeferralDepth > 0) {
+            this._deferredAnimationEvents.push({ element, event });
+            if (!this._rendering) this._scheduleAnimationFrame(element);
+          } else if (this._rendering) {
+            this._deferredAnimationEvents.push({ element, event });
+          } else dispatchEvent(element, event);
+        }
       } finally {
         if (feedback) matchingAnimation._completeEngineLifecycle(feedback);
       }
@@ -3363,7 +4011,7 @@ class DOMRenderSurface {
   _requireEndedTransitionsUnregistered() {
     const tickMilliseconds = this._transitionTickMilliseconds;
     if (tickMilliseconds === null) return;
-    for (const [element, timings] of this._transitionRecords) {
+    for (const timings of this._transitionRecords.values()) {
       for (const [propertyName, timing] of timings) {
         // A paused or held transition's track does not end, and one its
         // CSSTransition declared or seeked since that tick has not run.
@@ -3375,9 +4023,10 @@ class DOMRenderSurface {
         if (tickMilliseconds - activeStartMilliseconds < timing.duration) {
           continue;
         }
+        const element = timing.animation._element;
         const elementLabel = `${element.localName}${
           element.id ? `#${element.id}` : ""
-        }`;
+        }${timing.animation._pseudoElement}`;
         throw new Error(
           `The render surface still counts the ${propertyName} transition of ${elementLabel} as running after the frame at ${tickMilliseconds} ms, which reached its end at ${
             activeStartMilliseconds + timing.duration
@@ -3400,17 +4049,20 @@ class DOMRenderSurface {
 
   _hasActiveAnimationWork() {
     if (this._shutdown) return false;
+    const exports = this._root._domCore.exports;
     const pseudoContentIsActive = [...this._pseudoContentAnimations.values()]
       .some((pseudoElements) =>
         [...pseudoElements.values()].some((records) =>
           records.some((record) => {
-            if (record.definition.paused) return false;
-            const { duration, delay = 0, iterations = 1 } =
-              record.definition.timing;
-            const endTimeMilliseconds = record.startTimeMilliseconds + delay +
-              duration * iterations;
-            return !Number.isFinite(endTimeMilliseconds) ||
-              this._currentTime < endTimeMilliseconds;
+            const { duration, delay = 0, iterations = 1 } = record.definition.timing;
+            return exports.animation_content_active(
+              record.definition.paused ? 1 : 0,
+              record.startTimeMilliseconds,
+              delay,
+              duration,
+              iterations,
+              this._currentTime,
+            ) === 1;
           })
         )
       );
@@ -3432,14 +4084,17 @@ class DOMRenderSurface {
     }
     this._currentTime = timeMilliseconds;
     scheduleFocusFixup(this._root);
+    // The suggestion popup's rows, placement and top layer entry follow its
+    // state before the frame reads the tree (core/dom/datalist-popup.watpart).
+    this._root._runTreeOperation(() => this._root._domCore.status("datalist_popup_prepare", this._root._coreHandle));
     this._advanceSmoothScrolls(timeMilliseconds);
     if (this._hasActiveAnimationWork()) {
       this._dirty = true;
       for (const animation of this._animations) {
         if (animation._needsFrame()) this._mutatedNodes.add(animation._element);
       }
-      for (const [element] of this._transitionRecords) {
-        this._mutatedNodes.add(element);
+      for (const timings of this._transitionRecords.values()) {
+        for (const timing of timings.values()) this._mutatedNodes.add(timing.animation._element);
       }
       if (this._pseudoContentAnimations.size > 0) {
         this._forceFullInvalidation = true;
@@ -3453,7 +4108,15 @@ class DOMRenderSurface {
       true,
       true,
       pixelReadback,
-    );
+    ).then((frame) => {
+      // The last step of the rendering opportunity: the pending top layer
+      // removals leave the top layer (CSS Positioned Layout 4, "process
+      // top layer removals"; core/dom/top-layer.watpart).
+      if (this._shutdown) return frame;
+      const document = this._root.ownerDocument ?? this._root;
+      document._domCore.status("top_layer_process_removals", document._coreHandle);
+      return frame;
+    });
   }
 
   _createAnimation(
@@ -3534,16 +4197,188 @@ class DOMRenderSurface {
       renderer.declareTransitionTrack(nodeIndex, propertyName, keyframes, timing, declarationOptions)
     );
   }
+  // A provisional track applies the effect of a pending animation that has
+  // no track of its own before the frame that declares it: a pending
+  // transition's (CSSTransition._refreshProvisionalTrack), and that of an
+  // animation of an element that no frame has rendered
+  // (_declareUnrenderedEffects). Each runs under its animation's identity,
+  // over the element's other tracks, reports no lifecycle, and leaves at
+  // the start of the next frame.
+  // An animation whose timeline script cleared waits for no frame; one
+  // given the document timeline again starts at the next frame.
+  _suspendTimeline(animation) {
+    this._animationsAwaitingTimeline.delete(animation);
+  }
+  _resumeTimeline(animation) {
+    if (!animation._timelinePending) return;
+    this._animationsAwaitingTimeline.add(animation);
+    this._scheduleAnimationFrame(animation._element);
+  }
+  _setProvisionalTrack(animationId, track) {
+    this._dropProvisionalTrack(animationId);
+    this._provisionalTracks.set(animationId, track);
+  }
+  _dropProvisionalTrack(animationId) {
+    const track = this._provisionalTracks.get(animationId);
+    if (track === undefined) return;
+    track.cancelSilently();
+    this._provisionalTracks.delete(animationId);
+  }
+  // The node index of animation target `target` (an element, or a
+  // pseudo-element-target.js identity) in a serialization's maps: by
+  // default the last frame's.
+  _targetIndex(target, indexOf = this._indexOfElement, pseudoIndexOf = this._indexOfPseudoTarget) {
+    return isPseudoElementTarget(target) ? pseudoIndexOf.get(target) : indexOf.get(target);
+  }
+  // The provisional track of a pending transition over its target's row
+  // of the last frame; null when the renderer has no row for the target.
+  _declareProvisionalTransitionTrack(target, propertyName, keyframes, timing, animationId) {
+    const nodeIndex = this._targetIndex(target);
+    if (!this._persistentRenderer || nodeIndex === undefined) return null;
+    return this._persistentRenderer.declareTransitionTrack(nodeIndex, propertyName, keyframes, timing,
+      { animationId, preserveReplacedTracks: true });
+  }
+  // Runs a synchronous layout between frames: the engine events of its
+  // tick wait for the next frame. Tracks that the layout moved to its own
+  // rows (_moveTracksToLayoutRows) move back to the last frame's rows.
+  _runSyncLayout(layout) {
+    this._animationEventDeferralDepth++;
+    try {
+      return layout();
+    } finally {
+      this._animationEventDeferralDepth--;
+      const back = this._layoutRowsReturn;
+      this._layoutRowsReturn = null;
+      if (back) this._persistentRenderer?.remapAnimations(back);
+    }
+  }
+  // A synchronous layout between frames writes the rows of the elements
+  // that no frame has rendered; `indexOf` gives their nodes. Before it
+  // samples the tracks, the animations of those elements take provisional
+  // tracks there: a pending animation holds at its current time, and its
+  // effect applies the value at that time (Web Animations 1, "The current
+  // time of an animation"). Their own tracks wait for the frame that
+  // writes the rows (_declareEngineEffect). The computed samples of the
+  // layout's tick then follow the layout's rows, so a computed style read
+  // of such an element includes the effect.
+  _declareUnrenderedEffects(indexOf, pseudoIndexOf) {
+    const renderer = this._persistentRenderer;
+    if (!renderer || this._shutdown || this._rendering) return;
+    const back = this._moveTracksToLayoutRows(renderer, indexOf, pseudoIndexOf);
+    for (const animation of this._unrenderedEffectCandidates()) {
+      // A parked animation's track waits for the next frame; meanwhile a
+      // layout that has the target's row gives it a provisional one.
+      if (this._targetIndex(animation._target) !== undefined && !this._parkedAnimations?.has(animation)) continue;
+      const nodeIndex = this._targetIndex(animation._target, indexOf, pseudoIndexOf);
+      if (nodeIndex === undefined) continue;
+      this._dropProvisionalTrack(animation._animationId);
+      const track = animation._declareProvisionalTrack(renderer, nodeIndex);
+      if (track === null) continue;
+      this._provisionalTracks.set(animation._animationId, track);
+      // A provisional track stays over the layout's row.
+      back?.set(nodeIndex, nodeIndex);
+    }
+    // Each layout binds its own rows' animation targets: an earlier
+    // layout's binding names other rows. The generated boxes carry their
+    // elements in the scene (generatedBoxRows).
+    if (!this._computedSamples) return;
+    renderer.engineWriteToken.bindComputedSamples({
+      core: this._root._domCore,
+      owner: this._computedSamples,
+      targets: targetsAtRow(indexOf, pseudoIndexOf),
+    });
+  }
+  // A synchronous layout of a tree that changed since the last frame
+  // numbers its rows anew, while the tracks of the rendered elements name
+  // the frame's rows: sampled as they are, they would apply to other rows
+  // or to rows the layout does not have. Before the layout samples them they
+  // move to the layout's rows, as a frame's full serialization moves them,
+  // and _runSyncLayout moves them back after it, so the next frame finds
+  // the rows of the last one. The tracks of elements that the layout has
+  // no row for are cancelled, as that frame would cancel them, and the
+  // provisional tracks of earlier layouts are dropped; the layout declares
+  // its own. Returns the map back, which the caller extends with its
+  // provisional tracks, or null when every row stayed.
+  _moveTracksToLayoutRows(renderer, indexOf, pseudoIndexOf) {
+    const forward = new Map();
+    const back = new Map();
+    let moved = false;
+    const follow = (frameRows, layoutRows) => {
+      for (const [target, frameIndex] of frameRows) {
+        const layoutIndex = layoutRows.get(target);
+        if (layoutIndex !== frameIndex) moved = true;
+        if (layoutIndex === undefined) continue;
+        forward.set(frameIndex, layoutIndex);
+        back.set(layoutIndex, frameIndex);
+      }
+    };
+    follow(this._indexOfElement, indexOf);
+    follow(this._indexOfPseudoTarget, pseudoIndexOf);
+    if (!moved) return null;
+    for (const animationId of [...this._provisionalTracks.keys()]) this._dropProvisionalTrack(animationId);
+    this._parkHiddenAnimations(indexOf, pseudoIndexOf);
+    renderer.remapAnimations(forward);
+    this._layoutRowsReturn = back;
+    return back;
+  }
+  // A script animation (element.animate(), new Animation()) keeps its state
+  // while its target has no box (Web Animations 1: an effect whose target
+  // is not rendered stays in its animation): before a remap omits the
+  // target's row, its track ends silently, so the remap cancels nothing,
+  // and the animation waits in _parkedAnimations. The next frame that sets
+  // the surface's rows declares its track again at its state
+  // (_redeclareParkedAnimations), deferred to the frame that renders the
+  // target again; until then a layout read gives it a provisional track
+  // (_declareUnrenderedEffects). CSS animations and transitions end with
+  // display: none (CSS Animations 1 §3, CSS Transitions 1 §3) and keep
+  // their cancellation.
+  _parkHiddenAnimations(indexOf, pseudoIndexOf) {
+    this._parkedAnimations ??= new Set();
+    for (const animation of this._animations) {
+      if (animation instanceof CSSAnimation || animation instanceof CSSTransition) continue;
+      if (this._parkedAnimations.has(animation)) continue;
+      if (this._targetIndex(animation._target, indexOf, pseudoIndexOf) !== undefined) continue;
+      if (animation.playState === "idle") continue;
+      animation._engineHandle.cancelSilently();
+      this._parkedAnimations.add(animation);
+    }
+    return this._parkedAnimations;
+  }
+  _redeclareParkedAnimations() {
+    const parked = this._parkedAnimations;
+    this._parkedAnimations = null;
+    if (!parked) return;
+    for (const animation of parked) {
+      if (this._animations.includes(animation) && animation.playState !== "idle") animation._redeclareTrack();
+    }
+  }
+  // Whether an animation of an element that no frame has rendered applies
+  // an effect: a computed style read runs the synchronous layout that
+  // declares its provisional track (_declareUnrenderedEffects).
+  _hasUnrenderedEffects() {
+    if (!this._persistentRenderer || this._shutdown || this._rendering) return false;
+    for (const animation of this._unrenderedEffectCandidates()) {
+      if (animation._element?.isConnected && this._targetIndex(animation._target) === undefined) return true;
+    }
+    return false;
+  }
+  // The animations whose effects a synchronous layout applies to elements
+  // that no frame has rendered: the surface's animations and the pending
+  // transitions that reads started.
+  *_unrenderedEffectCandidates() {
+    yield* this._animations;
+    for (const transitions of this._pendingTransitions.values()) yield* transitions.values();
+  }
   // Declares through the renderer, or, before the renderer has the
-  // element's row, defers the declaration to the frame that writes it.
-  _declareEngineEffect(element, declare) {
-    const nodeIndex = this._indexOfElement.get(element);
+  // target's row, defers the declaration to the frame that writes it.
+  _declareEngineEffect(target, declare) {
+    const nodeIndex = this._targetIndex(target);
     if (this._persistentRenderer && nodeIndex !== undefined) {
       return declare(this._persistentRenderer, nodeIndex);
     }
     const deferred = deferAnimationBinding(declare);
     this._pendingAnimationDeclarations.push({
-      element,
+      target,
       bind: deferred.bind,
       release: deferred.release,
     });
@@ -3568,15 +4403,13 @@ class DOMRenderSurface {
     const index = this._animations.indexOf(animation);
     if (index >= 0) this._animations.splice(index, 1);
     this._animationsAwaitingTimeline.delete(animation);
+    this._animationsPausePending.delete(animation);
   }
 
   _restoreAnimation(animation) {
     if (!this._animations.includes(animation)) this._animations.push(animation);
   }
 
-  // The current text of every animated ::before/::after, for the core's
-  // scene build: an entry per element and pseudo-element whose content
-  // animation has a record.
   // A synchronous layout getter's serialization, offered by
   // computeLayoutBoxes (src/dom/live-geometry.js): the next frame under
   // the same style generation, resource revision and viewport takes it
@@ -3591,12 +4424,13 @@ class DOMRenderSurface {
       // one is stale and the new one takes its place: its lowered rows are
       // relative to the held publication rather than the frame's last, so
       // the renderer's provenance check sends that frame to a full row
-      // write, but the frame still skips serializing and laying out again.
-      if (
-        held.styleGeneration === styleGeneration &&
-        held.resourceRevision === resourceRevision &&
-        held.scrollRevision === scrollRevision
-      ) return false;
+      // write, but the frame still skips serializing and laying out again
+      // (frame_sync_layout).
+      const core = this._root._domCore;
+      if (core.status("frame_sync_layout", SYNC_LAYOUT_OFFER, ...core.valueListInput([
+        held.styleGeneration, held.resourceRevision, held.scrollRevision,
+        styleGeneration, resourceRevision, scrollRevision,
+      ])) === 1) return false;
       this._releaseSyncLayout();
     }
     this._syncLayout = {
@@ -3606,79 +4440,217 @@ class DOMRenderSurface {
       scrollRevision,
       frameSequence: this._frameSequence,
       timeMilliseconds: this._now(),
+      // The time the layout sampled the surface's animations at
+      // (computeLayoutBoxes, src/dom/live-geometry.js), and the animation
+      // controller's revision then.
+      sampleTime: this._currentTime,
+      animationRevision: this._persistentRenderer?.engineWriteToken?.revision ?? -1,
     };
     return true;
   }
   // The held layout for another synchronous getter, left held: it answers
   // while the style generation, resource revision, scroll positions and
   // viewport are unchanged, no frame has rendered since (a frame samples
-  // the engine's animation tracks, which the layout inherits), and nothing
-  // animates.
+  // the engine's animation tracks, which the layout inherits), and, while
+  // something animates, the surface's time is the one the layout sampled
+  // and no track or time changed since (the controller's revision).
   _peekSyncLayout(styleGeneration, viewport, resourceRevision, scrollRevision) {
     const held = this._syncLayout;
-    if (
-      held === null ||
-      this._animations.length + this._cssAnimations.size + this._pseudoContentAnimations.size +
-          this._activeTransitionCount + this._pendingAnimationDeclarations.length > 0 ||
-      this._pendingScrollSources.size > 0 ||
-      held.styleGeneration !== styleGeneration ||
-      held.resourceRevision !== resourceRevision ||
-      held.scrollRevision !== scrollRevision ||
-      held.frameSequence !== this._frameSequence
-    ) return null;
+    if (held === null) return null;
     const heldViewport = held.layout.viewport;
-    if (
-      heldViewport.width !== viewport.width ||
-      heldViewport.height !== viewport.height ||
-      (heldViewport.deviceScale ?? 1) !== (viewport.deviceScale ?? 1) ||
-      heldViewport._requestedLeft !== viewport._requestedLeft ||
-      heldViewport._requestedTop !== viewport._requestedTop
-    ) return null;
-    return held.layout;
+    const core = this._root._domCore;
+    const answers = core.status("frame_sync_layout", SYNC_LAYOUT_PEEK, ...core.valueListInput([
+      this._animations.length, this._cssAnimations.size, this._pseudoContentAnimations.size,
+      this._activeTransitionCount, this._pendingAnimationDeclarations.length, this._pendingScrollSources.size,
+      held.styleGeneration, held.resourceRevision, held.scrollRevision, held.frameSequence,
+      styleGeneration, resourceRevision, scrollRevision, this._frameSequence,
+      heldViewport.width, heldViewport.height, heldViewport.deviceScale ?? 1, heldViewport._requestedLeft, heldViewport._requestedTop,
+      viewport.width, viewport.height, viewport.deviceScale ?? 1, viewport._requestedLeft, viewport._requestedTop,
+      held.sampleTime, this._currentTime,
+      held.animationRevision, this._persistentRenderer?.engineWriteToken?.revision ?? -1,
+    ]));
+    return answers === 1 ? held.layout : null;
   }
   _takeSyncLayout(styleGeneration, viewport, resourceRevision) {
     const held = this._syncLayout;
     if (held === null) return null;
     this._syncLayout = null;
+    // A frame's own layout is the presented frame's: the next frame does
+    // not take it.
+    if (held.layout.borrowed) {
+      this._releaseSyncLayoutState(held.layout);
+      return null;
+    }
     const { layout, timeMilliseconds } = held;
-    if (
-      held.styleGeneration === styleGeneration &&
-      held.resourceRevision === resourceRevision &&
-      layout.viewport.width === viewport.width &&
-      layout.viewport.height === viewport.height &&
-      (layout.viewport.deviceScale ?? 1) === (viewport.deviceScale ?? 1)
-    ) {
-      // The frame takes the layout alone; getters' geometry stays behind.
-      this._releaseRetainedGeometry(layout);
+    const core = this._root._domCore;
+    if (core.status("frame_sync_layout", SYNC_LAYOUT_TAKE, ...core.valueListInput([
+      held.styleGeneration, held.resourceRevision, styleGeneration, resourceRevision,
+      layout.viewport.width, layout.viewport.height, layout.viewport.deviceScale ?? 1,
+      viewport.width, viewport.height, viewport.deviceScale ?? 1,
+    ])) === 1) {
+      // The frame takes the layout with its getters' geometry, which the
+      // frame derives its own from and releases (_render, readGeometry).
       layout.transitionChangeTimeMilliseconds = timeMilliseconds;
       return layout;
     }
     this._releaseSyncLayoutState(layout);
     return null;
   }
+  // A frame of a document with query containers takes the layout of a
+  // synchronous getter (computeLayoutBoxes, src/dom/live-geometry.js),
+  // which serializes and lays out until the size of every container
+  // settles. A paged surface and animated ::before or ::after content
+  // have no such layout to take, so their frames refuse query containers.
+  _settleQueryContainers(viewport, generatedContent) {
+    if (this._page !== null || generatedContent !== null) {
+      throw new Error(
+        `A ${this._page !== null ? "paged surface" : "frame with animated ::before or ::after content"} ` +
+          "cannot lay out size query containers (container-type: size or inline-size): their sizes settle only in " +
+          "a continuous synchronous layout. Remove the container type or render the document continuously.",
+      );
+    }
+    computeLayoutBoxes(this._root);
+    const core = this._root._domCore;
+    this._serializedStyleGeneration = this._root.ownerDocument?._styleSystem?.generation ?? -1;
+    const layout = this._takeSyncLayout(this._serializedStyleGeneration, viewport, core.status("resource_revision"));
+    if (layout === null) {
+      throw new Error(
+        "The synchronous layout that settled the query containers did not reach the frame: the surface " +
+          `refused its offer or its viewport differs from the frame's (${viewport.width}x${viewport.height}).`,
+      );
+    }
+    return layout;
+  }
   _releaseSyncLayout() {
     const held = this._syncLayout;
+    if (held !== null) {
+      this._syncLayout = null;
+      this._releaseSyncLayoutState(held.layout);
+    }
+    this._releaseSyncPageLayout();
+  }
+  // A synchronous getter's page layout (src/dom/live-geometry.js), offered
+  // for the getters that follow it: one is held at a time.
+  _offerSyncPageLayout(layout, styleGeneration, resourceRevision, scrollRevision) {
+    if (this._shutdown) return false;
+    this._releaseSyncPageLayout();
+    this._syncPageLayout = {
+      layout,
+      styleGeneration,
+      resourceRevision,
+      scrollRevision,
+      frameSequence: this._frameSequence,
+      page: this._page,
+    };
+    return true;
+  }
+  // The held page layout for another getter, left held: it answers while
+  // the page shown and its @page rules, the style generation, resource
+  // revision, scroll positions and viewport are those it was laid out
+  // under, no frame has rendered since and nothing animates. A stale one
+  // is released.
+  _peekSyncPageLayout(styleGeneration, viewport, resourceRevision, scrollRevision, rulesKey) {
+    const held = this._syncPageLayout;
+    if (held === null) return null;
+    const heldViewport = held.layout.viewport;
+    if (
+      this._animations.length + this._cssAnimations.size + this._pseudoContentAnimations.size +
+          this._activeTransitionCount + this._pendingAnimationDeclarations.length > 0 ||
+      this._pendingScrollSources.size > 0 ||
+      held.page !== this._page ||
+      held.layout.pageRulesKey !== rulesKey ||
+      held.styleGeneration !== styleGeneration ||
+      held.resourceRevision !== resourceRevision ||
+      held.scrollRevision !== scrollRevision ||
+      held.frameSequence !== this._frameSequence ||
+      heldViewport.width !== viewport.width ||
+      heldViewport.height !== viewport.height ||
+      (heldViewport.deviceScale ?? 1) !== (viewport.deviceScale ?? 1)
+    ) {
+      this._releaseSyncPageLayout();
+      return null;
+    }
+    return held.layout;
+  }
+  _releaseSyncPageLayout() {
+    const held = this._syncPageLayout;
     if (held === null) return;
-    this._syncLayout = null;
+    this._syncPageLayout = null;
     this._releaseSyncLayoutState(held.layout);
   }
   _releaseSyncLayoutState(layout) {
     this._releaseRetainedGeometry(layout);
+    if (layout.borrowed) return;
     layout.serialized.release();
     this._root._domCore.releaseSceneResources(layout.serialized.nodes);
     releaseBoxSnapshot(layout.boxes);
+  }
+  // The layout of the frame just presented, held for the synchronous
+  // getters that follow it: its observers' callbacks read layout before
+  // anything changes, and each read laid the document out again. The
+  // layout borrows the frame's serialization and boxes, which the frame
+  // releases when the next one supersedes it (publish drops the held
+  // layout first); it answers while the frame's revisions, the scroll
+  // positions and the surface's time hold (_peekSyncLayout).
+  _offerFrameLayout(serialized, boxes, sourceRevisions) {
+    const viewport = this.viewport;
+    const layout = {
+      boxes, indexOf: serialized.indexOf, root: this._root,
+      viewport: {
+        width: viewport.width, height: viewport.height, deviceScale: viewport.deviceScale ?? 1,
+        density: viewport.density, _requestedLeft: viewport._requestedLeft, _requestedTop: viewport._requestedTop,
+      },
+      viewportIndex: serialized.viewportIndex, publication: serialized.publication, serialized,
+      ownedBySurface: true, textStore: 0, paging: null, pageRulesKey: null, borrowed: true,
+    };
+    // A held layout predates this frame, so the frame's replaces it.
+    this._releaseSyncLayout();
+    this._offerSyncLayout(layout, Number(sourceRevisions.document) >>> 0, Number(sourceRevisions.resource) >>> 0,
+      this._root._domCore.status("scroll_revision") >>> 0);
   }
   _releaseRetainedGeometry(layout) {
     layout.retainedGeometry?.release();
     layout.retainedGeometry = undefined;
   }
+  _dropPlannedSerialization() {
+    const held = this._plannedSerialization;
+    if (held === null) return;
+    this._plannedSerialization = null;
+    held.serialized.release();
+    this._root._domCore.releaseSceneResources(held.serialized.nodes);
+  }
+  // The serialization of the last transition planning, for a layout read of
+  // the same tree: taken while the document's style generation, the
+  // resource revision and the viewport are the ones it serialized under;
+  // else dropped, and null.
+  _takePlannedSerialization(styleGeneration, resourceRevision, viewport) {
+    const held = this._plannedSerialization;
+    if (held === null) return null;
+    this._plannedSerialization = null;
+    if (held.styleGeneration === styleGeneration && held.resourceRevision === resourceRevision &&
+        held.width === viewport.width && held.height === viewport.height &&
+        held.deviceScale === (viewport.deviceScale ?? 1) &&
+        held.requestedLeft === viewport._requestedLeft && held.requestedTop === viewport._requestedTop) {
+      return held.serialized;
+    }
+    held.serialized.release();
+    this._root._domCore.releaseSceneResources(held.serialized.nodes);
+    return null;
+  }
+  // The text of every animated ::before/::after at `timeMilliseconds`,
+  // for the core's scene build of a frame or of a synchronous layout
+  // (computeLayoutBoxes): an entry per element and pseudo-element whose
+  // content animations have an effect; null without a record. The
+  // animations replace, in animation-name order (Web Animations 1 §5.4.4,
+  // "the effect stack"), so the last one with an effect shows; one
+  // outside its active interval without a fill, or at an implicit
+  // keyframe, leaves the content beneath it.
   _animatedGeneratedContent(timeMilliseconds) {
     if (this._pseudoContentAnimations.size === 0) return null;
     const overrides = [];
     for (const [element, pseudoElements] of this._pseudoContentAnimations) {
       for (const [pseudoElement, records] of pseudoElements) {
-        if (!records?.length) continue;
-        const text = pseudoContentAt(records.at(-1), timeMilliseconds);
+        const text = stackedAnimationContent(records, timeMilliseconds);
         if (text === undefined) continue;
         overrides.push({ element, pseudoElement, text });
       }
@@ -3713,20 +4685,50 @@ class DOMRenderSurface {
     // surface stays dirty and the loop renders again. A forced render
     // (renderNow, prepareNow, captureFrames) waits for the render in
     // flight, then renders its own frame, so its caller always gets one.
-    if (this._rendering) {
+    if (this._rendering || this._animationCheckpoint) {
       if (!forceDelivery) {
         this._dirty = true;
         return null;
       }
-      while (this._rendering) await this.whenIdle();
+      while (this._rendering || this._animationCheckpoint) await this.whenIdle();
       if (this._shutdown) return null;
       if (this._stagedFrame) return this._stagedFrame.frame;
     }
     if (!this._dirty && !forceDelivery) return null;
+    // The frame's restyle counters start before the style change event,
+    // whose resolutions are this frame's work.
+    const frameRestyleCounts = continuation === null
+      ? FRAME_RESTYLE_COUNTS.map((kind) => this._frameCore.status("computed_restyle_counts", kind))
+      : null;
+    // When a presented element declares a transition of a property that
+    // computed resolution animates (font-size), the style change since the
+    // last frame starts its CSS animations and transitions before this
+    // frame resolves styles, as a read between frames does: the transition
+    // then applies at this frame's scene build.
+    if (this._declaresDependencyTransitions()) this._startStyleChangeAnimations();
+    // A document with resize observers lays its style change out as a read
+    // between frames does: the layout starts the change's transitions and
+    // samples them (computeLayoutBoxes), and this frame takes that layout.
+    // The frame's observer stage then reads the sizes the frame presents,
+    // not a transition's end value, which the frame's own layout would
+    // give before its render starts the transition. A change of state
+    // alone (hover, focus) restyles the retained scene instead.
+    if (this._page === null && this._hasNonStateMutation &&
+        this._root.ownerDocument?._resizeObservers?.size > 0 &&
+        this._root.ownerDocument._styleSystem !== undefined &&
+        this._serializedStyleGeneration !== this._root.ownerDocument._styleSystem.generation) {
+      computeLayoutBoxes(this._root);
+    }
     this._requireEndedTransitionsUnregistered();
     this._rendering = true;
     this._dirty = false;
     this._currentTime = timeMilliseconds;
+    this._animationPromisesSettled = false;
+    // The provisional tracks leave before this frame resolves the pending
+    // animations, remaps the tracks and plans the transitions of the style
+    // change (_setProvisionalTrack).
+    for (const track of this._provisionalTracks.values()) track.cancelSilently();
+    this._provisionalTracks.clear();
     // An adopted animation's timeline had no time until now. This frame's
     // time is its first, so it starts here and samples from its first
     // keyframe instead of from a clock it never saw.
@@ -3735,11 +4737,64 @@ class DOMRenderSurface {
       this._animationsAwaitingTimeline.clear();
       for (const animation of awaiting) animation._resolveTimeline();
     }
-    // A ::before or ::after content animation that a read between frames
-    // started begins at this frame.
+    // The pending pause tasks hold each pause-pending animation at this
+    // frame's time.
+    if (this._animationsPausePending.size > 0) {
+      const pending = [...this._animationsPausePending];
+      this._animationsPausePending.clear();
+      for (const animation of pending) animation._commitPendingPause();
+    }
+    // The frame's time updates the finished state of each animation and
+    // transition (Web Animations 1, section 4.4.16) before its tick
+    // samples their tracks.
+    for (const animation of this._animations) animation._updateFinishedState();
+    for (const records of this._transitionRecords.values()) {
+      for (const record of records.values()) record.animation._updateFinishedState();
+    }
+    // The frame's time is the time of the effects that computed resolution
+    // applies (font-size): an element whose effect moved resolves again.
+    setAnimationDependencyTime(this._root.ownerDocument ?? this._root, timeMilliseconds);
+    // The microtask checkpoint of "update animations and send events"
+    // (HTML §8.1.7.3; Web Animations 1 §4.4.18): the reactions to the
+    // promises that the update settled run as script between frames, so a
+    // read in them updates the style and starts its animations. A macrotask
+    // turn drains the whole microtask queue. The outermost call holds it
+    // when the update settled a promise (_animationPromisesSettled);
+    // an observer restart renders within the frame. No other frame starts
+    // meanwhile (_animationCheckpoint), and the provisional tracks that the
+    // reads made leave before the frame remaps the tracks.
+    // The animation events that a synchronous layout since the last frame
+    // queued are sent after that checkpoint, still as script: the reactions
+    // to their listeners run before the frame resumes.
+    const deferredEvents = this._deferredAnimationEvents;
+    this._deferredAnimationEvents = [];
+    if (continuation === null && (this._animationPromisesSettled || deferredEvents.length > 0)) {
+      this._rendering = false;
+      this._animationCheckpoint = true;
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        for (const { element, event } of deferredEvents) dispatchEvent(element, event);
+        if (deferredEvents.length > 0) await new Promise((resolve) => setTimeout(resolve, 0));
+      } finally {
+        this._animationCheckpoint = false;
+        this._rendering = true;
+      }
+      if (this._shutdown) {
+        this._rendering = false;
+        for (const resolve of this._idleWaiters.splice(0)) resolve();
+        return null;
+      }
+      for (const track of this._provisionalTracks.values()) track.cancelSilently();
+      this._provisionalTracks.clear();
+    } else {
+      for (const { element, event } of deferredEvents) dispatchEvent(element, event);
+    }
+    // A running ::before or ::after content animation that a read between
+    // frames started, or played on from its held time, begins at this
+    // frame, at that held time.
     for (const pseudoElements of this._pseudoContentAnimations.values()) {
       for (const records of pseudoElements.values()) {
-        for (const record of records) record.startTimeMilliseconds ??= timeMilliseconds;
+        for (const record of records) Object.assign(record, contentAnimationFrameStart(record, timeMilliseconds));
       }
     }
     this._stageCounters.currentStage = "prepare";
@@ -3763,20 +4818,17 @@ class DOMRenderSurface {
       this._frameHeldTransitions = this._pendingTransitions;
       this._pendingTransitions = new Map();
       this._pendingTransitionsKey = null;
+      this._styleChangeAnimationsKey = null;
+      this._frameReadBaselines = this._readBaselines;
+      this._readBaselines = new Map();
     }
     const core = this._frameCore;
     const frameOwner = this._frameOwner;
     const frameBindings = this._frameBindings;
     // The frame's restyle work: the core's record counters before the frame
-    // and after it, taken by the outermost call only (an observer restart
-    // renders within this call).
-    const restyleCountsBefore = ownsContinuation
-      ? [
-        core.status("computed_restyle_counts", 0),
-        core.status("computed_restyle_counts", 1),
-        core.status("computed_restyle_counts", 2),
-      ]
-      : null;
+    // (and its style change event) and after it, taken by the outermost
+    // call only (an observer restart renders within this call).
+    const restyleCountsBefore = ownsContinuation ? frameRestyleCounts : null;
     continuation ??= core.status(
       "frame_begin",
       frameOwner,
@@ -3800,6 +4852,7 @@ class DOMRenderSurface {
       lastBoxes: this._lastBoxes,
       lastPixels: this._lastPixels,
       indexOfElement: this._indexOfElement,
+      indexOfPseudoTarget: this._indexOfPseudoTarget,
       elementAtIndex: this._elementAtIndex,
       scrollbars: this._scrollbars,
     };
@@ -3817,6 +4870,7 @@ class DOMRenderSurface {
       this._lastBoxes = previousPublication.lastBoxes;
       this._lastPixels = previousPublication.lastPixels;
       this._indexOfElement = previousPublication.indexOfElement;
+      this._indexOfPseudoTarget = previousPublication.indexOfPseudoTarget;
       this._elementAtIndex = previousPublication.elementAtIndex;
       this._scrollbars = previousPublication.scrollbars;
       this._serializedStyleGeneration = -1;
@@ -3829,10 +4883,38 @@ class DOMRenderSurface {
       }
       this._dirty = true;
     };
+    // The renderer's text geometry capture and this frame's text geometry
+    // store (geometry_text_store), which the frame's snapshot holds.
+    let frameTextCapture = 0;
+    let frameTextStore = 0;
+    // A frame that laid out again derives its geometry from the presented
+    // snapshot once, before it rasters (deriveRestyleBasis): its scrollbars
+    // read that geometry, and its interaction snapshot derives from it; the
+    // frame releases it.
+    let restyleBasis = null;
+    let restyleBasisRefusal = null;
+    // The geometry of this frame's tree for its boxes (frameGeometryFor),
+    // with the box list, publication and viewport it describes: its
+    // observer checkpoint reads it, its scrollbars read it when no restyle
+    // basis gives them, and its interaction snapshot derives from it. The
+    // frame releases it.
+    let checkpointLayout = null;
+    // The live geometry of the synchronous layout read whose layout this
+    // frame took, with that layout's boxes, publication and viewport, or
+    // null: the frame geometry derives from it instead of a build. The
+    // frame releases it.
+    let readGeometry = null;
     try {
       const observerDocument = this._root.ownerDocument;
+      this._dropPlannedSerialization();
+      // Whether an animation ran when the frame began: the engine samples
+      // it while it renders, so the observer stage before the render saw
+      // none of its sizes, and the frame in which it ends still owes its
+      // end value (the notify below, which also takes the animations the
+      // render started).
+      const animatedAtStart = this._animating();
       const styleSystem = observerDocument?._styleSystem;
-      let preparationToken = this._frameClaim(continuation, 1, frameBindings);
+      let preparationToken = this._frameClaim(continuation, FRAME_STAGE.PREPARE, frameBindings);
       for (;;) {
         const resourceRevision = core.status("resource_revision");
         await observerDocument?._readyForRendering();
@@ -3841,21 +4923,35 @@ class DOMRenderSurface {
         this._frameResume(
           continuation,
           preparationToken,
-          16,
+          FRAME_FACT_PREPARATION_CHANGED,
           -1,
           frameBindings,
         );
-        preparationToken = this._frameClaim(continuation, 1, frameBindings);
+        preparationToken = this._frameClaim(continuation, FRAME_STAGE.PREPARE, frameBindings);
       }
       core.status(
         "frame_configure",
         continuation,
-        this._frameFlags(rasterize, deliverObservers, pixelReadback) | 32768,
+        this._frameFlags(rasterize, deliverObservers, pixelReadback),
       );
-      let scrollOnly = core.status("frame_mode", continuation) === 1;
-      let transformOnly = core.status("frame_mode", continuation) === 2;
+      let scrollOnly = core.status("frame_mode", continuation) === FRAME_MODE.PURE_SCROLL;
+      let transformOnly = core.status("frame_mode", continuation) === FRAME_MODE.TRANSFORM;
       if (styleSystem && !scrollOnly) {
         this._prepareStyleSystem(styleSystem);
+        // The core's media environment is shared by every document; the
+        // record writer reads it (print-color-adjust, forced colors), so
+        // each frame installs this surface's.
+        core.mediaEnvironmentSet(styleSystem.environment);
+        // Forced colors and the media type act on used values in the
+        // record writer, not on computed styles: a change rewrites every
+        // record.
+        const usedValueMedia = `${styleSystem.environment.forcedColors}\u0000${styleSystem.environment.mediaType}`;
+        if (this._usedValueMedia !== undefined && this._usedValueMedia !== usedValueMedia) {
+          this._releaseSyncLayout();
+          this._forceFullInvalidation = true;
+          this._forceFullDamage = true;
+        }
+        this._usedValueMedia = usedValueMedia;
         this._synchronizeCSSAnimations(core, styleSystem, timeMilliseconds);
       }
       if (this._applyPageMargins(core, this._pageMarginBoxesFor(this._page, {
@@ -3870,20 +4966,21 @@ class DOMRenderSurface {
       core.status(
         "frame_configure",
         continuation,
-        this._frameFlags(rasterize, deliverObservers, pixelReadback) | 32768,
+        this._frameFlags(rasterize, deliverObservers, pixelReadback),
       );
       this._frameResume(continuation, preparationToken, 0, -1, frameBindings);
       const frameMode = core.status("frame_mode", continuation);
-      scrollOnly = frameMode === 1;
-      transformOnly = frameMode === 2;
-      const cleanSceneReuse = frameMode === 3;
-      const sceneToken = this._frameClaim(continuation, 2, frameBindings);
+      scrollOnly = frameMode === FRAME_MODE.PURE_SCROLL;
+      transformOnly = frameMode === FRAME_MODE.TRANSFORM;
+      const cleanSceneReuse = frameMode === FRAME_MODE.CLEAN;
+      const sceneToken = this._frameClaim(continuation, FRAME_STAGE.SCENE, frameBindings);
       capturedScrollRequests = this._captureScrollRequests();
       const capturedViewportScroll = capturedScrollRequests.get(this.viewport);
       const frameViewport = {
         width: this.viewport.width,
         height: this.viewport.height,
         deviceScale: this.viewport.deviceScale,
+        density: this.viewport.density,
         _requestedLeft: capturedViewportScroll?.left ??
           this.viewport._requestedLeft,
         _requestedTop: capturedViewportScroll?.top ??
@@ -3914,7 +5011,7 @@ class DOMRenderSurface {
       let captureTextGeometry = this._textSelectionEnabled;
       // Frame mode 4: the retained scene with its restyled rows, or null
       // when the frame builds the scene after all.
-      publicationRestyled = frameMode === 4 &&
+      publicationRestyled = frameMode === FRAME_MODE.RESTYLE &&
         this._restyleRetainedPublication(core, frameViewport, styleSystem);
       const restyledScene = publicationRestyled
         ? this._restyledSerialization(core)
@@ -3961,17 +5058,12 @@ class DOMRenderSurface {
           const index = serialized.indexOf.get(element);
           if (!Number.isInteger(index)) continue;
           // The core writes the row's transform from the element's style
-          // (engine_record_transform_restate); the node keeps the resolved
-          // fields for the host's own readers.
+          // (engine_record_transform_restate); the node keeps the
+          // transform list for the transition diff.
           serialized.rowRevision = publication.core.status(
             "engine_record_transform_restate", publication.handle, index,
           );
-          const fields = resolvedElementFields(element);
-          serialized.nodes[index] = {
-            ...serialized.nodes[index],
-            transform: fields.transform,
-            transformOrigin: fields.transformOrigin,
-          };
+          serialized.nodes[index] = { ...serialized.nodes[index], transform: elementTransform(element) };
           declaredChangedNodeIndices.add(index);
         }
         this._stageCounters.retainedTransformFrames++;
@@ -4004,18 +5096,42 @@ class DOMRenderSurface {
         const generatedContent = this._animatedGeneratedContent(
           timeMilliseconds,
         );
-        const syncLayout = generatedContent === null
+        let syncLayout = generatedContent === null
           ? this._takeSyncLayout(
             this._serializedStyleGeneration,
             frameViewport,
             core.status("resource_revision"),
           )
           : null;
-        if (syncLayout !== null) {
-          transitionChangeTimeMilliseconds =
-            syncLayout.transitionChangeTimeMilliseconds;
+        if (syncLayout === null) {
+          serialized = serializeToScene(this._root, {
+            viewportWidth: frameViewport.width,
+            viewportHeight: frameViewport.height,
+            generatedContent,
+            viewport: frameViewport,
+          });
+          this._stageCounters.sceneRowsBuilt += serialized.nodes.length;
+          this._stageCounters.rowsLowered += serialized.loweredRows.length;
+          // Query containers take their sizes from a synchronous layout,
+          // which serializes and lays out until the sizes settle
+          // (computeLayoutBoxes); the frame takes that layout.
+          if (serialized.queryContainers.length > 0) {
+            serialized.release();
+            core.releaseSceneResources(serialized.nodes);
+            syncLayout = this._settleQueryContainers(frameViewport, generatedContent);
+          }
         }
         if (syncLayout !== null) {
+          if (syncLayout.retainedGeometry !== undefined) {
+            const { viewport } = syncLayout;
+            readGeometry = {
+              geometry: syncLayout.retainedGeometry, boxes: syncLayout.boxes, publication: syncLayout.publication,
+              width: viewport.width, height: viewport.height, deviceScale: viewport.deviceScale ?? 1,
+            };
+            syncLayout.retainedGeometry = undefined;
+          }
+          transitionChangeTimeMilliseconds =
+            syncLayout.transitionChangeTimeMilliseconds;
           serialized = syncLayout.serialized;
           syncLayoutSource = serialized.nodes;
           syncLayoutBoxes = syncLayout.boxes;
@@ -4041,21 +5157,12 @@ class DOMRenderSurface {
             this._restateScroll(serialized, capturedScrollRequests);
             core.releaseSceneResources(syncLayout.serialized.nodes);
           }
-        } else {
-          serialized = serializeToScene(this._root, {
-            viewportWidth: frameViewport.width,
-            viewportHeight: frameViewport.height,
-            generatedContent,
-            viewport: frameViewport,
-          });
-          this._stageCounters.sceneRowsBuilt += serialized.nodes.length;
-          this._stageCounters.rowsLowered += serialized.loweredRows.length;
         }
       }
       // Every mode but a full serialization keeps the retained scene; a
       // restyle the core refused serialized in full.
-      const retainedScene = frameMode !== 0 &&
-        (frameMode !== 4 || restyledScene !== null);
+      const retainedScene = frameMode !== FRAME_MODE.FULL &&
+        (frameMode !== FRAME_MODE.RESTYLE || restyledScene !== null);
       if (scrollOnly || transformOnly || restyledScene !== null) {
         core.shareSceneResources(
           this._preparedState.serialized.nodes,
@@ -4076,9 +5183,15 @@ class DOMRenderSurface {
             remappedIndices.set(previousIndex, nextIndex);
           }
         }
+        for (const [target, previousIndex] of this._indexOfPseudoTarget) {
+          const nextIndex = serialized.pseudoIndexOf.get(target);
+          if (nextIndex !== undefined) remappedIndices.set(previousIndex, nextIndex);
+        }
+        const parked = this._parkHiddenAnimations(serialized.indexOf, serialized.pseudoIndexOf);
         this._persistentRenderer.remapAnimations(remappedIndices);
         for (const animation of [...this._animations]) {
-          if (!serialized.indexOf.has(animation._element)) {
+          if (parked.has(animation)) continue;
+          if (this._targetIndex(animation._target, serialized.indexOf, serialized.pseudoIndexOf) === undefined) {
             this._removeAnimation(animation);
           }
         }
@@ -4101,26 +5214,24 @@ class DOMRenderSurface {
         frameViewport.deviceScale;
       // Damage uses the same integer extent as the native raster allocation;
       // the origin and device scale remain in unrounded device coordinates.
-      const physicalWidth = Math.trunc(
-        (visibleRegion?.width ?? frameViewport.width) *
-          frameViewport.deviceScale,
+      const physicalWidth = core.exports.frame_device_extent(
+        visibleRegion?.width ?? frameViewport.width,
+        frameViewport.deviceScale,
       );
-      const physicalHeight = Math.trunc(
-        (visibleRegion?.height ?? frameViewport.height) *
-          frameViewport.deviceScale,
+      const physicalHeight = core.exports.frame_device_extent(
+        visibleRegion?.height ?? frameViewport.height,
+        frameViewport.deviceScale,
       );
-      const toTargetRectangle = (rectangle) =>
-        originDeviceX === 0 && originDeviceY === 0 ? rectangle : {
-          ...rectangle,
-          x: rectangle.x - originDeviceX,
-          y: rectangle.y - originDeviceY,
-        };
+      const toTargetRectangle = (rectangle) => ({
+        ...rectangle,
+        x: rectangle.x - originDeviceX,
+        y: rectangle.y - originDeviceY,
+      });
       let boxes = syncLayoutBoxes ?? (retainedScene ? this._lastBoxes : []);
       core.status(
         "frame_configure",
         continuation,
-        this._frameFlags(rasterize, deliverObservers, pixelReadback) |
-          32768,
+        this._frameFlags(rasterize, deliverObservers, pixelReadback),
       );
       const sourceRevisions = {
         document: BigInt(
@@ -4137,6 +5248,36 @@ class DOMRenderSurface {
       };
       serialized.sourceRevisions = sourceRevisions;
       serialized.root = this._root;
+      // The geometry of this frame's tree for `frameBoxes`: the one the frame
+      // has when its boxes are equal (boxesEqual) under the same publication
+      // and viewport; else derived from the synchronous layout read's live
+      // geometry under the same terms (geometry_frame_successor); else built.
+      const frameGeometryFor = (frameBoxes) => {
+        const describes = (held) =>
+          held !== null && held.publication === serialized.publication &&
+          held.width === this.viewport.width && held.height === this.viewport.height &&
+          held.deviceScale === this.viewport.deviceScale && boxesEqual(held.boxes, frameBoxes);
+        if (describes(checkpointLayout)) return checkpointLayout.geometry;
+        let geometry;
+        if (describes(readGeometry) &&
+          core.status("scroll_geometry_current", readGeometry.geometry.handle, observerDocument._coreHandle) === 1) {
+          ({ geometry } = buildGeometryFrameSuccessor({
+            predecessor: readGeometry.geometry, root: this._root, boxes: frameBoxes, revision: 0,
+            scrollbars: [], textStore: 0, sourceRevisions,
+          }));
+          this._stageCounters.geometryReadSuccessorFrames++;
+        } else {
+          geometry = observerLayout(serialized, frameBoxes, this.viewport);
+          this._stageCounters.geometryBuilds++;
+        }
+        checkpointLayout?.geometry.release();
+        checkpointLayout = {
+          boxes: frameBoxes, publication: serialized.publication,
+          width: this.viewport.width, height: this.viewport.height, deviceScale: this.viewport.deviceScale,
+          geometry,
+        };
+        return geometry;
+      };
       core.status(
         "frame_sources",
         continuation,
@@ -4156,14 +5297,15 @@ class DOMRenderSurface {
       this._forceFullDamage = false;
       this._selectionChanged = false;
       this._eventElementAtIndex = nodesAtRow(serialized);
+      this._eventTargetAtIndex = targetsAtRow(serialized.indexOf, serialized.pseudoIndexOf);
       for (;;) {
         const action = core.status("frame_stage", continuation);
-        if (action === 8) break;
+        if (action === FRAME_STAGE.DAMAGE) break;
         const token = this._frameClaim(continuation, action, frameBindings);
         let facts = 0;
         let depth = -1;
         switch (action) {
-          case 3:
+          case FRAME_STAGE.LAYOUT:
             if (
               boxes !== syncLayoutBoxes ||
               boxes.length !== serialized.nodes.length
@@ -4172,21 +5314,22 @@ class DOMRenderSurface {
                 width: frameViewport.width,
                 height: frameViewport.height,
                 nodes: serialized.nodes,
+                generatedBoxRows: serialized.generatedBoxRows,
                 imageSources: serialized.imageSources,
                 rowRevision: serialized.rowRevision ?? 0,
               });
             }
             break;
-          case 5:
+          case FRAME_STAGE.SCROLL_ANCHORING:
             facts = this._applyScrollAnchoring(
                 serialized,
                 boxes,
                 capturedScrollRequests,
               )
-              ? 1
+              ? FRAME_FACT_GEOMETRY_CHANGED
               : 0;
             break;
-          case 6:
+          case FRAME_STAGE.SCROLL_TIMELINES:
             for (const animation of this._animations) {
               if (!animation._isScrollDriven()) continue;
               const progress = sampleScrollTimeline(
@@ -4201,29 +5344,29 @@ class DOMRenderSurface {
               }
             }
             break;
-          case 7: {
+          case FRAME_STAGE.OBSERVERS: {
             this._pendingObserverDelivery = false;
             const delivery = deliverRenderingObservers(
               observerDocument,
               serialized,
               boxes,
-              this.viewport,
               timeMilliseconds,
               core.status("frame_depth", continuation),
+              () => frameGeometryFor(boxes),
             );
-            facts = (this._dirty ? 2 : 0) | (delivery.skippedResize ? 4 : 0);
+            facts = (this._dirty ? FRAME_FACT_OBSERVER_MUTATION : 0) | (delivery.skippedResize ? FRAME_FACT_RESIZE_SKIPPED : 0);
             depth = Number.isFinite(delivery.shallowestResizeDepth)
               ? delivery.shallowestResizeDepth
               : -1;
             break;
           }
-          case 11:
+          case FRAME_STAGE.OBSERVER_LIMIT:
             break;
           default:
             throw new Error(`Unsupported frame action ${action}`);
         }
         this._frameResume(continuation, token, facts, depth, frameBindings);
-        if (core.status("frame_stage", continuation) === 1) {
+        if (core.status("frame_stage", continuation) === FRAME_STAGE.PREPARE) {
           for (const node of frameMutatedNodes) this._mutatedNodes.add(node);
           for (const node of frameForcedGenerationNodes) {
             this._forcedGenerationNodes.add(node);
@@ -4273,7 +5416,7 @@ class DOMRenderSurface {
         // rebuilt, so the presented frame is not this one.
         !textGeometryStale &&
         // A scrollbar whose visibility changes is an overlay input too.
-        !this._scrollbarVisibility.due(this._scrollbars, timeMilliseconds) &&
+        !this._scrollbarVisibility.due(timeMilliseconds) &&
         this._retainedDeliveryPossible(
           cleanSceneReuse,
           pixelReadback,
@@ -4309,15 +5452,15 @@ class DOMRenderSurface {
         this._notifyFrameListeners(frame, resizeObserverLoopError);
         return frame;
       }
-      const damageToken = this._frameClaim(continuation, 8, frameBindings);
+      const damageToken = this._frameClaim(continuation, FRAME_STAGE.DAMAGE, frameBindings);
       const damageMode = core.status(
         "frame_damage_begin",
         continuation,
         physicalWidth,
         physicalHeight,
       );
-      const pureScrollMutation = damageMode === 2;
-      let requestedDirtyRectangles = damageMode === 0
+      const pureScrollMutation = damageMode === FRAME_DAMAGE_PURE_SCROLL;
+      let requestedDirtyRectangles = damageMode === FRAME_DAMAGE_FULL
         ? core.frameDamageRectangles(continuation)
         : [];
       let dirtyTiles = damageMode === 0 ? null : new Uint8Array(0);
@@ -4364,6 +5507,7 @@ class DOMRenderSurface {
           width: frameViewport.width,
           height: frameViewport.height,
           nodes: serialized.nodes,
+          generatedBoxRows: serialized.generatedBoxRows,
           imageSources: serialized.imageSources,
           rowRevision: serialized.rowRevision ?? 0,
         });
@@ -4394,13 +5538,29 @@ class DOMRenderSurface {
           const element = elementAtRow[index];
           if (element?.nodeType !== 1) continue;
           if (presented.has(element)) return true;
-          const { x, y } = resolvedOverflowAxes(resolvedElementFields(element));
-          if ((x !== "visible" && x !== "clip") || (y !== "visible" && y !== "clip")) return true;
+          // An overflow that scrolls, whatever the display.
+          if (element._domCore.status("scroll_overflow_scrolls", element._coreHandle) === 1) return true;
         }
         return false;
       };
       let scrollbars = null;
       let frameLayoutWork = null;
+      // Without a presented frame, or when the core refuses the derivation,
+      // the scrollbars of a frame that laid out again come from a geometry
+      // built from its boxes.
+      const laidOutScrollbars = (frameBoxes) => {
+        if (snapshot !== null && !scrollOnly) {
+          ({ basis: restyleBasis, refusal: restyleBasisRefusal } = deriveRestyleBasis(snapshot, {
+            root: this._root, viewport: frameViewport, viewportIndex: serialized.viewportIndex ?? 0,
+            boxes: frameBoxes, publication: serialized.publication, revision: this._frameSequence + 1, sourceRevisions,
+          }));
+        }
+        if (restyleBasis !== null) {
+          return snapshotScrollbars(this._root, this.viewport, restyleBasis.geometryCore, restyleBasis.geometryHandle, 0n, this.scrollbarStyle);
+        }
+        const geometry = frameGeometryFor(frameBoxes);
+        return snapshotScrollbars(this._root, this.viewport, geometry.core, geometry.handle, 0n, this.scrollbarStyle);
+      };
       const describeScrollbars = (frameBoxes, laidOut) => {
         scrollbars = snapshot && !laidOut
           ? snapshotScrollbars(
@@ -4411,12 +5571,11 @@ class DOMRenderSurface {
             capturedScrollRequests.size > 0 ? capturedScrollRequests.handle : 0n,
             this.scrollbarStyle,
           )
-          : computeScrollbars(serialized, frameBoxes, this.viewport, this.scrollbarStyle);
+          : laidOutScrollbars(frameBoxes);
         // Each descriptor carries the visibility it paints with; a hidden
         // overlay bar emits nothing, a fading one scales its colors' alpha.
         const scrollbarVisibility = this._scrollbarVisibility.advance(
           scrollbars,
-          this._scrollbars,
           timeMilliseconds,
         );
         for (const [index, scrollbar] of scrollbars.entries()) {
@@ -4548,6 +5707,8 @@ class DOMRenderSurface {
         }
       }
       const renderOptions = {
+        // The frame this render publishes, for its frame comparison record.
+        frameSequence: this._frameSequence + 1,
         ...(dirtyTiles
           ? {
             authoritativeDirtyTiles,
@@ -4560,7 +5721,8 @@ class DOMRenderSurface {
           : {}),
         scrollbarParts,
         selectionFrameOwner: this._frameOwner,
-        selectionPixelReadback: pixelReadback,
+        selectionPixelReadback: Boolean(pixelReadback),
+        ...(pixelReadback === "rgba8" ? { readback: "rgba8" } : {}),
         ...(declaredChangedNodeIndices !== null
           ? { declaredChangedNodeIndices }
           : {}),
@@ -4569,19 +5731,26 @@ class DOMRenderSurface {
           ? { forceGenerationNodeIndices }
           : {}),
         timeMilliseconds,
+        readBaseline: (nodeIndex) => {
+          const target = this._eventTargetAtIndex?.[nodeIndex];
+          return target ? this._frameReadBaselines?.get(target) ?? null : null;
+        },
         transitionChangeTimeMilliseconds,
         heldTransition: (nodeIndex, propertyName) =>
           this._heldTransitionDeclaration(nodeIndex, propertyName),
         onTransitionStarted: (transition) =>
           this._registerStartedTransition(transition),
         onTransitionPropertyUnanimated: ({ nodeIndex, propertyName }) => {
-          const element = this._eventElementAtIndex[nodeIndex];
-          if (element) recordUnanimatedProperty(element, propertyName, "transition-property");
+          const target = this._eventTargetAtIndex[nodeIndex];
+          if (target) {
+            recordUnanimatedProperty(isPseudoElementTarget(target) ? target.element : target, propertyName,
+              "transition-property");
+          }
         },
         computedSamples: {
           core: this._root._domCore,
           owner: this._computedSamples,
-          elements: this._eventElementAtIndex,
+          targets: this._eventTargetAtIndex,
         },
         ...(this._glyphResourceManager === null
           ? {}
@@ -4590,7 +5759,7 @@ class DOMRenderSurface {
           ? {
             prepareEngine: () => {
               for (const declaration of this._pendingAnimationDeclarations) {
-                const nodeIndex = serialized.indexOf.get(declaration.element);
+                const nodeIndex = this._targetIndex(declaration.target, serialized.indexOf, serialized.pseudoIndexOf);
                 if (nodeIndex !== undefined) {
                   declaration.bind(this._persistentRenderer, nodeIndex);
                 }
@@ -4605,11 +5774,12 @@ class DOMRenderSurface {
         onImageLoadError: this._onImageLoadError,
         svgImageTimings,
         ...(this._capturePaintArtifact
-          ? { capturePaintArtifact: true }
+          ? { capturePaintArtifact: true, textCapture: true }
           : captureTextGeometry
           ? {
             captureTextGeometry: true,
             textGeometryArtifactRead: !reuseTextGeometry,
+            textCapture: true,
           }
           : {}),
       };
@@ -4624,11 +5794,21 @@ class DOMRenderSurface {
       if (this._background !== undefined) {
         renderOptions.background = this._background;
       }
+      if (this._selectedRoot !== null && this._selectedRoot !== undefined) {
+        const selectedSceneIndex = serialized.indexOf.get(this._selectedRoot);
+        if (selectedSceneIndex === undefined) {
+          throw new RangeError("The selected root has no scene row: it renders nothing.");
+        }
+        renderOptions.selectedSceneIndex = selectedSceneIndex;
+      }
+      if (this._selectedLayer !== null) renderOptions.selectedLayer = this._selectedLayer;
       if (this._textThickening !== undefined) {
         renderOptions.textThickening = this._textThickening;
       }
       if (!rasterize) {
         this._indexOfElement = serialized.indexOf;
+        this._indexOfPseudoTarget = serialized.pseudoIndexOf;
+        this._redeclareParkedAnimations();
         this._elementAtIndex = nodesAtRow(serialized);
         this._lastBoxes = boxes;
         const supersededSerialized = this._preparedState?.serialized ?? null;
@@ -4659,7 +5839,7 @@ class DOMRenderSurface {
         accepted = true;
         return this._preparedState;
       }
-      const renderToken = this._frameClaim(continuation, 9, frameBindings);
+      const renderToken = this._frameClaim(continuation, FRAME_STAGE.RENDER, frameBindings);
       if (!this._persistentRendererPromise) this._startPersistentRenderer(frameViewport);
       this._stageCounters.currentStage = "raster";
       rasterStartedAt = hostNow();
@@ -4685,10 +5865,21 @@ class DOMRenderSurface {
       // a presenter catches up.
       const textureDelivery = !pixelReadback &&
         renderer.graphicsBackend !== "webgl2";
-      const rendered = textureDelivery
-        ? await renderer.renderTexture(scene, renderOptions)
-        : await renderer.render(scene, renderOptions);
+      // The animation events of this frame's tick wait until the frame
+      // ends (the finally block below): their listeners and the reactions
+      // to them run as script after the frame, where a read updates the
+      // style and starts animations.
+      this._animationEventDeferralDepth++;
+      let rendered;
+      try {
+        rendered = textureDelivery
+          ? await renderer.renderTexture(scene, renderOptions)
+          : await renderer.render(scene, renderOptions);
+      } finally {
+        this._animationEventDeferralDepth--;
+      }
       rasterFinishedAt = hostNow();
+      frameTextCapture = rendered.textCapture ?? 0;
       if (this._shutdown) {
         return null;
       }
@@ -4759,6 +5950,7 @@ class DOMRenderSurface {
           width: frameViewport.width,
           height: frameViewport.height,
           nodes: serialized.nodes,
+          generatedBoxRows: serialized.generatedBoxRows,
           imageSources: serialized.imageSources,
           rowRevision: serialized.rowRevision ?? 0,
         });
@@ -4841,6 +6033,7 @@ class DOMRenderSurface {
           width: frameViewport.width,
           height: frameViewport.height,
           nodes: serialized.nodes,
+          generatedBoxRows: serialized.generatedBoxRows,
           imageSources: serialized.imageSources,
           rowRevision: serialized.rowRevision ?? 0,
         });
@@ -4872,251 +6065,70 @@ class DOMRenderSurface {
         presentedBoxes[BOX_SNAPSHOT] = boxSnapshot;
       }
       freezeBoxes(presentedBoxes);
-      const textGeometryByElement = new Map();
-      let textGeometryByNode = new Map();
-      // A retained scene with unchanged text keeps the presented frame's
-      // glyph and caret geometry. A translation holds no scroll (the
-      // geometry records carry it), so a scroll changes none of it. Those
-      // entries are frozen and already complete, so the paint artifact's
-      // text operations (present whenever the surface captures paint
-      // artifacts) must not be accumulated onto them again.
-      const reusedTextGeometry = (reuseTextGeometry ||
-          (this._textSelectionEnabled &&
-            rendered.performance?.preparation?.retained))
-        ? this._presentedFrame?.textGeometryByNode ?? null
-        : null;
-      // A text node's reused geometry is final: its caret stops were made
-      // unique when it was built, and keeping the same frozen stop array is
-      // what lets the geometry build reuse the node's encoded wire blocks
-      // (textWireBlocks is keyed on it). Running it through the unique-stop
-      // pass again copied every stop array on every scroll frame, which
-      // re-encoded every text node's blocks. A text control still takes
-      // that pass: its selection rectangles follow the live selection.
-      // The entries still to be finished below (made unique, frozen, a text
-      // control's selection added); a kept entry is final.
-      const unfinishedTextGeometry = [];
-      if (reusedTextGeometry !== null) {
-        // A view over the reused entries, whatever scrolled: only a text
-        // control's entry is made, for its live selection. The text
-        // controls among the reused entries: a frame keys each control's
-        // entry under textGeometryByElement as well, and every other entry
-        // is a text node's.
-        const reusedControls = this._presentedFrame.textGeometryByElement;
-        textGeometryByNode = new TextGeometryView(
-          reusedTextGeometry instanceof TextGeometryView
-            ? reusedTextGeometry.base
-            : reusedTextGeometry,
-          textGeometryByElement,
-        );
-        unfinishedTextGeometry.push(...reusedControls.keys());
-        this._stageCounters.translatedTextGeometryEntries +=
-          reusedControls.size;
-      }
-      const textOperations = reusedTextGeometry === null
-        ? rendered.textGeometryArtifact?.operations ??
-          rendered.paintArtifact?.operations ?? []
-        : [];
-      // A text node whose row was not lowered anew (same text, same
-      // record) keeps the previous frame's glyph and caret geometry: those
-      // objects are functions of the shaped run and the line boxes only.
-      // The command stream paints in unscrolled coordinates (the raster
-      // applies the scroll table), so the geometry stays valid while the
-      // node's painted line rectangles keep their size, and a node whose
-      // lines all moved by the same delta - the line above it was removed,
-      // a paragraph was inserted before it - keeps them with that delta as
-      // its translation. `anchors` carries the rectangles the glyph
-      // coordinates were captured against, so the delta is measured from
-      // the capture and never accumulates. This unscrolled line displacement
-      // is combined with the absolute scroll shift of the published frame.
-      const previousTextGeometry = textOperations.length > 0
-        ? this._presentedFrame?.textGeometryByNode ?? null
-        : null;
-      const loweredRows = textOperations.length === 0 ||
-          serialized.loweredRows === undefined
-        ? null
-        : new Set(serialized.loweredRows);
-      // One eager pass: the operations of each text owner, in paint order.
-      // Reading operation.glyphs builds a frozen object per glyph, so the
-      // grouping uses the eager glyphCount and only a rebuild pays for it.
-      const operationsByOwner = new Map();
-      // An owner's kind (0 no text owner, 1 a text control, 2 a text node
-      // under the root) is a function of the node and of the tree. The
-      // surface keeps the kinds, and the ancestry verdicts behind them,
-      // until a tree mutation under the root: an insertion or a removal
-      // is the only change that moves a node's shadow-including ancestry,
-      // and either one reaches the surface (its target is under the root
-      // before a removal and after an insertion). A frame then classifies
-      // only the owners it has not met, instead of walking every owner's
-      // ancestry and reading its node type through the core again.
-      if (this._textOwnerKinds?.structureMutations !== this._structureMutations) {
-        this._textOwnerKinds = {
-          structureMutations: this._structureMutations,
-          kinds: new Map(),
-          isDocumentText: shadowIncludingInclusiveDescendantTest(this._root),
-        };
-      }
-      const { kinds: ownerKinds, isDocumentText } = this._textOwnerKinds;
-      this._stageCounters.textGeometryOperationsGrouped += textOperations.length;
-      for (const operation of textOperations) {
-        if (operation.kind !== "text" || operation.glyphCount === 0) continue;
-        const sourceNode = serialized.nodes[operation.nodeIndex];
-        const generated = sourceNode?.generatedOwnerIndex !== undefined;
-        const owner = elementAtIndex[
-          sourceNode?.generatedOwnerIndex ??
-            operation.nodeIndex
-        ];
-        if (owner == null) continue;
-        let ownerKind = ownerKinds.get(owner);
-        if (ownerKind === undefined) {
-          const ownerType = owner.nodeType;
-          ownerKind = ownerType === 1 &&
-              (owner.localName === "input" || owner.localName === "textarea")
-            ? 1
-            : ownerType === 3 && isDocumentText(owner)
-            ? 2
-            : 0;
-          ownerKinds.set(owner, ownerKind);
+      // The frame's text geometry store (geometry_text_store), from the
+      // renderer's capture and the presented frame's store, whose entries
+      // it keeps where their values hold: a text node none of whose rows
+      // was lowered anew keeps its glyphs and caret stops while its painted
+      // line rectangles keep their sizes, a uniform move becoming its
+      // translation. A retained scene with unchanged text carries the
+      // presented store: a translation holds no scroll (the geometry records
+      // carry it), so a scroll changes none of it.
+      const presentedTextStore = this._presentedFrame?.textStore ?? 0;
+      const textCarried = this._presentedFrame != null &&
+        (reuseTextGeometry || (this._textSelectionEnabled && rendered.performance?.preparation?.retained));
+      if (textCarried) {
+        if (presentedTextStore !== 0) {
+          frameTextStore = core.status("geometry_text_store_carry", presentedTextStore);
         }
-        // Generated text belongs to its element, never a text owner.
-        if (ownerKind === 0 || (ownerKind === 2 && generated)) continue;
-        const entry = operationsByOwner.get(owner);
-        if (entry === undefined) {
-          operationsByOwner.set(owner, {
-            operations: [operation],
-            keepable: ownerKind === 2 && loweredRows !== null &&
-              !textGeometryStale && !loweredRows.has(operation.nodeIndex),
-          });
-          continue;
-        }
-        entry.operations.push(operation);
-        entry.keepable = entry.keepable &&
-          !loweredRows.has(operation.nodeIndex);
+      } else if (frameTextCapture !== 0) {
+        const keep = serialized.loweredRows !== undefined && !textGeometryStale;
+        const rows = keep ? Uint32Array.from(serialized.loweredRows) : null;
+        const [rowPointer, rowBytes] = rows === null || rows.length === 0
+          ? [0, 0]
+          : core.byteInput(new Uint8Array(rows.buffer));
+        frameTextStore = core.status("geometry_text_store", frameTextCapture, presentedTextStore,
+          rowPointer, rowBytes / Uint32Array.BYTES_PER_ELEMENT, keep ? 1 : 0);
+        this._stageCounters.textGeometryOperationsGrouped +=
+          new DataView(core.refreshBytes().buffer).getUint32(frameTextCapture + TEXT_CAPTURE_OPERATION_COUNT, true);
       }
-      // Captured line coordinates are unscrolled, and so is a translation:
-      // the geometry records carry each scroll.
-      const owners = [...operationsByOwner.keys()];
-      this._stageCounters.textGeometryOwnersGrouped += owners.length;
-      for (let ownerIndex = 0; ownerIndex < owners.length; ownerIndex++) {
-        const owner = owners[ownerIndex];
-        const { operations, keepable } = operationsByOwner.get(owner);
-        const previous = previousTextGeometry?.get(owner);
-        const kept = keepable && previous !== undefined
-          ? keptTextGeometryFor(previous, operations)
-          : null;
-        if (kept !== null) {
-          // The presented entry itself when the translation did not move
-          // either, so the snapshot can keep the presented text block.
-          textGeometryByNode.set(
-            owner,
-            Object.is(kept.translationX ?? 0, previous.translationX ?? 0) &&
-              Object.is(kept.translationY ?? 0, previous.translationY ?? 0)
-              ? previous
-              : kept,
-          );
-          continue;
-        }
-        const anchors = new Float64Array(operations.length * 4);
-        const geometry = {
-          caretStops: [],
-          glyphs: [],
-          anchors,
-          translationX: 0,
-          translationY: 0,
-        };
-        textGeometryByNode.set(owner, geometry);
-        unfinishedTextGeometry.push(owner);
-        for (let index = 0; index < operations.length; index++) {
-          const operation = operations[index];
-          const rectangle = operation.logicalRectangle;
-          anchors[index * 4] = rectangle.x;
-          anchors[index * 4 + 1] = rectangle.y;
-          anchors[index * 4 + 2] = rectangle.width;
-          anchors[index * 4 + 3] = rectangle.height;
-          const top = rectangle.y;
-          const bottom = top + rectangle.height;
-          for (const glyph of operation.glyphs) {
-            geometry.glyphs.push(Object.freeze({
-              sourceStart: glyph.sourceStart,
-              sourceEnd: glyph.sourceEnd,
-              x: glyph.x,
-              width: glyph.width,
-              top,
-              bottom,
-            }));
-            geometry.caretStops.push(
-              Object.freeze({
-                sourceOffset: glyph.rtl ? glyph.sourceEnd : glyph.sourceStart,
-                x: glyph.x,
-                top,
-                bottom,
-                affinity: glyph.rtl ? "upstream" : "downstream",
-              }),
-              Object.freeze({
-                sourceOffset: glyph.rtl ? glyph.sourceStart : glyph.sourceEnd,
-                x: glyph.x + glyph.width,
-                top,
-                bottom,
-                affinity: glyph.rtl ? "downstream" : "upstream",
-              }),
-            );
-          }
+      if (frameTextCapture !== 0) {
+        core.status("geometry_text_release", frameTextCapture);
+        frameTextCapture = 0;
+      }
+      // A text control's entry carries its live selection.
+      if (frameTextStore !== 0) {
+        const view = new DataView(core.refreshBytes().buffer);
+        const count = view.getUint32(frameTextStore + TEXT_STORE.COUNT, true);
+        if (!textCarried) this._stageCounters.textGeometryOwnersGrouped += count;
+        for (let index = 0; index < count; index++) {
+          const entry = frameTextStore + TEXT_STORE.ENTRIES + index * TEXT_STORE.ENTRY_SIZE;
+          if (view.getUint32(entry + TEXT_STORE.ENTRY_KIND, true) !== TEXT_STORE.KIND_CONTROL) continue;
+          const control = core.wrapperFor(view.getBigUint64(entry + TEXT_STORE.ENTRY_OWNER, true));
+          const start = control.selectionStart ?? control.value.length;
+          core.status("geometry_text_store_select", frameTextStore, index, start, control.selectionEnd ?? start);
+          if (textCarried) this._stageCounters.translatedTextGeometryEntries++;
         }
       }
-      // A rebuilt entry whose values are the presented frame's entry's
-      // keeps that frozen entry: a restyle that lowered a text row without
-      // moving a glyph (a color or underline hover) rebuilds the row's
-      // operations into the same caret stops and glyphs, and the snapshot
-      // can keep the presented text block only for the same objects
-      // (presented-frame.js sameTextObjects).
-      const presentedTextGeometry = this._presentedFrame?.textGeometryByNode ??
-        null;
-      for (const node of unfinishedTextGeometry) {
-        const geometry = textGeometryByNode.get(node);
-        const uniqueStops = uniqueCaretStops(node, geometry.caretStops);
-        const baseGeometry = {
-          caretStops: Object.freeze(uniqueStops),
-          glyphs: Object.freeze(geometry.glyphs),
-          anchors: geometry.anchors,
-          translationX: geometry.translationX ?? 0,
-          translationY: geometry.translationY ?? 0,
-        };
-        const previous = presentedTextGeometry?.get(node);
-        const sameValues = previous !== undefined &&
-          sameTextGeometryValues(previous, baseGeometry);
-        if (node.nodeType === 3) {
-          textGeometryByNode.set(
-            node,
-            sameValues ? previous : Object.freeze(baseGeometry),
-          );
-          continue;
-        }
-        const selectionStart = node.selectionStart ?? node.value.length;
-        const selectionEnd = node.selectionEnd ?? selectionStart;
-        // A control's entry carries its selection; its selection
-        // rectangles depend on its scroll too, so the frame's geometry
-        // answers them (controlSelectionRectangles).
-        const controlGeometry = sameValues &&
-            previous.selectionStart === selectionStart &&
-            previous.selectionEnd === selectionEnd
-          ? previous
-          : Object.freeze({ ...baseGeometry, selectionStart, selectionEnd });
-        // A view reads a control's entry from textGeometryByElement.
-        if (textGeometryByNode instanceof Map) {
-          textGeometryByNode.set(node, controlGeometry);
-        }
-        textGeometryByElement.set(node, controlGeometry);
-      }
-      const preparedState = Object.freeze({
-        scene: Object.freeze({
-          width: scene.width,
-          height: scene.height,
-          nodes: Object.freeze(scene.nodes),
-          imageSources: scene.imageSources,
-        }),
-        serialized,
-        boxes: freezeBoxes(boxes),
-        page: renderOptions.page ?? null,
-      });
+      // A frame that reuses the scene's rows for the same page (a tool
+      // highlight, a caret, a selection) lays nothing out again: it keeps
+      // the prepared state, so layoutTree() and everything keyed on it
+      // stay as they are.
+      const previousState = this._preparedState;
+      const preparedState = previousState !== null &&
+          previousState.scene.nodes === scene.nodes &&
+          (previousState.page?.index ?? null) === (renderOptions.page?.index ?? null)
+        ? previousState
+        : Object.freeze({
+          scene: Object.freeze({
+            width: scene.width,
+            height: scene.height,
+            nodes: Object.freeze(scene.nodes),
+            imageSources: scene.imageSources,
+          }),
+          serialized,
+          boxes: freezeBoxes(boxes),
+          page: renderOptions.page ?? null,
+        });
       const acceptState = (geometryHandle) => {
         const completedScrollTargets = this._acceptScrollFeedback(
           serialized,
@@ -5125,9 +6137,12 @@ class DOMRenderSurface {
         );
         this._scrollbars = scrollbars;
         this._indexOfElement = serialized.indexOf;
+        this._indexOfPseudoTarget = serialized.pseudoIndexOf;
+        this._redeclareParkedAnimations();
         this._elementAtIndex = elementAtIndex;
         this._refreshScrollAnchors(serialized, boxes, geometryHandle);
         this._lastBoxes = boxes;
+        this._snapshotScrollStates(serialized, effectiveBoxes, geometryHandle ?? this._presentedFrame?.geometryHandle);
         this._preparedState = preparedState;
         return completedScrollTargets;
       };
@@ -5141,6 +6156,8 @@ class DOMRenderSurface {
           dispatchEvent(target, createEvent("scroll"));
           this._pendingScrollEndTargets.add(target);
         }
+        this._revealFocusedCaret(this._presentedFrame?.geometryHandle);
+        this._placeSuggestionPopup(this._presentedFrame?.geometryHandle);
         if (resizeObserverLoopError) {
           throw new Error(
             "ResizeObserver loop completed with undelivered notifications",
@@ -5155,7 +6172,7 @@ class DOMRenderSurface {
       let retainedPixels = this._lastPixels;
       let pixels = rendered.pixels ? retainedPixels : null;
       if (pixelsChanged && rendered.pixels) {
-        if (snapshotPixels || retainedPixels === null) {
+        if (snapshotPixels || retainedPixels === null || retainedPixels.constructor !== rendered.pixels.constructor) {
           retainedPixels = rendered.pixels.slice();
         } else {
           for (const rectangle of dirtyRectangles) {
@@ -5200,13 +6217,26 @@ class DOMRenderSurface {
         boxes: presentedBoxes,
         scrollbars,
         timeMilliseconds,
-        textGeometryByElement,
-        textGeometryByNode,
+        previousTextGeometry: this._presentedFrame?.textGeometryByNode ?? null,
+        textStore: frameTextStore,
         // A frame that only scrolled derives its geometry from the
         // presented one: only boxes, scrollbars and text translations move.
         scrollPredecessor: scrollOnly ? this._presentedFrame : null,
+        restyleBasis,
+        restyleBasisRefusal,
         restylePredecessor: restyledInPlace ? this._presentedFrame : null,
+        frameGeometry: checkpointLayout === null ? null : {
+          geometry: checkpointLayout.geometry,
+          geometryCore: checkpointLayout.geometry.core, geometryHandle: checkpointLayout.geometry.handle,
+          _root: this._root, _publication: checkpointLayout.publication,
+          _viewportIndex: serialized.viewportIndex ?? 0, _inputBoxes: checkpointLayout.boxes,
+          viewport: { width: checkpointLayout.width, height: checkpointLayout.height, deviceScale: checkpointLayout.deviceScale },
+        },
       });
+      if (successor._derivation === null) this._stageCounters.geometryBuilds++;
+      if (successor._derivation === "frame") this._stageCounters.geometryFrameSuccessorFrames++;
+      if (successor._frameGeometryRefusal === "envelope") this._stageCounters.geometryFrameRefusedEnvelope++;
+      if (successor._frameGeometryRefusal === "revisions") this._stageCounters.geometryFrameRefusedRevisions++;
       if (successor._derivation === "scroll") {
         this._stageCounters.geometrySuccessorFrames++;
       }
@@ -5232,7 +6262,10 @@ class DOMRenderSurface {
       }
       let successorPublished = false;
       releaseUnpublishedSuccessor = () => {
-        if (!successorPublished) successor.geometry.release();
+        if (!successorPublished) {
+          successor.geometry.release();
+          successor.textGeometryByNode.release();
+        }
       };
       core.status("frame_publish", continuation, successor.geometryHandle);
       this._frameResume(continuation, publicationToken, 0, -1, frameBindings);
@@ -5253,6 +6286,10 @@ class DOMRenderSurface {
           width: rendered.width,
           height: rendered.height,
           deviceScale: frameViewport.deviceScale,
+          // The CSS-px rectangle of the scene the frame covers, or null for
+          // the whole scene (setVisibleRectangle, a page's box): a host
+          // places the frame there, as the frame arrives.
+          region: visibleRegion === null ? null : Object.freeze({ ...visibleRegion }),
           graphicsBackend: rendered.graphicsBackend,
           graphicsBackendInfo: rendered.graphicsBackendInfo,
           dirtyRectangles,
@@ -5282,6 +6319,9 @@ class DOMRenderSurface {
             rasterMilliseconds: rasterFinishedAt -
               (visibleRectangleSetAt ?? rasterStartedAt),
             postprocessMilliseconds: framePreparedAt - rasterFinishedAt,
+            // The part of rasterMilliseconds after layout and the paint
+            // walk: resources, the raster plan, and the GPU raster.
+            rendererRasterMilliseconds: rendered.performance?.rasterMilliseconds ?? 0,
           }),
           ...(this._capturePaintArtifact
             ? {
@@ -5313,6 +6353,9 @@ class DOMRenderSurface {
         // exerts no pressure on the JavaScript heap.
         const superseded = this._presentedFrame;
         const supersededSerialized = this._preparedState?.serialized ?? null;
+        // The held layout of the superseded frame borrows what this frame
+        // releases below.
+        if (this._syncLayout?.layout.borrowed) this._releaseSyncLayout();
         this._lastPixels = retainedPixels;
         this._lastDeliveredFrame = frame;
         this._lastRendered = rendered;
@@ -5325,8 +6368,11 @@ class DOMRenderSurface {
           successor.geometryHandle,
         );
         completedScrollTargets = acceptState(successor.geometryHandle);
+        this._revealFocusedCaret(successor.geometryHandle);
+        this._placeSuggestionPopup(successor.geometryHandle);
         if (superseded !== null && superseded !== successor) {
           superseded.geometry.release();
+          superseded.textGeometryByNode.release();
           const supersededSnapshot = superseded._inputBoxes?.[BOX_SNAPSHOT];
           if (
             supersededSnapshot !== undefined &&
@@ -5352,6 +6398,15 @@ class DOMRenderSurface {
         for (const target of completedScrollTargets) {
           dispatchEvent(target, createEvent("scroll"));
           this._pendingScrollEndTargets.add(target);
+        }
+        // The rendering observers of an animated frame take the sizes and
+        // positions it presents: the presented geometry holds the samples
+        // the render applied. Their callbacks' changes schedule the next
+        // frame, which presents them.
+        if (framePage === null) this._offerFrameLayout(serialized, presentedBoxes, sourceRevisions);
+        if ((animatedAtStart || this._animating()) && deliverObservers && documentHasRenderingObservers(observerDocument)) {
+          deliverRenderingObservers(observerDocument, serialized, presentedBoxes, timeMilliseconds, 0,
+            () => successor.geometry);
         }
         this._notifyFrameListeners(frame, resizeObserverLoopError);
       };
@@ -5383,10 +6438,27 @@ class DOMRenderSurface {
         } finally {
           this._presentingFrame = false;
         }
-        notify();
+        // A shutdown during the presentation (the presenter's own callback
+        // may shut the surface down) released what notify reads.
+        if (!this._shutdown) {
+          notify();
+          // The next frame is held for the host's next change, which a
+          // host that changes the document in its animation frame
+          // callbacks makes in the next frame's callbacks
+          // (FRAME_WORK_FOLLOW); a held frame that finds none releases it.
+          if (this._loopFrameRendering) {
+            this._followFrame = true;
+            this._schedule();
+          }
+        }
       }
       return frame;
     } finally {
+      if (frameTextCapture !== 0) core.status("geometry_text_release", frameTextCapture);
+      if (frameTextStore !== 0) core.status("geometry_text_store_release", frameTextStore);
+      restyleBasis?.geometry.release();
+      checkpointLayout?.geometry.release();
+      readGeometry?.geometry.release();
       if (!accepted) rollback();
       if (!accepted) releaseUnpublishedSuccessor?.();
       if (ownsContinuation && !this._stagedFrame) {
@@ -5396,44 +6468,66 @@ class DOMRenderSurface {
         capturedScrollRequests?.release();
       }
       if (restyleCountsBefore !== null && this._frameCore === core) {
-        this._stageCounters.elementsRestyled +=
-          (core.status("computed_restyle_counts", 0) - restyleCountsBefore[0]) >>> 0;
-        this._stageCounters.pseudoElementsRestyled +=
-          (core.status("computed_restyle_counts", 1) - restyleCountsBefore[1]) >>> 0;
-        this._stageCounters.sceneRestyleRowsRead +=
-          (core.status("computed_restyle_counts", 2) - restyleCountsBefore[2]) >>> 0;
+        const restyled = (index) =>
+          (core.status("computed_restyle_counts", FRAME_RESTYLE_COUNTS[index]) - restyleCountsBefore[index]) >>> 0;
+        this._stageCounters.elementsRestyled += restyled(0);
+        this._stageCounters.pseudoElementsRestyled += restyled(1);
+        this._stageCounters.sceneRestyleRowsRead += restyled(2);
+        this._stageCounters.sceneElementsVisited += restyled(3);
+        this._stageCounters.sceneBoxesMade += restyled(4);
+        this._stageCounters.elementsRestyledUnchanged += restyled(5);
+        this._stageCounters.sceneSubtreesReplayed += restyled(6);
       }
-      if (ownsContinuation) this._cancelUndeclaredTransitions();
+      if (ownsContinuation) {
+        this._cancelUndeclaredTransitions();
+        this._frameReadBaselines = null;
+      }
       this._eventElementAtIndex = null;
+      this._eventTargetAtIndex = null;
       this._stageCounters.currentStage = "idle";
       this._rendering = false;
-      // A native change that landed after this frame sealed its scene (a
-      // font face or an image its own layout pass loaded) belongs to the
-      // next frame, and no host mutation callback reports it: only the
-      // frame surface holds it. That frame follows now, instead of the next
-      // input's frame paying for it.
-      if (
-        accepted && !this._dirty && !this._shutdown &&
-        this._mutationConsequence > 0
-      ) this._dirty = true;
-      if (this._snapCheckOwed && !this._dirty) {
-        this._snapCheckOwed = false;
-        this._snapCheckPending = this._snapCheckPending ||
-          this._snappedTargets.size > 0 || this._snapContainersInLastBuild();
+      // A shutdown during this frame's presentation does not wait for the
+      // frame (shutdown()), and it released the surface's native state:
+      // the frame ends by settling its idle waiters.
+      if (this._shutdown) {
+        for (const resolve of this._idleWaiters.splice(0)) resolve();
+      } else {
+        if (ownsContinuation) {
+          const frameEvents = this._deferredAnimationEvents;
+          this._deferredAnimationEvents = [];
+          for (const { element, event } of frameEvents) dispatchEvent(element, event);
+          // The fields whose value changed in this frame go to the host's
+          // spellchecker (src/dom/spellcheck.js).
+          if (accepted) sendSpellcheckRequests(this._root.ownerDocument ?? this._root);
+          // A picker that opened in this frame goes to the host that draws
+          // its kind (src/dom/host-picker.js).
+          if (accepted) sendPickerRequest(this._root.ownerDocument ?? this._root, this._root);
+        }
+        // A native change that landed after this frame sealed its scene (a
+        // font face or an image its own layout pass loaded) belongs to the
+        // next frame, and no host mutation callback reports it: only the
+        // frame surface holds it. That frame follows now, instead of the next
+        // input's frame paying for it.
+        if (accepted && !this._dirty && this._mutationConsequence > 0) this._dirty = true;
+        if (this._snapCheckOwed && !this._dirty) {
+          this._snapCheckOwed = false;
+          this._snapCheckPending = this._snapCheckPending ||
+            this._snappedTargets.size > 0 || this._snapContainersInLastBuild();
+        }
+        const idleWaiters = this._idleWaiters.splice(0);
+        for (const resolve of idleWaiters) resolve();
+        if (this._deferredAnimationEvents.length > 0 || this._hasActiveAnimationWork() || this._scrollMomentum) {
+          this._dirty = true;
+        }
+        if (pixelReadback && this._presentFrame !== null) {
+          // The capture bypassed presentation delivery; schedule one
+          // presentation frame so the presenter shows the captured state.
+          // The engine is clean after the capture, so that frame reuses the
+          // retained texture (webgpu) or re-delivers pixels (webgl2).
+          this._dirty = true;
+        }
+        this._schedule();
       }
-      const idleWaiters = this._idleWaiters.splice(0);
-      for (const resolve of idleWaiters) resolve();
-      if (this._hasActiveAnimationWork() || this._scrollMomentum) {
-        this._dirty = true;
-      }
-      if (pixelReadback && this._presentFrame !== null) {
-        // The capture bypassed presentation delivery; schedule one
-        // presentation frame so the presenter shows the captured state.
-        // The engine is clean after the capture, so that frame reuses the
-        // retained texture (webgpu) or re-delivers pixels (webgl2).
-        this._dirty = true;
-      }
-      this._schedule();
     }
   }
   inspectMotion() {
@@ -5458,42 +6552,45 @@ class DOMRenderSurface {
     durationMilliseconds,
   } = {}) {
     if (this._shutdown) throw new Error("render surface is shut down");
-    if (this._running || this._frameRequest !== null) {
-      throw new Error("captureFrames() requires a stopped render surface");
-    }
-    if (this._capturingFrames) {
-      throw new Error("captureFrames() is already active");
-    }
-    if (!Number.isInteger(frameBudget) || frameBudget <= 0) {
-      throw new RangeError("frameBudget must be a positive integer");
-    }
+    const core = this._root._domCore;
+    core.status("frame_capture_check", FRAME_CAPTURE_SURFACE, ...core.valueListInput([
+      this._running || this._frameRequest !== null ? 1 : 0,
+      this._capturingFrames ? 1 : 0,
+      frameBudget,
+    ]));
     const model = createMotionModel(this);
-    if (model.inspection.classification === "external") {
-      throw new Error(
-        "captureFrames() requires a progress schedule for an external timeline",
+    // The schedule holds at most this many samples; a larger budget
+    // cannot be filled.
+    const sampleLimit = model.exports.schedule_sample_limit();
+    if (frameBudget > sampleLimit) {
+      throw new RangeError(
+        `frameBudget ${frameBudget} exceeds the capture schedule limit of ${sampleLimit} samples; ` +
+          `use a frameBudget of at most ${sampleLimit}`,
       );
     }
-    if (model.inspection.classification === "static") return;
     const captureDuration = durationMilliseconds ??
       model.inspection.finiteDurationMilliseconds;
-    if (!Number.isFinite(captureDuration) || captureDuration <= 0) {
-      throw new RangeError(
-        "durationMilliseconds must bound an unbounded animation",
-      );
-    }
+    const captures = core.status("frame_capture_check", FRAME_CAPTURE_MOTION, ...core.valueListInput([
+      model.inspection.classification,
+      captureDuration,
+    ]));
+    if (captures === 0) return;
+    // A failed schedule operation throws the Error that WAT gives for it.
+    const scheduleFailure = (operation, effectIndex) =>
+      core.status("frame_capture_check", FRAME_CAPTURE_SCHEDULE, ...core.valueListInput([
+        operation,
+        model.exports.motion_error(),
+        effectIndex,
+      ]));
     const startTime = this.currentTime;
     const endTime = startTime + captureDuration;
     if (!model.exports.schedule_prepare(startTime, endTime, frameBudget)) {
-      throw new Error(
-        `Cannot prepare frame schedule: WebAssembly error ${model.exports.motion_error()}`,
-      );
+      scheduleFailure(MOTION_SCHEDULE_PREPARE, 0);
     }
     for (const effect of model.scheduleEffects) {
       if (!effect.progressing || effect.external) continue;
       if (!model.exports.schedule_add_effect(effect.effectIndex)) {
-        throw new Error(
-          `Cannot add effect schedule: WebAssembly error ${model.exports.motion_error()}`,
-        );
+        scheduleFailure(MOTION_SCHEDULE_EFFECT, effect.effectIndex);
       }
       for (const keyframe of effect.keyframes) {
         if (
@@ -5503,9 +6600,7 @@ class DOMRenderSurface {
             effect.discrete ? 1 : 0,
           )
         ) {
-          throw new Error(
-            `Cannot add keyframe schedule: WebAssembly error ${model.exports.motion_error()}`,
-          );
+          scheduleFailure(MOTION_SCHEDULE_KEYFRAME, effect.effectIndex);
         }
       }
     }
@@ -5538,13 +6633,13 @@ class DOMRenderSurface {
           sequence,
           timeMilliseconds,
           durationMilliseconds: nextTimeMilliseconds - timeMilliseconds,
-          width: frame?.width ?? Math.trunc(
-            (this._visibleRectangle?.width ?? this.viewport.width) *
-              this.viewport.deviceScale,
+          width: frame?.width ?? core.exports.frame_device_extent(
+            this._visibleRectangle?.width ?? this.viewport.width,
+            this.viewport.deviceScale,
           ),
-          height: frame?.height ?? Math.trunc(
-            (this._visibleRectangle?.height ?? this.viewport.height) *
-              this.viewport.deviceScale,
+          height: frame?.height ?? core.exports.frame_device_extent(
+            this._visibleRectangle?.height ?? this.viewport.height,
+            this.viewport.deviceScale,
           ),
           pixels: frame?.pixels ?? this._lastPixels,
           dirtyRectangles: frame?.dirtyRectangles ?? Object.freeze([]),
@@ -5562,7 +6657,7 @@ class DOMRenderSurface {
   }
 
   whenIdle() {
-    if (!this._rendering) return Promise.resolve();
+    if (!this._rendering && !this._animationCheckpoint) return Promise.resolve();
     return new Promise((resolve) => this._idleWaiters.push(resolve));
   }
 
@@ -5581,7 +6676,7 @@ class DOMRenderSurface {
       );
     }
     const renderer = await this._persistentRendererPromise;
-    while (this._rendering) await this.whenIdle();
+    while (this._rendering || this._animationCheckpoint) await this.whenIdle();
     if (this._shutdown) throw new Error("render surface is shut down");
     const { scene, page: pageOption } = this._preparedState;
     const page = pageOption === null ? null : this.page;
@@ -5591,10 +6686,14 @@ class DOMRenderSurface {
 
   // The one render entry. Delivers the renderer's GPU texture frame on
   // WebGPU (no readback); `pixels: true` reads this frame back into a
-  // retained CPU snapshot for encoding or inspection. WebGL 2 always
-  // delivers pixels.
+  // retained CPU snapshot of float32 samples for encoding or inspection, and
+  // `pixels: "rgba8"` of the rgba8unorm render precision's uint8 samples.
+  // WebGL 2 always delivers pixels.
   renderNow({ pixels = false, _transaction = null } = {}) {
     if (this._shutdown) throw new Error("render surface is shut down");
+    if (pixels !== false && pixels !== true && pixels !== "rgba8") {
+      throw new TypeError(`renderNow: pixels must be false, true, or "rgba8", got ${JSON.stringify(pixels)}`);
+    }
     const timeMilliseconds = this._now();
     const render = () => this._renderOpportunity(timeMilliseconds, true, true, pixels, _transaction);
     // A page frame that targeted another box than its page's (the page's
@@ -5618,6 +6717,7 @@ class DOMRenderSurface {
     if (this._shutdown) throw new Error("render surface is shut down");
     return this._afterDocumentClock(timeMilliseconds, () => {
       this._updateAnimationsAndSendEvents(timeMilliseconds);
+      this._markOverlaysDue(timeMilliseconds);
       return this._renderOpportunity(timeMilliseconds, false);
     });
   }
@@ -5630,6 +6730,16 @@ class DOMRenderSurface {
       if (this._shutdown) throw new Error("render surface is shut down");
       return render();
     });
+  }
+
+  // Whether the live loop renders frames (start() and stop()), and the
+  // sequence number of the last delivered frame.
+  get running() {
+    return this._running;
+  }
+
+  get frameSequence() {
+    return this._frameSequence;
   }
 
   start() {
@@ -5646,6 +6756,8 @@ class DOMRenderSurface {
       this._cancelFrame(this._frameRequest);
       this._frameRequest = null;
     }
+    this._cancelCaretTimer();
+    this._cancelSpinTimer();
     if (this._drivesDocumentClock()) this._root.ownerDocument._documentTimers?.driverChanged();
   }
 
@@ -5670,6 +6782,7 @@ class DOMRenderSurface {
       this._persistentRenderer.remapAnimations(new Map());
       this._animations.length = 0;
       this._animationsAwaitingTimeline.clear();
+      this._animationsPausePending.clear();
     }
     const previousRegistry = this._root._renderSurfaces;
     const wasPrimary = this._root._renderSurface === this;
@@ -5694,8 +6807,6 @@ class DOMRenderSurface {
     );
     this._scrollGeometry = null;
     this._root = nextRoot;
-    // Text ownership memoizes ancestry against the surface root.
-    this._textOwnerKinds = null;
     nextRegistry.set(this._environmentKey, this);
     this._document._liveRenderSurfaces.delete(this);
     this._document = surfaceDocument(nextRoot);
@@ -5705,6 +6816,7 @@ class DOMRenderSurface {
     this._connectSubtree(nextRoot);
     this.viewport.root = nextRoot;
     this._indexOfElement = new Map();
+    this._indexOfPseudoTarget = new Map();
     this._elementAtIndex = [];
     this._presentedFrame = null;
     this._lastDeliveredFrame = null;
@@ -5730,10 +6842,12 @@ class DOMRenderSurface {
     this.stop();
     this._shutdown = true;
     if (!this._presentingFrame) await this.whenIdle();
+    this._root.ownerDocument?._styleSystem?.environmentListeners.delete(this._environmentListener);
     if (this._pageRuleCache) {
       releasePageRules(this._pageRuleCache.rules);
       this._pageRuleCache = null;
     }
+    this._scrollbarVisibility.release();
     this._scrollAnchors.clear();
     this._anchoringSuppressionProperties.clear();
     this._positionSuppressionNodes.clear();
@@ -5744,7 +6858,7 @@ class DOMRenderSurface {
     // leaves the rendering: they become idle and reject `finished`. A
     // script animation keeps its current time without a timeline.
     for (const animation of [...this._animations]) {
-      if (animation instanceof CSSAnimation) animation.cancel();
+      if (animation instanceof CSSAnimation) animation._cancelByUserAgent();
       else animation._moveToPendingTimeline();
     }
     for (const records of [...this._transitionRecords.values()]) {
@@ -5754,8 +6868,10 @@ class DOMRenderSurface {
       for (const animation of [...transitions.values()]) animation.cancel();
     }
     this._pendingTransitions.clear();
+    this._readBaselines.clear();
     this._animations.length = 0;
     this._animationsAwaitingTimeline.clear();
+    this._animationsPausePending.clear();
     const surfaceRegistry = this._root._renderSurfaces;
     const wasPrimary = this._root._renderSurface === this;
     this._disconnectSubtree(this._root);
@@ -5785,6 +6901,7 @@ class DOMRenderSurface {
     this._activeTransitionCount = 0;
     this._frameListeners.length = 0;
     this._indexOfElement = new Map();
+    this._indexOfPseudoTarget = new Map();
     this._lastPixels = null;
     this._lastDeliveredFrame = null;
     this._lastRendered = null;
@@ -5807,12 +6924,13 @@ class DOMRenderSurface {
     this._scrollGeometry = null;
     this._root._domCore.status("scroll_owner_release", this._scrollOwner);
     this._scrollOwner = 0n;
-    if (this._persistentRendererPromise) {
-      await (await this._persistentRendererPromise).shutdown();
-    }
+    // The renderer releases its engine side even when its graphics context
+    // failed to start.
+    if (this._persistentRenderer) await this._persistentRenderer.shutdown();
     this._root._domCore.status("computed_samples_release", this._computedSamples);
     this._computedSamples = 0;
     this._releaseSyncLayout();
+    this._dropPlannedSerialization();
     this._frameCore.releaseSceneResources(
       this._preparedState?.serialized?.nodes,
     );

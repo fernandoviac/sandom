@@ -4,14 +4,7 @@
 // One descriptor shape serves decoded images, readback, and encoder input.
 // Every validator throws with one precise reason.
 
-import {
-  REFERENCE_WHITE_LUMINANCE,
-  validateColorEncoding,
-  validateRenderMode,
-} from './color.js';
-import { loadColorKernel } from './wasm/color-kernel.js';
-
-const { linearRgbToWorkingMatrix } = loadColorKernel();
+import { validateColorEncoding } from './color.js';
 
 // Sample types with their required typed-array constructor and the byte size
 // of one sample. float16 carries IEEE 754 binary16 bits in Uint16Array
@@ -145,7 +138,7 @@ export function srgbRgba8ImageDescriptor(width, height, pixels, metadata = {}) {
 // ---------------------------------------------------------------------------
 // Eight-bit sRGB flattener. NOT part of the color-managed render path: the
 // renderer uploads native precision (imageUploadRepresentation +
-// sourceConversionPlan below). This serves the two places whose contract is
+// image_conversion_uniform). This serves the two places whose contract is
 // genuinely eight-bit sRGB — pixel comparisons against eight-bit Chrome
 // screenshots, and the degraded WebGL 2 backend's input boundary. It throws
 // on any descriptor that cannot be represented losslessly-in-kind as
@@ -186,9 +179,9 @@ export function toSrgbRgba8(descriptor) {
 // The renderer uploads each descriptor's own samples and converts them into
 // the selected mode's working encoding on the graphics processing unit.
 // JavaScript only reshapes channel layouts into a WebGPU-uploadable RGBA
-// form (a layout shuffle, not color math) and derives the per-image
-// conversion parameters; every per-pixel color operation runs in the
-// conversion shader (src/rasterize.js).
+// form (a layout shuffle, not color math); the conversion uniform comes
+// from image_conversion_uniform (src/image-conversion.js) and every
+// per-pixel color operation runs in the conversion shader (src/rasterize.js).
 // ---------------------------------------------------------------------------
 
 // Channel-expand a descriptor into an uploadable RGBA texture payload.
@@ -214,67 +207,4 @@ export function prepareImageProfile(descriptor) {
   const profile = parseIccProfile(descriptor.colorEncoding.profile);
   try { return prepareProfileImage(profile, descriptor); }
   finally { releaseIccProfile(profile); }
-}
-
-// Conversion-shader transfer identifiers. A shared contract with
-// SOURCE_CONVERT_SHADER in src/rasterize.js.
-export const CONVERSION_TRANSFER_IDS = Object.freeze({
-  linear: 0,
-  srgb: 1,
-  gamma: 2,
-  pq: 3,
-  hlg: 4,
-  rec2020: 5,
-  'prophoto-rgb': 6,
-});
-
-// Per-image parameters for the source-to-working conversion shader.
-// The matrix maps source-linear RGB into the mode's linear working
-// primaries (sRGB for standard mode, Rec. 2020 for high-dynamic-range
-// mode); standard mode re-encodes with the extended sign-mirrored sRGB
-// transfer after the matrix. ICC-tagged descriptors are rejected here:
-// the registration boundary must have already replaced them (uint8
-// profiles convert through src/color-profile.js; anything else needs the
-// source-to-working transform module, package 4 step 5).
-export function sourceConversionPlan(descriptor, renderMode) {
-  validateRenderMode(renderMode);
-  const { colorEncoding, alphaMode, sampleType, bitsPerSample } = descriptor;
-  const transfer = colorEncoding.transferFunction;
-  if (transfer === 'icc') {
-    throw new Error(
-      'sourceConversionPlan: ICC-tagged descriptors must be converted before upload',
-    );
-  }
-  const transferId = CONVERSION_TRANSFER_IDS[transfer];
-  if (transferId === undefined) {
-    throw new Error(`sourceConversionPlan: unknown transfer function "${transfer}"`);
-  }
-  const destinationPrimaries = renderMode === 'high-dynamic-range' ? 'rec2020' : 'srgb';
-  const rows = linearRgbToWorkingMatrix(colorEncoding.primaries, destinationPrimaries);
-  // Three rows padded to vec4 columns for the WGSL uniform layout.
-  const matrix = new Float32Array(12);
-  for (let row = 0; row < 3; row++) {
-    matrix[row * 4] = rows[row][0];
-    matrix[row * 4 + 1] = rows[row][1];
-    matrix[row * 4 + 2] = rows[row][2];
-  }
-  // PQ and HLG carry absolute luminance in their own decode; every other
-  // transfer scales diffuse white by the source's stated reference white
-  // against the 203-candela working white.
-  const linearScale = transfer === 'pq' || transfer === 'hlg'
-    ? 1
-    : colorEncoding.referenceWhiteLuminance / REFERENCE_WHITE_LUMINANCE;
-  // Integer samples normalize by the coded maximum of their meaningful
-  // bits (rgba8unorm normalizes in hardware; sixteen-bit integer loads
-  // arrive raw).
-  const sourceScale = sampleType === 'uint16' ? 1 / ((1 << bitsPerSample) - 1) : 1;
-  return {
-    transferId,
-    gammaExponent: transfer === 'gamma' ? colorEncoding.transferFunctionParameters : 1,
-    matrix,
-    linearScale,
-    sourceScale,
-    encodeSrgbOutput: renderMode === 'standard' ? 1 : 0,
-    alphaSourceMode: alphaMode === 'opaque' ? 1 : alphaMode === 'premultiplied' ? 2 : 0,
-  };
 }

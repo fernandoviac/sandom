@@ -74,6 +74,11 @@ export function degradedSrgbPixels(descriptor) {
   return prepare(descriptor, "color_source_degraded", 4, Uint8Array);
 }
 
+// Straight sRGB RGBA8 for an 8-bit display surface (color_source_srgb8).
+export function srgb8Pixels(descriptor) {
+  return prepare(descriptor, "color_source_srgb8", 4, Uint8Array);
+}
+
 // Gain-map base calculations require destination-linear Rec.2020 explicitly;
 // the package no longer has a policy-bearing "base" operation.
 export function baseCalculationPixelsNative(descriptor) {

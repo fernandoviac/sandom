@@ -8,10 +8,16 @@ import { enterDocumentRealm } from "./document-realm.js";
 import * as layoutGetters from "./layout-getters.js";
 import { DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH } from "./live-geometry.js";
 import { documentClockFromOptions } from "./document-clock.js";
-import { createEvent, eventIntrinsics } from "./events.js";
+import { createSyntheticEvent, eventIntrinsics } from "./events.js";
 import { createRenderSurface } from "./render-surface.js";
 import { SandomViewport } from "./viewport.js";
-import { createInputController, hostEditingPlatform } from "./input-controller.js";
+import { createInputController, hostDoubleClickInterval, hostEditingPlatform } from "./input-controller.js";
+import { setDocumentSpellchecker } from "./spellcheck.js";
+import { setDocumentContextMenu } from "./field-menu.js";
+import { setDocumentEyeDropper } from "./eyedropper.js";
+import { setDocumentPickers } from "./host-picker.js";
+import { assertTimeZone } from "./local-time.js";
+import { attachDocument } from "./attach.js";
 
 // The layout-getter family, keyed by the EXACT property names swarm.js
 // routes through getProperty (swarm.js:153-172) — a plain lookup table
@@ -40,13 +46,23 @@ const DOM_OPTION_NAMES = new Set([
   "sceneRendererRuntime",
   "fontRegistry",
   "editingPlatform",
+  "doubleClickInterval",
   "host",
   "url",
   "now",
   "requestFrame",
   "cancelFrame",
   "timeOrigin",
+  "timeZone",
 ]);
+
+const FORCED_STATE_NAMES = new Set(["hover", "active", "focus", "focusVisible", "focusWithin"]);
+const PREFERENCE_VALUES = Object.freeze({
+  colorScheme: ["light", "dark"],
+  reducedMotion: ["no-preference", "reduce"],
+  forcedColors: ["none", "light", "dark"],
+});
+const PREFERENCE_NAMES = new Set(Object.keys(PREFERENCE_VALUES));
 
 export function createSandomDOM(options = {}) {
   validateClosedRecord(options, DOM_OPTION_NAMES, "createSandomDOM options");
@@ -59,8 +75,16 @@ export function createSandomDOM(options = {}) {
     sceneRendererRuntime = null,
     fontRegistry = null,
     editingPlatform = hostEditingPlatform(),
+    // The longest time in milliseconds between two mouse presses that
+    // count as a double click: the host's system setting where the host
+    // can read it, else the platform's default (input-controller.js).
+    doubleClickInterval = hostDoubleClickInterval(editingPlatform),
     host,
     url,
+    // The IANA time zone of the document's local date and time
+    // (src/dom/local-time.js), UTC without one; the date and time inputs
+    // take today from it.
+    timeZone,
   } = options;
   // `now`, `requestFrame`, `cancelFrame` and `timeOrigin` are the
   // document's clock (src/dom/document-clock.js): of the new document, or
@@ -107,6 +131,7 @@ export function createSandomDOM(options = {}) {
   // The document's lengths and its synchronous layout resolve against this
   // viewport, also when another document shares its core.
   document._setViewport(viewportW, viewportH, deviceScale);
+  if (timeZone !== undefined) document._timeZone = assertTimeZone(timeZone, "createSandomDOM options");
   const layoutOptions = { viewportW, viewportH };
   const viewport = new SandomViewport({
     width: viewportW,
@@ -114,8 +139,10 @@ export function createSandomDOM(options = {}) {
     deviceScale,
   });
   const eventListenerWrappers = new WeakMap();
-  const input = createInputController(layoutOptions, editingPlatform);
+  const input = createInputController(layoutOptions, editingPlatform, document, doubleClickInterval);
   const { pointerController, ...inputBindings } = input;
+  // The text editor of Document.execCommand (src/dom/editing-commands.js).
+  document._editingCommands = input;
 
   return {
     ...inputBindings,
@@ -177,7 +204,17 @@ export function createSandomDOM(options = {}) {
       return layoutGetters.getBoundingClientRect(node, layoutOptions);
     },
 
+    // The surface draws into the DOM's viewport; its size, raster scale and
+    // density options apply to that viewport.
     createRenderSurface(root, options = {}) {
+      if (options.viewport === undefined || options.viewport === null) {
+        viewport.resizeTo(
+          options.viewportWidth ?? viewport.width,
+          options.viewportHeight ?? viewport.height,
+          options.deviceScale ?? viewport.deviceScale,
+          options.density === undefined ? viewport._density : options.density,
+        );
+      }
       return createRenderSurface(root, {
         ...options,
         viewport: options.viewport ?? viewport,
@@ -225,8 +262,74 @@ export function createSandomDOM(options = {}) {
     scrollIntoView(node, options) {
       node.scrollIntoView(options);
     },
+    // Forces the user action pseudo-classes of `element` (hover, active,
+    // focus, focusVisible, focusWithin; each a boolean, absent false), as a
+    // developer tool's "force element state" does. A forced state adds to
+    // the real one; it changes selector matching only, and moves no focus.
+    forceElementState(element, states) {
+      if (element?.nodeType !== 1 || element.ownerDocument !== document) {
+        throw new TypeError(
+          `forceElementState: element must be an element of this document, received ${String(element)}`,
+        );
+      }
+      validateClosedRecord(states, FORCED_STATE_NAMES, "forceElementState states");
+      for (const [name, value] of Object.entries(states)) {
+        if (typeof value !== "boolean") {
+          throw new TypeError(`forceElementState: ${name} must be a boolean, received ${String(value)}`);
+        }
+      }
+      if (element._domCore.setForcedState(element._coreHandle, states)) {
+        element._notifyMutation("state", "forced");
+      }
+    },
+    // The user's preferences, as the host's media queries report them:
+    // colorScheme ("light" or "dark", prefers-color-scheme), reducedMotion
+    // ("no-preference" or "reduce", prefers-reduced-motion) and forcedColors
+    // ("none", or the palette "light" or "dark" of forced colors mode).
+    // Absent keys stay. Styles and MediaQueryLists follow; a render surface
+    // owes a frame.
+    setPreferences(preferences) {
+      validateClosedRecord(preferences, PREFERENCE_NAMES, "setPreferences preferences");
+      const environment = {};
+      for (const [name, value] of Object.entries(preferences)) {
+        if (!PREFERENCE_VALUES[name].includes(value)) {
+          throw new RangeError(`setPreferences: ${name} is ${JSON.stringify(value)}; expected ${PREFERENCE_VALUES[name].join(" or ")}`);
+        }
+        environment[name] = name === "reducedMotion" ? value === "reduce" : value;
+      }
+      document._styleSystem.setEnvironment(environment);
+      document._reevaluateMediaQueryLists?.();
+    },
+    // The host's spellchecker for the document's text and search fields,
+    // or null for none (src/dom/spellcheck.js).
+    setSpellchecker(checker) {
+      setDocumentSpellchecker(document, checker);
+    },
+    // The labels and the clipboard of the document's text field context
+    // menus (src/dom/field-menu.js).
+    setContextMenu(options) {
+      setDocumentContextMenu(document, options);
+    },
+    // Puts the document into one place of the host: its frames there and
+    // the host's input in it (src/dom/attach.js). Resolves to the view once
+    // its first frame is presented.
+    attach(target, options) {
+      return attachDocument(this, target, options);
+    },
+    // The host's screen eyedropper for the colour picker, or null for the
+    // page eyedropper only (src/dom/eyedropper.js).
+    setEyeDropper(eyeDropper) {
+      setDocumentEyeDropper(document, eyeDropper);
+    },
+    // The host's date and time pickers and colour picker, drawn in place
+    // of Sandom's, or null for Sandom's (src/dom/host-picker.js).
+    setPickers(pickers) {
+      setDocumentPickers(document, pickers);
+    },
+    // The element under a host pointer: the presented frame's, as the input
+    // path hit-tests it.
     elementFromPoint(root, x, y) {
-      return layoutGetters.elementFromPoint(root, x, y, layoutOptions);
+      return layoutGetters.presentedElementFromPoint(root, x, y, layoutOptions);
     },
     inspectScrolling(root, target = root._renderSurface?.viewport) {
       const surface = root._renderSurface;
@@ -277,8 +380,10 @@ export function createSandomDOM(options = {}) {
       const wrapper = eventListenerWrappers.get(callback);
       if (wrapper) node.removeEventListener(type, wrapper);
     },
+    // A dispatch of the node's dispatchEvent(), as a script's: its event is
+    // untrusted (DOM "dispatchEvent(event)").
     dispatchEvent(node, name, detail) {
-      return node.dispatchEvent(createEvent(name, { detail, bubbles: true }));
+      return node.dispatchEvent(createSyntheticEvent(name, { detail, bubbles: true }));
     },
   };
 }

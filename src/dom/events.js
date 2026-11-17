@@ -1,23 +1,46 @@
 import { sharedDomCore } from "../dom-wasm/core.js";
 import { createEventBindings } from "./dom-bindings.generated.js";
 import { enterComponentCode } from "./component-code.js";
+import { layoutConstant } from "../wasm/layout-table.js";
+import { nodeMember } from "./node-members.js";
+
+// The flags of event-state.watpart, by WAT name without the EVENT_STATE_
+// prefix.
+const EVENT_STATE = Object.freeze(Object.fromEntries([
+  "BUBBLES", "CANCELABLE", "COMPOSED", "TRUSTED", "CANCELED", "STOP_PROPAGATION", "STOP_IMMEDIATE_PROPAGATION",
+].map((name) => [name, layoutConstant(`EVENT_STATE_${name}`)])));
+const EVENT_LISTENER_RETURNED = layoutConstant("EVENT_LISTENER_RETURNED");
+const EVENT_LISTENER_THREW = layoutConstant("EVENT_LISTENER_THREW");
+// The listener invocation and listener flags of event-dispatch.watpart.
+const EVENT_INVOCATION = Object.freeze(Object.fromEntries(["SIZE", "LISTENER", "IDENTITY", "INDEX", "PHASE", "FLAGS"]
+  .map((name) => [name, layoutConstant(`EVENT_INVOCATION_${name}`)])));
+const EVENT_LISTENER_CAPTURE = layoutConstant("EVENT_LISTENER_CAPTURE");
+const EVENT_LISTENER_ONCE = layoutConstant("EVENT_LISTENER_ONCE");
+const EVENT_LISTENER_PASSIVE = layoutConstant("EVENT_LISTENER_PASSIVE");
 
 // Language identities and invocation transport only. Native records own
 // registration, snapshots, propagation, removal, and invocation lifetime.
-const dispatchStateByEvent = new WeakMap();
 // A realm target can acquire a new document/core while an old dispatch still
 // owns its path. Never reuse that owner's handles or callbacks in the new core.
 const bindingsByCore = new WeakMap();
 const targetsByCore = new WeakMap();
 const hostListenerDetailsByCallback = new WeakMap();
-// A node wrapper is weak (DomCore.wrapperFor), but its listeners' callbacks
+// The wrapper of a detached node is weak (DomCore.wrapperFor; a connected
+// node's wrapper lives with its document's tree,
+// DomCore.connectedWrappersByDocument), but its listeners' callbacks
 // and its event-handler records live in JavaScript state keyed by that
 // wrapper. A collected wrapper would lose them while the native target keeps
 // the listeners, and a new wrapper of the node would dispatch identities it
 // does not know. A node wrapper with a registered listener therefore stays
-// alive until its last registration is released: by removal, or by the
-// disposal of its document.
-const listenedNodesByCore = new WeakMap();
+// alive while its document wrapper does, until its last registration is
+// released: by removal, or by the disposal of its document. Every node
+// wrapper keeps its document wrapper (_documentRetention), so a document that
+// nothing else reaches is collected with its listened nodes, and its
+// finalizer disposes it.
+const listenedNodesByDocument = new WeakMap();
+function listenedNodeDocument(target) {
+  return target._documentRetention ?? target;
+}
 let nextCallbackIdentity = 1;
 let nextEventIdentity = 1n;
 const targetFinalizer = new FinalizationRegistry(({ core, handle }) => {
@@ -56,7 +79,7 @@ function releaseRegistration(binding, handle) {
   const entry = binding.registrations.get(handle);
   if (!entry) return;
   binding.registrations.delete(handle);
-  if (binding.registrations.size === 0) listenedNodesByCore.get(binding.core)?.delete(binding.target);
+  if (binding.registrations.size === 0) listenedNodesByDocument.get(listenedNodeDocument(binding.target))?.delete(binding.target);
   const identity = binding.callbacks.get(entry.identity);
   identity.references--;
   if (identity.references === 0) {
@@ -87,6 +110,17 @@ function prepareEventDisposal(core, documentHandle) {
       }
     }
   };
+}
+
+// Adoption gives a node wrapper another document: a listened node moves to
+// the listened nodes of that document.
+export function moveListenedNode(target, previousDocument, document) {
+  const previous = listenedNodesByDocument.get(previousDocument ?? target);
+  if (!previous?.delete(target)) return;
+  const owner = document ?? target;
+  let listenedNodes = listenedNodesByDocument.get(owner);
+  if (!listenedNodes) listenedNodesByDocument.set(owner, listenedNodes = new Set());
+  listenedNodes.add(target);
 }
 
 export function normalizeListenerOptions(options) {
@@ -134,8 +168,8 @@ function addListener(target, eventType, callback, normalized) {
     binding.handle,
     ...binding.core.input(eventType),
     identity,
-    (normalized.capture ? 1 : 0) | (normalized.once ? 2 : 0) |
-      (normalized.passive ? 4 : 0),
+    (normalized.capture ? EVENT_LISTENER_CAPTURE : 0) | (normalized.once ? EVENT_LISTENER_ONCE : 0) |
+      (normalized.passive ? EVENT_LISTENER_PASSIVE : 0),
   );
   if (handle === 0n) return;
   const retained = binding.callbacks.get(identity) ??
@@ -146,8 +180,9 @@ function addListener(target, eventType, callback, normalized) {
   const entry = { identity, type: eventType, capture: normalized.capture, signal: normalized.signal, abortHandler: null };
   binding.registrations.set(handle, entry);
   if (target._coreHandle) {
-    let listenedNodes = listenedNodesByCore.get(binding.core);
-    if (!listenedNodes) listenedNodesByCore.set(binding.core, listenedNodes = new Set());
+    const document = listenedNodeDocument(target);
+    let listenedNodes = listenedNodesByDocument.get(document);
+    if (!listenedNodes) listenedNodesByDocument.set(document, listenedNodes = new Set());
     listenedNodes.add(target);
   }
   if (entry.signal) {
@@ -195,86 +230,103 @@ export function removeAllEventListeners(target, core = targetCore(target)) {
 
 // Event.timeStamp on the page's clock (DOM, §2.2 "Interface Event": event
 // creation sets it to the relative high resolution time of the event's
-// relevant global). A window's event constructors stamp an event when the
-// page creates it (src/dom/page-clock.js); an event that Sandom or the host
-// created takes the time when it is first dispatched to a node or window of
-// a document whose page has a clock.
-const eventTimeClocks = new WeakMap();
+// relevant global). An event takes the host's high resolution time when it
+// is created; a window's event constructors stamp an event on the page's
+// clock when the page creates it (src/dom/page-clock.js); an event that
+// Sandom or the host created takes the time when it is first dispatched to
+// a node or window of a document whose page has a clock.
+const hostPerformance = globalThis.performance;
 
 export function stampEventTime(event, clock) {
-  Object.defineProperty(event, "timeStamp", { configurable: true, value: clock.now() });
-  eventTimeClocks.set(event, clock);
+  const state = eventState(event);
+  state.timeStamp = clock.now();
+  state.clock = clock;
 }
 
-function instrumentEvent(event) {
-  let state = dispatchStateByEvent.get(event);
-  if (state) return state;
+// The state of each Sandom event (DOM §2.2 "Interface Event"): the core's
+// event state record (event-state.watpart), which holds its flags and phase
+// and decides every change of them, and the type, time stamp and targets,
+// which the host holds. While it is dispatched, `handle` is the dispatch
+// record of `core`. Only the constructors and the dispatch algorithm of
+// this module write it.
+const eventStates = new WeakMap();
+const stateCore = sharedDomCore;
+const eventStateFinalizer = new FinalizationRegistry((handle) => stateCore.status("event_state_release", handle));
+
+function eventState(event) {
+  const state = eventStates.get(event);
+  if (state === undefined) throw new TypeError("Illegal invocation: the receiver is not an Event");
+  return state;
+}
+
+// Whether `value` is an Event of Sandom (any of its interfaces).
+export function isSandomEvent(value) {
+  return eventStates.has(value);
+}
+
+// Whether the core's event state of `state` has EVENT_STATE_* flag `flag`.
+function hasFlag(state, flag) {
+  return (stateCore.status("event_state_flags", state.stateHandle) & flag) !== 0;
+}
+
+// Forwards the event_dispatch_flags mask that an event state operation
+// returned to the dispatch record of the event's dispatch.
+function forwardDispatchFlags(state, mask) {
+  if (mask !== 0) state.core.status("event_dispatch_flags", state.handle, mask);
+}
+
+// The isTrusted attribute (DOM §2.2) is [LegacyUnforgeable]: an own,
+// non-configurable accessor of each event, the same getter for all.
+const isTrustedGetter = Object.getOwnPropertyDescriptor({
+  get isTrusted() {
+    return hasFlag(eventState(this), EVENT_STATE.TRUSTED);
+  },
+}, "isTrusted").get;
+
+// DOM "inner event creation steps" and "initialize": the state of a new
+// event of `type` (a converted DOMString) with the converted EventInit
+// members of `init`.
+function createEventState(event, type, init) {
   if (nextEventIdentity > 0xffffffffffffffffn) {
     throw new RangeError("Event identities exhausted");
   }
-  const nativePreventDefault = event.preventDefault.bind(event);
-  const nativeStopPropagation = event.stopPropagation.bind(event);
-  const nativeStopImmediatePropagation = event.stopImmediatePropagation.bind(
-    event,
-  );
-  state = {
+  const stateHandle = stateCore.handle("event_state_create", init.bubbles ? 1 : 0, init.cancelable ? 1 : 0,
+    init.composed ? 1 : 0);
+  eventStates.set(event, {
+    stateHandle,
+    type,
+    timeStamp: hostPerformance.now(),
+    clock: null,
     target: null,
     originalTarget: null,
-    relatedTarget: "relatedTarget" in event ? event.relatedTarget : null,
+    relatedTarget: null,
     currentTarget: null,
     currentRelatedTarget: null,
-    eventPhase: Event.NONE,
     path: [],
     visiblePath: [],
     handle: 0n,
     core: null,
     identity: nextEventIdentity++,
-    passive: false,
-  };
-  Object.defineProperties(event, {
-    target: { configurable: true, get: () => state.target },
-    currentTarget: { configurable: true, get: () => state.currentTarget },
-    eventPhase: { configurable: true, get: () => state.eventPhase },
-    composedPath: { configurable: true, value: () => [...state.visiblePath] },
-    preventDefault: {
-      configurable: true,
-      value: () => {
-        if (!state.passive) {
-          nativePreventDefault();
-          if (state.handle && event.defaultPrevented) {
-            state.core.status("event_dispatch_flags", state.handle, 4);
-          }
-        }
-      },
-    },
-    stopPropagation: {
-      configurable: true,
-      value: () => {
-        if (state.handle) {
-          state.core.status("event_dispatch_flags", state.handle, 1);
-        }
-        nativeStopPropagation();
-      },
-    },
-    stopImmediatePropagation: {
-      configurable: true,
-      value: () => {
-        if (state.handle) {
-          state.core.status("event_dispatch_flags", state.handle, 3);
-        }
-        nativeStopImmediatePropagation();
-      },
-    },
   });
-  if ("relatedTarget" in event) {
-    Object.defineProperty(event, "relatedTarget", {
-      configurable: true,
-      get: () =>
-        state.currentTarget ? state.currentRelatedTarget : state.relatedTarget,
-    });
-  }
-  dispatchStateByEvent.set(event, state);
-  return state;
+  eventStateFinalizer.register(event, stateHandle);
+  Object.defineProperty(event, "isTrusted", { get: isTrustedGetter, enumerable: true, configurable: false });
+}
+
+// DOM "set the canceled flag" (event_state_cancel).
+function setCanceledFlag(state) {
+  forwardDispatchFlags(state, stateCore.status("event_state_cancel", state.stateHandle));
+}
+
+// The stop propagation flag, with the stop immediate propagation flag when
+// `immediate` (event_state_stop).
+function setStopPropagationFlag(state, immediate = false) {
+  forwardDispatchFlags(state, stateCore.status("event_state_stop", state.stateHandle, immediate ? 1 : 0));
+}
+
+// The trusted flag of `event`, and the canceled flag of a host event that
+// the host canceled (event_state_trust).
+function trustEvent(event, trusted = true, canceled = false) {
+  stateCore.status("event_state_trust", eventState(event).stateHandle, trusted ? 1 : 0, canceled ? 1 : 0);
 }
 
 function isNode(value) {
@@ -282,21 +334,28 @@ function isNode(value) {
     value._coreHandle !== undefined;
 }
 
+// The dispatch path entries and listener records of event-dispatch.watpart,
+// by WAT name without the EVENT_ prefix.
+const EVENT = Object.freeze(Object.fromEntries([
+  "PATH_SIZE", "PATH_IDENTITY", "PATH_NODE", "PATH_TARGET", "PATH_RELATED",
+  "LISTENER_SIZE", "LISTENER_PATH_INDEX", "LISTENER_CALLBACK",
+].map((name) => [name, layoutConstant(`EVENT_${name}`)])));
+
 function decodeDispatchPath(core, handle) {
   const count = core.status("event_dispatch_path", handle);
   const view = new DataView(
     core.memory.buffer,
     core.exports.abi_output_pointer(),
-    count * 48,
+    count * EVENT.PATH_SIZE,
   );
   // Copy numeric values before wrapper materialization can allocate/grow memory.
   const records = Array.from({ length: count }, (_, index) => {
-    const offset = index * 48;
+    const offset = index * EVENT.PATH_SIZE;
     return {
-      identity: view.getBigUint64(offset, true),
-      node: view.getBigUint64(offset + 8, true),
-      target: view.getBigUint64(offset + 16, true),
-      related: view.getBigUint64(offset + 40, true),
+      identity: view.getBigUint64(offset + EVENT.PATH_IDENTITY, true),
+      node: view.getBigUint64(offset + EVENT.PATH_NODE, true),
+      target: view.getBigUint64(offset + EVENT.PATH_TARGET, true),
+      related: view.getBigUint64(offset + EVENT.PATH_RELATED, true),
     };
   });
   return records.map((record) => {
@@ -321,12 +380,13 @@ function dispatchCoordinator(core, handle, path) {
   const view = new DataView(
     core.memory.buffer,
     core.exports.abi_output_pointer(),
-    count * 8,
+    count * EVENT.LISTENER_SIZE,
   );
   let coordinator = null;
   for (let index = 0; index < count; index++) {
-    const binding = path[view.getUint32(index * 8, true)].binding;
-    const identity = view.getUint32(index * 8 + 4, true);
+    const at = index * EVENT.LISTENER_SIZE;
+    const binding = path[view.getUint32(at + EVENT.LISTENER_PATH_INDEX, true)].binding;
+    const identity = view.getUint32(at + EVENT.LISTENER_CALLBACK, true);
     const callback = binding.callbacks.get(identity)
       ?.callback;
     const details = hostListenerDetailsByCallback.get(callback);
@@ -352,13 +412,14 @@ function invokeListener(callback, event) {
 // `targetOverride` is the HTML Standard's "legacy target override flag": the
 // window's load event reports the document as its target.
 function dispatch(target, event, reportException, targetOverride = null) {
-  const state = instrumentEvent(event);
+  const state = eventState(event);
   const binding = targetBinding(target);
   const core = binding.core;
-  const document = target.nodeType === 9 ? target : target.ownerDocument;
+  // A form's controls can shadow its members (form-dom.js, nodeMember).
+  const document = nodeMember(target, "nodeType") === 9 ? target : nodeMember(target, "ownerDocument");
   const windowDocument = document ?? (target.document?.defaultView === target ? target.document : null);
   const pageClock = windowDocument?._clock ?? null;
-  if (pageClock !== null && eventTimeClocks.get(event) !== pageClock) stampEventTime(event, pageClock);
+  if (pageClock !== null && state.clock !== pageClock) stampEventTime(event, pageClock);
   // The document whose node, window or media query list the event targets.
   // Its listeners run as its component code (src/dom/component-code.js).
   const listenerDocument = windowDocument ?? target._document ?? null;
@@ -378,31 +439,35 @@ function dispatch(target, event, reportException, targetOverride = null) {
         typeof state.relatedTarget === "function")
     ? targetBinding(state.relatedTarget, core).handle
     : 0n;
+  const flags = stateCore.status("event_state_flags", state.stateHandle);
   const handle = core.handle(
     "event_dispatch_begin",
     binding.handle,
     state.identity,
-    ...core.input(event.type),
-    event.bubbles ? 1 : 0,
-    event.composed ? 1 : 0,
+    ...core.input(state.type),
+    (flags & EVENT_STATE.BUBBLES) !== 0 ? 1 : 0,
+    (flags & EVENT_STATE.COMPOSED) !== 0 ? 1 : 0,
     isNode(state.relatedTarget) ? state.relatedTarget._coreHandle : 0n,
-    event.defaultPrevented ? 1 : 0,
+    (flags & EVENT_STATE.CANCELED) !== 0 ? 1 : 0,
     relatedOpaque,
   );
   state.handle = handle;
   state.core = core;
   state.originalTarget = targetOverride ?? target;
   state.target = state.originalTarget;
+  // The stop flags that the event has before its dispatch stop it before
+  // its first listener (event_state_dispatch_begin).
+  forwardDispatchFlags(state, stateCore.status("event_state_dispatch_begin", state.stateHandle));
   let completed = false;
+  // DOM "dispatch", steps 11 and 12 (event_state_dispatch_end).
   const finish = () => {
     if (!completed) core.status("event_dispatch_abort", handle);
+    stateCore.status("event_state_dispatch_end", state.stateHandle);
     state.handle = 0n;
     state.currentTarget = null;
     state.target = state.originalTarget;
-    state.eventPhase = Event.NONE;
     state.path = [];
     state.visiblePath = [];
-    state.passive = false;
   };
   try {
     const path = decodeDispatchPath(core, handle);
@@ -421,13 +486,13 @@ function dispatch(target, event, reportException, targetOverride = null) {
         const view = new DataView(
           core.memory.buffer,
           core.exports.abi_output_pointer(),
-          24,
+          EVENT_INVOCATION.SIZE,
         );
-        const listener = view.getBigUint64(0, true);
-        const identity = view.getUint32(8, true);
-        const index = view.getUint32(12, true);
-        const phase = view.getUint32(16, true);
-        const flags = view.getUint32(20, true);
+        const listener = view.getBigUint64(EVENT_INVOCATION.LISTENER, true);
+        const identity = view.getUint32(EVENT_INVOCATION.IDENTITY, true);
+        const index = view.getUint32(EVENT_INVOCATION.INDEX, true);
+        const phase = view.getUint32(EVENT_INVOCATION.PHASE, true);
+        const flags = view.getUint32(EVENT_INVOCATION.FLAGS, true);
         const current = path[index];
         const currentBinding = current.binding;
         const callback = currentBinding.callbacks.get(identity).callback;
@@ -436,7 +501,7 @@ function dispatch(target, event, reportException, targetOverride = null) {
         state.currentRelatedTarget = isNode(state.relatedTarget)
           ? current.related
           : state.relatedTarget;
-        state.eventPhase = phase;
+        stateCore.status("event_state_listener", state.stateHandle, phase, flags);
         const visibleCount = core.status(
           "event_dispatch_visible_path",
           handle,
@@ -445,37 +510,36 @@ function dispatch(target, event, reportException, targetOverride = null) {
         const visible = new DataView(
           core.memory.buffer,
           core.exports.abi_output_pointer(),
-          visibleCount * 4,
+          visibleCount * Uint32Array.BYTES_PER_ELEMENT,
         );
         state.visiblePath = Array.from(
           { length: visibleCount },
-          (_, offset) => path[visible.getUint32(offset * 4, true)].node,
+          (_, offset) => path[visible.getUint32(offset * Uint32Array.BYTES_PER_ELEMENT, true)].node,
         );
-        if (flags & 2) releaseRegistration(currentBinding, listener);
-        state.passive = (flags & 4) !== 0;
+        if (flags & EVENT_LISTENER_ONCE) releaseRegistration(currentBinding, listener);
         let result;
-        let outcome = 0;
+        let outcome = EVENT_LISTENER_RETURNED;
         try {
           result = enterComponentCode(listenerDocument, invokeListener, current.node, [callback, event]);
         } catch (error) {
-          outcome = 1;
+          outcome = EVENT_LISTENER_THREW;
           reportException(error);
         }
         if (result && typeof result.then === "function") {
           return Promise.resolve(result).then(
             () => {
-              state.passive = false;
+              stateCore.status("event_state_listener", state.stateHandle, -1, 0);
               core.status("event_dispatch_resume", handle, token, outcome);
               return advance();
             },
             (error) => {
-              state.passive = false;
-              core.status("event_dispatch_resume", handle, token, 1);
+              stateCore.status("event_state_listener", state.stateHandle, -1, 0);
+              core.status("event_dispatch_resume", handle, token, EVENT_LISTENER_THREW);
               throw error;
             },
           );
         }
-        state.passive = false;
+        stateCore.status("event_state_listener", state.stateHandle, -1, 0);
         core.status("event_dispatch_resume", handle, token, outcome);
       }
     };
@@ -494,8 +558,10 @@ function dispatch(target, event, reportException, targetOverride = null) {
     }
     finish();
     // A click that no listener canceled reaches the activation behavior of
-    // the hyperlink around its target (src/dom/scripts.js).
-    if (event.type === "click" && !event.defaultPrevented && document?._scriptProcessing) {
+    // the hyperlink around its target (event_state_follows_hyperlink,
+    // src/dom/scripts.js).
+    if (document?._scriptProcessing &&
+      stateCore.status("event_state_follows_hyperlink", state.stateHandle, ...stateCore.input(state.type)) !== 0) {
       document._scriptProcessing.followHyperlink(target);
     }
     return result;
@@ -511,8 +577,8 @@ export const { addEventListener, removeEventListener, dispatchEvent } =
     lookupTarget: (target) => bindingsByCore.get(targetCore(target))?.get(target),
     exceptionReporter: ({ reportException }) => reportException,
     eventIdentity: (event) => {
-      if (!(event instanceof Event)) {
-        throw new TypeError("dispatchEvent expects an Event");
+      if (!eventStates.has(event)) {
+        throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
       }
       return event;
     },
@@ -561,7 +627,7 @@ export const SDEventTarget = class EventTarget {
   dispatchEvent(event) {
     requireEventTarget(this);
     if (arguments.length < 1) throw new TypeError("dispatchEvent requires an event");
-    return dispatchEvent(this, event);
+    return dispatchEventFromScript(this, event);
   }
 };
 Object.defineProperty(SDEventTarget.prototype, Symbol.toStringTag, {
@@ -574,207 +640,735 @@ for (const name of ["addEventListener", "removeEventListener", "dispatchEvent"])
 // Fires `event` at a document's window with the legacy target override:
 // listeners see the document as the event's target.
 export function dispatchWindowEventWithDocumentTarget(window, event, document, reportException) {
-  if (!(event instanceof Event)) throw new TypeError("dispatchEvent expects an Event");
+  if (!eventStates.has(event)) throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   return dispatch(window, event, reportException, document);
 }
 
-function defineEventFields(event, init) {
-  for (const [name, value] of Object.entries(init)) {
-    if (name === "bubbles" || name === "cancelable" || name === "composed") {
-      continue;
+// Sandom's event interfaces (DOM §2.2 Event, §2.4 CustomEvent; UI Events;
+// HTML; CSS Animations and Transitions; Web Animations). They are
+// independent of the host's Event: a window exposes them to its page, the
+// user agent creates its events from them, and every event that Sandom
+// dispatches is one of them. Each constructor converts its arguments as
+// Web IDL does: the type, then the members of its dictionary, the
+// inherited dictionary's first, each dictionary's in lexicographic order.
+
+function missingArgument(interfaceName) {
+  return new TypeError(`Failed to construct '${interfaceName}': 1 argument required, but only 0 present.`);
+}
+
+// A dictionary argument: undefined and null are an empty dictionary.
+function dictionaryArgument(interfaceName, value) {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" && typeof value !== "function") {
+    throw new TypeError(`Failed to construct '${interfaceName}': The provided value is not of type '${interfaceName}Init'.`);
+  }
+  return value;
+}
+
+// Web IDL conversions of a dictionary member, given its default.
+const toDOMString = (value, fallback = "") => value === undefined ? fallback : `${value}`;
+const toLong = (value) => value === undefined ? 0 : Number(value) | 0;
+const toUnsignedLong = (value) => value === undefined ? 0 : Number(value) >>> 0;
+const toShort = (value) => value === undefined ? 0 : (Number(value) << 16) >> 16;
+const toUnsignedShort = (value) => value === undefined ? 0 : Number(value) & 0xffff;
+function toDouble(interfaceName, member, value, fallback = 0) {
+  if (value === undefined) return fallback;
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    throw new TypeError(`Failed to construct '${interfaceName}': The provided double value of '${member}' is non-finite.`);
+  }
+  return number;
+}
+const toNullable = (value) => value ?? null;
+// A Window? member: null, or a window (the global object of a document,
+// whose document's defaultView it is).
+function toWindow(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "object" && value.nodeType === undefined && value.document?.defaultView === value) return value;
+  throw new TypeError("Failed to construct 'UIEvent': member view is not of type Window.");
+}
+
+// Web IDL's interface members are enumerable, and its prototype's class
+// string is the interface's name. A constant is on the interface object
+// and on its prototype.
+function defineEventInterface(Interface, name, constants = {}) {
+  for (const key of Reflect.ownKeys(Interface.prototype)) {
+    if (key !== "constructor") Object.defineProperty(Interface.prototype, key, { enumerable: true });
+  }
+  Object.defineProperty(Interface.prototype, Symbol.toStringTag, { value: name, configurable: true });
+  for (const [constant, value] of Object.entries(constants)) {
+    for (const holder of [Interface, Interface.prototype]) {
+      Object.defineProperty(holder, constant, { value, enumerable: true });
     }
-    Object.defineProperty(event, name, {
-      configurable: true,
-      enumerable: true,
-      value,
+  }
+}
+
+// DOM "initialize" of initEvent() and initCustomEvent(): the core leaves an
+// event that is dispatched as it is (false) and resets the flags of another
+// (event_state_initialize), whose type and target the host then sets.
+function reinitializeEvent(state, type, bubbles, cancelable) {
+  if (stateCore.status("event_state_initialize", state.stateHandle, bubbles ? 1 : 0, cancelable ? 1 : 0) === 0) {
+    return false;
+  }
+  state.target = null;
+  state.originalTarget = null;
+  state.type = type;
+  return true;
+}
+
+export const SDEvent = class Event {
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("Event");
+    const eventType = `${type}`;
+    const init = dictionaryArgument("Event", eventInitDict);
+    createEventState(this, eventType, {
+      bubbles: Boolean(init.bubbles),
+      cancelable: Boolean(init.cancelable),
+      composed: Boolean(init.composed),
     });
   }
-}
+  get type() {
+    return eventState(this).type;
+  }
+  get target() {
+    return eventState(this).target;
+  }
+  get srcElement() {
+    return eventState(this).target;
+  }
+  get currentTarget() {
+    return eventState(this).currentTarget;
+  }
+  composedPath() {
+    return [...eventState(this).visiblePath];
+  }
+  get eventPhase() {
+    return stateCore.status("event_state_phase", eventState(this).stateHandle);
+  }
+  stopPropagation() {
+    setStopPropagationFlag(eventState(this));
+  }
+  get cancelBubble() {
+    return hasFlag(eventState(this), EVENT_STATE.STOP_PROPAGATION);
+  }
+  set cancelBubble(value) {
+    const state = eventState(this);
+    if (value) setStopPropagationFlag(state);
+  }
+  stopImmediatePropagation() {
+    setStopPropagationFlag(eventState(this), true);
+  }
+  get bubbles() {
+    return hasFlag(eventState(this), EVENT_STATE.BUBBLES);
+  }
+  get cancelable() {
+    return hasFlag(eventState(this), EVENT_STATE.CANCELABLE);
+  }
+  get returnValue() {
+    return !hasFlag(eventState(this), EVENT_STATE.CANCELED);
+  }
+  set returnValue(value) {
+    const state = eventState(this);
+    if (!value) setCanceledFlag(state);
+  }
+  preventDefault() {
+    setCanceledFlag(eventState(this));
+  }
+  get defaultPrevented() {
+    return hasFlag(eventState(this), EVENT_STATE.CANCELED);
+  }
+  get composed() {
+    return hasFlag(eventState(this), EVENT_STATE.COMPOSED);
+  }
+  get timeStamp() {
+    return eventState(this).timeStamp;
+  }
+  initEvent(type, bubbles = false, cancelable = false) {
+    const state = eventState(this);
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present.");
+    }
+    const eventType = `${type}`;
+    reinitializeEvent(state, eventType, Boolean(bubbles), Boolean(cancelable));
+  }
+};
+defineEventInterface(SDEvent, "Event", { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 });
 
-export class SDKeyboardEvent extends Event {
-  constructor(type, init = {}) {
+export const SDCustomEvent = class CustomEvent extends SDEvent {
+  #detail;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("CustomEvent");
+    const init = dictionaryArgument("CustomEvent", eventInitDict);
     super(type, init);
-    defineEventFields(this, init);
+    this.#detail = init.detail === undefined ? null : init.detail;
   }
-}
+  get detail() {
+    return this.#detail;
+  }
+  initCustomEvent(type, bubbles = false, cancelable = false, detail = null) {
+    if (!(#detail in this)) throw new TypeError("Illegal invocation: the receiver is not a CustomEvent");
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'initCustomEvent' on 'CustomEvent': 1 argument required, but only 0 present.");
+    }
+    const eventType = `${type}`;
+    const state = eventState(this);
+    if (reinitializeEvent(state, eventType, Boolean(bubbles), Boolean(cancelable))) this.#detail = detail;
+  }
+};
+defineEventInterface(SDCustomEvent, "CustomEvent");
 
-export class SDMouseEvent extends Event {
-  constructor(type, init = {}) {
+export const SDUIEvent = class UIEvent extends SDEvent {
+  #detail;
+  #view;
+  #which;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("UIEvent");
+    const init = dictionaryArgument("UIEvent", eventInitDict);
     super(type, init);
-    defineEventFields(this, {
-      button: 0,
-      buttons: 0,
-      clientX: 0,
-      clientY: 0,
-      screenX: 0,
-      screenY: 0,
-      ctrlKey: false,
-      shiftKey: false,
-      altKey: false,
-      metaKey: false,
-      ...init,
-    });
+    this.#detail = toLong(init.detail);
+    this.#view = toWindow(init.view);
+    this.#which = toUnsignedLong(init.which);
   }
+  get view() {
+    return this.#view;
+  }
+  get detail() {
+    return this.#detail;
+  }
+  get which() {
+    return this.#which;
+  }
+};
+defineEventInterface(SDUIEvent, "UIEvent");
+
+// UI Events' EventModifierInit, by key of getModifierState().
+const MODIFIER_MEMBERS = Object.freeze([
+  ["Alt", "altKey"], ["Control", "ctrlKey"], ["Meta", "metaKey"], ["AltGraph", "modifierAltGraph"],
+  ["CapsLock", "modifierCapsLock"], ["Fn", "modifierFn"], ["FnLock", "modifierFnLock"], ["Hyper", "modifierHyper"],
+  ["NumLock", "modifierNumLock"], ["ScrollLock", "modifierScrollLock"], ["Super", "modifierSuper"],
+  ["Symbol", "modifierSymbol"], ["SymbolLock", "modifierSymbolLock"], ["Shift", "shiftKey"],
+]);
+
+// The modifier keys of an EventModifierInit, read in its members' order.
+function modifierKeys(init) {
+  const keys = new Set();
+  for (const [key, member] of MODIFIER_MEMBERS) if (init[member]) keys.add(key);
+  return keys;
 }
-export class SDFocusEvent extends Event {
-  constructor(type, init = {}) {
+
+// The relatedTarget of a FocusEvent or a MouseEvent: during its dispatch,
+// the one retargeted against the current target (DOM "dispatch").
+function eventRelatedTarget(event) {
+  const state = eventState(event);
+  return state.currentTarget ? state.currentRelatedTarget : state.relatedTarget;
+}
+
+export const SDFocusEvent = class FocusEvent extends SDUIEvent {
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("FocusEvent");
+    const init = dictionaryArgument("FocusEvent", eventInitDict);
     super(type, init);
-    defineEventFields(this, init);
+    eventState(this).relatedTarget = toNullable(init.relatedTarget);
   }
-}
+  get relatedTarget() {
+    return eventRelatedTarget(this);
+  }
+};
+defineEventInterface(SDFocusEvent, "FocusEvent");
 
-// A DataTransfer's text data store. Formats compare ASCII-case-insensitively;
-// "text" names text/plain and "url" names text/uri-list, read back as its
-// first URL.
-function dataTransferFormat(format) {
-  const normalized = String(format).replace(/[A-Z]/g, (letter) => letter.toLowerCase());
-  if (normalized === "text") return ["text/plain", false];
-  if (normalized === "url") return ["text/uri-list", true];
-  return [normalized, false];
-}
-
-export class SDDataTransfer {
-  #data = new Map();
-  get types() {
-    return Object.freeze([...this.#data.keys()]);
-  }
-  getData(format) {
-    const [type, firstURL] = dataTransferFormat(format);
-    const data = this.#data.get(type) ?? "";
-    if (!firstURL) return data;
-    return data.split(/\r\n|\n|\r/).find((line) => line !== "" && !line.startsWith("#")) ?? "";
-  }
-  setData(format, data) {
-    const [type] = dataTransferFormat(format);
-    this.#data.delete(type);
-    this.#data.set(type, String(data));
-  }
-  clearData(format) {
-    if (format === undefined) this.#data.clear();
-    else this.#data.delete(dataTransferFormat(format)[0]);
-  }
-}
-
-export class SDClipboardEvent extends Event {
-  constructor(type, init = {}) {
+export const SDMouseEvent = class MouseEvent extends SDUIEvent {
+  #modifiers;
+  #button;
+  #buttons;
+  #clientX;
+  #clientY;
+  #screenX;
+  #screenY;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("MouseEvent");
+    const init = dictionaryArgument("MouseEvent", eventInitDict);
     super(type, init);
-    defineEventFields(this, { clipboardData: null, ...init });
+    this.#modifiers = modifierKeys(init);
+    this.#button = toShort(init.button);
+    this.#buttons = toUnsignedShort(init.buttons);
+    this.#clientX = toDouble("MouseEvent", "clientX", init.clientX);
+    this.#clientY = toDouble("MouseEvent", "clientY", init.clientY);
+    eventState(this).relatedTarget = toNullable(init.relatedTarget);
+    this.#screenX = toDouble("MouseEvent", "screenX", init.screenX);
+    this.#screenY = toDouble("MouseEvent", "screenY", init.screenY);
   }
-}
+  get screenX() {
+    return this.#screenX;
+  }
+  get screenY() {
+    return this.#screenY;
+  }
+  get clientX() {
+    return this.#clientX;
+  }
+  get clientY() {
+    return this.#clientY;
+  }
+  get ctrlKey() {
+    return this.#modifiers.has("Control");
+  }
+  get shiftKey() {
+    return this.#modifiers.has("Shift");
+  }
+  get altKey() {
+    return this.#modifiers.has("Alt");
+  }
+  get metaKey() {
+    return this.#modifiers.has("Meta");
+  }
+  get button() {
+    return this.#button;
+  }
+  get buttons() {
+    return this.#buttons;
+  }
+  get relatedTarget() {
+    return eventRelatedTarget(this);
+  }
+  getModifierState(keyArg) {
+    const modifiers = this.#modifiers;
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'getModifierState' on 'MouseEvent': 1 argument required, but only 0 present.");
+    }
+    return modifiers.has(`${keyArg}`);
+  }
+};
+defineEventInterface(SDMouseEvent, "MouseEvent");
+
+export const SDPointerEvent = class PointerEvent extends SDMouseEvent {
+  #height;
+  #isPrimary;
+  #pointerId;
+  #pointerType;
+  #pressure;
+  #tangentialPressure;
+  #tiltX;
+  #tiltY;
+  #twist;
+  #width;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("PointerEvent");
+    const init = dictionaryArgument("PointerEvent", eventInitDict);
+    super(type, init);
+    this.#height = toDouble("PointerEvent", "height", init.height, 1);
+    this.#isPrimary = Boolean(init.isPrimary);
+    this.#pointerId = toLong(init.pointerId);
+    this.#pointerType = toDOMString(init.pointerType);
+    this.#pressure = toDouble("PointerEvent", "pressure", init.pressure);
+    this.#tangentialPressure = toDouble("PointerEvent", "tangentialPressure", init.tangentialPressure);
+    this.#tiltX = toLong(init.tiltX);
+    this.#tiltY = toLong(init.tiltY);
+    this.#twist = toLong(init.twist);
+    this.#width = toDouble("PointerEvent", "width", init.width, 1);
+  }
+  get pointerId() {
+    return this.#pointerId;
+  }
+  get width() {
+    return this.#width;
+  }
+  get height() {
+    return this.#height;
+  }
+  get pressure() {
+    return this.#pressure;
+  }
+  get tangentialPressure() {
+    return this.#tangentialPressure;
+  }
+  get tiltX() {
+    return this.#tiltX;
+  }
+  get tiltY() {
+    return this.#tiltY;
+  }
+  get twist() {
+    return this.#twist;
+  }
+  get pointerType() {
+    return this.#pointerType;
+  }
+  get isPrimary() {
+    return this.#isPrimary;
+  }
+};
+defineEventInterface(SDPointerEvent, "PointerEvent");
+
+export const SDKeyboardEvent = class KeyboardEvent extends SDUIEvent {
+  #modifiers;
+  #charCode;
+  #code;
+  #isComposing;
+  #key;
+  #keyCode;
+  #location;
+  #repeat;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("KeyboardEvent");
+    const init = dictionaryArgument("KeyboardEvent", eventInitDict);
+    super(type, init);
+    this.#modifiers = modifierKeys(init);
+    this.#charCode = toUnsignedLong(init.charCode);
+    this.#code = toDOMString(init.code);
+    this.#isComposing = Boolean(init.isComposing);
+    this.#key = toDOMString(init.key);
+    this.#keyCode = toUnsignedLong(init.keyCode);
+    this.#location = toUnsignedLong(init.location);
+    this.#repeat = Boolean(init.repeat);
+  }
+  get key() {
+    return this.#key;
+  }
+  get code() {
+    return this.#code;
+  }
+  get location() {
+    return this.#location;
+  }
+  get ctrlKey() {
+    return this.#modifiers.has("Control");
+  }
+  get shiftKey() {
+    return this.#modifiers.has("Shift");
+  }
+  get altKey() {
+    return this.#modifiers.has("Alt");
+  }
+  get metaKey() {
+    return this.#modifiers.has("Meta");
+  }
+  get repeat() {
+    return this.#repeat;
+  }
+  get isComposing() {
+    return this.#isComposing;
+  }
+  get charCode() {
+    return this.#charCode;
+  }
+  get keyCode() {
+    return this.#keyCode;
+  }
+  getModifierState(keyArg) {
+    const modifiers = this.#modifiers;
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'getModifierState' on 'KeyboardEvent': 1 argument required, but only 0 present.");
+    }
+    return modifiers.has(`${keyArg}`);
+  }
+};
+defineEventInterface(SDKeyboardEvent, "KeyboardEvent", {
+  DOM_KEY_LOCATION_STANDARD: 0, DOM_KEY_LOCATION_LEFT: 1, DOM_KEY_LOCATION_RIGHT: 2, DOM_KEY_LOCATION_NUMPAD: 3,
+});
+
+export const SDClipboardEvent = class ClipboardEvent extends SDEvent {
+  #clipboardData;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("ClipboardEvent");
+    const init = dictionaryArgument("ClipboardEvent", eventInitDict);
+    super(type, init);
+    this.#clipboardData = toNullable(init.clipboardData);
+  }
+  get clipboardData() {
+    return this.#clipboardData;
+  }
+};
+defineEventInterface(SDClipboardEvent, "ClipboardEvent");
 
 // A form's submit event; submitter is the button that submitted it, null
 // when the form submitted itself.
-export class SDSubmitEvent extends Event {
-  constructor(type, init = {}) {
+export const SDSubmitEvent = class SubmitEvent extends SDEvent {
+  #submitter;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("SubmitEvent");
+    const init = dictionaryArgument("SubmitEvent", eventInitDict);
     super(type, init);
-    defineEventFields(this, { submitter: null, ...init });
+    this.#submitter = toNullable(init.submitter);
   }
-}
-
-// HTML's ToggleEvent: the state a details element or popover had before a
-// toggle and the state it has after it, "open" or "closed".
-export class SDToggleEvent extends Event {
-  constructor(type, init = {}) {
-    super(type, init);
-    defineEventFields(this, { oldState: String(init.oldState ?? ""), newState: String(init.newState ?? "") });
-  }
-}
-
-// CSS Animations' AnimationEvent: exactly animationName, elapsedTime and
-// pseudoElement.
-export class SDAnimationEvent extends Event {
-  constructor(type, init = {}) {
-    super(type, init);
-    defineEventFields(this, {
-      animationName: String(init.animationName ?? ""),
-      elapsedTime: Number(init.elapsedTime ?? 0),
-      pseudoElement: String(init.pseudoElement ?? ""),
-    });
-  }
-}
-
-// CSS Transitions' TransitionEvent: exactly propertyName, elapsedTime and
-// pseudoElement.
-export class SDTransitionEvent extends Event {
-  constructor(type, init = {}) {
-    super(type, init);
-    defineEventFields(this, {
-      propertyName: String(init.propertyName ?? ""),
-      elapsedTime: Number(init.elapsedTime ?? 0),
-      pseudoElement: String(init.pseudoElement ?? ""),
-    });
-  }
-}
-// Web Animations' AnimationPlaybackEvent: exactly currentTime and
-// timelineTime, null when unresolved. Animations dispatch it (remove). Its
-// constructor has the interface's name, as in a browser.
-export const SDAnimationPlaybackEvent = class AnimationPlaybackEvent extends Event {
-  constructor(type, init = {}) {
-    super(type, init);
-    defineEventFields(this, {
-      currentTime: init.currentTime == null ? null : Number(init.currentTime),
-      timelineTime: init.timelineTime == null ? null : Number(init.timelineTime),
-    });
+  get submitter() {
+    return this.#submitter;
   }
 };
-const ANIMATION_EVENT_TYPES = new Set(["animationstart", "animationiteration", "animationend", "animationcancel"]);
-const TRANSITION_EVENT_TYPES = new Set(["transitionrun", "transitionstart", "transitionend", "transitioncancel"]);
+defineEventInterface(SDSubmitEvent, "SubmitEvent");
 
-export class SDPointerEvent extends SDMouseEvent {}
+// HTML's ToggleEvent: the state a details element, a dialog or a popover
+// had before a toggle and the state it has after it, "open" or "closed",
+// and the element that caused it.
+export const SDToggleEvent = class ToggleEvent extends SDEvent {
+  #newState;
+  #oldState;
+  #source;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("ToggleEvent");
+    const init = dictionaryArgument("ToggleEvent", eventInitDict);
+    super(type, init);
+    this.#newState = toDOMString(init.newState);
+    this.#oldState = toDOMString(init.oldState);
+    this.#source = toNullable(init.source);
+  }
+  get oldState() {
+    return this.#oldState;
+  }
+  get newState() {
+    return this.#newState;
+  }
+  get source() {
+    return this.#source;
+  }
+};
+defineEventInterface(SDToggleEvent, "ToggleEvent");
 
+// CSS Animations' AnimationEvent: animationName, elapsedTime and
+// pseudoElement.
+export const SDAnimationEvent = class AnimationEvent extends SDEvent {
+  #animationName;
+  #elapsedTime;
+  #pseudoElement;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("AnimationEvent");
+    const init = dictionaryArgument("AnimationEvent", eventInitDict);
+    super(type, init);
+    this.#animationName = toDOMString(init.animationName);
+    this.#elapsedTime = toDouble("AnimationEvent", "elapsedTime", init.elapsedTime);
+    this.#pseudoElement = toDOMString(init.pseudoElement);
+  }
+  get animationName() {
+    return this.#animationName;
+  }
+  get elapsedTime() {
+    return this.#elapsedTime;
+  }
+  get pseudoElement() {
+    return this.#pseudoElement;
+  }
+};
+defineEventInterface(SDAnimationEvent, "AnimationEvent");
+
+// CSS Transitions' TransitionEvent: propertyName, elapsedTime and
+// pseudoElement.
+export const SDTransitionEvent = class TransitionEvent extends SDEvent {
+  #elapsedTime;
+  #propertyName;
+  #pseudoElement;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("TransitionEvent");
+    const init = dictionaryArgument("TransitionEvent", eventInitDict);
+    super(type, init);
+    this.#elapsedTime = toDouble("TransitionEvent", "elapsedTime", init.elapsedTime);
+    this.#propertyName = toDOMString(init.propertyName);
+    this.#pseudoElement = toDOMString(init.pseudoElement);
+  }
+  get propertyName() {
+    return this.#propertyName;
+  }
+  get elapsedTime() {
+    return this.#elapsedTime;
+  }
+  get pseudoElement() {
+    return this.#pseudoElement;
+  }
+};
+defineEventInterface(SDTransitionEvent, "TransitionEvent");
+
+// Web Animations' AnimationPlaybackEvent: currentTime and timelineTime,
+// null when unresolved. Animations dispatch it (remove).
+export const SDAnimationPlaybackEvent = class AnimationPlaybackEvent extends SDEvent {
+  #currentTime;
+  #timelineTime;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("AnimationPlaybackEvent");
+    const init = dictionaryArgument("AnimationPlaybackEvent", eventInitDict);
+    super(type, init);
+    this.#currentTime = init.currentTime == null ? null : toDouble("AnimationPlaybackEvent", "currentTime", init.currentTime);
+    this.#timelineTime = init.timelineTime == null ? null : toDouble("AnimationPlaybackEvent", "timelineTime", init.timelineTime);
+  }
+  get currentTime() {
+    return this.#currentTime;
+  }
+  get timelineTime() {
+    return this.#timelineTime;
+  }
+};
+defineEventInterface(SDAnimationPlaybackEvent, "AnimationPlaybackEvent");
+
+// HTML's ErrorEvent: the error event of "report an exception".
+export const SDErrorEvent = class ErrorEvent extends SDEvent {
+  #colno;
+  #error;
+  #filename;
+  #lineno;
+  #message;
+  constructor(type, eventInitDict = undefined) {
+    if (arguments.length < 1) throw missingArgument("ErrorEvent");
+    const init = dictionaryArgument("ErrorEvent", eventInitDict);
+    super(type, init);
+    this.#colno = toUnsignedLong(init.colno);
+    this.#error = init.error === undefined ? null : init.error;
+    this.#filename = toDOMString(init.filename);
+    this.#lineno = toUnsignedLong(init.lineno);
+    this.#message = toDOMString(init.message);
+  }
+  get message() {
+    return this.#message;
+  }
+  get filename() {
+    return this.#filename;
+  }
+  get lineno() {
+    return this.#lineno;
+  }
+  get colno() {
+    return this.#colno;
+  }
+  get error() {
+    return this.#error;
+  }
+};
+defineEventInterface(SDErrorEvent, "ErrorEvent");
+
+// HTML's PromiseRejectionEvent: the unhandledrejection event of a rejected
+// promise that no handler handled.
+export const SDPromiseRejectionEvent = class PromiseRejectionEvent extends SDEvent {
+  #promise;
+  #reason;
+  constructor(type, eventInitDict) {
+    if (arguments.length < 2) {
+      throw new TypeError(`Failed to construct 'PromiseRejectionEvent': 2 arguments required, but only ${arguments.length} present.`);
+    }
+    const init = dictionaryArgument("PromiseRejectionEvent", eventInitDict);
+    super(type, init);
+    if (init.promise === null || (typeof init.promise !== "object" && typeof init.promise !== "function")) {
+      throw new TypeError("Failed to construct 'PromiseRejectionEvent': member promise is not an object.");
+    }
+    this.#promise = init.promise;
+    this.#reason = init.reason;
+  }
+  get promise() {
+    return this.#promise;
+  }
+  get reason() {
+    return this.#reason;
+  }
+};
+defineEventInterface(SDPromiseRejectionEvent, "PromiseRejectionEvent");
+
+// The interface objects of Sandom's events that a window exposes, by name.
+export const eventInterfaces = Object.freeze({
+  Event: SDEvent,
+  CustomEvent: SDCustomEvent,
+  UIEvent: SDUIEvent,
+  FocusEvent: SDFocusEvent,
+  MouseEvent: SDMouseEvent,
+  PointerEvent: SDPointerEvent,
+  KeyboardEvent: SDKeyboardEvent,
+  ClipboardEvent: SDClipboardEvent,
+  SubmitEvent: SDSubmitEvent,
+  ToggleEvent: SDToggleEvent,
+  AnimationEvent: SDAnimationEvent,
+  TransitionEvent: SDTransitionEvent,
+  AnimationPlaybackEvent: SDAnimationPlaybackEvent,
+  ErrorEvent: SDErrorEvent,
+  PromiseRejectionEvent: SDPromiseRejectionEvent,
+});
+
+// The dispatchEvent() method: it initializes the event's isTrusted to false
+// before it dispatches it (DOM "dispatchEvent(event)"). An event that is
+// being dispatched keeps it: its dispatch throws InvalidStateError first.
+export function dispatchEventFromScript(target, event) {
+  if (eventStates.has(event)) stateCore.status("event_state_script_dispatch", eventState(event).stateHandle);
+  return dispatchEvent(target, event);
+}
+
+// An event that the user agent creates and dispatches (DOM "fire an
+// event"): its isTrusted is true. The type names the interface: the
+// interface's members come from `init` and `fields` (constructEvent).
 export function createEvent(type, init = {}, fields = {}) {
-  const nativeInit = {
-    bubbles: Boolean(init.bubbles),
-    cancelable: Boolean(init.cancelable),
-    composed: Boolean(init.composed),
-    ...init,
-    ...fields,
-  };
-  if (
-    type === "focus" || type === "blur" || type === "focusin" ||
-    type === "focusout"
-  ) {
-    return new SDFocusEvent(type, nativeInit);
+  const event = constructEvent(type, init, fields);
+  trustEvent(event);
+  return event;
+}
+
+// An event that the user agent creates on behalf of a script, such as the
+// click of click() (HTML "fire a synthetic pointer event" with the not
+// trusted flag): its isTrusted is false.
+export function createSyntheticEvent(type, init = {}, fields = {}) {
+  return constructEvent(type, init, fields);
+}
+
+// An event of `Interface`, one of Sandom's event interfaces, that the user
+// agent creates and dispatches (DOM "fire an event" using
+// eventConstructor): its isTrusted is true.
+export function createEventUsing(Interface, type, init = {}) {
+  const event = new Interface(type, init);
+  trustEvent(event);
+  return event;
+}
+
+// Sandom's event interfaces by the core's EVENT_INTERFACE_* codes.
+const EVENT_INTERFACE_CLASSES = new Map([
+  ["EVENT", SDEvent], ["CUSTOM", SDCustomEvent], ["FOCUS", SDFocusEvent], ["KEYBOARD", SDKeyboardEvent],
+  ["POINTER", SDPointerEvent], ["CLIPBOARD", SDClipboardEvent], ["SUBMIT", SDSubmitEvent], ["TOGGLE", SDToggleEvent],
+  ["ANIMATION", SDAnimationEvent], ["TRANSITION", SDTransitionEvent], ["MOUSE", SDMouseEvent],
+].map(([name, Interface]) => [layoutConstant(`EVENT_INTERFACE_${name}`), Interface]));
+
+// An event of `type` that the user agent creates: the core chooses its
+// interface (event_interface_for_type) and whether the members of `init`
+// and `fields` that the interface does not have become properties of the
+// event (event_interface_exact).
+function constructEvent(type, init, fields) {
+  const eventType = String(type);
+  const members = { ...init, ...fields };
+  const code = stateCore.status("event_interface_for_type", ...stateCore.input(eventType),
+    Object.hasOwn(init, "detail") ? 1 : 0);
+  const Interface = EVENT_INTERFACE_CLASSES.get(code);
+  if (Interface === undefined) throw new Error(`The core named event interface ${code} for "${eventType}", which Sandom does not have`);
+  const event = new Interface(eventType, members);
+  if (stateCore.status("event_interface_exact", code) !== 0) return event;
+  for (const [name, value] of Object.entries(members)) {
+    if (!(name in event)) Object.defineProperty(event, name, { configurable: true, enumerable: true, value });
   }
-  if (String(type).startsWith("key")) {
-    return new SDKeyboardEvent(type, nativeInit);
-  }
-  if (String(type).startsWith("pointer")) {
-    return new SDPointerEvent(type, nativeInit);
-  }
-  if (type === "copy" || type === "cut" || type === "paste") {
-    return new SDClipboardEvent(type, nativeInit);
-  }
-  if (type === "submit") {
-    return new SDSubmitEvent(type, nativeInit);
-  }
-  if (type === "toggle" || type === "beforetoggle") {
-    return new SDToggleEvent(type, nativeInit);
-  }
-  if (ANIMATION_EVENT_TYPES.has(type)) {
-    return new SDAnimationEvent(type, nativeInit);
-  }
-  if (TRANSITION_EVENT_TYPES.has(type)) {
-    return new SDTransitionEvent(type, nativeInit);
-  }
-  if (
-    String(type).startsWith("mouse") || type === "click" ||
-    type === "dblclick" || type === "contextmenu"
-  ) {
-    return new SDMouseEvent(type, nativeInit);
-  }
-  if (Object.hasOwn(init, "detail")) {
-    const event = new CustomEvent(type, {
-      bubbles: nativeInit.bubbles,
-      cancelable: nativeInit.cancelable,
-      composed: nativeInit.composed,
-      detail: init.detail,
+  return event;
+}
+
+// The host's Event and its subclasses of runtime reports, taken before a
+// window can replace the globals.
+const HostEvent = globalThis.Event;
+const HostErrorEvent = globalThis.ErrorEvent;
+const HostPromiseRejectionEvent = globalThis.PromiseRejectionEvent;
+
+// Whether `value` is an event of the host, not of Sandom.
+export function isHostEvent(value) {
+  return typeof HostEvent === "function" && value instanceof HostEvent && !eventStates.has(value);
+}
+
+// The Sandom event for `hostEvent`, an event of the host that the host
+// dispatches at a window: in Deno, the runtime reports an exception, an
+// unhandled rejection and its load and unload events through the global
+// object's dispatchEvent, and that global object can be a window. It has
+// the host event's type, flags and fields, and the host's isTrusted.
+export function sandomEventForHostEvent(hostEvent) {
+  const init = { bubbles: hostEvent.bubbles, cancelable: hostEvent.cancelable, composed: hostEvent.composed };
+  let event;
+  if (typeof HostErrorEvent === "function" && hostEvent instanceof HostErrorEvent) {
+    event = new SDErrorEvent(hostEvent.type, {
+      ...init,
+      message: hostEvent.message,
+      filename: hostEvent.filename,
+      lineno: hostEvent.lineno,
+      colno: hostEvent.colno,
+      error: hostEvent.error,
     });
-    defineEventFields(event, fields);
-    return event;
+  } else if (typeof HostPromiseRejectionEvent === "function" && hostEvent instanceof HostPromiseRejectionEvent) {
+    event = new SDPromiseRejectionEvent(hostEvent.type, { ...init, promise: hostEvent.promise, reason: hostEvent.reason });
+  } else {
+    event = new SDEvent(hostEvent.type, init);
   }
-  const event = new Event(type, nativeInit);
-  defineEventFields(event, { ...init, ...fields });
+  trustEvent(event, hostEvent.isTrusted === true, hostEvent.defaultPrevented === true);
   return event;
 }
 
