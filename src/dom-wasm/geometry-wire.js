@@ -50,11 +50,6 @@ const SVG_ROW_SIZE = layoutConstant("GEOMETRY_SVG_ROW_SIZE");
 export const GEOMETRY_FRAGMENT_SIZE = layoutConstant("GEOMETRY_FRAGMENT_SIZE");
 const FRAGMENT_FIELDS = ["X", "Y", "WIDTH", "HEIGHT"].map((name) => layoutConstant(`GEOMETRY_FRAGMENT_${name}`));
 export const GEOMETRY_RECORD_SIZE = layoutConstant("GEOMETRY_RECORD_SIZE");
-const GEOMETRY_SCROLLBAR_SIZE = layoutConstant("GEOMETRY_SCROLLBAR_SIZE");
-const SCROLLBAR = Object.fromEntries(["TRACK", "CLIP", "HAS_CLIP", "VERTICAL", "TARGET", "VALUES", "THUMB"]
-  .map((name) => [name, layoutConstant(`GEOMETRY_SCROLLBAR_${name}`)]));
-const GEOMETRY_TAIL_HEADER_SIZE = layoutConstant("GEOMETRY_TAIL_HEADER_SIZE");
-const GEOMETRY_TAIL_SCROLLBARS = layoutConstant("GEOMETRY_TAIL_SCROLLBARS");
 
 // Writes the fragment { x, y, w, h } at `at`, its origin moved by `origin`.
 function writeFragment(view, at, { x, y, w, h }, origin = { x: 0, y: 0 }) {
@@ -440,41 +435,4 @@ export function boxSnapshotFor(boxes, core) {
       core.status("geometry_boxes_release", handle);
     },
   };
-}
-
-// One wire scrollbar block at `offset`.
-function writeScrollbar(view, offset, scrollbar) {
-  for (const [index, name] of ["x", "y", "width", "height"].entries()) {
-    view.setFloat64(offset + SCROLLBAR.TRACK + index * F64, scrollbar.track[name], true);
-    view.setFloat64(offset + SCROLLBAR.CLIP + index * F64, scrollbar.clip?.[name] ?? 0, true);
-    view.setFloat64(offset + SCROLLBAR.THUMB + index * F64, scrollbar.thumb?.[name] ?? 0, true);
-  }
-  view.setUint32(offset + SCROLLBAR.HAS_CLIP, scrollbar.clip ? 1 : 0, true);
-  view.setUint32(offset + SCROLLBAR.VERTICAL, scrollbar.orientation === "vertical" ? 1 : 0, true);
-  view.setBigUint64(offset + SCROLLBAR.TARGET, scrollbar.element?._coreHandle ?? scrollbar.targetHandle ?? 0n, true);
-  ["value", "minimum", "maximum", "range", "viewportLength", "scrollLength", "thickness"].forEach((name, index) =>
-    view.setFloat64(offset + SCROLLBAR.VALUES + index * F64, scrollbar[name] ?? 0, true)
-  );
-}
-
-// The host tail of a geometry build, or of a successor (geometry-build.watpart
-// geometry_scroll_successor, geometry_restyle_successor): the scrollbar
-// count in a GEOMETRY_TAIL header, then the wire scrollbar blocks. The
-// carets, glyphs and text come from the text geometry store.
-function encodeTail(scrollbars) {
-  const bytes = new Uint8Array(GEOMETRY_TAIL_HEADER_SIZE + scrollbars.length * GEOMETRY_SCROLLBAR_SIZE);
-  const view = new DataView(bytes.buffer);
-  view.setUint32(GEOMETRY_TAIL_SCROLLBARS, scrollbars.length, true);
-  let offset = GEOMETRY_TAIL_HEADER_SIZE;
-  for (const scrollbar of scrollbars) {
-    writeScrollbar(view, offset, scrollbar);
-    offset += GEOMETRY_SCROLLBAR_SIZE;
-  }
-  return bytes;
-}
-export function encodeGeometryTail({ scrollbars = [] }) {
-  return encodeTail(scrollbars);
-}
-export function encodeGeometrySuccessorTail({ scrollbars }) {
-  return encodeTail(scrollbars);
 }

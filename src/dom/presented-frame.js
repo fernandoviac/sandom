@@ -4,7 +4,7 @@
 // Host-side records are decoded on demand: hit testing, scrolling and
 // anchoring query the native snapshot directly, so a frame that nobody
 // inspects materializes no JavaScript records.
-import { buildGeometry, buildGeometryFrameSuccessor, buildGeometryRestyleSuccessor, buildGeometrySuccessor, controlSelectionRectangles, geometryRect, TextStoreGeometry } from "./geometry.js";
+import { buildGeometry, buildGeometryFrameSuccessor, buildGeometryRestyleSuccessor, buildGeometrySuccessor, controlSelectionRectangles, EMPTY_SCROLLBAR_TAIL, geometryRect, TextStoreGeometry } from "./geometry.js";
 import { GEOMETRY_RECORD_SIZE } from "../dom-wasm/geometry-wire.js";
 import { layoutConstant } from "../wasm/layout-table.js";
 
@@ -27,7 +27,7 @@ const overscroll = ["auto", "contain", "none"];
 
 function decodeRecord(core, handle, index) {
   core.status("geometry_record_export", handle, index);
-  const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), GEOMETRY_RECORD_SIZE);
+  const view = core.output("geometry_record_export");
   const value = (name) => view.getFloat64(RECORD.BOX + FIELD[name] * F64, true);
   const flags = view.getUint32(RECORD.FLAGS, true);
   const nodeHandle = view.getBigUint64(RECORD.HANDLE, true);
@@ -178,7 +178,7 @@ export function deriveRestyleBasis(predecessor, { root, viewport, viewportIndex,
   const refusal = restyleRefusal(predecessor, { root, viewport, viewportIndex, sourceRevisions, textStore });
   if (refusal !== null) return { basis: null, refusal };
   const derived = buildGeometryRestyleSuccessor({
-    predecessor: predecessor.geometry, root, boxes, publication, viewportIndex, revision, scrollbars: [], textStore, sourceRevisions,
+    predecessor: predecessor.geometry, root, boxes, publication, viewportIndex, revision, scrollbarTail: EMPTY_SCROLLBAR_TAIL, textStore, sourceRevisions,
   });
   if (derived.geometry === null) return { basis: null, refusal: derived.refusal };
   return {
@@ -214,7 +214,7 @@ export function deriveRestyleBasis(predecessor, { root, viewport, viewportIndex,
 // `frameGeometry`: the geometry this frame built of its tree before it
 // rasterized, shaped as a presented frame, or null; a snapshot that no
 // predecessor gives derives from it (geometry_frame_successor).
-export function buildInteractionSnapshot({ root, viewport, viewportIndex = 0, revision, boxes, publication, scrollbars, timeMilliseconds, textStore = 0, previousTextGeometry = null, sourceRevisions, scrollPredecessor = null, restyleBasis = null, restyleBasisRefusal = null, restylePredecessor = null, frameGeometry = null }) {
+export function buildInteractionSnapshot({ root, viewport, viewportIndex = 0, revision, boxes, publication, scrollbars, scrollbarTail, timeMilliseconds, textStore = 0, previousTextGeometry = null, sourceRevisions, scrollPredecessor = null, restyleBasis = null, restyleBasisRefusal = null, restylePredecessor = null, frameGeometry = null }) {
   let derivation = null;
   let refusal = null;
   let work = null;
@@ -224,16 +224,16 @@ export function buildInteractionSnapshot({ root, viewport, viewportIndex = 0, re
   const basisRefused = restyleBasis === null ? null
     : scrollRefusal(restyleBasis, { root, viewport, viewportIndex, boxes, publication, sourceRevisions, textStore });
   if (scrollPredecessor !== null && scrollRefused === null) {
-    ({ geometry, work } = buildGeometrySuccessor({ predecessor: scrollPredecessor.geometry, root, boxes, revision, scrollbars, textStore, sourceRevisions }));
+    ({ geometry, work } = buildGeometrySuccessor({ predecessor: scrollPredecessor.geometry, root, boxes, revision, scrollbarTail, textStore, sourceRevisions }));
     derivation = "scroll";
   } else if (restyleBasis !== null && basisRefused === null) {
-    ({ geometry } = buildGeometrySuccessor({ predecessor: restyleBasis.geometry, root, boxes, revision, scrollbars, textStore, sourceRevisions }));
+    ({ geometry } = buildGeometrySuccessor({ predecessor: restyleBasis.geometry, root, boxes, revision, scrollbarTail, textStore, sourceRevisions }));
     work = restyleBasis.work;
     derivation = "restyle";
   } else if (restylePredecessor !== null) {
     refusal = restyleRefusal(restylePredecessor, { root, viewport, viewportIndex, sourceRevisions, textStore });
     if (refusal === null) {
-      const derived = buildGeometryRestyleSuccessor({ predecessor: restylePredecessor.geometry, root, boxes, publication, viewportIndex, revision, scrollbars, textStore, sourceRevisions });
+      const derived = buildGeometryRestyleSuccessor({ predecessor: restylePredecessor.geometry, root, boxes, publication, viewportIndex, revision, scrollbarTail, textStore, sourceRevisions });
       refusal = derived.refusal;
       if (derived.geometry !== null) {
         geometry = derived.geometry;
@@ -246,12 +246,12 @@ export function buildInteractionSnapshot({ root, viewport, viewportIndex = 0, re
   if (geometry === null && frameGeometry !== null) {
     frameRefused = frameGeometryRefusal(frameGeometry, { root, viewport, viewportIndex, boxes, publication, sourceRevisions });
     if (frameRefused === null) {
-      ({ geometry, work } = buildGeometryFrameSuccessor({ predecessor: frameGeometry.geometry, root, boxes, revision, scrollbars, textStore, sourceRevisions }));
+      ({ geometry, work } = buildGeometryFrameSuccessor({ predecessor: frameGeometry.geometry, root, boxes, revision, scrollbarTail, textStore, sourceRevisions }));
       derivation = "frame";
     }
   }
   if (geometry === null) {
-    geometry = buildGeometry({ root, viewport, viewportIndex, revision, boxes, publication, scrollbars, textStore, sourceRevisions, presented: true });
+    geometry = buildGeometry({ root, viewport, viewportIndex, revision, boxes, publication, scrollbarTail, textStore, sourceRevisions, presented: true });
   }
   let decoded = null;
   const textGeometryByNode = new TextStoreGeometry(geometry.core, textStore, previousTextGeometry);
@@ -284,6 +284,8 @@ export function buildInteractionSnapshot({ root, viewport, viewportIndex = 0, re
     _successorWork: work,
     _inputBoxes: boxes, _root: root, _publication: publication, _viewportIndex: viewportIndex,
     textGeometryByElement, textGeometryByNode,
+    // The scrollbars and the geometry tail that holds them.
+    scrollbarTail,
     scrollbars: Object.freeze(scrollbars.map((scrollbar) => Object.freeze({ ...scrollbar, track: Object.freeze({ ...scrollbar.track }), clip: scrollbar.clip ? Object.freeze({ ...scrollbar.clip }) : null }))),
   };
   // Each text control's selection rectangles (selectionRectanglesByElement),

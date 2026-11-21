@@ -36,7 +36,7 @@ function metricsFacade(core, handle, onRelease) {
   let artifact = null;
   const record = () => {
     const block = core.status("projection_block", handle, KIND_METRICS);
-    return { block, view: new DataView(core.refreshBytes().buffer) };
+    return { block, view: core.resultMemory("projection_block") };
   };
   const materialize = () => {
     if (artifact !== null) {
@@ -48,8 +48,7 @@ function metricsFacade(core, handle, onRelease) {
     // The string whose block-relative offset is at `row + field` and whose
     // byte length is at `row + lengthField`.
     const string = (row, field, lengthField) =>
-      decoder.decode(new Uint8Array(view.buffer, block + view.getUint32(row + field, true),
-        view.getUint32(row + lengthField, true)));
+      view.memoryText(decoder, block + view.getUint32(row + field, true), view.getUint32(row + lengthField, true));
     const nodesBase = at(HEADER.NODES);
     const childrenBase = at(HEADER.CHILDREN);
     const selectionBase = at(HEADER.SELECTION);
@@ -131,7 +130,7 @@ function metricsFacade(core, handle, onRelease) {
     bytes: {
       value() {
         const { block, view } = record();
-        return new Uint8Array(view.buffer, block, view.getUint32(block + HEADER.TOTAL, true)).slice();
+        return view.memoryBytes(block, view.getUint32(block + HEADER.TOTAL, true));
       },
     },
     // Frees the record; a later read throws.

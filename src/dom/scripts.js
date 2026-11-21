@@ -158,8 +158,7 @@ function exceptionMessage(error) {
 // URL Standard, "percent-decode" of a string (url_percent_decode).
 function percentDecode(core, text) {
   core.status("url_percent_decode", ...core.input(text));
-  const pointer = core.exports.abi_output_pointer();
-  return core.refreshBytes().slice(pointer, pointer + core.exports.abi_output_length());
+  return core.outputBytes("url_percent_decode");
 }
 
 // "Erase all event listeners and handlers" for each shadow-including
@@ -1013,7 +1012,7 @@ class DocumentScripts {
     if (!this.scripting || this.released) return;
     const core = this.document._domCore;
     const prepareListed = (handle, mutation, oldPresent = 0) => {
-      for (const script of core.outputNodes(core.status("script_mutation_prepares", handle, mutation, oldPresent))) {
+      for (const script of core.statusNodes("script_mutation_prepares", handle, mutation, oldPresent)) {
         this.prepare(script);
       }
     };
@@ -1088,7 +1087,16 @@ class DocumentScripts {
     if (link === null) return;
     const url = URL.parse(link.getAttribute("href"), this.document.baseURI);
     if (url === null) return;
-    if (core.status("script_url_is_javascript", ...core.input(url.href)) === 1) this.queueJavaScriptURL(url.href);
+    this.followURL(url.href);
+  }
+
+  // A followed hyperlink to serialized URL `href` (an input run's
+  // hyperlink effect, src/dom/input-activation.js): a javascript: URL
+  // runs.
+  followURL(href) {
+    if (!this.scripting || this.released) return;
+    const core = this.document._domCore;
+    if (core.status("script_url_is_javascript", ...core.input(href)) === 1) this.queueJavaScriptURL(href);
   }
 
   // "Evaluate a javascript: URL" as a task of the document: the decoded

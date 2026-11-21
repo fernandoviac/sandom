@@ -12,10 +12,15 @@ the same plain ES modules for Node and Bun hosts.
 
 ## Requirements
 
-- A WebGPU adapter for pixel or texture output.
-- Node 22 or later with the optional peer dependency `webgpu`, or
-- Bun 1.3 or later with the optional peer dependency `bun-webgpu`, or
-- Deno 2 or a current browser, which provide WebGPU natively.
+- A GPU for pixel or texture output.
+- Node 22 or later, Bun 1.3 or later, or Deno 2 on macOS (arm64, x64) or
+  Linux with glibc 2.36 or later (x64, arm64). There Sandom renders through
+  its native GPU host, `@sandom/gpu-host`, which npm installs with the
+  native library of the machine. Deno needs `--allow-ffi` for it.
+  `SANDOM_NATIVE_GPU_HOST=0` turns the host off.
+- Elsewhere, or with the host off: Node with the optional peer dependency
+  `webgpu`, Bun with the optional peer dependency `bun-webgpu`, or Deno or a
+  current browser, which provide WebGPU natively.
 
 ## Coverage
 

@@ -99,6 +99,9 @@ const modifierOptions = (event) => ({
   metaKey: event.metaKey,
 });
 
+// The pointer fields of `event` but its contact width and height, which are
+// CSS pixels of the host page; the binding maps them into the document
+// (`contactSize` in bindDocumentInput).
 const pointerOptions = (event) => ({
   ...modifierOptions(event),
   button: event.button,
@@ -107,6 +110,10 @@ const pointerOptions = (event) => ({
   pointerType: event.pointerType || "mouse",
   isPrimary: event.isPrimary,
   pressure: event.pressure,
+  tiltX: event.tiltX,
+  tiltY: event.tiltY,
+  twist: event.twist,
+  tangentialPressure: event.tangentialPressure,
   timeMilliseconds: event.timeStamp,
 });
 
@@ -217,11 +224,13 @@ function createInputSink(host, label) {
 // null when the event misses every document. It may add `backend` and
 // `root` to route the point to another document than the default. `event`
 // is never null: a `pointerdown`, `pointermove`, `pointerup`,
-// `pointercancel` or `wheel` event, or the last `pointermove` again when a
-// presented frame resolves the cursor of a resting pointer. `target` is
-// null except during a pressed gesture, where it is the `{ backend, root }`
-// the press started on, so a drag can keep tracking past that document's
-// edge.
+// `pointercancel` or `wheel` event, the last `pointermove` again when a
+// presented frame resolves the cursor of a resting pointer, or a client
+// point `{ clientX, clientY }` one pixel from a pointer event's along an
+// axis, which measures the scale that maps the event's contact width and
+// height into document CSS pixels. `target` is null except during a
+// pressed gesture, where it is the `{ backend, root }` the press started
+// on, so a drag can keep tracking past that document's edge.
 //
 // `unproject(point, target)` is the inverse: `point` (never null) is a point
 // of `target`'s document in document CSS pixels, and `target` (never null)
@@ -301,6 +310,30 @@ export function bindDocumentInput({
     return target;
   };
   const sameTarget = (left, right) => left?.root === right?.root;
+  // The pointer options of `event`, whose document point `point` (null for
+  // a miss) `project` gave with gesture target `gesture`, with its contact
+  // width and height in document CSS pixels (Pointer Events 3 §4.1): each
+  // axis of the contact box takes the projection's scale along that axis at
+  // the event, the length of the image of one client pixel, measured toward
+  // the inside of the host where the outward step misses. A point that
+  // misses has no document geometry: its width and height are the
+  // document's default.
+  const pointerOptionsAt = (event, point, gesture) => {
+    const options = pointerOptions(event);
+    if (point === null) return options;
+    const scale = (dx, dy) => {
+      const at = (sign) => project({ clientX: event.clientX + sign * dx, clientY: event.clientY + sign * dy }, { target: gesture });
+      const step = at(1) ?? at(-1);
+      if (step === null) {
+        throw new Error(`bindDocumentInput: project maps neither client point one pixel from (${event.clientX}, ${event.clientY}) along ` +
+          `${dx ? "x" : "y"}, so the pointer's contact ${dx ? "width" : "height"} has no document size`);
+      }
+      return Math.hypot(step.x - point.x, step.y - point.y);
+    };
+    if (event.width !== undefined) options.width = event.width * scale(1, 0);
+    if (event.height !== undefined) options.height = event.height * scale(0, 1);
+    return options;
+  };
 
   if (touchAction !== null) host.style.touchAction = touchAction;
   const sink = createInputSink(host, label);
@@ -478,7 +511,7 @@ export function bindDocumentInput({
     captured = { pointerId: event.pointerId, target };
     host.setPointerCapture?.(event.pointerId);
     focusSink(target);
-    target.port.deliver("pointerDown", point.x, point.y, pointerOptions(event));
+    target.port.deliver("pointerDown", point.x, point.y, pointerOptionsAt(event, point, null));
     applyCursor(point, event, target);
     delivered();
   };
@@ -494,7 +527,7 @@ export function bindDocumentInput({
       // The resting cursor resolves at the pointer's last place, so a
       // release away from the press place shows the cursor there.
       hoverEvent = event;
-      captured.target.port.deliver("pointerMove", point.x, point.y, pointerOptions(event));
+      captured.target.port.deliver("pointerMove", point.x, point.y, pointerOptionsAt(event, point, captured.target));
       applyCursor(point, event, captured.target);
       delivered();
       return;
@@ -510,7 +543,7 @@ export function bindDocumentInput({
     hoverPointer = event.pointerId;
     hoverEvent = event;
     followHoverFrames();
-    target.port.deliver("pointerMove", point.x, point.y, pointerOptions(event));
+    target.port.deliver("pointerMove", point.x, point.y, pointerOptionsAt(event, point, null));
     applyCursor(point, event, target);
     delivered();
   };
@@ -533,8 +566,9 @@ export function bindDocumentInput({
   const onPointerUp = (event) => {
     const target = release(event);
     if (target === null) return;
-    const point = project(event, { target }) ?? { x: -1, y: -1 };
-    target.port.deliver("pointerUp", point.x, point.y, pointerOptions(event));
+    const projected = project(event, { target });
+    const point = projected ?? { x: -1, y: -1 };
+    target.port.deliver("pointerUp", point.x, point.y, pointerOptionsAt(event, projected, target));
     if (point.x >= 0) applyCursor(point, event, target);
     delivered();
   };

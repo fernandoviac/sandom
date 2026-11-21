@@ -102,7 +102,7 @@ const ADAPTIVE_OUTPUT_REQUEST = Object.freeze({
 // The SHA-256 digest text of the bytes (output_input_digest).
 function digest(bytes) {
   sharedDomCore.status("output_input_digest", ...sharedDomCore.byteInput(bytes));
-  return sharedDomCore.outputString();
+  return sharedDomCore.outputString("output_input_digest");
 }
 // Each prepared input's lifecycle record (output-render-input.watpart).
 const preparedInputStates = new WeakMap();
@@ -130,7 +130,7 @@ function frameMetadata(frame) {
   const hasDuration = frame.durationMilliseconds !== null && frame.durationMilliseconds !== undefined;
   sharedDomCore.status("output_frame_metadata", hasSequence ? 1 : 0, hasSequence ? Number(frame.sequence) : NaN,
     Number(frame.frameSequence), hasDuration ? 1 : 0, hasDuration ? Number(frame.durationMilliseconds) : NaN);
-  const output = new DataView(sharedDomCore.refreshBytes().buffer, sharedDomCore.exports.abi_output_pointer(), OUTPUT_FRAME_METADATA.SIZE);
+  const output = sharedDomCore.output("output_frame_metadata");
   const sequence = output.getFloat64(OUTPUT_FRAME_METADATA.SEQUENCE, true);
   const durationMilliseconds = output.getFloat64(OUTPUT_FRAME_METADATA.DURATION, true);
   return Object.freeze({
@@ -160,7 +160,7 @@ export async function renderDocumentAnimation(document, options = {}) {
   const formatIndex = core.statusRaw("output_render_request",
     ...core.input(typeof format === "string" ? format : ""), ...core.input(String(JSON.stringify(format))),
     numberOrNaN(width), numberOrNaN(height), numberOrNaN(deviceScale), numberOrNaN(frameBudget));
-  const checked = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), OUTPUT_RENDER_REQUEST.SIZE);
+  const checked = core.output("output_render_request");
   const highDynamicRangeStillOutput = checked.getUint32(OUTPUT_RENDER_REQUEST.HIGH_DYNAMIC_RANGE, true) !== 0;
   const gifWidth = checked.getUint32(OUTPUT_RENDER_REQUEST.GIF_WIDTH, true);
   const gifHeight = checked.getUint32(OUTPUT_RENDER_REQUEST.GIF_HEIGHT, true);
@@ -308,9 +308,11 @@ function selectInputPreprocessor(registry, inputURL, mediaType, explicitName, fe
     ...sharedDomCore.input(typeof mediaType === "string" ? mediaType : ""),
     ...sharedDomCore.input(String(JSON.stringify(mediaType))), ...sharedDomCore.input(inputURL.href));
   if (choice === OUTPUT_CODE.PREPROCESSOR_EXPLICIT) return selectPreprocessor(registry, inputURL, explicitName);
-  if (choice === OUTPUT_CODE.PREPROCESSOR_BY_MEDIA_TYPE) return selectPreprocessor(registry, inputURL, sharedDomCore.outputString());
+  if (choice === OUTPUT_CODE.PREPROCESSOR_BY_MEDIA_TYPE) {
+    return selectPreprocessor(registry, inputURL, sharedDomCore.outputString("output_preprocessor_choice"));
+  }
   if (choice === OUTPUT_CODE.PREPROCESSOR_BY_EXTENSION) return selectPreprocessor(registry, inputURL, undefined);
-  throw new SandomHostError("response-media-type", sharedDomCore.outputString(), { details: { mediaType } });
+  throw new SandomHostError("response-media-type", sharedDomCore.outputString("output_preprocessor_choice"), { details: { mediaType } });
 }
 
 // Obtains the primary input through the host as a document demand. The
@@ -510,8 +512,7 @@ function renderRequestFromPlan(plan) {
   const request = { format, width, height, deviceScale, graphicsBackend, scrollbarStyle };
   if (formatIndex === OUTPUT_CODE.PLAN_FORMAT_JPEG_GAIN_MAP) return { ...request, adaptiveCodecOptions: plan.output.codecOptions ?? {} };
   if (formatIndex !== OUTPUT_CODE.PLAN_FORMAT_GIF) return request;
-  const loopCount = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), OUTPUT_PLAN_REQUEST.SIZE)
-    .getUint32(OUTPUT_PLAN_REQUEST.LOOP_COUNT, true);
+  const loopCount = core.output("output_render_plan_request").getUint32(OUTPUT_PLAN_REQUEST.LOOP_COUNT, true);
   return { ...request, durationMilliseconds, frameBudget, loopCount };
 }
 
@@ -622,8 +623,7 @@ function inspectionNodes(sceneNodes, sourceNodeAt, styleSourceAt) {
     );
   });
   core.status("output_inspection_nodes", sceneNodes.length, ...core.valueListInput(values));
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(),
-    sceneNodes.length * INSPECTION.NODE_SIZE);
+  const view = sceneNodes.length === 0 ? null : core.output("output_inspection_nodes");
   const optional = (number) => Number.isNaN(number) ? null : number;
   return sceneNodes.map((_, sceneIndex) => {
     const at = sceneIndex * INSPECTION.NODE_SIZE;
@@ -644,7 +644,7 @@ function inspectionNodes(sceneNodes, sourceNodeAt, styleSourceAt) {
 // A scene node identifier (output_inspection_identifier).
 function inspectionIdentifier(sceneIndex) {
   sharedDomCore.status("output_inspection_identifier", sceneIndex);
-  return sharedDomCore.outputString();
+  return sharedDomCore.outputString("output_inspection_identifier");
 }
 
 // The device-pixel numbers of logical numbers (output_inspection_scale).
@@ -652,7 +652,7 @@ function devicePixelNumbers(numbers, deviceScale) {
   const core = sharedDomCore;
   const [pointer] = core.byteInput(new Uint8Array(numbers.buffer, numbers.byteOffset, numbers.byteLength));
   core.status("output_inspection_scale", pointer, numbers.length, deviceScale);
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), numbers.byteLength);
+  const view = numbers.length === 0 ? null : core.output("output_inspection_scale");
   return Float64Array.from({ length: numbers.length },
     (_, index) => view.getFloat64(index * Float64Array.BYTES_PER_ELEMENT, true));
 }
@@ -710,14 +710,14 @@ function immutableLayoutFacts(
     direction: "host-to-core", bytes: serialized.nodes.length * FRAME_INSPECTION.NODE_RESULT,
   });
   core.status("frame_inspection_resolve", inspection);
-  const aggregate = core.exports.abi_output_pointer();
+  const aggregate = core.output("frame_inspection_resolve");
   view = new DataView(core.refreshBytes().buffer);
-  const scrollWidth = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_SCROLL_WIDTH, true);
-  const scrollHeight = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_SCROLL_HEIGHT, true);
-  const overflowLeft = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_OVERFLOW_LEFT, true);
-  const overflowTop = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_OVERFLOW_TOP, true);
-  const overflowRight = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_OVERFLOW_RIGHT, true);
-  const overflowBottom = view.getFloat64(aggregate + FRAME_INSPECTION.AGGREGATE_OVERFLOW_BOTTOM, true);
+  const scrollWidth = aggregate.getFloat64(FRAME_INSPECTION.AGGREGATE_SCROLL_WIDTH, true);
+  const scrollHeight = aggregate.getFloat64(FRAME_INSPECTION.AGGREGATE_SCROLL_HEIGHT, true);
+  const overflowLeft = aggregate.getFloat64(FRAME_INSPECTION.AGGREGATE_OVERFLOW_LEFT, true);
+  const overflowTop = aggregate.getFloat64(FRAME_INSPECTION.AGGREGATE_OVERFLOW_TOP, true);
+  const overflowRight = aggregate.getFloat64(FRAME_INSPECTION.AGGREGATE_OVERFLOW_RIGHT, true);
+  const overflowBottom = aggregate.getFloat64(FRAME_INSPECTION.AGGREGATE_OVERFLOW_BOTTOM, true);
   const nodes = serialized.nodes.map((sceneNode, sceneIndex) => {
     const element = elementAt(sceneIndex);
     const box = artifact.boxes[sceneIndex];
@@ -1222,10 +1222,9 @@ export async function inspectAnimationPreparedInput(
       );
       sharedDomCore.status("output_inspection_text_operations",
         ...sharedDomCore.valueListInput(paintOperations.map((operation) => operation.operationKind)));
-      const textOperation = sharedDomCore.refreshBytes().slice(
-        sharedDomCore.exports.abi_output_pointer(),
-        sharedDomCore.exports.abi_output_pointer() + paintOperations.length,
-      );
+      const textOperation = paintOperations.length === 0
+        ? new Uint8Array(0)
+        : sharedDomCore.outputBytes("output_inspection_text_operations", 0, paintOperations.length);
       const textChunks = paintOperations.filter((_, operationPosition) =>
         textOperation[operationPosition] === OUTPUT_CODE.INSPECTION_TEXT_OPERATION);
       const compositingGroups = paintArtifact.compositingGroups.map((group) =>

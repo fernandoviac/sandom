@@ -36,28 +36,28 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
   const failures = new Map();
   let nextFailure = 1;
 
-  function withSource(record) {
-    record.source = decoder.decode(new Uint8Array(core.memory.buffer, record.sourcePointer, record.sourceLength));
+  // The record with its source URL, which `memory` (the reads of the output
+  // that holds the record) names.
+  function withSource(record, memory) {
+    record.source = memory.memoryText(decoder, record.sourcePointer, record.sourceLength);
     return record;
   }
   function info(identity) {
     core.status("image_join_info", identity);
-    const view = new DataView(core.memory.buffer);
-    const pointer = core.exports.abi_output_pointer();
-    const available = core.exports.abi_output_length();
+    const output = core.output("image_join_info");
+    const available = output.byteLength;
     if (available < ImageJoinInfoSize) throw new Error(`Image request has ${available} bytes; requires ${ImageJoinInfoSize}`);
-    return withSource(checkImageRecord(readImageJoinInfo(view, pointer), false));
+    return withSource(checkImageRecord(readImageJoinInfo(output, 0), false), output);
   }
   function requests(nodes) {
     const count = prepareImageSceneInput(core, nodes, ensureScope());
-    const pointer = core.exports.abi_output_pointer();
-    const view = new DataView(core.memory.buffer);
-    const end = pointer + core.exports.abi_output_length();
+    const table = core.output("image_requests_prepare");
+    const end = table.byteLength;
     const output = new Array(count);
-    let offset = pointer;
+    let offset = 0;
     for (let index = 0; index < count; index++) {
       if (end - offset < ImageRequestSize) throw new Error(`Image request has ${end - offset} bytes; requires ${ImageRequestSize}`);
-      output[index] = withSource(checkImageRecord(readImageRequest(view, offset), true));
+      output[index] = withSource(checkImageRecord(readImageRequest(table, offset), true), table);
       offset += ImageRequestSize;
     }
     if (offset !== end) throw new Error(`Image request table has ${end - offset} unconsumed bytes`);
@@ -65,7 +65,7 @@ export function createImageResourceBinding({ core, ensureScope, pixels, decode, 
   }
   function releasePixels() {
     const count = core.status("image_join_released");
-    const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * Uint32Array.BYTES_PER_ELEMENT);
+    const view = count === 0 ? null : core.output("image_join_released");
     for (let index = 0; index < count; index++) pixels.delete(view.getUint32(index * Uint32Array.BYTES_PER_ELEMENT, true));
   }
   function commit(identity, entry) {

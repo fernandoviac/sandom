@@ -23,7 +23,7 @@ export async function createGpuPipelineLibrary(device, colorFormat) {
     throw new Error(`GPU pipeline library format ${colorFormat}: expected rgba8unorm or rgba16float`);
   }
   const core = libraryCore ??= instantiateRendererCore().exports;
-  const gpu = createGpuBinding(core, device);
+  const gpu = createGpuBinding(core, device, { label: "pipeline library" });
   const sources = PIPELINE_LIBRARY_SHADERS.map(([name, variant]) => ({
     name,
     ...composeShaderBytes(core, name, { ...SHADER_CONSTANTS, ...variant }),

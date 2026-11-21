@@ -104,7 +104,7 @@ export const topLayerBindingRuntime = Object.freeze({
   dialogReturnValue(element) {
     const core = element._domCore;
     core.status("dialog_return_value", element._coreHandle);
-    return core.outputString();
+    return core.outputString("dialog_return_value");
   },
   setDialogReturnValue(element, value) {
     const core = element._domCore;

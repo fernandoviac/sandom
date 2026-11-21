@@ -9,7 +9,13 @@
 // it takes the OffscreenCanvas: it transfers it to the GPU thread, which
 // presents from that device, and sizes it there. The host does not use the
 // canvas afterwards.
+//
+// A server host presents onto a canvas of its own, such as the
+// OffscreenCanvas of sandom-gpu-host (bindings/canvas.js), whose
+// getContext("webgpu") gives a GPUCanvasContext; its device may be a
+// GPUDevice of the native GPU host (src/native-gpu-host.js).
 import { createGpuBinding } from "./gpu-binding.js";
+import { isNativeGpuDevice, nativeGpuHostOf } from "./native-gpu-host.js";
 import { composeShaderBytes } from "./shaders/compose.js";
 import { instantiateRendererCore } from "./wasm/renderer-core-binary.js";
 import { adoptGpuThreadCanvas, flushGpuThread, gpuThreadResource, sizeGpuThreadCanvas } from "./dom/webgpu-facade.js";
@@ -39,14 +45,15 @@ export function createCanvasPresenter({
     canvas instanceof HostHTMLCanvasElement;
   const isOffscreenCanvas = HostOffscreenCanvas !== undefined &&
     canvas instanceof HostOffscreenCanvas;
-  if (!isHTMLCanvas && !isOffscreenCanvas) {
+  if (!isHTMLCanvas && !isOffscreenCanvas && typeof canvas?.getContext !== "function") {
     throw new TypeError(
-      "createCanvasPresenter: canvas must be an HTMLCanvasElement or OffscreenCanvas",
+      'createCanvasPresenter: canvas must be an HTMLCanvasElement, an OffscreenCanvas, or a server host\'s canvas with getContext("webgpu")',
     );
   }
   if (!device || typeof device.createShaderModule !== "function") {
     throw new TypeError("createCanvasPresenter: device must be a GPUDevice");
   }
+  const nativeDevice = isNativeGpuDevice(device);
   if (renderMode !== "standard" && renderMode !== "high-dynamic-range") {
     throw new RangeError(
       `createCanvasPresenter: unknown render mode "${renderMode}"`,
@@ -58,13 +65,17 @@ export function createCanvasPresenter({
     );
   }
   const threadDevice = gpuThreadResource(device) !== null;
-  if (threadDevice && !isOffscreenCanvas) {
+  if (threadDevice && isHTMLCanvas) {
     throw new TypeError(
       "createCanvasPresenter: a GPU-thread device presents onto an OffscreenCanvas, which the presenter transfers to the GPU thread; give it one, such as from transferControlToOffscreen()",
     );
   }
+  // A worker's GPU-thread device takes the host's OffscreenCanvas to its
+  // thread; a server host's canvas, and any canvas of a native GPU host's
+  // device, makes its textures with the device itself.
+  const adoptedCanvas = threadDevice && isOffscreenCanvas && !nativeDevice;
 
-  const context = threadDevice ? adoptGpuThreadCanvas(device, canvas) : canvas.getContext("webgpu");
+  const context = adoptedCanvas ? adoptGpuThreadCanvas(device, canvas) : canvas.getContext("webgpu");
   if (!context) {
     throw new Error(
       "createCanvasPresenter: the browser did not provide a WebGPU canvas",
@@ -72,7 +83,7 @@ export function createCanvasPresenter({
   }
   const format = extended
     ? "rgba16float"
-    : hostGpu.getPreferredCanvasFormat();
+    : nativeDevice ? nativeGpuHostOf(device).preferredCanvasFormat : hostGpu.getPreferredCanvasFormat();
   const formatIndex = TEXTURE_FORMATS[format];
   if (formatIndex === undefined) {
     throw new Error(
@@ -93,7 +104,7 @@ export function createCanvasPresenter({
   });
 
   const core = presentationCore ??= instantiateRendererCore().exports;
-  const gpu = createGpuBinding(core, device);
+  const gpu = createGpuBinding(core, device, { label: "canvas presentation" });
   const shader = composeShaderBytes(core, "canvas-presentation");
   const state = core.gpu_presentation_create(
     gpu.stream,
@@ -119,7 +130,7 @@ export function createCanvasPresenter({
       }
       const { width, height } = textureImage.texture;
       if (width !== canvasWidth || height !== canvasHeight) {
-        if (threadDevice) sizeGpuThreadCanvas(context, width, height);
+        if (adoptedCanvas) sizeGpuThreadCanvas(context, width, height);
         else {
           canvas.width = width;
           canvas.height = height;

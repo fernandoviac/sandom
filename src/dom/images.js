@@ -248,7 +248,7 @@ export function imageCloned(clone) {
 // document or a fragment) start to load.
 export function imagesParsed(root) {
   const core = root._domCore;
-  for (const element of core.outputNodes(core.status("image_parsed_elements", root._coreHandle))) {
+  for (const element of core.statusNodes("image_parsed_elements", root._coreHandle)) {
     updateImageData(element);
   }
 }

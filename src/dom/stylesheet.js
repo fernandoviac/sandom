@@ -84,8 +84,7 @@ export const CSS = Object.freeze(Object.defineProperty(createCSSBindings({
 function fontFaceRangeDescriptor(text, stretch) {
   const count = sharedDomCore.status("font_face_range_descriptor", ...sharedDomCore.input(String(text ?? "")), stretch ? 1 : 0);
   if (count === 0) return "auto";
-  const values = new Float64Array(sharedDomCore.refreshBytes().slice(sharedDomCore.exports.abi_output_pointer(),
-    sharedDomCore.exports.abi_output_pointer() + 16).buffer);
+  const values = new Float64Array(sharedDomCore.outputBytes("font_face_range_descriptor", 0, 16).buffer);
   return count === 1 ? values[0] : [values[0], values[1]];
 }
 
@@ -1077,7 +1076,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
     // load's AbortController and sheet.
     reconcileResources() {
       const obsolete = () => new DOMException("Stylesheet load became obsolete", "AbortError");
-      for (const element of core.outputNodes(core.status("link_sheet_prune", document._coreHandle))) {
+      for (const element of core.statusNodes("link_sheet_prune", document._coreHandle)) {
         linkedResources.get(element)?.controller.abort(obsolete());
         linkedResources.delete(element);
       }
@@ -1288,7 +1287,7 @@ export function createDocumentStyleSystem(document, environment = {}) {
           }
         }
       }
-      for (const rule of core.outputRuleHandles(core.status("font_face_prune", document._coreHandle, 0))) {
+      for (const rule of core.outputRuleHandles("font_face_prune", core.status("font_face_prune", document._coreHandle, 0))) {
         releaseRule(rule);
       }
     },

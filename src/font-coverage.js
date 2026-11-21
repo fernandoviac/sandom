@@ -64,12 +64,11 @@ export function encodeFontCoverage({ families, languages, defaultRanges, languag
   }
   sharedDomCore.status("font_coverage_encode", strings, families.length, languages.length,
     pointer, defaultRanges.length, languageRanges.length);
-  return coverageByteOutput();
+  return coverageByteOutput("font_coverage_encode");
 }
 
-function coverageByteOutput() {
-  return new Uint8Array(sharedDomCore.refreshBytes().buffer, sharedDomCore.exports.abi_output_pointer(),
-    sharedDomCore.exports.abi_output_length()).slice();
+function coverageByteOutput(operation) {
+  return sharedDomCore.outputBytes(operation);
 }
 
 // The families, the language tags, the count of default ranges, and the
@@ -81,20 +80,19 @@ export function decodeFontCoverage(bytes) {
     throw new TypeError(`A font coverage index must be a Uint8Array; it is ${Object.prototype.toString.call(bytes)}`);
   }
   sharedDomCore.status("font_coverage_decode", ...sharedDomCore.byteInput(bytes));
-  const pointer = sharedDomCore.exports.abi_output_pointer();
-  const view = new DataView(sharedDomCore.refreshBytes().buffer);
-  const familyCount = view.getUint32(pointer + COVERAGE.DECODED_FAMILIES, true);
-  const languageCount = view.getUint32(pointer + COVERAGE.DECODED_LANGUAGES, true);
+  const view = sharedDomCore.output("font_coverage_decode");
+  const familyCount = view.getUint32(COVERAGE.DECODED_FAMILIES, true);
+  const languageCount = view.getUint32(COVERAGE.DECODED_LANGUAGES, true);
   const strings = Array.from({ length: familyCount + languageCount }, (_, index) => {
-    const row = pointer + COVERAGE.DECODED_STRINGS + index * COVERAGE.STRING_SIZE;
+    const row = COVERAGE.DECODED_STRINGS + index * COVERAGE.STRING_SIZE;
     const offset = view.getUint32(row + COVERAGE.STRING_POINTER, true);
     return utf8Decoder.decode(bytes.subarray(offset, offset + view.getUint32(row + COVERAGE.STRING_LENGTH, true)));
   });
   return {
     families: strings.slice(0, familyCount),
     languages: strings.slice(familyCount),
-    defaultCount: view.getUint32(pointer + COVERAGE.DECODED_DEFAULTS, true),
-    ranges: bytes.subarray(view.getUint32(pointer + COVERAGE.DECODED_RANGES, true)),
+    defaultCount: view.getUint32(COVERAGE.DECODED_DEFAULTS, true),
+    ranges: bytes.subarray(view.getUint32(COVERAGE.DECODED_RANGES, true)),
   };
 }
 
@@ -144,12 +142,12 @@ function coverageRangeTable(ranges) {
   return [pointer, ranges.length];
 }
 
-function coverageRangeOutput(count) {
-  const pointer = sharedDomCore.exports.abi_output_pointer();
-  const view = new DataView(sharedDomCore.refreshBytes().buffer);
+function coverageRangeOutput(operation, count) {
+  if (count === 0) return [];
+  const view = sharedDomCore.output(operation);
   return Array.from({ length: count }, (_, index) => [
-    view.getUint32(pointer + index * FONT_RANGE_SIZE + FONT_RANGE_FIRST, true),
-    view.getUint32(pointer + index * FONT_RANGE_SIZE + FONT_RANGE_LAST, true),
+    view.getUint32(index * FONT_RANGE_SIZE + FONT_RANGE_FIRST, true),
+    view.getUint32(index * FONT_RANGE_SIZE + FONT_RANGE_LAST, true),
   ]);
 }
 
@@ -160,14 +158,14 @@ export function fontCmapRanges(bytes, faceIndex) {
   const index = sharedDomCore.status("font_face_index",
     typeof faceIndex === "number" ? faceIndex : 0,
     faceIndex === undefined ? OPTIONAL_ABSENT : typeof faceIndex === "number" ? OPTIONAL_PRESENT : OPTIONAL_OTHER) >>> 0;
-  return coverageRangeOutput(sharedDomCore.status("font_cmap_ranges",
+  return coverageRangeOutput("font_cmap_ranges", sharedDomCore.status("font_cmap_ranges",
     ...sharedDomCore.byteInput(bytes), index));
 }
 
 // [first, last] ranges of `ranges` that `covered` (sorted, disjoint) does
 // not cover.
 export function subtractRanges(ranges, covered) {
-  return coverageRangeOutput(sharedDomCore.status("font_ranges_subtract",
+  return coverageRangeOutput("font_ranges_subtract", sharedDomCore.status("font_ranges_subtract",
     ...coverageRangeTable(ranges), ...coverageRangeTable(covered)));
 }
 
@@ -198,5 +196,5 @@ export function buildFontCoverage(families) {
     view.setUint32(offset + COVERAGE.FAMILY_LANGUAGE_KIND, row.languageKind, true);
   }
   sharedDomCore.status("font_coverage_build", pointer, rows.length);
-  return coverageByteOutput();
+  return coverageByteOutput("font_coverage_build");
 }

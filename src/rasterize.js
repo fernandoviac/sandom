@@ -15,6 +15,8 @@ import {
   renderWebgl2,
 } from "./rasterize-webgl2.js";
 import { getDefaultGpu } from "./gpu-thread.js";
+// WebGPU's constants, which a server runtime without WebGPU lacks as globals.
+import { GPUTextureUsage } from "./dom/webgpu-facade.js";
 // The host realm's navigator, captured at module load without reading its
 // `gpu` getter (a permissions:none worker would request GPU access).
 const hostNavigator = globalThis.navigator ?? null;
@@ -39,6 +41,7 @@ import { createGpuBinding } from "./gpu-binding.js";
 import { createGpuSceneResources } from "./gpu-scene-binding.js";
 import { createRasterRetention, readbackResult } from "./gpu-raster-binding.js";
 import { layoutConstant } from "./wasm/layout-table.js";
+import { gpuPassTimingFeatures } from "./gpu-pass-timing.js";
 
 
 
@@ -112,7 +115,7 @@ function workingReadback(gpu, slot, context) {
 export async function readbackTextureImage(device, textureImage) {
   const { texture, width, height, format } = textureImage;
   const core = instantiateRendererCore().exports;
-  const gpu = createGpuBinding(core, device);
+  const gpu = createGpuBinding(core, device, { label: "texture readback" });
   try {
     const frame = core.gpu_readback_frame(gpu.stream, width, height, readbackFormat(format, "float32"));
     const encoder = core.gpu_encoder_create(gpu.stream);
@@ -143,7 +146,7 @@ export function createTextureReader(device, { format = "float32" } = {}) {
     throw new TypeError(`createTextureReader: format must be "float32" or "rgba8", got ${JSON.stringify(format)}`);
   }
   const core = instantiateRendererCore().exports;
-  const gpu = createGpuBinding(core, device);
+  const gpu = createGpuBinding(core, device, { label: "texture reader" });
   let inFlight = 0;
   let destroyed = false;
   return Object.freeze({
@@ -204,7 +207,7 @@ export async function copyTextureImageInto(device, textureImage, target, x, y) {
     );
   }
   const core = instantiateRendererCore().exports;
-  const gpu = createGpuBinding(core, device);
+  const gpu = createGpuBinding(core, device, { label: "texture placement" });
   try {
     core.gpu_texture_place(gpu.stream, gpu.importResource(texture), gpu.importResource(target), width, height, x, y);
     gpu.execute();
@@ -293,7 +296,7 @@ async function createSharedWebgpuState(
   if (ownsDevice) {
     adapter = await defaultGpu().requestAdapter();
     if (!adapter) throw new WebgpuUnavailableError("WebGPU not available: no adapter found");
-    device = await adapter.requestDevice();
+    device = await adapter.requestDevice({ requiredFeatures: gpuPassTimingFeatures(adapter) });
     // A validation or out-of-memory error, or the loss of the device,
     // otherwise leaves every later frame blank without a word: report each
     // as the page's error.
@@ -364,6 +367,37 @@ export async function releaseSharedWebgpuStates(
   }
 }
 
+// The shared WebGPU state of `stateOwner` for `colorFormat`, created on
+// first use. Its reactions live as long as the device, so they close over
+// this function's scope only: a closure of a render context's scope would
+// keep that context, its renderer's last scene and that scene's document
+// for the device's lifetime.
+function sharedWebgpuState(stateOwner, colorFormat) {
+  const sharedStates = stateOwner.webgpu ??= new Map();
+  const existing = sharedStates.get(colorFormat);
+  if (existing) return existing;
+  const sharedPromise = createSharedWebgpuState(
+    colorFormat,
+    stateOwner.webgpuDevice ?? null,
+  );
+  sharedStates.set(colorFormat, sharedPromise);
+  sharedPromise.then(
+    // A lost device, such as one that a GPU-thread close destroyed,
+    // serves no later context: the next context creates a new state.
+    (shared) => shared.device.lost.then(() => {
+      if (sharedStates.get(colorFormat) === sharedPromise) sharedStates.delete(colorFormat);
+    }),
+    () => {
+      // A failed boot must not stick to the owner; the next caller retries.
+      // The awaiting caller still observes the rejection itself.
+      if (sharedStates.get(colorFormat) === sharedPromise) {
+        sharedStates.delete(colorFormat);
+      }
+    },
+  );
+  return sharedPromise;
+}
+
 async function createRenderContextWebgpu(options) {
   // Native texture extents truncate fractional requests. Resolve that once
   // here so textures, readback buffers, row strides, and metadata agree.
@@ -389,30 +423,7 @@ async function createRenderContextWebgpu(options) {
   const colorFormat = renderPrecision;
   const colorTexelBytes = colorFormat === "rgba16float" ? 8 : 4;
   const stateOwner = options.sharedStateOwner ?? defaultWebgpuStateOwner;
-  const sharedStates = stateOwner.webgpu ??= new Map();
-  let sharedPromise = sharedStates.get(colorFormat);
-  if (!sharedPromise) {
-    sharedPromise = createSharedWebgpuState(
-      colorFormat,
-      stateOwner.webgpuDevice ?? null,
-    );
-    sharedStates.set(colorFormat, sharedPromise);
-    sharedPromise.then(
-      // A lost device, such as one that a GPU-thread close destroyed,
-      // serves no later context: the next context creates a new state.
-      (shared) => shared.device.lost.then(() => {
-        if (sharedStates.get(colorFormat) === sharedPromise) sharedStates.delete(colorFormat);
-      }),
-      () => {
-        // A failed boot must not stick to the owner; the next caller retries.
-        // The awaiting caller below still observes the rejection itself.
-        if (sharedStates.get(colorFormat) === sharedPromise) {
-          sharedStates.delete(colorFormat);
-        }
-      },
-    );
-  }
-  const shared = await sharedPromise;
+  const shared = await sharedWebgpuState(stateOwner, colorFormat);
   const { device } = shared;
   let contextDestroyed = false;
 
@@ -488,6 +499,7 @@ async function createRenderContextWebgpu(options) {
     gpuBindingFor(core) {
       if (gpuBinding === null) {
         gpuBinding = createGpuBinding(core, device, {
+          label: "scene",
           pipeline: shared.library.pipeline,
           unpremultiplyTable: shared.unpremultiplyTable,
         });

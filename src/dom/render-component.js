@@ -14,6 +14,7 @@ import { createSandomDOM } from "./sandom-dom.js";
 import { documentClockFromOptions } from "./document-clock.js";
 import { documentScripts } from "./scripts.js";
 import { normalizeInputBatch } from "./interaction.js";
+import { dispatchInteraction } from "./document-operations.js";
 import { createPreparedDocument } from "./prepared-document.js";
 import { SandomViewport } from "./viewport.js";
 import { buildAccessibilitySnapshot } from "./accessibility.js";
@@ -706,7 +707,23 @@ export async function renderComponent(
         }
         return { ...record, target };
       });
-      backend.dispatchInputRecords(root, inputRecords);
+      // Text input, clipboard actions and system focus take the backend's
+      // own methods; the runs of other records between them go as batches,
+      // in record order.
+      let pending = [];
+      const flush = () => {
+        if (pending.length > 0) backend.dispatchInputRecords(root, pending);
+        pending = [];
+      };
+      for (const record of inputRecords) {
+        if (record.kind === "text-input" || record.kind === "clipboard" || record.kind === "system-focus") {
+          flush();
+          dispatchInteraction(backend, root, record);
+        } else {
+          pending.push(record);
+        }
+      }
+      flush();
       if (ready) await ready;
       precedingAccessibilitySnapshot = dispatchBaselineAccessibility;
       interactionRevision += 1;

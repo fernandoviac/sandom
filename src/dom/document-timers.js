@@ -41,9 +41,10 @@ const CLEAR_REARM = layoutConstant("FRAME_TIMERS_CLEAR_REARM");
 const DUE = Object.freeze(Object.fromEntries(["SIZE", "ID", "SEQUENCE"]
   .map((name) => [name, layoutConstant(`FRAME_TIMERS_DUE_${name}`)])));
 
-// The 4-byte output of frame_timers_set and frame_timers_clear.
-function outputWord() {
-  return new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 4).getInt32(0, true);
+// The 4-byte output of $operation: frame_timers_set, frame_timers_repeat
+// or frame_timers_clear.
+function outputWord(operation) {
+  return core.output(operation).getInt32(0, true);
 }
 
 export class DocumentTimers {
@@ -121,7 +122,7 @@ export class DocumentTimers {
   releaseDue() {
     if (this.released) return;
     const count = core.status("frame_timers_take_due", this.handle, this.now());
-    const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * DUE.SIZE);
+    const view = count === 0 ? null : core.output("frame_timers_take_due");
     const due = Array.from({ length: count }, (_, index) =>
       [view.getInt32(index * DUE.SIZE + DUE.ID, true), view.getInt32(index * DUE.SIZE + DUE.SEQUENCE, true)]);
     for (const [id, sequence] of due) {
@@ -135,8 +136,8 @@ export class DocumentTimers {
   // The timer's id was set: its task enters the queue now when it is due
   // now (a zero delay, after the timers due before it, as Chrome posts it),
   // else the clock waits for it.
-  initialized(id) {
-    const dueNow = outputWord() === 1;
+  initialized(id, operation) {
+    const dueNow = outputWord(operation) === 1;
     if (dueNow) this.releaseDue();
     else this.armClock();
     return id;
@@ -154,7 +155,7 @@ export class DocumentTimers {
         const ending = core.status("frame_timers_run_end", this.handle, id, sequence, outerLevel);
         if (ending === END_FORGET) this.callbacks.delete(id);
         if (ending === END_REPEAT) {
-          this.initialized(core.status("frame_timers_repeat", this.handle, id, outerLevel, this.now()));
+          this.initialized(core.status("frame_timers_repeat", this.handle, id, outerLevel, this.now()), "frame_timers_repeat");
         }
       }
     }
@@ -168,7 +169,7 @@ export class DocumentTimers {
     }
     const id = core.status("frame_timers_set", this.handle, +timeout, repeat ? 1 : 0, this.now());
     this.callbacks.set(id, callback);
-    return this.initialized(id);
+    return this.initialized(id, "frame_timers_set");
   }
 
   // clearTimeout and clearInterval.
@@ -176,7 +177,7 @@ export class DocumentTimers {
     if (this.released) return;
     const cleared = core.status("frame_timers_clear", this.handle, +id);
     if (cleared === 0) return;
-    this.callbacks.delete(outputWord());
+    this.callbacks.delete(outputWord("frame_timers_clear"));
     if (cleared & CLEAR_REARM) this.armClock();
   }
 

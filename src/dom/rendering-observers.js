@@ -48,8 +48,9 @@ const OBSERVER = Object.freeze(Object.fromEntries([
 const F64 = Float64Array.BYTES_PER_ELEMENT;
 
 // The first $count f64 values of the core's output.
-function outputNumbers(core, count) {
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), core.exports.abi_output_length());
+function outputNumbers(core, operation, count) {
+  if (count === 0) return [];
+  const view = core.output(operation);
   return Array.from({ length: count }, (_, index) => view.getFloat64(index * F64, true));
 }
 
@@ -87,21 +88,18 @@ function normalizeThresholds(core, value) {
     view.setUint32(at + OBSERVER.THRESHOLD_PRESENT, index in normalized ? 1 : 0, true);
   }
   const count = core.status("geometry_thresholds", pointer, normalized.length);
-  return outputNumbers(core, count).map((value) => Number.isNaN(value) ? undefined : value);
+  return outputNumbers(core, "geometry_thresholds", count).map((value) => Number.isNaN(value) ? undefined : value);
 }
 
 function parseRootMargin(core, value) {
   if (!core.status("geometry_root_margin", ...core.input(String(value ?? "0px")))) {
-    throw new SyntaxError(core.outputString());
+    throw new SyntaxError(core.outputString("geometry_root_margin"));
   }
-  const pointer = core.exports.abi_output_pointer();
-  const length = core.exports.abi_output_length();
-  const bytes = core.refreshBytes();
-  const view = new DataView(bytes.buffer, pointer, length);
+  const view = core.output("geometry_root_margin");
   return { parsed: Array.from({ length: 4 }, (_, index) => ({
     value: view.getFloat64(index * OBSERVER.MARGIN_SIZE + OBSERVER.MARGIN_VALUE, true),
     unit: view.getUint32(index * OBSERVER.MARGIN_SIZE + OBSERVER.MARGIN_PERCENT, true) ? "%" : "px",
-  })), cssText: core.decoder.decode(bytes.subarray(pointer + OBSERVER.MARGINS_SIZE, pointer + length)) };
+  })), cssText: view.text(core.decoder, OBSERVER.MARGINS_SIZE) };
 }
 
 
@@ -175,7 +173,7 @@ class ResizeObserverRuntime extends RenderingObserver {
         minimumDepth);
       if (outcome === RESIZE_UNCHANGED) continue;
       if (outcome === RESIZE_SKIPPED) { skipped = true; continue; }
-      const values = outputNumbers(this._core, 10);
+      const values = outputNumbers(this._core, "geometry_resize", 10);
       shallowestDepth = Math.min(shallowestDepth,
         this._core.status("geometry_observer_depth", state.geometryHandle));
       entries.push(Object.freeze({ target, contentRect: rectangle(...values.slice(0, 4)),
@@ -231,8 +229,8 @@ class IntersectionObserverRuntime extends RenderingObserver {
       if (!this._core.status("geometry_intersection", state.geometryHandle,
         geometry.handle, target._coreHandle, this.root?._coreHandle ?? 0n,
         pointer, pointer + OBSERVER.MARGINS_SIZE, this.thresholds.length)) continue;
-      const values = outputNumbers(this._core, OBSERVER.INTERSECTION_VALUE_COUNT);
-      const resultView = new DataView(this._core.memory.buffer, this._core.exports.abi_output_pointer(), OBSERVER.INTERSECTION_SIZE);
+      const values = outputNumbers(this._core, "geometry_intersection", OBSERVER.INTERSECTION_VALUE_COUNT);
+      const resultView = this._core.output("geometry_intersection");
       const isIntersecting = Boolean(resultView.getUint32(OBSERVER.INTERSECTION_INTERSECTING, true));
       entries.push(Object.freeze({ time, target,
         rootBounds: rectangle(...values.slice(0, 4)),

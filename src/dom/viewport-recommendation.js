@@ -29,7 +29,7 @@ const VIEWPORT_SESSION_SELECTED = layoutConstant("VIEWPORT_SESSION_SELECTED");
 
 function viewportText(id) {
   core.status("output_viewport_text", id);
-  return core.outputString();
+  return core.outputString("output_viewport_text");
 }
 
 // The facts of one inspected layout as the core's submission rows.
@@ -89,8 +89,9 @@ function submitInspection(session, layout) {
 // name nodes of its layout.
 function readTrial(session, sequence, inspection) {
   core.status("output_viewport_session_trial", session, sequence);
-  const output = core.exports.abi_output_pointer();
-  const view = new DataView(core.refreshBytes().buffer);
+  const trial = core.output("output_viewport_session_trial");
+  const output = trial.pointer;
+  const view = trial.memory();
   const numbers = (field, count) =>
     Array.from({ length: count }, (_, index) => view.getFloat64(output + field + index * F64, true));
   const word = (field) => view.getUint32(output + field, true);
@@ -171,8 +172,9 @@ export async function recommendViewportFromInspection(
     const inspections = [];
     let action;
     while ((action = core.status("output_viewport_session_next", session)) === VIEWPORT_SESSION_LAYOUT) {
-      const output = core.exports.abi_output_pointer();
-      const view = new DataView(core.refreshBytes().buffer);
+      const request = core.output("output_viewport_session_next");
+      const output = request.pointer;
+      const view = request.memory();
       const width = view.getFloat64(output + VIEWPORT.REQUEST_WIDTH, true);
       const height = view.getFloat64(output + VIEWPORT.REQUEST_HEIGHT, true);
       const inspection = await inspectLayout({ width, height });
@@ -180,8 +182,9 @@ export async function recommendViewportFromInspection(
       submitInspection(session, inspection.layout);
     }
     core.status("output_viewport_session_result", session);
-    const output = core.exports.abi_output_pointer();
-    const resultView = new DataView(core.refreshBytes().buffer);
+    const result = core.output("output_viewport_session_result");
+    const output = result.pointer;
+    const resultView = result.memory();
     const [selectedIndex, confidenceText, firstReason, reasonCount] =
       [VIEWPORT.RESULT_SELECTED, VIEWPORT.RESULT_CONFIDENCE, VIEWPORT.RESULT_FIRST_REASON, VIEWPORT.RESULT_REASON_COUNT]
         .map((field) => resultView.getUint32(output + field, true));

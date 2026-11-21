@@ -266,7 +266,7 @@ export async function createGpuCompositor(options) {
 
   const library = await createGpuPipelineLibrary(device, "rgba16float");
   const core = compositorCore ??= instantiateRendererCore().exports;
-  const gpu = createGpuBinding(core, device, { pipeline: library.pipeline });
+  const gpu = createGpuBinding(core, device, { label: "compositor", pipeline: library.pipeline });
   const compositorState = core.gpu_compositor_create(gpu.stream);
   gpu.execute();
   const glyphResourceManager = new GlyphResourceManager();

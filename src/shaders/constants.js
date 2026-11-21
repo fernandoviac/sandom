@@ -73,7 +73,6 @@ export const PIPELINE_LIBRARY_SHADERS = Object.freeze([
   ["mask-combine", {}],
   ["box-blur", {}],
   ["drop-shadow", {}],
-  ["filter-window", {}],
   ["text", {}],
   ["svg-path", {}],
   ["image", {}],

@@ -45,8 +45,7 @@ function artifactValues(artifact) {
 
 export function createArtifactSvgOperations(artifact) {
   core.statusRaw("output_artifact_svg", ...core.valueListInput(artifactValues(artifact)));
-  const pointer = core.exports.abi_output_pointer();
-  const bytes = core.refreshBytes().slice(pointer, pointer + core.exports.abi_output_length());
+  const bytes = core.outputBytes("output_artifact_svg");
   const view = new DataView(bytes.buffer);
   const decoder = new TextDecoder();
   let at = 0;

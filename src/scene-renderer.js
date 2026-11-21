@@ -229,6 +229,28 @@ const RASTER_PLAN_REUSE = Object.fromEntries(["NONE", "TARGET", "SAME"]
 const RASTER_PLAN_HEADER_RECORD_COUNT = layoutConstant("RASTER_PLAN_HEADER_RECORD_COUNT");
 const GLYPH_REQUEST_COUNT = layoutConstant("GLYPH_REQUEST_COUNT");
 const GLYPH_REQUEST_REVISION = layoutConstant("GLYPH_REQUEST_REVISION");
+
+// A static scene render of a document whose animations or transitions run.
+// The effects of a running animation (Web Animations 1 §5) and of a running
+// transition (CSS Transitions 1 §3) live in the renderer of the document's
+// render surface, not in the scene's records, so a static render would
+// paint the after-change style while the document shows another value.
+export class SceneAnimationsRunningError extends Error {
+  constructor(animations) {
+    const names = animations.map((animation) => {
+      const target = animation.effect.target;
+      const property = animation.transitionProperty ?? animation.animationName ?? "a script animation";
+      return `${property} at ${target.id ? `#${target.id}` : target.localName}`;
+    });
+    super(`A static scene render of a document with ${animations.length} running animations ` +
+      `(${names.join(", ")}) leaves out their effects, which only the document's render surface applies. ` +
+      "Render the surface's frame at the time to show (surface.renderNow({ pixels: true })), " +
+      "or run the surface's frames until the animations finish.");
+    this.name = "SceneAnimationsRunningError";
+    this.animations = animations;
+  }
+}
+
 // The font records of font-registration, font-instance-input and
 // font-requests watparts, by WAT name.
 const layoutConstants = (prefix, names) =>
@@ -553,7 +575,20 @@ export async function createSceneRendererRuntime({
   // White render background, shared by sandom render AND the Chrome SVG raster, so
   // the two pixel buffers compare against the same backdrop.
   const RENDER_BG = { r: 1, g: 1, b: 1, a: 1 };
-  const glyphGenerationBackend = Object.freeze({ kind: "cpu" });
+  // A WebGPU frame generates its glyph atlases on its own device, which
+  // its raster reads them from. WebGL2 has no compute shaders: its frames
+  // and frames without a render context generate them on the CPU.
+  const cpuGlyphGenerationBackend = Object.freeze({ kind: "cpu" });
+  const webGpuGlyphGenerationBackends = new WeakMap();
+  function glyphGenerationBackend(renderContext) {
+    if (renderContext?.kind !== "webgpu") return cpuGlyphGenerationBackend;
+    let backend = webGpuGlyphGenerationBackends.get(renderContext.device);
+    if (!backend) {
+      backend = Object.freeze({ kind: "webgpu", device: renderContext.device });
+      webGpuGlyphGenerationBackends.set(renderContext.device, backend);
+    }
+    return backend;
+  }
 
   // The font registry supplies complete font bytes. A host resolver can read
   // installed fonts synchronously before Sandom enters synchronous layout.
@@ -573,8 +608,8 @@ export async function createSceneRendererRuntime({
   }
 
   function fontIdentityForDocument(fontIndex, document) {
-    const pointer = core.status("font_registration_read", fontRegistry.fontCatalogHandle, fontIndex, document);
-    const record = new DataView(core.refreshBytes().buffer, pointer, FONT_REGISTRATION.SIZE);
+    core.status("font_registration_read", fontRegistry.fontCatalogHandle, fontIndex, document);
+    const record = core.output("font_registration_read");
     return Object.freeze({
       family: fontIdentityValues[record.getUint32(FONT_REGISTRATION.FAMILY, true)],
       faceIdentity: fontIdentityValues[record.getUint32(FONT_REGISTRATION.IDENTITY, true)],
@@ -619,7 +654,7 @@ export async function createSceneRendererRuntime({
       Number(Boolean(wghtOnAxis)) | (Number(typeof variationWidth === "number") << 1) |
         (Number(typeof variationSlant === "number") << 2),
     ]);
-    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_INSTANCE_REPORT.SIZE);
+    const report = core.output("font_instance_acquire");
     return recordFontInstance(index, {
       family, weight, stretch, faceIdentity, finalURL, resourceHandle,
       faceIndex: report.getUint32(FONT_INSTANCE_REPORT.FACE_INDEX, true),
@@ -692,10 +727,9 @@ export async function createSceneRendererRuntime({
           fontFileFor(fontFamily, weight, style, stretch, slope));
         const count = core.status("font_requests_shape", plan.handle, group, fontIndex, ...core.input(text));
         if (count < 0) continue;
-        const glyphIds = new Uint32Array(core.refreshBytes().buffer,
-          core.exports.abi_output_pointer(), count).slice();
+        const glyphIds = count === 0 ? new Uint32Array(0) : new Uint32Array(core.outputBytes("font_requests_shape", 0, count * 4).buffer);
         core.status("font_requests_glyph_request", plan.handle, group, fontRegistry.fontCatalogHandle);
-        const record = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_GLYPH_REQUEST.SIZE);
+        const record = core.output("font_requests_glyph_request");
         const glyphRequest = {
           faceIndex: record.getUint32(FONT_GLYPH_REQUEST.FACE_INDEX, true),
           weight: record.getFloat64(FONT_GLYPH_REQUEST.WEIGHT, true),
@@ -841,15 +875,16 @@ export async function createSceneRendererRuntime({
         ensureResourceScope(), root._coreHandle, ...core.input(defaultFamilyKey));
       const count = core.status("font_catalog_source_requests", computedRead ? root._coreHandle : 0n);
       if (count === 0) return;
-      const base = core.exports.abi_output_pointer();
-      const requestView = new DataView(core.memory.buffer);
+      const sources = core.output("font_catalog_source_requests");
+      const base = sources.pointer;
+      const requestView = sources.memory();
       const requests = new Array(count);
       for (let index = 0; index < count; index++) {
         const row = base + index * FONT_SOURCE_REQUEST.SIZE;
         const pointer = requestView.getUint32(row + FONT_SOURCE_REQUEST.FAMILY_POINTER, true);
         const length = requestView.getUint32(row + FONT_SOURCE_REQUEST.FAMILY_LENGTH, true);
         requests[index] = {
-          family: fontSourceDecoder.decode(new Uint8Array(core.memory.buffer, pointer, length)),
+          family: requestView.memoryText(fontSourceDecoder, pointer, length),
           weight: requestView.getUint32(row + FONT_SOURCE_REQUEST.WEIGHT, true),
           style: requestView.getUint32(row + FONT_SOURCE_REQUEST.STYLE, true) === 0 ? "normal" : "italic",
         };
@@ -1959,8 +1994,24 @@ export async function createSceneRendererRuntime({
   }
 
   // Prepared text remains retained for inspection; publication and generation
-  // comparison of its source spans are native.
+  // comparison of its source spans are native. The batch occupies engine
+  // memory until the next write or its owner's end (releaseTextBatch). Its
+  // owner is the write's engine write owner, else the write's
+  // `textBatchOwner`, else null: a persistent renderer, which releases it
+  // when it shuts down; a render surface's token, for a layout before its
+  // renderer starts, which the surface releases when it shuts down; or a
+  // document's handle, for a layout of a document without a surface, which
+  // the document's disposal releases (DomCore documentDisposalListeners),
+  // whether the host disposed it or the collector took it.
   let currentTextBatch = null;
+  let currentTextBatchOwner = null;
+  function releaseTextBatch(owner) {
+    if (owner === null || currentTextBatchOwner !== owner) return;
+    currentTextBatch.release();
+    currentTextBatch = null;
+    currentTextBatchOwner = null;
+  }
+  core.documentDisposalListeners.add(releaseTextBatch);
   // Text preparation work, totals over this runtime's writes: batches
   // prepared and the rows they prepared; rows a sparse write republished
   // whose run the core proved unchanged (kept) or found changed (rebuilt,
@@ -2305,6 +2356,8 @@ export async function createSceneRendererRuntime({
       commitTextRunKeys,
       captureNodeMarkers = false,
       engineWriteOwner = null,
+      // The owner of the text batch of an unowned write (releaseTextBatch).
+      textBatchOwner = null,
       // The time to sample the write owner's tracks at; by default the
       // time of its last tick.
       sampleTimeMilliseconds,
@@ -2329,6 +2382,10 @@ export async function createSceneRendererRuntime({
       layoutNodeCapacity,
       generationReservation,
       commitTextRunKeys,
+      null,
+      null,
+      false,
+      engineWriteOwner ?? textBatchOwner,
     );
     // Sample the write owner's animations onto the rows just written. The
     // owner takes the shared animation table in this synchronous turn, so
@@ -2402,6 +2459,7 @@ export async function createSceneRendererRuntime({
     forceGenerationNodeIndices = null,
     scrollOnlyNodeIndices = null,
     retained = false,
+    owner = null,
   ) {
     // Every engine write invalidates the previous owner's incremental
     // claim; an owned render re-claims after ITS write (renderScenePixels).
@@ -2504,6 +2562,7 @@ export async function createSceneRendererRuntime({
       }
     } finally {
       currentTextBatch = textBatch;
+      currentTextBatchOwner = owner;
     }
     // A write for layout reads (no raster target) keeps a CSS px grid; a
     // render sets the raster grid before it emits (writeTileGrid).
@@ -2530,7 +2589,7 @@ export async function createSceneRendererRuntime({
   // it, `paging` is null.
   function emitSceneCommandsSync(
     scene,
-    { layoutNodeCapacity = Infinity, commitTextRunKeys, discardCommands = false, engineWriteOwner = null, sampleTimeMilliseconds, prepareEngine = null, captureNodeMarkers = false, textGeometry = false, page = null } = {},
+    { layoutNodeCapacity = Infinity, commitTextRunKeys, discardCommands = false, engineWriteOwner = null, textBatchOwner = null, sampleTimeMilliseconds, prepareEngine = null, captureNodeMarkers = false, textGeometry = false, page = null } = {},
     generationReservation = null,
     emitPaintCommands = true,
   ) {
@@ -2550,6 +2609,10 @@ export async function createSceneRendererRuntime({
       layoutNodeCapacity,
       generationReservation,
       commitTextRunKeys,
+      null,
+      null,
+      false,
+      engineWriteOwner ?? textBatchOwner,
     );
     // The caller declares tracks over the rows just written, before they
     // are sampled (render-surface's _declareUnrenderedEffects).
@@ -3261,8 +3324,7 @@ export async function createSceneRendererRuntime({
   function rasterDirtyTiles(exportName, tiles, ...parameters) {
     if (tiles.byteLength === 0) return tiles;
     core.status(exportName, ...core.byteInput(tiles), ...parameters);
-    const pointer = core.exports.abi_output_pointer();
-    return core.refreshBytes().slice(pointer, pointer + core.exports.abi_output_length());
+    return core.outputBytes(exportName);
   }
 
   // `page` lists one page of a paged scene (emitPageCommands); null lists
@@ -3519,7 +3581,7 @@ export async function createSceneRendererRuntime({
     dirtyRectangles.forEach((rectangle, index) => rectangles.set([rectangle.x, rectangle.y, rectangle.w, rectangle.h], index * 4));
     core.status("frame_invalidation_tiles", frame.width, frame.height, tileSize,
       ...core.byteInput(new Uint8Array(rectangles.buffer)));
-    const output = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), core.exports.abi_output_length());
+    const output = core.output("frame_invalidation_tiles");
     const columns = output.getUint32(FRAME_TILES.COLUMNS, true);
     const rows = output.getUint32(FRAME_TILES.ROWS, true);
     const tileMap = Array.from({ length: columns * rows }, (_, tile) => output.getUint8(FRAME_TILES.MAP + tile) !== 0);
@@ -3667,11 +3729,14 @@ export async function createSceneRendererRuntime({
       }
     }
     await colorGlyphCache.release();
+    // The glyph atlases and generators execute on the shared devices: they
+    // end before the devices do.
+    await shutdownDefaultGlyphResourceManager();
     await releaseSharedWebgpuStates(graphicsStateOwner);
     await releaseSharedWebgl2State(graphicsStateOwner);
-    await shutdownDefaultGlyphResourceManager();
     currentTextBatch?.release();
     currentTextBatch = null;
+    currentTextBatchOwner = null;
     if (resourceEngineScope !== 0n) {
       core.resourceEngineRelease(resourceEngineScope);
       releasePixels();
@@ -3686,6 +3751,20 @@ export async function createSceneRendererRuntime({
       engineWriteOwner = null;
       throw error;
     }
+  }
+
+  // A render of one scene, outside a render surface: no animation of the
+  // scene's document applies here, so a document with a running one
+  // throws SceneAnimationsRunningError. getAnimations() first runs the
+  // style change event that starts the transitions of the last change. An
+  // authored scene (direct-scene-input.js) has no document.
+  async function renderStaticScenePixels(scene, deviceScale = 1, renderOptions = {}) {
+    const publication = scene.nodes.find((node) => node._corePublication?.documentHandle !== undefined)?._corePublication;
+    if (publication !== undefined) {
+      const running = publication.core.wrapperFor(publication.documentHandle).getAnimations();
+      if (running.length !== 0) throw new SceneAnimationsRunningError(running);
+    }
+    return await renderScenePixels(scene, deviceScale, renderOptions);
   }
 
   // Writes one row of `wordsPerRow` u32 words per range into an engine
@@ -3967,6 +4046,7 @@ export async function createSceneRendererRuntime({
         forceGenerationNodeIndices,
         null,
         false,
+        renderWriteOwner,
       );
     };
     if (sparse || patched) {
@@ -4063,6 +4143,7 @@ export async function createSceneRendererRuntime({
         forceGenerationNodeIndices,
         null,
         true,
+        renderWriteOwner,
       ) !== null;
     };
     // One patch write serves both: the retained frame needs it with every
@@ -4081,6 +4162,7 @@ export async function createSceneRendererRuntime({
         forceGenerationNodeIndices,
         scrollOnlyRows ? scrollOnlyNodeIndices : null,
         true,
+        renderWriteOwner,
       );
       rowsPatched = written !== null;
       if (rowsPatched) writtenRowCount = changed.size;
@@ -4221,7 +4303,7 @@ export async function createSceneRendererRuntime({
     engine.exports.glyph_request_collect_paths(commandBase, bytes, deviceScale);
     const textPublication = captureTextRequestPublication(renderWriteOwner, previous?.textResources,
       retainedCommands || commandRevision === previous?.commandRevision,
-      glyphResourceManager, glyphGenerationBackend);
+      glyphResourceManager, glyphGenerationBackend(renderContext));
     const writeClaim = engineWriteClaims.get(engine.memory);
     const coreWriteRevision = core.engineFrameRevision;
     const preparedResourceRevision = core.status("resource_revision");
@@ -4396,9 +4478,6 @@ export async function createSceneRendererRuntime({
     const frameScrollbarParts = typeof scrollbarParts === "function"
       ? scrollbarParts(boxes, engine.exports.layout_compute_total())
       : scrollbarParts;
-    // Generate glyph atlases on the CPU for every raster backend. The WebGPU
-    // atlas generator is not cross-browser safe: Chrome produced empty atlases,
-    // Firefox produced partial atlases, and Safari produced complete atlases.
     await prepareColorGlyphBitmaps(drawnResources.slots, deviceScale);
     await selectSvgImageRasters(drawnResources.images, Math.max(1, deviceScale), svgImageTimings);
     let colorGlyphFrame = null;
@@ -5643,6 +5722,7 @@ export async function createSceneRendererRuntime({
         animations.dispose();
         if (engineWriteOwner === animations) engineWriteOwner = null;
         if (retainedRowsOwner === animations) retainedRowsOwner = null;
+        releaseTextBatch(animations);
         releaseRetainedPreparation(animations);
         // A context that failed to start reported its error through `ready`
         // and holds nothing to release.
@@ -5704,6 +5784,7 @@ export async function createSceneRendererRuntime({
     layoutTreeBoxesSync,
     layoutPageBoxesSync,
     layoutTextGeometrySync,
+    releaseTextBatch,
     registerDecodedImage,
     canvasImageEntry: canvasImagePixels,
     layoutCanvasTextSync,
@@ -5719,7 +5800,7 @@ export async function createSceneRendererRuntime({
     hostGraphicsDevice,
     getDefaultGlyphResourceManager,
     shutdownDefaultGlyphResourceManager,
-    renderScenePixels,
+    renderScenePixels: renderStaticScenePixels,
     createPersistentSceneRenderer,
     createSceneRenderer: createSceneRenderer,
     openSceneRenderer,
@@ -5769,6 +5850,8 @@ export const layoutPageBoxesSync = (...arguments_) =>
   defaultSceneRendererRuntime.layoutPageBoxesSync(...arguments_);
 export const layoutTextGeometrySync = (...arguments_) =>
   defaultSceneRendererRuntime.layoutTextGeometrySync(...arguments_);
+export const releaseTextBatch = (...arguments_) =>
+  defaultSceneRendererRuntime.releaseTextBatch(...arguments_);
 export const layoutCanvasTextSync = (...arguments_) =>
   defaultSceneRendererRuntime.layoutCanvasTextSync(...arguments_);
 export const canvasTextWordsSync = (...arguments_) =>

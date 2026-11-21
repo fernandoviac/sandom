@@ -69,7 +69,7 @@ export function createColorGlyphCache({ engine, graphicsStateOwner, pathAtlas,
       Number(context.kind === 'webgl2'), Number(context.colorFormat === 'rgba16float'));
     let state = states.get(handle);
     if (!state) {
-      state = { scratch: null, pages: new Map(), binding: context.kind === 'webgl2' ? null : createGpuBinding(native, context.device) };
+      state = { scratch: null, pages: new Map(), binding: context.kind === 'webgl2' ? null : createGpuBinding(native, context.device, { label: 'color glyph cache' }) };
       states.set(handle, state);
     }
     await retire();

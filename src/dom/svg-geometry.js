@@ -20,8 +20,8 @@ const SVG_MATRIX_FLIP_Y = layoutConstant("SVG_MATRIX_FLIP_Y");
 const SVG_MATRIX_SKEW_X = layoutConstant("SVG_MATRIX_SKEW_X");
 const SVG_MATRIX_SKEW_Y = layoutConstant("SVG_MATRIX_SKEW_Y");
 
-function outputValues(core, count) {
-  const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * Float64Array.BYTES_PER_ELEMENT);
+function outputValues(core, operation, count) {
+  const view = core.output(operation);
   return Array.from({ length: count }, (_, index) => view.getFloat64(index * Float64Array.BYTES_PER_ELEMENT, true));
 }
 
@@ -69,7 +69,7 @@ function matrixOperation(matrix, operation, ...parameters) {
   const core = sharedDomCore;
   core.status("svg_matrix_operation", operation, ...values,
     ...[0, 1, 2, 3, 4, 5].map((index) => parameters[index] ?? 0));
-  return createSVGMatrix(outputValues(core, 6));
+  return createSVGMatrix(outputValues(core, "svg_matrix_operation", 6));
 }
 
 const MATRIX_FIELDS = ["a", "b", "c", "d", "e", "f"];
@@ -175,7 +175,7 @@ export const SVGRect = SDSVGRect;
 function graphicsMatrix(node, options, screen) {
   return withLiveGeometry(node, options, ({ core, handle }) =>
     core.status("svg_graphics_matrix", handle, node._coreHandle, screen)
-      ? createSVGMatrix(outputValues(core, 6))
+      ? createSVGMatrix(outputValues(core, "svg_graphics_matrix", 6))
       : null);
 }
 
@@ -183,7 +183,7 @@ export const svgGraphicsRuntime = {
   getBBox(node, options) {
     return withLiveGeometry(node, options, ({ core, handle }) => {
       core.status("svg_graphics_bbox", handle, node._coreHandle);
-      return createSVGRect(outputValues(core, 4).map(Math.fround));
+      return createSVGRect(outputValues(core, "svg_graphics_bbox", 4).map(Math.fround));
     });
   },
   getCTM(node, options) {

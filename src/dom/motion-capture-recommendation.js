@@ -137,12 +137,11 @@ function encodeFacts(effects, finiteDuration, inspectedAt) {
 // Performs the motion-capture operation that the core requests and answers
 // it.
 function performRequest(session, code, motion) {
-  const output = core.exports.abi_output_pointer();
-  const view = new DataView(core.refreshBytes().buffer);
-  const a = view.getInt32(output + MOTION.REQUEST_A, true);
-  const b = view.getInt32(output + MOTION.REQUEST_B, true);
-  const integer = (index) => view.getBigInt64(output + MOTION.REQUEST_ARGUMENTS + index * F64, true);
-  const number = (index) => view.getFloat64(output + MOTION.REQUEST_ARGUMENTS + index * F64, true);
+  const view = core.output("output_motion_session_next");
+  const a = view.getInt32(MOTION.REQUEST_A, true);
+  const b = view.getInt32(MOTION.REQUEST_B, true);
+  const integer = (index) => view.getBigInt64(MOTION.REQUEST_ARGUMENTS + index * F64, true);
+  const number = (index) => view.getFloat64(MOTION.REQUEST_ARGUMENTS + index * F64, true);
   let value = 0;
   let numerator = 0n;
   let denominator = 0n;
@@ -170,7 +169,7 @@ function performRequest(session, code, motion) {
 
 function motionText(id) {
   core.status("output_motion_text", id);
-  return core.outputString();
+  return core.outputString("output_motion_text");
 }
 
 function freezeRecommendation(value) {
@@ -210,22 +209,21 @@ export function recommendMotionCapture(motionInspection, options = {}) {
       performRequest(session, request, motion);
     }
     core.status("output_motion_session_result", session);
-    const output = core.exports.abi_output_pointer();
-    const view = new DataView(core.refreshBytes().buffer);
-    const word = (field) => view.getUint32(output + field, true);
-    const float = (field) => view.getFloat64(output + field, true);
+    const view = core.output("output_motion_session_result");
+    const word = (field) => view.getUint32(field, true);
+    const float = (field) => view.getFloat64(field, true);
     const kind = word(MOTION.RESULT_KIND);
     const confidence = word(MOTION.RESULT_CONFIDENCE);
     const reasonCode = word(MOTION.RESULT_REASON);
     const shape = word(MOTION.RESULT_SHAPE);
-    const reasonEffect = effects[view.getInt32(output + MOTION.RESULT_REASON_EFFECT, true)];
+    const reasonEffect = effects[view.getInt32(MOTION.RESULT_REASON_EFFECT, true)];
     const conditionKind = word(MOTION.RESULT_CONDITION_KIND);
-    const conditionValue = view.getInt32(output + MOTION.RESULT_CONDITION_VALUE, true);
+    const conditionValue = view.getInt32(MOTION.RESULT_CONDITION_VALUE, true);
     const returns = word(MOTION.RESULT_RETURNS);
     const duration = float(MOTION.RESULT_DURATION);
     const period = float(MOTION.RESULT_PERIOD);
-    const numerator = view.getBigInt64(output + MOTION.RESULT_NUMERATOR, true);
-    const denominator = view.getBigInt64(output + MOTION.RESULT_DENOMINATOR, true);
+    const numerator = view.getBigInt64(MOTION.RESULT_NUMERATOR, true);
+    const denominator = view.getBigInt64(MOTION.RESULT_DENOMINATOR, true);
     const sampled = word(MOTION.RESULT_SAMPLING);
     const requiredSampleCount = word(MOTION.RESULT_REQUIRED_SAMPLE_COUNT);
     const recommendedFrameBudget = word(MOTION.RESULT_FRAME_BUDGET);
@@ -236,7 +234,7 @@ export function recommendMotionCapture(motionInspection, options = {}) {
     const maximumFrameRate = float(MOTION.RESULT_MAXIMUM_FRAME_RATE);
     const maximumFrameCount = float(MOTION.RESULT_MAXIMUM_FRAME_COUNT);
     const maximumPeriodMilliseconds = float(MOTION.RESULT_MAXIMUM_PERIOD);
-    let cursor = output + MOTION.RESULT_TIMES;
+    let cursor = MOTION.RESULT_TIMES;
     const readTimes = (count) => Array.from({ length: count }, (_, index) => view.getFloat64(cursor + index * F64, true));
     const mandatorySampleTimesMilliseconds = readTimes(mandatoryCount);
     cursor += mandatoryCount * F64;

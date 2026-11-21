@@ -58,7 +58,7 @@ export class RenderPlanningError extends Error {
 
 function planText(id) {
   core.status("output_plan_text", id);
-  return core.outputString();
+  return core.outputString("output_plan_text");
 }
 
 const isAuto = (value) => value === undefined || value === "auto";
@@ -68,10 +68,9 @@ const jsonText = (value) => String(JSON.stringify(value));
 // The core's plan: its fields and decisions.
 function readPlan(session) {
   core.status("output_plan_result", session);
-  const output = core.exports.abi_output_pointer();
-  const view = new DataView(core.refreshBytes().buffer);
-  const word = (offset) => view.getUint32(output + offset, true);
-  const number = (offset) => view.getFloat64(output + offset, true);
+  const view = core.output("output_plan_result");
+  const word = (offset) => view.getUint32(offset, true);
+  const number = (offset) => view.getFloat64(offset, true);
   const plan = {
     format: word(PLAN.RESULT_FORMAT),
     repetition: word(PLAN.RESULT_REPETITION),
@@ -96,7 +95,7 @@ function readPlan(session) {
   const text = (id) => {
     if (id < dynamic) return planText(id);
     core.status("output_plan_dynamic_text", session, id - dynamic);
-    return core.outputString();
+    return core.outputString("output_plan_dynamic_text");
   };
   plan.decisions = entries.map(([field, source, code, message]) => ({
     field: text(field),

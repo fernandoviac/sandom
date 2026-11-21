@@ -25,17 +25,16 @@ export function autofillFields(root, control = null) {
   if (control !== null) requireNode("autofillFields", "control", control);
   const core = root._domCore;
   const count = core.status("autofill_fields", root._coreHandle, control?._coreHandle ?? 0n);
-  const output = core.exports.abi_output_pointer();
-  const memory = core.refreshBytes();
-  const view = new DataView(memory.buffer);
+  const fields = count === 0 ? null : core.output("autofill_fields");
+  const output = fields?.pointer ?? 0;
+  const view = fields?.memory();
   const records = [];
   // Decode before a wrapper lookup can reenter the core.
   for (let index = 0; index < count; index++) {
     const offset = output + index * FIELD.SIZE;
     const text = (field) => {
-      const pointer = view.getUint32(offset + field, true);
       const length = view.getUint32(offset + field + 4, true);
-      return length === 0 ? null : core.decoder.decode(memory.subarray(pointer, pointer + length));
+      return length === 0 ? null : view.memoryText(core.decoder, view.getUint32(offset + field, true), length);
     };
     records.push({
       element: view.getBigUint64(offset + FIELD.ELEMENT, true), form: view.getBigUint64(offset + FIELD.FORM, true),

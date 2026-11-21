@@ -117,51 +117,49 @@ export const DocumentMutationObserver = createMutationObserverClass({
   normalizeOptions,
 });
 
+// The records of a checkpoint: the borrowed list that
+// observer_checkpoint_records returns is decoded whole before wrapper
+// creation runs other core operations.
 function checkpointRecords(core, checkpoint, owner) {
   let pointer = core.status("observer_checkpoint_records", checkpoint, owner);
-  const records = [];
+  const view = core.resultMemory("observer_checkpoint_records");
+  const field = (name) => OBSERVER_QUEUED.RECORD + CALLBACK_FIELD[name];
+  const entries = [];
   while (pointer) {
-    const view = new DataView(core.memory.buffer, pointer, OBSERVER_QUEUED.SIZE);
-    const field = (name) => OBSERVER_QUEUED.RECORD + CALLBACK_FIELD[name];
-    const next = view.getUint32(OBSERVER_QUEUED.NEXT, true);
-    const hasOldValue = view.getUint32(OBSERVER_QUEUED.OLD_PRESENT, true) !== 0;
-    const kind = view.getUint32(field("KIND"), true);
-    const target = view.getBigUint64(field("TARGET"), true);
-    const added = view.getBigUint64(field("RELATED_A"), true);
-    const removed = view.getBigUint64(field("RELATED_B"), true);
-    const previous = view.getBigUint64(field("PREVIOUS"), true);
-    const following = view.getBigUint64(field("NEXT"), true);
-    const stringAt = (offset, lengthOffset) => {
-      const start = view.getUint32(offset, true);
-      const length = view.getUint32(lengthOffset, true);
-      return core.decoder.decode(
-        core.refreshBytes().subarray(start, start + length),
-      );
-    };
-    const attributeName = kind === CALLBACK_RECORD_ATTRIBUTES
-      ? stringAt(field("NAME_POINTER"), field("NAME_LENGTH"))
-      : null;
-    const attributeNamespace = kind === CALLBACK_RECORD_ATTRIBUTES && view.getUint32(OBSERVER_QUEUED.NAMESPACE_LENGTH, true)
-      ? stringAt(OBSERVER_QUEUED.NAMESPACE, OBSERVER_QUEUED.NAMESPACE_LENGTH)
-      : null;
-    const oldValue = hasOldValue ? stringAt(field("OLD_VALUE_POINTER"), field("OLD_VALUE_LENGTH")) : null;
-    // Decode all borrowed fields before wrapper creation can grow memory.
-    records.push(
-      new MutationRecord({
-        type: ["", "childList", "attributes", "characterData"][kind],
-        target: core.wrapperFor(target),
-        addedNodes: added ? [core.wrapperFor(added)] : [],
-        removedNodes: removed ? [core.wrapperFor(removed)] : [],
-        previousSibling: core.wrapperFor(previous),
-        nextSibling: core.wrapperFor(following),
-        attributeName,
-        attributeNamespace,
-        oldValue,
-      }),
-    );
-    pointer = next;
+    const at = (offset) => pointer + offset;
+    const kind = view.getUint32(at(field("KIND")), true);
+    const stringAt = (offset, lengthOffset) =>
+      view.memoryText(core.decoder, view.getUint32(at(offset), true), view.getUint32(at(lengthOffset), true));
+    entries.push({
+      kind,
+      target: view.getBigUint64(at(field("TARGET")), true),
+      added: view.getBigUint64(at(field("RELATED_A")), true),
+      removed: view.getBigUint64(at(field("RELATED_B")), true),
+      previous: view.getBigUint64(at(field("PREVIOUS")), true),
+      following: view.getBigUint64(at(field("NEXT")), true),
+      attributeName: kind === CALLBACK_RECORD_ATTRIBUTES ? stringAt(field("NAME_POINTER"), field("NAME_LENGTH")) : null,
+      attributeNamespace: kind === CALLBACK_RECORD_ATTRIBUTES && view.getUint32(at(OBSERVER_QUEUED.NAMESPACE_LENGTH), true)
+        ? stringAt(OBSERVER_QUEUED.NAMESPACE, OBSERVER_QUEUED.NAMESPACE_LENGTH)
+        : null,
+      oldValue: view.getUint32(at(OBSERVER_QUEUED.OLD_PRESENT), true) !== 0
+        ? stringAt(field("OLD_VALUE_POINTER"), field("OLD_VALUE_LENGTH"))
+        : null,
+    });
+    pointer = view.getUint32(at(OBSERVER_QUEUED.NEXT), true);
   }
-  return records;
+  return entries.map(({ kind, target, added, removed, previous, following, attributeName, attributeNamespace, oldValue }) =>
+    new MutationRecord({
+      type: ["", "childList", "attributes", "characterData"][kind],
+      target: core.wrapperFor(target),
+      addedNodes: added ? [core.wrapperFor(added)] : [],
+      removedNodes: removed ? [core.wrapperFor(removed)] : [],
+      previousSibling: core.wrapperFor(previous),
+      nextSibling: core.wrapperFor(following),
+      attributeName,
+      attributeNamespace,
+      oldValue,
+    })
+  );
 }
 
 // Calls the observer's callback as component code of its document.

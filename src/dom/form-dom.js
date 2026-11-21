@@ -273,13 +273,13 @@ function htmlCollection(prototype, items, extra = {}) {
 // The listed elements whose form owner is the form, in tree order, without
 // image buttons (HTML form.elements; form_controls).
 function formListedElements(form) {
-  return form._domCore.outputNodes(form._domCore.status("form_controls", form._coreHandle));
+  return form._domCore.statusNodes("form_controls", form._coreHandle);
 }
 
 // The form's controls with the id or name `name` (form_named_controls).
 function formNamedControls(form, name) {
   const core = form._domCore;
-  return core.outputNodes(core.status("form_named_controls", form._coreHandle, ...core.input(name)));
+  return core.statusNodes("form_named_controls", form._coreHandle, ...core.input(name));
 }
 
 // A live RadioNodeList over `items()`, the same object for each read of
@@ -337,13 +337,13 @@ function isInternal(property) {
 function formNamedItems(element, name, mode) {
   const core = element._domCore;
   const count = core.status("form_named_item", element._coreHandle, ...core.input(name), mode);
-  return count === 0 ? [] : core.outputNodes(count);
+  return core.outputNodes("form_named_item", count);
 }
 
 // The supported property indices of a form: its controls (form_controls).
 function formIndexed(element, property) {
   const core = element._domCore;
-  return core.outputNodes(core.status("form_controls", element._coreHandle))[Number(property)];
+  return core.statusNodes("form_controls", element._coreHandle)[Number(property)];
 }
 
 // Web IDL "named property visibility" without the supported property name
@@ -377,9 +377,7 @@ function isSupportedName(element, property) {
 function formSupportedNames(element) {
   const core = element._domCore;
   const count = core.status("form_supported_property_names", element._coreHandle);
-  const pointer = core.exports.abi_output_pointer();
-  const length = core.exports.abi_output_length();
-  const bytes = new Uint8Array(core.refreshBytes().buffer, pointer, length).slice();
+  const bytes = count === 0 ? new Uint8Array(0) : core.outputBytes("form_supported_property_names");
   const view = new DataView(bytes.buffer);
   const names = [];
   for (let index = 0, at = 0; index < count; index += 1) {
@@ -551,7 +549,7 @@ const labels = {
     const core = this._domCore;
     if (core.status("element_labels", this._coreHandle) < 0) return null;
     return cached(this, "labels", () => liveCollection(NodeList.prototype, {
-      items: () => core.outputNodes(core.status("element_labels", this._coreHandle)),
+      items: () => core.statusNodes("element_labels", this._coreHandle),
     }));
   },
   configurable: true,
@@ -584,7 +582,7 @@ export function resetOutput(output) {
 
 // The list of options of a select (input_control_options).
 function selectOptions(select) {
-  return select._domCore.outputNodes(select._domCore.status("input_control_options", select._coreHandle));
+  return select._domCore.statusNodes("input_control_options", select._coreHandle);
 }
 
 export function installFormDomBindings({
@@ -760,7 +758,7 @@ export function installFormDomBindings({
     elements: {
       get() {
         return cached(this, "elements", () => htmlCollection(HTMLCollection.prototype,
-          () => this._domCore.outputNodes(this._domCore.status("fieldset_elements", this._coreHandle))));
+          () => this._domCore.statusNodes("fieldset_elements", this._coreHandle)));
       },
       configurable: true,
     },

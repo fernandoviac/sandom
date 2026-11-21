@@ -116,8 +116,8 @@ function pageInput(pages) {
 }
 
 export function pageBox(rules, page, defaultSize) {
-  const pointer = core.status("scene_page_box", rules.handle, pageInput([page]), defaultSize.width, defaultSize.height);
-  const view = new DataView(core.memory.buffer, pointer, PAGE.GEOMETRY_SIZE);
+  core.status("scene_page_box", rules.handle, pageInput([page]), defaultSize.width, defaultSize.height);
+  const view = core.output("scene_page_box");
   const value = (field) => view.getFloat64(PAGE[`GEOMETRY_${field}`], true);
   return {
     width: value("WIDTH"), height: value("HEIGHT"),
@@ -127,22 +127,20 @@ export function pageBox(rules, page, defaultSize) {
 }
 
 export function pageCounters(rules, pages) {
-  const pointer = core.status("scene_page_counters", rules.handle, pageInput(pages), pages.length);
-  return { values: Array.from(new Float64Array(core.memory.buffer, pointer, pages.length)), pages: pages.length };
+  core.status("scene_page_counters", rules.handle, pageInput(pages), pages.length);
+  const values = pages.length === 0 ? [] : Array.from(new Float64Array(core.outputBytes("scene_page_counters", 0, pages.length * 8).buffer));
+  return { values, pages: pages.length };
 }
 
 export function pageMarginBoxes(rules, page, counters, box) {
   const { top, right, bottom, left } = box.margin;
   const margins = core.byteInput(new Uint8Array(new Float64Array([top, right, bottom, left]).buffer))[0];
-  const pointer = core.status("scene_page_margin_boxes", rules.handle, pageInput([page]), counters.page, counters.pages, margins);
-  const view = new DataView(core.memory.buffer);
-  const bytes = core.refreshBytes();
-  const string = (offset) => {
-    const pointer = view.getUint32(offset + TEXT_ROW_POINTER, true);
-    return core.decoder.decode(bytes.subarray(pointer, pointer + view.getUint32(offset + TEXT_ROW_LENGTH, true)));
-  };
-  return Array.from({ length: core.exports.abi_output_length() / PAGE.MARGIN_BOX_SIZE }, (_, index) => {
-    const row = pointer + index * PAGE.MARGIN_BOX_SIZE;
+  core.status("scene_page_margin_boxes", rules.handle, pageInput([page]), counters.page, counters.pages, margins);
+  const output = core.output("scene_page_margin_boxes");
+  const string = (offset) =>
+    output.memoryText(core.decoder, output.getUint32(offset + TEXT_ROW_POINTER, true), output.getUint32(offset + TEXT_ROW_LENGTH, true));
+  return Array.from({ length: output.byteLength / PAGE.MARGIN_BOX_SIZE }, (_, index) => {
+    const row = index * PAGE.MARGIN_BOX_SIZE;
     return { declarations: string(row + PAGE.MARGIN_BOX_DECLARATIONS), content: string(row + PAGE.MARGIN_BOX_CONTENT) };
   });
 }

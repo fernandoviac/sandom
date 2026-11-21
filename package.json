@@ -1,6 +1,6 @@
 {
   "name": "sandom",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Experimental in-process rendering engine: DOM-like tree in, WebAssembly layout, WebGPU rasterization, pixels out.",
   "type": "module",
   "license": "Apache-2.0",
@@ -37,6 +37,7 @@
     "@sandom/png": "0.1.0",
     "@sandom/image-codecs": "0.2.0",
     "@sandom/color": "0.5.0",
+    "@sandom/gpu-host": "0.1.0",
     "woff-lib": "^0.0.3"
   },
   "peerDependencies": {

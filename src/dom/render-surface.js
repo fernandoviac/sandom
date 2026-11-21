@@ -13,6 +13,7 @@ import {
   engineCounters,
   hostGraphicsDevice,
   layoutTreeBoxes,
+  releaseTextBatch,
 } from "../scene-renderer.js";
 import {
   deliverRenderingObservers,
@@ -63,7 +64,7 @@ import {
   releaseBoxSnapshot,
 } from "../dom-wasm/geometry-wire.js";
 import { buildInteractionSnapshot, deriveRestyleBasis } from "./presented-frame.js";
-import { buildGeometryFrameSuccessor, selectionRectangles } from "./geometry.js";
+import { buildGeometryFrameSuccessor, EMPTY_SCROLLBAR_TAIL, selectionRectangles } from "./geometry.js";
 import { recordUnanimatedProperty } from "./style.js";
 import {
   cssAnimationSlots,
@@ -875,7 +876,7 @@ const layoutBoxKindNames = new Map();
 function layoutBoxKindName(core, kind) {
   let name = layoutBoxKindNames.get(kind);
   if (name === undefined) {
-    name = core.status("scene_box_kind_name", kind) ? core.outputString() : null;
+    name = core.string("scene_box_kind_name", kind);
     layoutBoxKindNames.set(kind, name);
   }
   return name;
@@ -1179,6 +1180,12 @@ class DOMRenderSurface {
         }));
     const layoutScene = sceneRendererRuntime?.layoutTreeBoxes ??
       layoutTreeBoxes;
+    // The owner of the text batch of a layout this surface writes before
+    // its renderer starts (the renderer owns the batch of its own writes);
+    // the surface releases the batch's engine memory when it shuts down
+    // (scene-renderer releaseTextBatch).
+    this._textBatchOwner = Object.freeze({});
+    this._releaseTextBatch = sceneRendererRuntime?.releaseTextBatch ?? releaseTextBatch;
     this._engineCounters = sceneRendererRuntime?.engineCounters ??
       engineCounters;
     if (presentFrame !== null && typeof presentFrame !== "function") {
@@ -1237,6 +1244,7 @@ class DOMRenderSurface {
       const boxes = await layoutScene(scene, {
         resolveResource: this._resolveResource,
         onImageLoadError: this._onImageLoadError,
+        textBatchOwner: this._textBatchOwner,
         ...(engineWriteOwner === null ? {} : { engineWriteOwner }),
       });
       this._stageCounters.nodesLaidOut +=
@@ -1405,6 +1413,8 @@ class DOMRenderSurface {
     // Synchronous layout and DOM removal defer engine events until a frame.
     this._animationEventDeferralDepth = 0;
     this._deferredAnimationEvents = [];
+    // The node targets of the synchronous layout in progress, by its rows.
+    this._layoutEventTargets = null;
     this._running = true;
     this._idleWaiters = [];
     this._shutdown = false;
@@ -1435,10 +1445,8 @@ class DOMRenderSurface {
     // The page index the last rendered frame requested.
     this._renderedPage = null;
     this._presentedFrame = null;
-    // The element whose cursor follows the document, and the value last
-    // written there so an unchanged cursor is not re-assigned.
+    // The element whose cursor follows the document.
     this._cursorTarget = cursorTarget;
-    this._appliedCursor = null;
     this._preparedState = null;
     // The box tree layoutTree() built, and the prepared frame it is for.
     this._layoutTree = null;
@@ -1536,6 +1544,11 @@ class DOMRenderSurface {
     this._animationsAwaitingTimeline = new Set();
     // Pause-pending animations: the next frame commits their pauses.
     this._animationsPausePending = new Set();
+    // The pending animation event queue (Web Animations 1, section 4.4.18):
+    // the finish and cancel events wait in it for the next update.
+    this._pendingPlaybackEvents = [];
+    // The remove events of the update in progress (_updateAnimations).
+    this._pendingRemoveEvents = [];
     this._animationCancelingThroughEngine = null;
     this._cssAnimations = new Map();
     this._pseudoContentAnimations = new Map();
@@ -1555,10 +1568,12 @@ class DOMRenderSurface {
     this._snapContainersBuild = -1;
     this._smoothScrolls = new NativeScrollMotions(this);
     this._scrollbars = [];
+    // The parts the last presented frame painted of its scrollbars.
+    this._scrollbarParts = [];
     // Overlay scrollbar visibility on the surface clock (decision 2 of
     // design/scrollbars.md). Each published descriptor carries
     // the visibility it was painted with.
-    this._scrollbarVisibility = new ScrollbarVisibility(this.scrollbarStyle);
+    this._scrollbarVisibility = new ScrollbarVisibility(this.scrollbarStyle, root._domCore);
     // Tool overlay (an inspector's highlight): rectangles painted above
     // the document and its scrollbars. `Rendered` is the list the last
     // rendered frame painted.
@@ -1804,6 +1819,12 @@ class DOMRenderSurface {
   get scrollbars() {
     return this._scrollbars;
   }
+  // The parts of the scrollbars that the last presented frame painted,
+  // back to front: [{ bar, role, x, y, width, height, radius, color }], with
+  // `bar` one of `scrollbars` and role "corner", "track", "edge" or "thumb".
+  get scrollbarParts() {
+    return this._scrollbarParts;
+  }
   inspectScrolling(target = this.viewport) {
     if (this._shutdown) throw new Error("render surface is shut down");
     if (target !== this.viewport && target._renderSurface !== this) {
@@ -1939,6 +1960,9 @@ class DOMRenderSurface {
       this._animations.push(animation);
       if (animation._timelinePending && !animation._timelineCleared) this._animationsAwaitingTimeline.add(animation);
       else animation._restoreEngineBinding();
+      for (const { type, currentTime } of animation._heldPlaybackEvents?.splice(0) ?? []) {
+        this._queuePlaybackEvent(animation, type, currentTime);
+      }
     }
     this._scheduleAnimationFrame(node);
   }
@@ -2408,12 +2432,20 @@ class DOMRenderSurface {
   }
 
   // "Update animations and send events" (HTML, the rendering steps of a
-  // frame, before its animation frame callbacks): the document timeline
-  // takes the frame's time, so that the animations' current times follow
-  // it in the animation frame callbacks (Web Animations 1, section 4.4.4),
-  // and the replaced script animations leave the effect stack, each firing
-  // `remove` (section 5.5), in composite order.
+  // frame, before its animation frame callbacks; Web Animations 1, section
+  // 4.4.18): the document timeline takes the frame's time, so that the
+  // animations' current times follow it in the animation frame callbacks,
+  // and each animation's finished state follows that time, which queues the
+  // finish notification steps of those that finished. After a microtask
+  // checkpoint, which runs those steps, the replaced script animations
+  // leave the effect stack (section 5.5) and the queued playback events
+  // are dispatched, finish and cancel before remove. A caller without a
+  // checkpoint of its own runs the two halves in one turn.
   _updateAnimationsAndSendEvents(timeMilliseconds) {
+    this._updateAnimations(timeMilliseconds);
+    this._sendAnimationEvents();
+  }
+  _updateAnimations(timeMilliseconds) {
     if (this._shutdown) return;
     this._currentTime = timeMilliseconds;
     // The document's log keeps the time of a frame that follows its
@@ -2421,23 +2453,42 @@ class DOMRenderSurface {
     // (core/dom/document-log.watpart document_log_frame).
     const document = this._root.nodeType === 9 ? this._root : this._root.ownerDocument;
     if (document) document._domCore.status("document_log_frame", document._coreHandle, timeMilliseconds);
+    for (const animation of this._animations) {
+      if (!(animation instanceof CSSAnimation)) animation._updateFinishedState();
+    }
+    // The animations this update replaced leave the effect stack before the
+    // checkpoint, so a reaction to `finished` sees them removed; their
+    // `remove` events wait for the send.
     const removed = removeReplacedAnimations(this._animations, timeMilliseconds);
-    if (removed.length === 0) return;
     const timelineTime = documentTimeline(this._root.ownerDocument)?.currentTime ?? null;
-    const events = removed.map((animation) => {
+    for (const animation of removed) {
       const currentTime = animation._core.status("animation_value", animation._animationId, ANIMATION_VALUE_CURRENT_TIME, timeMilliseconds);
-      return createEventUsing(SDAnimationPlaybackEvent, "remove", {
+      this._pendingRemoveEvents.push([animation, createEventUsing(SDAnimationPlaybackEvent, "remove", {
         currentTime: Number.isNaN(currentTime) ? null : currentTime,
         timelineTime,
-      });
-    });
-    for (let index = 0; index < removed.length; index++) {
+      })]);
+    }
+  }
+  _sendAnimationEvents() {
+    if (this._shutdown) return;
+    const pending = this._pendingPlaybackEvents.splice(0).map(({ animation, event }) => [animation, event]);
+    for (const [animation, event] of [...pending, ...this._pendingRemoveEvents.splice(0)]) {
       try {
-        dispatchEvent(removed[index], events[index]);
+        dispatchEvent(animation, event);
       } catch (error) {
         this._reportBackgroundException(error);
       }
     }
+  }
+
+  // The finish notification steps and the cancel of an animation (Web
+  // Animations 1, sections 4.4.15 and 4.4.14) queue its `finish` or
+  // `cancel` event with the animation's current time and the timeline's;
+  // the next frame's update dispatches it.
+  _queuePlaybackEvent(animation, type, currentTime) {
+    const timelineTime = documentTimeline(this._root.ownerDocument)?.currentTime ?? null;
+    this._pendingPlaybackEvents.push({ animation, event: createEventUsing(SDAnimationPlaybackEvent, type, { currentTime, timelineTime }) });
+    this._scheduleAnimationFrame();
   }
 
   // The animation frame callbacks of the frame, each followed by a microtask
@@ -3027,6 +3078,15 @@ class DOMRenderSurface {
     return this._stagedFrame?.snapshot ?? this._presentedFrame;
   }
 
+  // Fires `type` ("scroll" or "scrollend") for scroll target `target`: at an
+  // element, an event that does not bubble; for the viewport, an event that
+  // bubbles at the surface's Document (CSSOM View, "run the scroll steps"
+  // and "scrollend": the viewport's events go to the Document).
+  _dispatchScrollEvent(target, type) {
+    if (target === this.viewport) dispatchEvent(this._document, createEvent(type, { bubbles: true }));
+    else dispatchEvent(target, createEvent(type));
+  }
+
   _flushScrollEndEvents() {
     const core = this._root._domCore;
     const checkpoint = core.status("scroll_end_begin", this._scrollOwner);
@@ -3037,10 +3097,7 @@ class DOMRenderSurface {
         if (!token) break;
         const node = core.status("scroll_end_target", checkpoint, token);
         try {
-          dispatchEvent(
-            node ? core.wrapperFor(node) : this.viewport,
-            createEvent("scrollend"),
-          );
+          this._dispatchScrollEvent(node ? core.wrapperFor(node) : this.viewport, "scrollend");
         } finally {
           core.status("scroll_end_ack", checkpoint, token);
         }
@@ -3117,20 +3174,12 @@ class DOMRenderSurface {
     ) & FRAME_CARET_PHASE_CHANGED) !== 0;
   }
 
-  // The CSS cursor the engine resolves at a document point, written to the
-  // host's element. Called from input dispatch, which is the only moment
-  // the answer can change: the pointer moved, or what is under it did.
-  _applyCursor(x, y) {
+  // Writes the cursor keyword of an input run's cursor effect
+  // (core/dom/input-run.watpart, INPUT_EFFECT_CURSOR) to the host's
+  // element. The core gives the effect only when the cursor changed.
+  _applyCursor(cursor) {
     const target = this._cursorTarget;
-    if (!target || this._shutdown || !this._presentedFrame) return;
-    const cursor = this._presentedFrame.geometryCore.string(
-      "input_pointer_cursor",
-      this._presentedFrame.geometryHandle,
-      x,
-      y,
-    );
-    if (cursor === this._appliedCursor) return;
-    this._appliedCursor = cursor;
+    if (!target || this._shutdown) return;
     if (target.style) target.style.cursor = cursor;
   }
 
@@ -3210,15 +3259,30 @@ class DOMRenderSurface {
     // The style update at the start of a frame checks the focus (focus
     // fixup, input-activation.js), before the animation frame callbacks.
     scheduleFocusFixup(this._root);
-    // Native snapshots detach before invoking. Exceptions still reach the
-    // realm sink without preventing the remaining callbacks or the render.
-    this._updateAnimationsAndSendEvents(frameTimeMilliseconds);
-    // The callbacks and their microtask checkpoints belong to this
-    // rendering update, a task of its own: the document's queued tasks
-    // (timers among them) wait until it is done.
+    // The animation update, its microtask checkpoint, its events and the
+    // callbacks belong to this rendering update, a task of its own: the
+    // document's queued tasks (timers and the focus fixup among them) wait
+    // until it is done, also while the checkpoint awaits.
     const scripts = this._root.ownerDocument?._scriptProcessing ?? null;
     scripts?.enterTask();
     try {
+      // Native snapshots detach before invoking. Exceptions still reach the
+      // realm sink without preventing the remaining callbacks or the render.
+      this._updateAnimations(frameTimeMilliseconds);
+      // The finish notification steps that the update queued run here. The
+      // frame is under way: a mutation meanwhile belongs to it, and no
+      // other frame starts (_animationCheckpoint).
+      this._animationCheckpoint = true;
+      try {
+        await microtaskCheckpoint();
+      } finally {
+        this._animationCheckpoint = false;
+        // A whenIdle() of the checkpoint resolves now: this frame may end
+        // without a render, which would release it.
+        if (!this._rendering) for (const resolve of this._idleWaiters.splice(0)) resolve();
+      }
+      if (this._shutdown) return null;
+      this._sendAnimationEvents();
       await this._runDocumentAnimationFrameCheckpoint(frameTimeMilliseconds);
     } finally {
       scripts?.leaveTask();
@@ -3940,9 +4004,11 @@ class DOMRenderSurface {
     // A provisional track reports no lifecycle (_setProvisionalTrack): the
     // frame that declares its animation's own track starts it.
     if (this._provisionalTracks.has(record.animationId)) return;
-    const target = (this._eventTargetAtIndex ?? targetsAtRow(this._indexOfElement, this._indexOfPseudoTarget))[
-      record.nodeIndex
-    ];
+    // A synchronous layout moves the tracks to its own rows
+    // (_moveTracksToLayoutRows): the events of its tick name those rows.
+    const targets = this._layoutEventTargets ?? this._eventTargetAtIndex ??
+      targetsAtRow(this._indexOfElement, this._indexOfPseudoTarget);
+    const target = targets[record.nodeIndex];
     if (!target) {
       throw new RangeError(
         `No DOM element for animated layout index ${record.nodeIndex}`,
@@ -4247,6 +4313,7 @@ class DOMRenderSurface {
       return layout();
     } finally {
       this._animationEventDeferralDepth--;
+      this._layoutEventTargets = null;
       const back = this._layoutRowsReturn;
       this._layoutRowsReturn = null;
       if (back) this._persistentRenderer?.remapAnimations(back);
@@ -4264,6 +4331,7 @@ class DOMRenderSurface {
   _declareUnrenderedEffects(indexOf, pseudoIndexOf) {
     const renderer = this._persistentRenderer;
     if (!renderer || this._shutdown || this._rendering) return;
+    this._layoutEventTargets = targetsAtRow(indexOf, pseudoIndexOf);
     const back = this._moveTracksToLayoutRows(renderer, indexOf, pseudoIndexOf);
     for (const animation of this._unrenderedEffectCandidates()) {
       // A parked animation's track waits for the next frame; meanwhile a
@@ -4855,6 +4923,7 @@ class DOMRenderSurface {
       indexOfPseudoTarget: this._indexOfPseudoTarget,
       elementAtIndex: this._elementAtIndex,
       scrollbars: this._scrollbars,
+      scrollbarParts: this._scrollbarParts,
     };
     const rollback = () => {
       core.status("frame_abort", continuation);
@@ -4873,6 +4942,7 @@ class DOMRenderSurface {
       this._indexOfPseudoTarget = previousPublication.indexOfPseudoTarget;
       this._elementAtIndex = previousPublication.elementAtIndex;
       this._scrollbars = previousPublication.scrollbars;
+      this._scrollbarParts = previousPublication.scrollbarParts;
       this._serializedStyleGeneration = -1;
       this._hasNonStateMutation = true;
       // The retained publication holds this frame's restyled rows, which
@@ -5263,7 +5333,7 @@ class DOMRenderSurface {
           core.status("scroll_geometry_current", readGeometry.geometry.handle, observerDocument._coreHandle) === 1) {
           ({ geometry } = buildGeometryFrameSuccessor({
             predecessor: readGeometry.geometry, root: this._root, boxes: frameBoxes, revision: 0,
-            scrollbars: [], textStore: 0, sourceRevisions,
+            scrollbarTail: EMPTY_SCROLLBAR_TAIL, textStore: 0, sourceRevisions,
           }));
           this._stageCounters.geometryReadSuccessorFrames++;
         } else {
@@ -5544,6 +5614,10 @@ class DOMRenderSurface {
         return false;
       };
       let scrollbars = null;
+      // The geometry tail of `scrollbars`, which the frame's presented
+      // geometry takes, and the parts the frame paints of them.
+      let scrollbarTail = null;
+      let paintedScrollbarParts = [];
       let frameLayoutWork = null;
       // Without a presented frame, or when the core refuses the derivation,
       // the scrollbars of a frame that laid out again come from a geometry
@@ -5556,24 +5630,23 @@ class DOMRenderSurface {
           }));
         }
         if (restyleBasis !== null) {
-          return snapshotScrollbars(this._root, this.viewport, restyleBasis.geometryCore, restyleBasis.geometryHandle, 0n, this.scrollbarStyle);
+          return snapshotScrollbars(this._root, this.viewport, restyleBasis.geometryCore, restyleBasis.geometryHandle, 0n);
         }
         const geometry = frameGeometryFor(frameBoxes);
-        return snapshotScrollbars(this._root, this.viewport, geometry.core, geometry.handle, 0n, this.scrollbarStyle);
+        return snapshotScrollbars(this._root, this.viewport, geometry.core, geometry.handle, 0n);
       };
       const describeScrollbars = (frameBoxes, laidOut) => {
-        scrollbars = snapshot && !laidOut
+        ({ tail: scrollbarTail, scrollbars } = snapshot && !laidOut
           ? snapshotScrollbars(
             this._root,
             this.viewport,
             snapshot.geometryCore,
             snapshot.geometryHandle,
             capturedScrollRequests.size > 0 ? capturedScrollRequests.handle : 0n,
-            this.scrollbarStyle,
           )
-          : laidOutScrollbars(frameBoxes);
+          : laidOutScrollbars(frameBoxes));
         // Each descriptor carries the visibility it paints with; a hidden
-        // overlay bar emits nothing, a fading one scales its colors' alpha.
+        // overlay bar paints nothing, a fading one scales its colors' alpha.
         const scrollbarVisibility = this._scrollbarVisibility.advance(
           scrollbars,
           timeMilliseconds,
@@ -5582,11 +5655,12 @@ class DOMRenderSurface {
           scrollbar.visibility = scrollbarVisibility[index];
         }
       };
-      // Sandom's scrollbar design (src/dom/scrollbar-paint.js): each bar's
-      // track, edge line, rounded thumb and classic corner in viewport CSS
-      // px, under its scroller's scene index (-1 for the viewport). The
-      // engine paints them at its scroller's scrollbar marker, inside the
-      // clips over the scroller, and repaints what changed.
+      // Sandom's scrollbar design (core/dom/scrollbar-paint.watpart): each
+      // bar's track, edge line, rounded thumb and classic corner in
+      // viewport CSS px, under its scroller's scene index (-1 for the
+      // viewport). The engine paints them at its scroller's scrollbar
+      // marker, inside the clips over the scroller, and repaints what
+      // changed.
       //
       // One frame has one set of bars. The first call describes them; a
       // later call (a caller that renders this frame's render options
@@ -5602,24 +5676,17 @@ class DOMRenderSurface {
               scrollbarInputsChanged(),
           );
         }
-        const parts = [];
-        for (const { bar, parts: barParts } of paintScrollbars(scrollbars, this.scrollbarStyle)) {
-          const ownerIndex = bar.element === this.viewport
-            ? -1
-            : serialized.indexOf.get(bar.element);
-          if (ownerIndex === undefined) continue;
-          for (const part of barParts) {
-            parts.push({
-              ownerIndex,
-              x: part.x,
-              y: part.y,
-              width: part.width,
-              height: part.height,
-              radius: part.radius,
-              color: part.color,
-            });
-          }
-        }
+        paintedScrollbarParts = paintScrollbars(this._root._domCore, this._scrollbarVisibility.set, scrollbarTail, this._root,
+          serialized.publication);
+        const parts = paintedScrollbarParts.map((part) => ({
+          ownerIndex: part.row,
+          x: part.x,
+          y: part.y,
+          width: part.width,
+          height: part.height,
+          radius: part.radius,
+          color: part.color,
+        }));
         // The tool overlay paints at the viewport's marker after its bars,
         // so above everything.
         for (const highlight of this._toolHighlights) {
@@ -6095,18 +6162,17 @@ class DOMRenderSurface {
         core.status("geometry_text_release", frameTextCapture);
         frameTextCapture = 0;
       }
-      // A text control's entry carries its live selection.
+      // A text control's entry carries its live selection, which the core
+      // sets (geometry_text_store, geometry_text_store_carry).
       if (frameTextStore !== 0) {
         const view = new DataView(core.refreshBytes().buffer);
         const count = view.getUint32(frameTextStore + TEXT_STORE.COUNT, true);
         if (!textCarried) this._stageCounters.textGeometryOwnersGrouped += count;
-        for (let index = 0; index < count; index++) {
+        for (let index = 0; textCarried && index < count; index++) {
           const entry = frameTextStore + TEXT_STORE.ENTRIES + index * TEXT_STORE.ENTRY_SIZE;
-          if (view.getUint32(entry + TEXT_STORE.ENTRY_KIND, true) !== TEXT_STORE.KIND_CONTROL) continue;
-          const control = core.wrapperFor(view.getBigUint64(entry + TEXT_STORE.ENTRY_OWNER, true));
-          const start = control.selectionStart ?? control.value.length;
-          core.status("geometry_text_store_select", frameTextStore, index, start, control.selectionEnd ?? start);
-          if (textCarried) this._stageCounters.translatedTextGeometryEntries++;
+          if (view.getUint32(entry + TEXT_STORE.ENTRY_KIND, true) === TEXT_STORE.KIND_CONTROL) {
+            this._stageCounters.translatedTextGeometryEntries++;
+          }
         }
       }
       // A frame that reuses the scene's rows for the same page (a tool
@@ -6136,6 +6202,7 @@ class DOMRenderSurface {
           capturedScrollRequests,
         );
         this._scrollbars = scrollbars;
+        this._scrollbarParts = paintedScrollbarParts.map(({ barIndex, row, ...part }) => ({ bar: scrollbars[barIndex], ...part }));
         this._indexOfElement = serialized.indexOf;
         this._indexOfPseudoTarget = serialized.pseudoIndexOf;
         this._redeclareParkedAnimations();
@@ -6153,7 +6220,7 @@ class DOMRenderSurface {
         core.status("frame_finish", continuation);
         accepted = true;
         for (const target of acceptState()) {
-          dispatchEvent(target, createEvent("scroll"));
+          this._dispatchScrollEvent(target, "scroll");
           this._pendingScrollEndTargets.add(target);
         }
         this._revealFocusedCaret(this._presentedFrame?.geometryHandle);
@@ -6216,6 +6283,7 @@ class DOMRenderSurface {
         revision: this._frameSequence + 1,
         boxes: presentedBoxes,
         scrollbars,
+        scrollbarTail,
         timeMilliseconds,
         previousTextGeometry: this._presentedFrame?.textGeometryByNode ?? null,
         textStore: frameTextStore,
@@ -6396,7 +6464,7 @@ class DOMRenderSurface {
       };
       const notify = () => {
         for (const target of completedScrollTargets) {
-          dispatchEvent(target, createEvent("scroll"));
+          this._dispatchScrollEvent(target, "scroll");
           this._pendingScrollEndTargets.add(target);
         }
         // The rendering observers of an animated frame take the sizes and
@@ -6691,10 +6759,17 @@ class DOMRenderSurface {
   // WebGL 2 always delivers pixels.
   renderNow({ pixels = false, _transaction = null } = {}) {
     if (this._shutdown) throw new Error("render surface is shut down");
+    return this._renderAt(this._now(), { pixels, _transaction });
+  }
+
+  // Renders at `timeMilliseconds`, after the document's clock advanced to
+  // it: a frame stream (attach({ frames })) over a document whose clock
+  // its host injected gives each frame its time this way.
+  _renderAt(timeMilliseconds, { pixels = false, _transaction = null } = {}) {
+    if (this._shutdown) throw new Error("render surface is shut down");
     if (pixels !== false && pixels !== true && pixels !== "rgba8") {
       throw new TypeError(`renderNow: pixels must be false, true, or "rgba8", got ${JSON.stringify(pixels)}`);
     }
-    const timeMilliseconds = this._now();
     const render = () => this._renderOpportunity(timeMilliseconds, true, true, pixels, _transaction);
     // A page frame that targeted another box than its page's (the page's
     // box was not known before its count) renders again at its own box.
@@ -6839,6 +6914,14 @@ class DOMRenderSurface {
 
   async shutdown() {
     if (this._shutdown) return;
+    // The popups of the document end with its last surface, which presented
+    // them (popups_release_document): the process holds one popup state of
+    // each kind, and another document's frame or input must not reach this
+    // document's nodes after the host drops it. The surface still takes the
+    // mutations; stop() cancels the frame they request.
+    if (![...this._document._liveRenderSurfaces].some((surface) => surface !== this && !surface._shutdown)) {
+      this._root._runTreeOperation(() => this._root._domCore.status("popups_release_document", this._document._coreHandle));
+    }
     this.stop();
     this._shutdown = true;
     if (!this._presentingFrame) await this.whenIdle();
@@ -6877,15 +6960,17 @@ class DOMRenderSurface {
     this._disconnectSubtree(this._root);
     surfaceRegistry?.delete(this._environmentKey);
     this._document._liveRenderSurfaces.delete(this);
+    // A surface that is shutting down stays in the registry until its own
+    // shutdown reaches this point: only a live one takes over.
+    const successor = surfaceRegistry ? [...surfaceRegistry.values()].find((surface) => !surface._shutdown) ?? null : null;
     if (wasPrimary) {
       // Promote any remaining surface over this root to primary: it claims
       // the node _renderSurface slots the shutdown just released.
-      surfaceRegistry?.values().next().value?._connectSubtree(this._root);
+      successor?._connectSubtree(this._root);
     }
     const ownerDocument = this._root.ownerDocument;
     if (ownerDocument?._componentRenderSurface === this) {
-      ownerDocument._componentRenderSurface =
-        surfaceRegistry?.values().next().value ?? null;
+      ownerDocument._componentRenderSurface = successor;
       ownerDocument._documentTimers?.driverChanged();
     }
     const animationFrameCheckpoint = this._animationFrameCore.status(
@@ -6927,6 +7012,7 @@ class DOMRenderSurface {
     // The renderer releases its engine side even when its graphics context
     // failed to start.
     if (this._persistentRenderer) await this._persistentRenderer.shutdown();
+    this._releaseTextBatch(this._textBatchOwner);
     this._root._domCore.status("computed_samples_release", this._computedSamples);
     this._computedSamples = 0;
     this._releaseSyncLayout();
@@ -6937,6 +7023,7 @@ class DOMRenderSurface {
     this._preparedState?.serialized?.release?.();
     this._preparedState = null;
     this._scrollbars = [];
+    this._scrollbarParts = [];
     for (const declaration of this._pendingAnimationDeclarations) {
       declaration.release?.();
     }

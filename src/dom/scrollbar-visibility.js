@@ -57,14 +57,21 @@ const STATES = new Map(["HIDDEN", "FADING", "SHOWN"]
 // and the hovered and pressed bars. A bar is named by its scroller's node
 // handle (0 for the viewport) and its orientation.
 export class ScrollbarVisibility {
-  constructor(style = "overlay") {
+  // `core` is the DOM core of the surface's document, which holds the set.
+  constructor(style = "overlay", core = sharedDomCore) {
     this.style = assertScrollbarStyle(style, "ScrollbarVisibility");
-    this._set = sharedDomCore.status("scroll_bars_create", this.style === "classic" ? 1 : 0);
+    this._core = core;
+    this._set = core.status("scroll_bars_create", this.style === "classic" ? 1 : 0);
   }
 
   release() {
-    sharedDomCore.status("scroll_bars_release", this._set);
+    this._core.status("scroll_bars_release", this._set);
     this._set = 0;
+  }
+
+  // The core's bar set (scroll_bars_create), which scroll_bars_paint reads.
+  get set() {
+    return this._set;
   }
 
   // Input dispatch reports the scrollbar under the pointer (a descriptor or
@@ -72,7 +79,7 @@ export class ScrollbarVisibility {
   // (null on release; undefined keeps the pressed bar). Returns true when a
   // bar needs a frame for it.
   notePointer(scrollbar, pressed = undefined) {
-    return sharedDomCore.status("scroll_bars_note_pointer", this._set,
+    return this._core.status("scroll_bars_note_pointer", this._set,
       scrollbar ? 1 : 0, barElement(scrollbar), barOrientation(scrollbar),
       pressed === undefined ? 0 : 1, pressed ? 1 : 0, barElement(pressed), barOrientation(pressed)) === 1;
   }
@@ -80,9 +87,9 @@ export class ScrollbarVisibility {
   // Advances every presented bar to this frame and returns one visibility
   // record per descriptor, in order.
   advance(scrollbars, timeMilliseconds) {
-    const core = sharedDomCore;
+    const core = this._core;
     core.status("scroll_bars_advance_begin", this._set);
-    const records = scrollbars.map((scrollbar) => visibilityRecord(this._set, scrollbar,
+    const records = scrollbars.map((scrollbar) => visibilityRecord(core, this._set, scrollbar,
       core.status("scroll_bars_step", this._set, barElement(scrollbar), barOrientation(scrollbar), scrollbar.value, timeMilliseconds)));
     core.status("scroll_bars_advance_end", this._set);
     return records;
@@ -91,18 +98,19 @@ export class ScrollbarVisibility {
   // The visibility each descriptor would have at this time, without
   // advancing.
   sample(scrollbars, timeMilliseconds) {
-    return scrollbars.map((scrollbar) => visibilityRecord(this._set, scrollbar,
-      sharedDomCore.status("scroll_bars_sample", this._set, barElement(scrollbar), barOrientation(scrollbar), timeMilliseconds)));
+    const core = this._core;
+    return scrollbars.map((scrollbar) => visibilityRecord(core, this._set, scrollbar,
+      core.status("scroll_bars_sample", this._set, barElement(scrollbar), barOrientation(scrollbar), timeMilliseconds)));
   }
 
   // True while a later frame can change a bar without input.
   get active() {
-    return sharedDomCore.status("scroll_bars_active", this._set) === 1;
+    return this._core.status("scroll_bars_active", this._set) === 1;
   }
 
   // True when a frame at this time paints a presented bar differently.
   due(timeMilliseconds) {
-    return sharedDomCore.status("scroll_bars_due", this._set, timeMilliseconds) === 1;
+    return this._core.status("scroll_bars_due", this._set, timeMilliseconds) === 1;
   }
 }
 
@@ -114,8 +122,7 @@ function barOrientation(scrollbar) {
   return scrollbar ? ORIENTATIONS.get(scrollbar.orientation) : 0;
 }
 
-function visibilityRecord(set, scrollbar, state) {
-  const core = sharedDomCore;
+function visibilityRecord(core, set, scrollbar, state) {
   return {
     state: STATES.get(state),
     thumbAlpha: core.exports.scroll_bar_value(VALUE_THUMB),

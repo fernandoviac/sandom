@@ -75,7 +75,7 @@ function paintFacade(core, handle) {
   let materialized = null;
   const record = () => {
     const block = core.status("projection_block", handle, KIND_PAINT);
-    return { block, view: new DataView(core.refreshBytes().buffer) };
+    return { block, view: core.resultMemory("projection_block") };
   };
   const materialize = () => {
     if (materialized !== null) {
@@ -195,7 +195,7 @@ function paintFacade(core, handle) {
         const textOffset = view.getUint32(row + OPERATION.TEXT, true);
         operation = {
           ...common,
-          text: decoder.decode(new Uint8Array(view.buffer, textBase + textOffset, view.getUint32(row + OPERATION.TEXT_LENGTH, true))),
+          text: view.memoryText(decoder, textBase + textOffset, view.getUint32(row + OPERATION.TEXT_LENGTH, true)),
           fontSize: view.getFloat64(row + OPERATION.FONT_SIZE, true),
           lineHeight: view.getFloat64(row + OPERATION.LINE_HEIGHT, true),
           ascent: view.getFloat64(row + OPERATION.ASCENT, true),

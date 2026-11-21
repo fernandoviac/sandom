@@ -129,12 +129,16 @@ export function computeLayoutBoxes(node, { viewportW, viewportH } = {}, withText
     // frame without a running animation does not tick them, and a track
     // that a read since then declared starts at that time. The animations
     // of elements that no frame has rendered take provisional tracks over
-    // the rows this layout writes.
-    const layoutOptions = engineWriteOwner === null ? {} : {
-      engineWriteOwner,
-      sampleTimeMilliseconds: surface.currentTime,
-      prepareEngine: () => surface._declareUnrenderedEffects(serialized.indexOf, serialized.pseudoIndexOf),
-    };
+    // the rows this layout writes. Before the surface's renderer starts, the
+    // surface owns the layout's text batch, and without a surface the
+    // document does, by its handle (scene-renderer releaseTextBatch).
+    const layoutOptions = engineWriteOwner === null
+      ? { textBatchOwner: surface?._textBatchOwner ?? document._coreHandle }
+      : {
+        engineWriteOwner,
+        sampleTimeMilliseconds: surface.currentTime,
+        prepareEngine: () => surface._declareUnrenderedEffects(serialized.indexOf, serialized.pseudoIndexOf),
+      };
     let laidOut = runtimeLayout(scene, { ...layoutOptions, ...(page === null ? {} : { page }) });
     const paging = withText || page !== null ? laidOut.paging : null;
     let textCapture = withText ? laidOut.textCapture : 0;

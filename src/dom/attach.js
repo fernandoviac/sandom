@@ -51,6 +51,7 @@ import { createTextureReader, TEXTURE_READS_IN_FLIGHT } from "../rasterize.js";
 import { bindProjectedInput, layoutBoxSize, projectOntoRectangle } from "./projected-surface.js";
 import { serveWorkerInput } from "./worker-input.js";
 import { hasGraphicsDevice, useGraphicsDevice } from "../scene-renderer.js";
+import { gpuPassTimingFeatures } from "../gpu-pass-timing.js";
 
 const OPTION_NAMES = new Set(["clock", "input", "deviceScale", "schedule", "onInput"]);
 
@@ -94,7 +95,7 @@ async function useWorkerDevice(backend) {
   if (!adapter) {
     throw new Error("attach in a worker needs WebGPU: this worker has no WebGPU adapter");
   }
-  const device = await adapter.requestDevice();
+  const device = await adapter.requestDevice({ requiredFeatures: gpuPassTimingFeatures(adapter) });
   device.addEventListener("uncapturederror", (event) => {
     hostReportError(new Error(`Sandom worker device: ${event.error.constructor.name}: ${event.error.message}`));
   });
@@ -131,7 +132,7 @@ export async function attachDocument(backend, target, options = {}) {
 
 const FRAME_FORMATS = new Set(["rgba8", "float32"]);
 
-function attachFrames(backend, frames, options) {
+async function attachFrames(backend, frames, options) {
   if (frames === null || typeof frames !== "object") {
     throw new TypeError(`attach({ frames }) takes { width, height, deviceScale, format }; it received ${frames}`);
   }
@@ -155,19 +156,40 @@ function attachFrames(backend, frames, options) {
   if (!root) {
     throw new Error("attach: the document has no root element; append an <html> element before attach");
   }
-  // The document's time: the time of the frame that renders.
-  let timeMilliseconds = 0;
+  // The frame stream drives the document's time. A document whose clock is
+  // not fixed takes the stream's clock: the time of the frame that renders.
+  // A document whose host injected its clock (prepareRenderInput,
+  // createSandomDOM: now, requestFrame) keeps that clock, and each frame
+  // advances it to the frame's time. A document on the host's real clock
+  // has a time that no stream drives.
+  const documentClock = backend.document._clock ?? null;
+  if (documentClock?.real) {
+    throw new TypeError(
+      "attach({ frames }) drives the document's time, and this document runs on the host's real clock; " +
+        "give the document a clock where it is created (prepareRenderInput or createSandomDOM: now, requestFrame, cancelFrame)",
+    );
+  }
+  let timeMilliseconds = documentClock === null ? 0 : documentClock.now();
   const surface = backend.createRenderSurface(root, {
     viewportWidth: width,
     viewportHeight: height,
     deviceScale,
     ...(format === "rgba8" ? { renderPrecision: "rgba8unorm" } : {}),
-    now: () => timeMilliseconds,
     // The stream renders every frame itself (view.frames), so a frame the
     // surface requests after a change is the stream's next frame.
-    requestFrame: () => 0,
-    cancelFrame: () => {},
+    ...(documentClock === null ? { now: () => timeMilliseconds, requestFrame: () => 0, cancelFrame: () => {} } : {}),
   });
+  // The frame surface drives the document's injected clock and its page
+  // timers, as the surface that a page's window binds to does.
+  if (documentClock !== null) {
+    const driver = backend.document._componentRenderSurface ?? null;
+    if (driver !== null && driver !== surface) {
+      await surface.shutdown();
+      throw new Error("attach({ frames }) drives the document's time, and another live surface over the document drives it; shut that surface down first");
+    }
+    backend.document._componentRenderSurface = surface;
+    backend.document._documentTimers?.driverChanged();
+  }
   let reader = null;
   let streaming = false;
   let detached = false;
@@ -180,6 +202,7 @@ function attachFrames(backend, frames, options) {
     if (!(Number.isFinite(frameRate) && frameRate > 0)) {
       throw new RangeError(`view.frames frameRate must be a positive number of frames per second; it is ${frameRate}`);
     }
+    if (documentClock !== null) timeMilliseconds = documentClock.now();
     if (from < timeMilliseconds) {
       throw new RangeError(`view.frames starts at ${from} ms, before the document's time ${timeMilliseconds} ms; a document's time only advances`);
     }
@@ -189,7 +212,7 @@ function attachFrames(backend, frames, options) {
     try {
       for (let sequence = 0; from + sequence * frameDuration < to; sequence++) {
         timeMilliseconds = from + sequence * frameDuration;
-        const frame = await surface.renderNow();
+        const frame = await (documentClock === null ? surface.renderNow() : surface._renderAt(timeMilliseconds));
         if (!frame.textureImage) {
           throw new Error(`attach({ frames }) streams GPU texture frames; this surface renders on ${frame.graphicsBackend ?? "a backend"} without them`);
         }

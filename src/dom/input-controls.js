@@ -104,9 +104,9 @@ export function controlValueEdited(node, valueChanged, selectionChanged) {
   if (selectionChanged) node._notifyMutation("selection");
 }
 // The core set a text control's selection as setSelectionRange does (input
-// run state 7): the select event follows.
-export function controlSelectionSet(node) {
-  dispatchEvent(node, createEvent("select", { bubbles: true }));
+// run state 7): the select event follows when the core says it is due.
+export function controlSelectionSet(node, selectDue) {
+  if (selectDue) dispatchEvent(node, createEvent("select", { bubbles: true }));
   node._notifyMutation("selection");
 }
 // The result of a core number operation that sets the value as the value
@@ -148,6 +148,8 @@ export const inputControlRuntime = {
     } finally {
       selectingEveryOption--;
     }
+    // The setter updates the selectedcontent elements whatever changed.
+    status(node, "select_selected_content_mark");
     node._domCore.deliverSelectedContent();
   },
   value(node) {
@@ -186,6 +188,7 @@ export const inputControlRuntime = {
       } finally {
         selectingEveryOption--;
       }
+      status(node, "select_selected_content_mark");
       node._domCore.deliverSelectedContent();
       return;
     }

@@ -404,7 +404,7 @@ export function createAtlasRuntime({
       let state = this._webGpuTextures.get(device);
       if (!state) {
         const native = wasmModule.exports;
-        const binding = createGpuBinding(native, device);
+        const binding = createGpuBinding(native, device, { label: "glyph atlas" });
         const handle = native.gpu_atlas_create(binding.stream, this.id);
         const consumer = native.gpu_atlas_consumer(handle);
         state = { binding, handle, consumer };
@@ -808,7 +808,10 @@ export function createAtlasRuntime({
             const verbsLength = verbs.length || 1;
             const verbsPointer = Module.exports.abi_malloc(verbsLength);
             let preparedPointer = 0;
-            let preparedCapacity = 96;
+            // Preparation reports the length it needs when the buffer is
+            // too small, and preparing again repeats all of its work: the
+            // buffer starts at the largest geometry this atlas prepared.
+            let preparedCapacity = this._preparedGeometryCapacity ?? 16384;
             let preparedLength = 0;
             try {
               new Uint8Array(Module.memory.buffer).set(verbs, verbsPointer);
@@ -833,6 +836,7 @@ export function createAtlasRuntime({
               if (preparedLength > preparedCapacity) {
                 Module.exports.abi_free(preparedPointer);
                 preparedCapacity = preparedLength;
+                this._preparedGeometryCapacity = preparedLength;
                 preparedPointer = Module.exports.abi_malloc(preparedCapacity);
                 preparedLength = Module.prepareOutline(
                   verbsPointer,

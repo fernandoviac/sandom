@@ -2,6 +2,7 @@ import { instantiateRendererCore } from './wasm/renderer-core-binary.js';
 import { decodeGpuValue, encodeGpuValue, GPU_REPLY, gpuWriteBufferArguments } from './gpu-thread-codec.js';
 import { createGpuFacade, gpuThreadError, gpuThreadResource } from './dom/webgpu-facade.js';
 import { layoutConstant } from './wasm/layout-table.js';
+import { createNativeGpuThread, nativeGpuHostAvailable } from './native-gpu-host.js';
 
 const GPU_QUEUE_STAGE = layoutConstant('GPU_QUEUE_STAGE');
 const GPU_QUEUE_SUBMIT = layoutConstant('GPU_QUEUE_SUBMIT');
@@ -50,7 +51,9 @@ const QUEUED_CALLS = new Set([
 // ignored. An optional `gpu` export supplies the GPU capability on that thread.
 // `gpuModule` is a module URL that the GPU thread imports first; it mounts
 // `navigator.gpu` in that realm on a host whose workers lack it (sandom/gpu
-// on Node and Bun).
+// on Node and Bun). On a server with the native GPU host
+// (src/native-gpu-host.js), a GPU thread without a provider forwards to the
+// host instead of to a worker.
 export function createGpuThread({ provider = null, gpuModule = null } = {}, operation) {
   if (!operation || typeof operation.reply !== 'function' || typeof operation.throw !== 'function') {
     throw new TypeError('createGpuThread requires an explicit reply/throw operation');
@@ -65,6 +68,13 @@ export function createGpuThread({ provider = null, gpuModule = null } = {}, oper
   }
   if (gpuModule !== null && (typeof gpuModule !== 'string' || !gpuModule.length)) {
     operation.throw(new TypeError('GPU-thread gpuModule must be a worker-reachable module URL'));
+    return;
+  }
+  if (provider === null && nativeGpuHostAvailable) {
+    let thread;
+    try { thread = createNativeGpuThread(); }
+    catch (error) { operation.throw(error); return; }
+    operation.reply(thread);
     return;
   }
   const open = () => {
@@ -594,8 +604,10 @@ function workerModuleReadable() {
 // The GPU-thread facade of this realm's WebGPU, or null on a realm without
 // WebGPU or one that cannot host a GPU thread (a browser main thread, a
 // page that is not cross-origin isolated, a Deno realm that cannot read the
-// worker module). Such a realm renders with its own native WebGPU.
+// worker module). Such a realm renders with its own native WebGPU. With the
+// native GPU host, the realm's GPU is the host's.
 export function getDefaultGpu() {
+  if (nativeGpuHostAvailable) return defaultBinding().gpu;
   if (!hostNavigator?.gpu || browserMainThread || typeof SharedArrayBuffer !== 'function') return null;
   if (!workerModuleReadable()) return null;
   return defaultBinding().gpu;

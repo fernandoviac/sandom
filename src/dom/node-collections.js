@@ -125,10 +125,9 @@ function tokenInput(core, value) {
   return core.byteInput(bytes);
 }
 
-function tokenOutput(core) {
-  const pointer = core.exports.abi_output_pointer();
-  const length = core.exports.abi_output_length();
-  const bytes = new Uint8Array(core.memory.buffer, pointer, length);
+function tokenOutput(core, operation) {
+  const bytes = core.outputBytes(operation);
+  const length = bytes.length;
   let text = "";
   for (let offset = 0; offset < length; offset += 8192) {
     const count = Math.min(4096, (length - offset) / 2);
@@ -175,7 +174,7 @@ export function createDataset(element) {
   const name = (property) => {
     const input = tokenInput(core, String(property));
     core.status("dataset_binding_name", input[0], input[1]);
-    return tokenOutput(core);
+    return tokenOutput(core, "dataset_binding_name");
   };
   // The baseline has no ownKeys/has/getOwnPropertyDescriptor trap. Enumeration
   // therefore concerns only the ordinary target, never the data-* attributes.

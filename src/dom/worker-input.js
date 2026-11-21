@@ -30,7 +30,11 @@ import { bindDocumentInput, layoutBoxSize, localDocumentPort, projectOntoRectang
 // `port` to the worker for attach's `input` option. The document's viewport
 // is the canvas's layout box, or `viewport` ({ width, height } in CSS
 // pixels) for a document of a fixed size that the canvas scales; the input
-// maps the canvas box onto it. `deviceScale` replaces the display's density.
+// maps the canvas box onto it. The density is the display's; with
+// `viewport`, it is the canvas's physical pixels for each viewport pixel, so
+// a canvas that the page shows larger or smaller renders at its displayed
+// size, and each change of that size reaches the worker. `deviceScale`
+// replaces either.
 export function bindWorkerInput(canvas, { deviceScale = null, viewport = null, label = "Sandom document" } = {}) {
   if (typeof globalThis.HTMLCanvasElement !== "function" || !(canvas instanceof globalThis.HTMLCanvasElement)) {
     throw new TypeError(`bindWorkerInput takes the page's HTMLCanvasElement; it received ${canvas}`);
@@ -43,10 +47,18 @@ export function bindWorkerInput(canvas, { deviceScale = null, viewport = null, l
   }
   const channel = new MessageChannel();
   const port = channel.port1;
-  const scale = () => deviceScale ?? globalThis.devicePixelRatio ?? 1;
+  const scale = () => {
+    if (deviceScale !== null) return deviceScale;
+    const displayDensity = globalThis.devicePixelRatio ?? 1;
+    if (viewport === null) return displayDensity;
+    // A hidden canvas has no box: its document keeps the last density.
+    const displayedWidth = canvas.getBoundingClientRect().width;
+    return displayedWidth > 0 ? displayDensity * (displayedWidth / viewport.width) : density ?? displayDensity;
+  };
   const layoutSize = () => viewport === null ? layoutBoxSize(canvas, "bindWorkerInput") : { width: viewport.width, height: viewport.height };
   let size = layoutSize();
-  let density = scale();
+  let density = null;
+  density = scale();
   let projection = projectOntoRectangle(canvas, size);
   const sendSize = () => port.postMessage({ kind: "size", width: size.width, height: size.height, deviceScale: density });
   sendSize();
@@ -120,7 +132,7 @@ export function bindWorkerInput(canvas, { deviceScale = null, viewport = null, l
   let densityQuery = null;
   const watchDensity = () => {
     densityQuery?.removeEventListener("change", onDensity);
-    densityQuery = deviceScale === null ? globalThis.matchMedia(`(resolution: ${scale()}dppx)`) : null;
+    densityQuery = deviceScale === null ? globalThis.matchMedia(`(resolution: ${globalThis.devicePixelRatio ?? 1}dppx)`) : null;
     densityQuery?.addEventListener("change", onDensity);
   };
   function onDensity() {

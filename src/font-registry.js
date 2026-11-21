@@ -118,7 +118,7 @@ function defaultSlope(core, style) {
 // text.
 export function fontFaceStyleDescriptor(text, core = sharedDomCore) {
   if (core.status("font_face_style_descriptor", ...core.input(String(text ?? ""))) === 0) return null;
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_STYLE_DESCRIPTOR.SIZE);
+  const view = core.output("font_face_style_descriptor");
   return {
     slopeMinimum: view.getFloat64(FONT_STYLE_DESCRIPTOR.MINIMUM, true),
     slopeMaximum: view.getFloat64(FONT_STYLE_DESCRIPTOR.MAXIMUM, true),
@@ -302,7 +302,7 @@ function createRegistry({
     if (hostSources === null) return;
     const count = recordHostSources();
     if (count < 0) return;
-    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * FONT_FACE_ROW.SIZE);
+    const report = count === 0 ? null : core.output("font_catalog_host_sources");
     const released = Array.from({ length: count }, (_, row) => [
       report.getUint32(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.FACE, true),
       report.getBigInt64(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.RESOURCE, true),
@@ -416,11 +416,9 @@ function createRegistry({
       ...core.input(typeof stretch === "string" ? stretch : ""), Number(stretches[0]), Number(stretches[1]),
       ...core.input(String(style)), unicodeRange?.byteLength ?? 0,
     );
-    const pointer = core.exports.abi_output_pointer();
-    const bytes = core.refreshBytes();
-    const descriptor = new DataView(bytes.buffer, pointer, FONT_RUNTIME_DESCRIPTOR.NAME);
+    const descriptor = core.output("font_runtime_descriptor");
     return {
-      name: new TextDecoder().decode(bytes.subarray(pointer + FONT_RUNTIME_DESCRIPTOR.NAME, pointer + core.exports.abi_output_length())),
+      name: descriptor.text(new TextDecoder(), FONT_RUNTIME_DESCRIPTOR.NAME),
       weightMinimum: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.WEIGHT_MINIMUM, true),
       weightMaximum: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.WEIGHT_MAXIMUM, true),
       stretchMinimum: descriptor.getFloat64(FONT_RUNTIME_DESCRIPTOR.STRETCH_MINIMUM, true),
@@ -465,8 +463,7 @@ function createRegistry({
       if (ownerBinding.references === 0) runtimeOwnerTokens.delete(fields.owner);
       throw error;
     }
-    const outputPointer = core.exports.abi_output_pointer();
-    const output = core.refreshBytes().slice(outputPointer, outputPointer + core.exports.abi_output_length());
+    const output = core.outputBytes("font_runtime_face_publish");
     const report = new DataView(output.buffer, output.byteOffset, FONT_FACE_ROW.SIZE);
     const index = report.getInt32(FONT_FACE_ROW.INDEX, true);
     const resourceHandle = report.getBigInt64(FONT_FACE_ROW.RESOURCE, true);
@@ -518,8 +515,7 @@ function createRegistry({
     const removed = core.status("font_runtime_face_remove", fontCatalogHandle,
       ...core.input(familyKey), ownerBinding?.token ?? 0);
     if (removed === FONT_REMOVED_NONE) return;
-    const faceID = new DataView(core.refreshBytes().buffer,
-      core.exports.abi_output_pointer(), 4).getUint32(0, true);
+    const faceID = core.output("font_runtime_face_remove").getUint32(0, true);
     const face = facesByID.get(faceID);
     const resourceHandle = resources.get(faceID);
     const specification = runtimeFontFamilies.get(familyKey);
@@ -615,7 +611,7 @@ function createRegistry({
     const registered = (localKey) =>
       runtimeFontFamilies.get(localKey) ?? hostedFontFamilies.get(localKey) ?? genericFontFamilies.get(localKey);
     const kind = core.status("font_family_key_value", ...core.input(String(familyKey)));
-    const value = core.outputString() ?? "";
+    const value = core.outputString("font_family_key_value");
     let specification = kind === FONT_KEY_GENERIC ? undefined : registered(familyKey);
     if (!specification) {
       const [localKey] = stackKeys(value).keys;
@@ -638,7 +634,7 @@ function createRegistry({
       ...core.input(specification.fallback ?? ""), specification.variable === true ? 1 : 0,
       Number.isFinite(specification.zeroAdvanceRatio) ? specification.zeroAdvanceRatio : NaN,
     );
-    const key = core.outputString() ?? "";
+    const key = core.outputString("font_hosted_family_publish");
     familyKeys.set(specification, key);
     hostedFamilyKeys.add(key);
     changed();
@@ -668,11 +664,10 @@ function createRegistry({
       ...core.input(fallbackPresent ? String(resolved.fallback) : ""), Number(fallbackPresent),
     );
     core.throwIfError(true);
-    const bytes = core.refreshBytes();
-    const pointer = core.exports.abi_output_pointer();
-    const lengths = new DataView(bytes.buffer, pointer, FONT_HOST_FAMILY_RECORD.HEADER_SIZE);
+    const bytes = core.outputBytes("font_host_family_record");
+    const lengths = new DataView(bytes.buffer, 0, FONT_HOST_FAMILY_RECORD.HEADER_SIZE);
     const decoder = new TextDecoder();
-    let cursor = pointer + FONT_HOST_FAMILY_RECORD.HEADER_SIZE;
+    let cursor = FONT_HOST_FAMILY_RECORD.HEADER_SIZE;
     const [identity, cssFamily, fallback] = [
       FONT_HOST_FAMILY_RECORD.IDENTITY_LENGTH, FONT_HOST_FAMILY_RECORD.CSS_LENGTH, FONT_HOST_FAMILY_RECORD.FALLBACK_LENGTH,
     ].map((offset) => {
@@ -737,7 +732,7 @@ function createRegistry({
     for (;;) {
       const request = core.status("font_answer_next", session);
       if (request === FONT_REQUEST_DONE) return;
-      const name = core.outputString() ?? "";
+      const name = core.outputString("font_answer_next");
       const token = core.status("font_answer_token", session);
       if (request === FONT_REQUEST_SYSTEM_FAMILY || request === FONT_REQUEST_GENERIC_FAMILY) {
         const record = request === FONT_REQUEST_SYSTEM_FAMILY
@@ -752,7 +747,7 @@ function createRegistry({
           specification?.variable === true ? 1 : 0,
           Number.isFinite(specification?.zeroAdvanceRatio) ? specification.zeroAdvanceRatio : NaN,
         );
-        const key = core.outputString() ?? "";
+        const key = core.outputString("font_answer_family");
         if (request === FONT_REQUEST_SYSTEM_FAMILY && record !== null) adoptHostedFamily(key, record.specification);
         if (request === FONT_REQUEST_GENERIC_FAMILY) adoptGenericFamily(key, name, specification ?? null);
       } else {
@@ -884,7 +879,7 @@ function createRegistry({
         requestedWeight, styleCode,
         ...core.byteInput(face.bytes), face.faceIndex,
       );
-      const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_FACE_ROW.SIZE);
+      const report = core.output("font_hosted_face_supply");
       const index = report.getInt32(FONT_FACE_ROW.INDEX, true);
       const resource = report.getBigInt64(FONT_FACE_ROW.RESOURCE, true);
       faceIDs.set(face, faceID);
@@ -903,7 +898,7 @@ function createRegistry({
   // faces) in the renderer's scope.
   function registerKeptFaces() {
     const count = core.status("font_catalog_faces_register", fontCatalogHandle, engineSourceTransport.ensureScope());
-    const report = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * FONT_FACE_ROW.SIZE);
+    const report = count === 0 ? null : core.output("font_catalog_faces_register");
     const rows = Array.from({ length: count }, (_, row) => ({
       faceID: report.getInt32(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.FACE, true),
       index: report.getInt32(row * FONT_FACE_ROW.SIZE + FONT_FACE_ROW.INDEX, true),
@@ -956,7 +951,7 @@ function createRegistry({
       Number(weight), Number(stretch), Number(slope),
     );
     if (faceID === 0) return null;
-    const instance = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), FONT_INSTANCE.SIZE);
+    const instance = core.output("font_face_instance");
     const face = facesByID.get(faceID);
     return {
       bytes: face.bytes,
@@ -1155,8 +1150,7 @@ function createRegistry({
         }
       }
       const count = core.status("font_source_sync_stale", sync);
-      const pointer = core.exports.abi_output_pointer();
-      const stale = new Uint32Array(core.refreshBytes().slice(pointer, pointer + count * 4).buffer);
+      const stale = count === 0 ? new Uint32Array(0) : new Uint32Array(core.outputBytes("font_source_sync_stale", 0, count * 4).buffer);
       for (const token of stale) {
         const { key, face } = copies.get(token);
         copies.delete(token);

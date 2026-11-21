@@ -60,9 +60,7 @@ function isForm(value) {
 // come from its submission value (HTML "entry construction algorithm"): the
 // entries of a FormData, or one entry with its name and the value.
 function decodeEntries(core, count) {
-  const pointer = core.exports.abi_output_pointer();
-  const length = core.exports.abi_output_length();
-  const bytes = new Uint8Array(core.refreshBytes().buffer, pointer, length).slice();
+  const bytes = count === 0 ? new Uint8Array(0) : core.outputBytes("form_entry_list_begin");
   const view = new DataView(bytes.buffer);
   const records = [];
   let at = 0;
@@ -84,7 +82,7 @@ function decodeEntries(core, count) {
     }
     at += valueLength;
   }
-  if (at !== length) throw new Error(`The entry list records end at byte ${at} of ${length}`);
+  if (at !== bytes.length) throw new Error(`The entry list records end at byte ${at} of ${bytes.length}`);
   const entries = [];
   for (const record of records) {
     if (record.kind === FORM_ENTRY_STRING) entries.push([record.name, record.text]);
@@ -163,12 +161,20 @@ export function giveSubmissionEntries(form, submitter) {
     ...core.byteInput(bytes), entries.length);
 }
 
-// The request of form_navigation_claim's output, with the body of a POST
-// request as a Blob of its segments.
-function readNavigationRequest(core, entries) {
-  const pointer = core.exports.abi_output_pointer();
-  const length = core.exports.abi_output_length();
-  const bytes = new Uint8Array(core.refreshBytes().buffer, pointer, length).slice();
+// The task of form `form`'s planned navigation `token` claims its request
+// (form_navigation_claim): the request, with the body of a POST request as
+// a Blob of its segments, or null when a later submission of the form
+// replaced it. The request is read before any other core operation, which
+// would clear the core's output; an ownerDocument read is one when a node
+// changed documents since the last read.
+function claimNavigationRequest(form, token, entries) {
+  const core = form._domCore;
+  if (!core.status("form_navigation_claim", form._coreHandle, token)) return null;
+  const bytes = core.outputBytes("form_navigation_claim");
+  const length = bytes.length;
+  if (length < NAVIGATION.HEADER) {
+    throw new Error(`The form navigation request has ${length} bytes, fewer than its ${NAVIGATION.HEADER}-byte header`);
+  }
   const view = new DataView(bytes.buffer);
   let at = NAVIGATION.HEADER;
   const text = (size) => decoder.decode(bytes.subarray(at, at += size));
@@ -208,9 +214,8 @@ export function queueFormNavigation(form, token) {
   const entries = submittedEntries.get(form);
   submittedEntries.delete(form);
   documentScripts(nodeMember(form, "ownerDocument")).queueTask(() => {
-    const core = form._domCore;
-    if (!core.status("form_navigation_claim", form._coreHandle, token)) return;
-    navigateForForm(nodeMember(form, "ownerDocument"), readNavigationRequest(core, entries));
+    const request = claimNavigationRequest(form, token, entries);
+    if (request !== null) navigateForForm(nodeMember(form, "ownerDocument"), request);
   });
 }
 

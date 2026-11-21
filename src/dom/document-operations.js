@@ -72,8 +72,7 @@ export function withDocumentScope(document, origin, operation) {
 export function logInteraction(document, record) {
   const core = document._domCore;
   const length = core.statusRaw("document_log_interact", document._coreHandle, ...core.byteInput(encodeInputRecord(record)));
-  const pointer = core.exports.abi_output_pointer();
-  return decodeInputRecord(core.refreshBytes().slice(pointer, pointer + length));
+  return decodeInputRecord(core.outputBytes("document_log_interact", 0, length));
 }
 
 // Whether a document refuses changes outside an origin scope.
@@ -97,8 +96,7 @@ export function documentLogLength(document) {
 export function documentLogBytes(document) {
   const core = document._domCore;
   const length = core.status("document_log_bytes", document._coreHandle);
-  const pointer = core.exports.abi_output_pointer();
-  return core.refreshBytes().slice(pointer, pointer + length);
+  return length === 0 ? new Uint8Array(0) : core.outputBytes("document_log_bytes", 0, length);
 }
 
 // The operation of a logged batch (one operation, a creation with its
@@ -303,8 +301,21 @@ function runBatch(document, bytes) {
   const memory = core.refreshBytes();
   memory.set(bytes, pointer);
   new DataView(memory.buffer).setBigUint64(pointer + DomBatchHeaderFields.fontCatalog, registry.fontCatalogHandle, true);
-  const readResult = () =>
-    readDomBatchResult(new DataView(core.refreshBytes().buffer), core.exports.abi_output_pointer());
+  // The result of a step of the batch, with the diagnostic of a failure and
+  // the returned handles of the end, read before the step's records run
+  // other operations.
+  const readResult = (operation) => {
+    const output = core.output(operation);
+    const result = readDomBatchResult(output, 0);
+    const addresses = output.memory();
+    if (result.status === BATCH_FAILED) {
+      result.diagnostic = addresses.memoryText(core.decoder, result.diagnosticPointer, result.diagnosticLength);
+    } else if (result.status !== BATCH_SUSPENDED) {
+      result.returned = Array.from({ length: result.returnedCount },
+        (_, index) => addresses.getBigUint64(result.returnedPointer + index * 8, true));
+    }
+    return result;
+  };
   // Each run of the batch up to a suspension is one [CEReactions] step, as
   // each scalar operation is.
   const run = (step) =>
@@ -316,7 +327,7 @@ function runBatch(document, bytes) {
   let handle = 0n;
   let result = run(() => {
     handle = core.handle("dom_batch_apply", document._coreHandle, pointer, bytes.byteLength, -1n);
-    return readResult();
+    return readResult("dom_batch_apply");
   });
   try {
     while (result.status === BATCH_SUSPENDED) {
@@ -335,18 +346,15 @@ function runBatch(document, bytes) {
       }
       result = run(() => {
         core.status("dom_batch_resume", handle);
-        return readResult();
+        return readResult("dom_batch_resume");
       });
     }
     if (result.status === BATCH_FAILED) {
-      const diagnostic = core.decoder.decode(core.refreshBytes()
-        .subarray(result.diagnosticPointer, result.diagnosticPointer + result.diagnosticLength));
       throw new Error(
-        `Document operation ${result.operationIndex} (${OPCODE_NAMES.get(result.opcode) ?? result.opcode}) failed: ${diagnostic} (error kind ${result.errorKind})`,
+        `Document operation ${result.operationIndex} (${OPCODE_NAMES.get(result.opcode) ?? result.opcode}) failed: ${result.diagnostic} (error kind ${result.errorKind})`,
       );
     }
-    const returned = new DataView(core.refreshBytes().buffer, result.returnedPointer, result.returnedCount * 8);
-    return Array.from({ length: result.returnedCount }, (_, index) => returned.getBigUint64(index * 8, true));
+    return result.returned;
   } finally {
     core.status("dom_batch_release", handle);
   }
@@ -375,8 +383,14 @@ const modifierFields = ({ shiftKey = false, altKey = false, ctrlKey = false, met
   ({ shiftKey, altKey, controlKey: ctrlKey, metaKey });
 
 const pointerFields = (options = {}) => {
-  const { pointerId = 1, pointerType = "mouse", isPrimary = true, button = 0, buttons = 0, pressure = 0, timeMilliseconds } = options;
-  return { pointerId, pointerType, isPrimary, button, buttons, pressure, ...modifierFields(options), timeMilliseconds };
+  const {
+    pointerId = 1, pointerType = "mouse", isPrimary = true, button = 0, buttons = 0, pressure = 0, tiltX = 0, tiltY = 0, twist = 0,
+    width, height, tangentialPressure = 0, timeMilliseconds,
+  } = options;
+  return {
+    pointerId, pointerType, isPrimary, button, buttons, pressure, tiltX, tiltY, twist, width, height, tangentialPressure,
+    ...modifierFields(options), timeMilliseconds,
+  };
 };
 
 /**

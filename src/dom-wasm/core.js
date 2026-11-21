@@ -150,6 +150,8 @@ const CALLBACK_FIELD_OLD_VALUE_POINTER = layoutConstant("CALLBACK_FIELD_OLD_VALU
 const CALLBACK_FIELD_OLD_VALUE_LENGTH = layoutConstant("CALLBACK_FIELD_OLD_VALUE_LENGTH");
 const CALLBACK_FLAG_OLD_VALUE_ABSENT = layoutConstant("CALLBACK_FLAG_OLD_VALUE_ABSENT");
 const CALLBACK_FLAG_MOVED = layoutConstant("CALLBACK_FLAG_MOVED");
+const CALLBACK_NOTIFY_NONE = layoutConstant("CALLBACK_NOTIFY_NONE");
+const CALLBACK_NOTIFY_STRUCTURE = layoutConstant("CALLBACK_NOTIFY_STRUCTURE");
 const CALLBACK_RECORD_CHILD_LIST = layoutConstant("CALLBACK_RECORD_CHILD_LIST");
 const DETAILS_TOGGLE_SIZE = layoutConstant("DETAILS_TOGGLE_SIZE");
 const DETAILS_TOGGLE_NODE = layoutConstant("DETAILS_TOGGLE_NODE");
@@ -205,13 +207,250 @@ function wasmExportFailureState(name, args, memory, exports) {
   };
 }
 
+// The exports of the output registers: a host reads an operation's output
+// through CoreOperations.output, never through them.
+const OUTPUT_READS = new Set(["abi_output_pointer", "abi_output_length"]);
+
+// The operations of one renderer-core instance and the reads of their
+// output. The core counts each clear of its output registers
+// (abi_operation_serial_value); an operation begins with one and leaves no
+// output (the pointer at abi_output_none_value) unless it sets the
+// registers, empty or not. The export wrappers record each call that
+// cleared or set the registers as the last operation. A host reads an
+// output through output(name), which names the operation it expects: it
+// throws unless that operation is the last one and produced output, and
+// each read of the CoreOutput it returns throws once the registers changed.
+export class CoreOperations {
+  #memory;
+  #serialRegister;
+  #pointerRegister;
+  #lengthRegister;
+  #none;
+  #last = null;
+  #lastSerial = -1;
+  #lastPointer = -1;
+  #lastLength = -1;
+  #buffer = null;
+  #view = null;
+
+  constructor(exports) {
+    this.#memory = exports.memory;
+    this.#serialRegister = exports.abi_operation_serial_value;
+    this.#pointerRegister = exports.abi_output_pointer_value;
+    this.#lengthRegister = exports.abi_output_length_value;
+    this.#none = exports.abi_output_none_value.value;
+  }
+
+  // The registers before an export call, for ended().
+  get serial() {
+    return this.#serialRegister.value;
+  }
+
+  get pointer() {
+    return this.#pointerRegister.value;
+  }
+
+  get length() {
+    return this.#lengthRegister.value;
+  }
+
+  // Export `name` returned; it is the last operation when it cleared or set
+  // the output registers.
+  ended(name, serial, pointer, length) {
+    const nextSerial = this.#serialRegister.value;
+    const nextPointer = this.#pointerRegister.value;
+    const nextLength = this.#lengthRegister.value;
+    if (nextSerial === serial && nextPointer === pointer && nextLength === length) return;
+    this.#last = name;
+    this.#lastSerial = nextSerial;
+    this.#lastPointer = nextPointer;
+    this.#lastLength = nextLength;
+  }
+
+  // Whether the registers still hold what the last recorded operation left.
+  #current() {
+    return this.#serialRegister.value === this.#lastSerial && this.#pointerRegister.value === this.#lastPointer &&
+      this.#lengthRegister.value === this.#lastLength;
+  }
+
+  #checkExpected(name, produced = true) {
+    if (this.#last !== name || !this.#current()) {
+      throw new Error(this.#current()
+        ? `The output of ${name} was read, but the last core operation was ${this.#last}: ` +
+          `read an operation's output before the next core operation`
+        : `The output of ${name} was read after a core operation that no export wrapper recorded`);
+    }
+    if (produced && this.#lastPointer === this.#none) {
+      throw new Error(`The output of ${name} was read, but ${name} produced none`);
+    }
+  }
+
+  // The output of the last operation, which must be `name`.
+  output(name) {
+    this.#checkExpected(name);
+    return new CoreOutput(this, name, this.#serialRegister.value, this.#pointerRegister.value, this.#lengthRegister.value);
+  }
+
+  // The memory at the address that operation `name`, the last one, returned
+  // as its result rather than as its output: reads at absolute addresses,
+  // checked as the reads of an output are.
+  resultMemory(name) {
+    this.#checkExpected(name, false);
+    return new CoreOutput(this, name, this.#serialRegister.value, this.#pointerRegister.value, this.#lengthRegister.value,
+      true);
+  }
+
+  // A copy of the output bytes [start, end) of operation `name`.
+  outputBytes(name, start = 0, end = undefined) {
+    this.#checkExpected(name);
+    const pointer = this.#pointerRegister.value;
+    return new Uint8Array(this.#memory.buffer, pointer + start, (end ?? this.#lengthRegister.value) - start).slice();
+  }
+
+  // The output bytes [start, end) of operation `name`, decoded by `decoder`.
+  outputText(name, decoder, start = 0, end = undefined) {
+    this.#checkExpected(name);
+    const pointer = this.#pointerRegister.value;
+    return decoder.decode(new Uint8Array(this.#memory.buffer, pointer + start, (end ?? this.#lengthRegister.value) - start));
+  }
+
+  // A DataView of the whole memory, made again after a growth.
+  dataView() {
+    const buffer = this.#memory.buffer;
+    if (buffer !== this.#buffer) {
+      this.#buffer = buffer;
+      this.#view = new DataView(buffer);
+    }
+    return this.#view;
+  }
+
+  memoryBuffer() {
+    return this.#memory.buffer;
+  }
+
+  // Throws unless the registers still hold the output `output` reads.
+  checkOutput(output, serial, pointer, length) {
+    if (this.#serialRegister.value === serial && this.#pointerRegister.value === pointer &&
+      this.#lengthRegister.value === length) return;
+    throw new Error(`The output of ${output} was read after ${this.#last} ran: ` +
+      `read an operation's output before the next core operation`);
+  }
+}
+
+// The output of one operation (CoreOperations.output). Its reads take
+// byte offsets in the output, as a DataView over it does; memory() gives
+// the same reads at absolute addresses that the output names, and
+// memoryBytes and memoryText copy them. Every read throws once another
+// operation cleared or set the output registers.
+export class CoreOutput {
+  #operations;
+  #name;
+  #serial;
+  #pointer;
+  #length;
+  #absolute;
+
+  constructor(operations, name, serial, pointer, length, absolute = false) {
+    this.#operations = operations;
+    this.#name = name;
+    this.#serial = serial;
+    this.#pointer = pointer;
+    this.#length = length;
+    this.#absolute = absolute;
+  }
+
+  #check() {
+    this.#operations.checkOutput(this.#name, this.#serial, this.#pointer, this.#length);
+  }
+
+  #at(offset, size) {
+    this.#check();
+    if (this.#absolute) return offset;
+    if (!(offset >= 0 && offset + size <= this.#length)) {
+      throw new Error(`Offset ${offset} of a ${size}-byte read is outside the ${this.#length}-byte output of ${this.#name}`);
+    }
+    return this.#pointer + offset;
+  }
+
+  // The reads of this output at absolute addresses.
+  memory() {
+    return new CoreOutput(this.#operations, this.#name, this.#serial, this.#pointer, this.#length, true);
+  }
+
+  // The output's address, for an operation that takes it as input.
+  get pointer() {
+    this.#check();
+    return this.#pointer;
+  }
+
+  get byteLength() {
+    this.#check();
+    return this.#length;
+  }
+
+  getUint8(offset) {
+    return this.#operations.dataView().getUint8(this.#at(offset, 1));
+  }
+  getInt8(offset) {
+    return this.#operations.dataView().getInt8(this.#at(offset, 1));
+  }
+  getUint16(offset, littleEndian) {
+    return this.#operations.dataView().getUint16(this.#at(offset, 2), littleEndian);
+  }
+  getInt16(offset, littleEndian) {
+    return this.#operations.dataView().getInt16(this.#at(offset, 2), littleEndian);
+  }
+  getUint32(offset, littleEndian) {
+    return this.#operations.dataView().getUint32(this.#at(offset, 4), littleEndian);
+  }
+  getInt32(offset, littleEndian) {
+    return this.#operations.dataView().getInt32(this.#at(offset, 4), littleEndian);
+  }
+  getFloat32(offset, littleEndian) {
+    return this.#operations.dataView().getFloat32(this.#at(offset, 4), littleEndian);
+  }
+  getFloat64(offset, littleEndian) {
+    return this.#operations.dataView().getFloat64(this.#at(offset, 8), littleEndian);
+  }
+  getBigUint64(offset, littleEndian) {
+    return this.#operations.dataView().getBigUint64(this.#at(offset, 8), littleEndian);
+  }
+  getBigInt64(offset, littleEndian) {
+    return this.#operations.dataView().getBigInt64(this.#at(offset, 8), littleEndian);
+  }
+
+  // A copy of the output bytes [start, end).
+  bytes(start = 0, end = this.#length) {
+    const at = this.#at(start, end - start);
+    return new Uint8Array(this.#operations.memoryBuffer(), at, end - start).slice();
+  }
+
+  // The output bytes [start, end), decoded by `decoder`.
+  text(decoder, start = 0, end = this.#length) {
+    const at = this.#at(start, end - start);
+    return decoder.decode(new Uint8Array(this.#operations.memoryBuffer(), at, end - start));
+  }
+
+  // Copies at absolute addresses that the output names, valid as long as it.
+  memoryBytes(address, length) {
+    this.#check();
+    return new Uint8Array(this.#operations.memoryBuffer(), address, length).slice();
+  }
+  memoryText(decoder, address, length) {
+    this.#check();
+    return decoder.decode(new Uint8Array(this.#operations.memoryBuffer(), address, length));
+  }
+}
+
 // Wraps a module's exports so a memory growth inside any call is reported
 // before the caller can read a detached view. Only the DOM core's allocator
 // grows the shared memory, but it is reached from the engine's shaping
 // calls (through HarfBuzz) as well as from the core's own operations, so
 // both export sets are observed. A failed call records its state on the
-// error (WASM_EXPORT_FAILURE).
-export function observeMemoryGrowth(memory, exports, notify) {
+// error (WASM_EXPORT_FAILURE). With `operations`, a call that cleared or
+// set the output registers is recorded as the last operation, and the
+// output registers are read only through CoreOperations.output.
+export function observeMemoryGrowth(memory, exports, notify, operations = null) {
   let buffer = memory.buffer;
   const wrapped = {};
   const observe = () => {
@@ -226,11 +465,22 @@ export function observeMemoryGrowth(memory, exports, notify) {
       wrapped[name] = value;
       continue;
     }
+    if (operations !== null && OUTPUT_READS.has(name)) {
+      wrapped[name] = function () {
+        throw new Error(`${name} reads the output registers without naming their operation: ` +
+          `read an operation's output through its core's output(operation)`);
+      };
+      continue;
+    }
     wrapped[name] = function () {
+      const serial = operations?.serial;
+      const pointer = operations?.pointer;
+      const length = operations?.length;
       let result;
       try {
         result = applyNative(value, null, arguments);
       } catch (error) {
+        operations?.ended(name, serial, pointer, length);
         // The export's own failure has precedence over a failure of the
         // record or the notification. After a normal return, a
         // notification failure is the only failure and remains visible.
@@ -248,6 +498,7 @@ export function observeMemoryGrowth(memory, exports, notify) {
         }
         throw error;
       }
+      operations?.ended(name, serial, pointer, length);
       observe();
       return result;
     };
@@ -280,7 +531,6 @@ class SceneBuildBox {
     letterSpacing,
     host,
     textSource,
-    decoder,
   ) {
     this.kind = kind;
     this.display = display;
@@ -299,17 +549,15 @@ class SceneBuildBox {
     this.letterSpacing = letterSpacing;
     this.host = host;
     this._textSource = textSource;
-    this._decoder = decoder;
     this._text = textSource === null ? null : undefined;
   }
 
   get text() {
     if (this._text === undefined) {
-      this._text = this._decoder.decode(
-        this._textSource.core.engineRecordPublicationText(this._textSource.handle).subarray(
-          this.textOffset,
-          this.textOffset + this.textLength,
-        ),
+      this._text = this._textSource.core.engineRecordPublicationText(
+        this._textSource.handle,
+        this.textOffset,
+        this.textOffset + this.textLength,
       );
     }
     return this._text;
@@ -355,7 +603,8 @@ const documentFinalizer = typeof FinalizationRegistry === "function"
   : null;
 
 // A renderer-core instance used without DOM wrappers: one memory, its raw
-// DOM/engine exports, and growth notification for the loader's engine facade.
+// DOM/engine exports, its operations, and growth notification for the
+// loader's engine facade.
 export function createAllocatorCore() {
   const instance = instantiateRendererCore();
   const memory = instance.exports.memory;
@@ -363,6 +612,7 @@ export function createAllocatorCore() {
   return Object.freeze({
     memory,
     rawExports: instance.exports,
+    operations: new CoreOperations(instance.exports),
     onMemoryGrowth(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
@@ -384,6 +634,9 @@ export class DomCore {
     const instance = instantiateRendererCore();
     this.memory = instance.exports.memory;
     this.growthListeners = new Set();
+    // The operations of the core and of its engine (loader.js), which share
+    // the output registers.
+    this.operations = new CoreOperations(instance.exports);
     // Raw exports bind HarfBuzz's allocator directly; host calls go through
     // growth-observing wrappers so no caller reads a detached view.
     this.rawExports = instance.exports;
@@ -391,18 +644,22 @@ export class DomCore {
       this.memory,
       instance.exports,
       () => this.notifyGrowth(),
+      this.operations,
     );
     if (sceneCacheVerify) instance.exports.scene_cache_verify(1);
     const measurement = globalThis[measurementKey];
     this.exports = measurement
       ? measurement.wrapExports(this.nativeExports, "core")
       : this.nativeExports;
-    // The error kind and output registers, read without a call.
+    // The error kind register, read without a call.
     this.errorKindRegister = instance.exports.abi_error_kind_value;
-    this.outputPointerRegister = instance.exports.abi_output_pointer_value;
-    this.outputLengthRegister = instance.exports.abi_output_length_value;
     this.detailsToggleCountRegister = instance.exports.details_toggle_count_value;
     this.selectedContentPendingRegister = instance.exports.selected_content_pending_value;
+    // Selects with a pending selectedcontent update (HTML: "queue an update
+    // of a select's descendant selectedcontent elements"); one microtask runs
+    // them all.
+    this.selectedContentQueuedRegister = instance.exports.selected_content_queued_value;
+    this.selectedContentRunQueued = false;
     this.ownerEpochRegister = instance.exports.node_owner_epoch_value;
     this.backupReactionsRegister = instance.exports.custom_reactions_backup;
     // HTML "processing the backup element queue" flag.
@@ -453,8 +710,7 @@ export class DomCore {
 
   frameDamageRectangles(frame) {
     const count = this.status("frame_damage_export", frame);
-    const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().buffer);
+    const output = this.output("frame_damage_export");
     const measurement = globalThis[FRAME_MEASUREMENT];
     if (measurement) {
       measurement.record({
@@ -466,12 +722,12 @@ export class DomCore {
       });
     }
     return Array.from({ length: count }, (_, index) => {
-      const at = pointer + index * DAMAGE_RECT_SIZE;
+      const at = index * DAMAGE_RECT_SIZE;
       return {
-        x: view.getFloat64(at + DAMAGE_RECT_X, true),
-        y: view.getFloat64(at + DAMAGE_RECT_Y, true),
-        width: view.getFloat64(at + DAMAGE_RECT_WIDTH, true),
-        height: view.getFloat64(at + DAMAGE_RECT_HEIGHT, true),
+        x: output.getFloat64(at + DAMAGE_RECT_X, true),
+        y: output.getFloat64(at + DAMAGE_RECT_Y, true),
+        width: output.getFloat64(at + DAMAGE_RECT_WIDTH, true),
+        height: output.getFloat64(at + DAMAGE_RECT_HEIGHT, true),
       };
     });
   }
@@ -480,19 +736,13 @@ export class DomCore {
   // for `auto`. { r, g, b, a } in 0..1.
   styleUsedCaretColor(handle) {
     this.status("style_used_caret_color", handle);
-    const view = new DataView(
-      this.refreshBytes().buffer,
-      this.exports.abi_output_pointer(),
-      COLOR_RGBA_SIZE,
-    );
-    return rgba(view, 0);
+    return rgba(this.output("style_used_caret_color"), 0);
   }
 
   frameDamageTiles(frame, width, height, tileSize) {
     this.status("frame_damage_tiles", frame, width, height, tileSize);
-    const pointer = this.exports.abi_output_pointer();
-    const length = this.exports.abi_output_length();
-    const tiles = this.refreshBytes().slice(pointer, pointer + length);
+    const tiles = this.outputBytes("frame_damage_tiles");
+    const length = tiles.length;
     const measurement = globalThis[FRAME_MEASUREMENT];
     if (measurement) {
       measurement.record({
@@ -595,20 +845,32 @@ export class DomCore {
     return this.byteInput(encodeHostValues(values, options));
   }
 
-  outputString() {
-    const pointer = this.outputPointerRegister.value;
-    const length = this.outputLengthRegister.value;
+  // The output of the last operation, which must be `operation`
+  // (CoreOperations.output), and copies of its bytes.
+  output(operation) {
+    return this.operations.output(operation);
+  }
+
+  // The memory at the address that `operation`, the last operation, returned
+  // as its result (CoreOperations.resultMemory).
+  resultMemory(operation) {
+    return this.operations.resultMemory(operation);
+  }
+
+  outputBytes(operation, start = undefined, end = undefined) {
+    return this.operations.outputBytes(operation, start, end);
+  }
+
+  outputString(operation) {
     const measurement = globalThis[measurementKey];
     const start = measurement ? hostNow() : 0;
-    const result = this.decoder.decode(
-      this.refreshBytes().subarray(pointer, pointer + length),
-    );
+    const result = this.operations.outputText(operation, this.decoder);
     if (measurement) {
       measurement.record({
         category: "transport",
         operation: "utf8.output",
         direction: "core-to-host",
-        bytes: length,
+        bytes: this.operations.length,
         allocations: 1,
         milliseconds: hostNow() - start,
       });
@@ -620,10 +882,24 @@ export class DomCore {
   // (abi_error_report); `rawMessage` asks for the message without its
   // detail numbers, for a caller that names the subject itself. When the
   // call put the first reaction into the backup element queue
-  // (custom_reactions_backup), a microtask processes that queue.
+  // (custom_reactions_backup), a microtask processes that queue; when it
+  // queued a selectedcontent update, a microtask runs it.
   throwIfError(rawMessage = false) {
     if (this.backupReactionsRegister.value !== 0n && !this.backupReactionsQueued) this.queueBackupReactions();
+    if (this.selectedContentQueuedRegister.value !== 0 && !this.selectedContentRunQueued) this.queueSelectedContentRun();
     if (this.errorKindRegister.value !== 0) throw this.currentError(rawMessage);
+  }
+
+  // The queued updates reach the facade with their records, as an update
+  // of a selection change does (deliverSelectedContent).
+  queueSelectedContentRun() {
+    this.selectedContentRunQueued = true;
+    queueMicrotask(() => {
+      this.selectedContentRunQueued = false;
+      this.exports.selected_content_run_queued();
+      this.throwIfError();
+      this.selectedContentHandler(this);
+    });
   }
 
   queueBackupReactions() {
@@ -640,12 +916,12 @@ export class DomCore {
 
   currentError(rawMessage) {
     const errorClass = this.exports.abi_error_report(rawMessage ? 1 : 0);
-    const message = this.outputString();
+    const message = this.outputString("abi_error_report");
     if (errorClass === ERROR_CLASS_TYPE_ERROR) return new TypeError(message);
     if (errorClass === ERROR_CLASS_RANGE_ERROR) return new RangeError(message);
     if (errorClass === ERROR_CLASS_DOM_EXCEPTION && typeof DOMException === "function") {
       this.exports.abi_error_name();
-      return new DOMException(message, this.outputString());
+      return new DOMException(message, this.outputString("abi_error_name"));
     }
     return new Error(message);
   }
@@ -702,7 +978,7 @@ export class DomCore {
     if (epoch === this.selectionDocumentEpoch) return;
     this.selectionDocumentEpoch = epoch;
     const count = this.status("selection_foreign_changes");
-    const view = new DataView(this.refreshBytes().buffer, this.exports.abi_output_pointer(), count * SELECTION_FOREIGN_PAIR.SIZE);
+    const view = count === 0 ? null : this.output("selection_foreign_changes");
     const documents = new Map();
     for (let index = 0; index < count; index += 1) {
       const pair = index * SELECTION_FOREIGN_PAIR.SIZE;
@@ -741,8 +1017,7 @@ export class DomCore {
         handle,
       )
     ) return null;
-    const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().buffer, pointer, SELECTION_BOUNDARIES.SIZE);
+    const view = this.output(ordered ? "selection_ordered_export" : "selection_export");
     const first = view.getBigUint64(SELECTION_BOUNDARIES.FIRST_NODE, true);
     const firstOffset = view.getFloat64(SELECTION_BOUNDARIES.FIRST_OFFSET, true);
     const second = view.getBigUint64(SELECTION_BOUNDARIES.SECOND_NODE, true);
@@ -757,8 +1032,8 @@ export class DomCore {
 
   selectionSpans(handle, node = 0n) {
     const count = this.status("selection_text_spans", handle, node);
-    const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().buffer, pointer, count * SELECTION_SPAN_SIZE);
+    if (count === 0) return [];
+    const view = this.output("selection_text_spans");
     // Capture all transient facts before wrapper construction or data access
     // enters another operation; no native pointer crosses a host callback.
     const spans = new Array(count);
@@ -776,7 +1051,7 @@ export class DomCore {
     const native = this.exports;
     const result = applyNative(native[exportName], native, parameters);
     this.throwIfError();
-    return result === 0 ? null : this.outputString();
+    return result === 0 ? null : this.outputString(exportName);
   }
 
   createDocument(url, xmlDocument = false) {
@@ -851,7 +1126,7 @@ export class DomCore {
   htmlParserTakeHandlerElements(parser) {
     const count = this.status("html_parser_take_handler_elements", parser);
     if (count === 0) return [];
-    const view = new DataView(this.memory.buffer, this.exports.abi_output_pointer(), count * HANDLER_ELEMENT_SIZE);
+    const view = this.output("html_parser_take_handler_elements");
     // Copy the numbers before wrapper materialization can grow memory.
     const entries = Array.from({ length: count }, (_, index) => ({
       handle: view.getBigUint64(index * HANDLER_ELEMENT_SIZE + HANDLER_ELEMENT_NODE, true),
@@ -972,19 +1247,25 @@ export class DomCore {
     return result;
   }
 
-  // The wrappers of the `count` u64 node handles in standard output. The
-  // handles are copied before wrapperFor can reenter the core.
-  outputNodes(count) {
+  // The wrappers of the `count` u64 node handles in the output of
+  // `operation`. The handles are copied before wrapperFor can reenter the
+  // core.
+  outputNodes(operation, count) {
     if (count <= 0) return [];
-    const view = new DataView(this.refreshBytes().buffer, this.exports.abi_output_pointer(), count * BigUint64Array.BYTES_PER_ELEMENT);
+    const view = this.output(operation);
     const handles = Array.from({ length: count }, (_, index) => view.getBigUint64(index * BigUint64Array.BYTES_PER_ELEMENT, true));
     return handles.map((handle) => this.wrapperFor(handle));
+  }
+
+  // The nodes in the output of export `exportName`, whose result counts them.
+  statusNodes(exportName, ...parameters) {
+    return this.outputNodes(exportName, this.status(exportName, ...parameters));
   }
 
   // The nodes of a root that a collection filter accepts, and the named
   // item among them (node_collection_list, form-collections.watpart).
   collectionList(rootHandle, scope, filter, a, b) {
-    return this.outputNodes(this.status("node_collection_list", rootHandle, scope, filter, ...this.input(a), ...this.input(b)));
+    return this.outputNodes("node_collection_list", this.status("node_collection_list", rootHandle, scope, filter, ...this.input(a), ...this.input(b)));
   }
 
   collectionListNamed(rootHandle, scope, filter, a, b, name) {
@@ -1091,7 +1372,7 @@ export class DomCore {
   sceneResourceLayers(handle, pseudo) {
     const count = this.status("scene_resource_layers", handle, pseudo);
     if (count === 0) return null;
-    const counts = new Uint32Array(this.refreshBytes().buffer, this.exports.abi_output_pointer(), IMAGE_RESOURCE.KIND_COUNT).slice();
+    const counts = new Uint32Array(this.outputBytes("scene_resource_layers", 0, IMAGE_RESOURCE.KIND_COUNT * 4).buffer);
     const result = {};
     let index = 0;
     for (const [kind, name] of [[IMAGE_RESOURCE.BACKGROUND, "backgroundImages"], [IMAGE_RESOURCE.MASK, "masks"], [IMAGE_RESOURCE.BORDER, "borderImage"]]) {
@@ -1145,6 +1426,11 @@ export class DomCore {
   // Per document handle, the entry of its wrapper's document finalizer:
   // { reference }, also its unregister token.
   documentFinalizerEntries = new Map();
+  // Host state that a document owns outside its tree (a scene renderer
+  // runtime's prepared text of the document's layout): each listener gets
+  // the handle of a document that a disposal ends, whether the host
+  // disposed it or the collector took its wrapper.
+  documentDisposalListeners = new Set();
 
   // The wrappers of the nodes in a document's tree, keyed by the document's
   // wrapper. A script can reach a connected node through its document at
@@ -1207,7 +1493,7 @@ export class DomCore {
     const documentWrapper = this.connectedDocumentWrapper(rootHandle);
     const count = this.status("node_retained_subtree", rootHandle);
     if (count <= 0) return;
-    const view = new DataView(this.refreshBytes().buffer, this.exports.abi_output_pointer(), count * BigUint64Array.BYTES_PER_ELEMENT);
+    const view = this.output("node_retained_subtree");
     for (let index = 0; index < count; index += 1) {
       const wrapper = this.wrapperByHandle.get(view.getBigUint64(index * BigUint64Array.BYTES_PER_ELEMENT, true))?.deref();
       if (wrapper !== undefined) this.holdConnectedWrapper(wrapper, documentWrapper);
@@ -1356,7 +1642,7 @@ export class DomCore {
 
   textContent(handle) {
     this.status("node_text_content", handle);
-    return this.outputString();
+    return this.outputString("node_text_content");
   }
 
   elementById(rootHandle, id) {
@@ -1579,14 +1865,14 @@ export class DomCore {
       ...this.byteInput(bytes), tokens.length);
     return {
       result: (result & TOKEN_RESULT) !== 0,
-      value: (result & TOKEN_RESULT_WRITE) === 0 ? null : this.outputString(),
+      value: (result & TOKEN_RESULT_WRITE) === 0 ? null : this.outputString("token_list_update"),
     };
   }
 
   attributeStringAt(exportName, handle, index) {
     const result = this.exports[exportName](handle, index);
     this.throwIfError();
-    return result === 0 ? null : this.outputString();
+    return result === 0 ? null : this.outputString(exportName);
   }
 
   // `document`: the owner document of the element, whose @font-face
@@ -1618,7 +1904,7 @@ export class DomCore {
 
   styleRemove(handle, name) {
     this.status("style_remove", handle, ...this.input(name));
-    return this.outputString();
+    return this.outputString("style_remove");
   }
 
   styleCount(handle) {
@@ -1719,7 +2005,7 @@ export class DomCore {
 
   styleCheckName(name) {
     if (!this.status("style_check_name", ...this.input(name))) {
-      throw new Error(this.outputString());
+      throw new Error(this.outputString("style_check_name"));
     }
   }
 
@@ -1728,7 +2014,7 @@ export class DomCore {
     const diagnostics = new Array(count);
     for (let index = 0; index < count; index++) {
       const code = this.status("style_diagnostic_at", handle, index);
-      const message = this.outputString();
+      const message = this.outputString("style_diagnostic_at");
       diagnostics[index] = Object.freeze(
         code === STYLE_DIAGNOSTIC_INVALID_DECLARATION
           ? {
@@ -1762,7 +2048,7 @@ export class DomCore {
       if (kind === 0) return diagnostics;
       diagnostics.push({
         code: kind === MATHML_DIAGNOSTIC_ELEMENT ? "mathml-unsupported-element" : "mathml-unsupported-attribute",
-        message: this.outputString(),
+        message: this.outputString("mathml_diagnostic_at"),
       });
     }
   }
@@ -1808,10 +2094,10 @@ export class DomCore {
     return Object.freeze(declarations);
   }
 
-  // The rule handles of a u64 list in the standard output.
-  outputRuleHandles(count) {
-    const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().buffer, pointer, count * 8);
+  // The rule handles of a u64 list in the output of `operation`.
+  outputRuleHandles(operation, count) {
+    if (count === 0) return [];
+    const view = this.output(operation);
     return Array.from({ length: count }, (_, index) => view.getBigUint64(index * 8, true));
   }
 
@@ -1819,7 +2105,7 @@ export class DomCore {
   // active in the media environment (css_active_named_rules).
   activeNamedRules(sheetHandle, name, environment) {
     this.mediaEnvironmentSet(environment);
-    return this.outputRuleHandles(this.status("css_active_named_rules", sheetHandle, ...this.input(name)));
+    return this.outputRuleHandles("css_active_named_rules", this.status("css_active_named_rules", sheetHandle, ...this.input(name)));
   }
 
   // The keyframes of the @keyframes rule `name` of a scope root in the
@@ -1831,8 +2117,8 @@ export class DomCore {
     const rule = this.handle("css_keyframes_rule", rootHandle, ...this.input(name));
     if (rule === 0n) return null;
     const count = this.status("css_keyframes_frames", rule);
-    const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().slice(pointer, pointer + count * KEYFRAME_RECORD_SIZE).buffer);
+    if (count === 0) return [];
+    const view = new DataView(this.outputBytes("css_keyframes_frames", 0, count * KEYFRAME_RECORD_SIZE).buffer);
     const frames = [];
     for (let index = 0; index < count; index += 1) {
       const record = index * KEYFRAME_RECORD_SIZE;
@@ -1854,7 +2140,7 @@ export class DomCore {
     const diagnostics = new Array(diagnosticCount);
     for (let index = 0; index < diagnosticCount; index += 1) {
       const kind = STYLE_SHEET_DIAGNOSTICS[this.status("css_sheet_diagnostic_at", sheetHandle, index)];
-      const construct = this.outputString();
+      const construct = this.outputString("css_sheet_diagnostic_at");
       diagnostics[index] = Object.freeze({
         code: kind.code,
         severity: "warning",
@@ -1997,25 +2283,24 @@ export class DomCore {
       viewport ? "scene_build_viewport" : "scene_build",
       rootHandle,
     );
-    const base = this.exports.abi_output_pointer();
-    const view = new DataView(this.memory.buffer);
+    const output = this.output(viewport ? "scene_build_viewport" : "scene_build");
     const arena = this.exports.scene_text_arena_pointer();
     const boxes = new Array(count);
-    const childBase = base + count * SceneBuildBoxSize;
+    // The child lists follow the boxes, outside the output.
+    const childBase = output.pointer + count * SceneBuildBoxSize;
     const field = SceneBuildBoxFields;
+    const view = output;
+    const memory = output.memory();
     for (let index = 0; index < count; index += 1) {
       // Decoded field by field into its final shape: the generated reader
       // would build an intermediate object per box, and a text page has
       // thousands of boxes per build.
-      const pointer = base + index * SceneBuildBoxSize;
+      const pointer = index * SceneBuildBoxSize;
       const childOffset = view.getUint32(pointer + field.childOffset, true);
       const childCount = view.getUint32(pointer + field.childCount, true);
       const children = new Array(childCount);
       for (let child = 0; child < childCount; child += 1) {
-        children[child] = view.getUint32(
-          childBase + (childOffset + child) * Uint32Array.BYTES_PER_ELEMENT,
-          true,
-        );
+        children[child] = memory.getUint32(childBase + (childOffset + child) * Uint32Array.BYTES_PER_ELEMENT, true);
       }
       const textPointer = view.getUint32(pointer + field.textPointer, true);
       const textLength = view.getUint32(pointer + field.textLength, true);
@@ -2039,7 +2324,6 @@ export class DomCore {
         view.getFloat64(pointer + field.letterSpacing, true),
         view.getUint8(pointer + field.host),
         hasText ? publication : null,
-        hasText ? this.decoder : null,
       );
     }
     // Rows and child lists are build-owned; the readers below may rotate
@@ -2060,12 +2344,7 @@ export class DomCore {
   // or its body (CSS 2.1 14.2), as { r, g, b, a }, or null.
   sceneCanvasBackground() {
     if (this.status("scene_canvas_background") === 0) return null;
-    const view = new DataView(
-      this.memory.buffer,
-      this.exports.abi_output_pointer(),
-      COLOR_RGBA_SIZE,
-    );
-    return rgba(view, 0);
+    return rgba(this.output("scene_canvas_background"), 0);
   }
 
   // Host generated-content overrides (animated pseudo-element content) for
@@ -2118,8 +2397,7 @@ export class DomCore {
     this.throwIfError();
     if (status === COLOR_CURRENT) return "currentColor";
     if (status !== COLOR_PARSED) return null;
-    const pointer = this.exports.abi_output_pointer();
-    return rgba(new DataView(this.memory.buffer), pointer);
+    return rgba(this.output(currentColor === null ? "color_parse" : "color_parse_with_current"), 0);
   }
 
   // Chrome's serialization of the color the last parseColor() returned when
@@ -2127,7 +2405,7 @@ export class DomCore {
   // color(), color-mix()), or null for a keyword, hex, rgb(), hsl() or
   // hwb() color, which serializes from its 8-bit components.
   parsedColorText() {
-    return this.exports.color_parsed_text() === 0 ? null : this.outputString();
+    return this.exports.color_parsed_text() === 0 ? null : this.outputString("color_parsed_text");
   }
 
   // Blink's stop of a gradient that interpolates in OKLab for the color the
@@ -2138,9 +2416,8 @@ export class DomCore {
   parsedOklabStop(r, g, b) {
     this.exports.color_parsed_oklab_stop(r, g, b);
     this.throwIfError();
-    const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.memory.buffer);
-    const color = (start) => [0, 1, 2].map((index) => view.getFloat64(pointer + start + index * Float64Array.BYTES_PER_ELEMENT, true));
+    const view = this.output("color_parsed_oklab_stop");
+    const color = (start) => [0, 1, 2].map((index) => view.getFloat64(start + index * Float64Array.BYTES_PER_ELEMENT, true));
     return { stop: color(OKLAB_STOP_INTERPOLATED), own: color(OKLAB_STOP_OWN) };
   }
 
@@ -2151,9 +2428,8 @@ export class DomCore {
   cssURLs(text) {
     const source = this.encoder.encode(String(text));
     const count = this.status("css_url_tokens", ...this.byteInput(source, true));
-    const pointer = this.exports.abi_output_pointer();
-    const length = this.exports.abi_output_length();
-    const records = this.refreshBytes().slice(pointer, pointer + length);
+    if (count === 0) return [];
+    const records = this.outputBytes("css_url_tokens");
     const view = new DataView(records.buffer);
     // The records count UTF-8 bytes; every byte that does not continue a
     // sequence is one UTF-16 code unit, and a four-byte sequence is two.
@@ -2192,8 +2468,8 @@ export class DomCore {
   // demand fields of its url()'s modifiers, requestFields) }.
   cssSheetReferences(source) {
     const count = this.status("css_sheet_references", ...this.input(source));
-    const pointer = this.exports.abi_output_pointer();
-    const records = this.refreshBytes().slice(pointer, pointer + this.exports.abi_output_length());
+    if (count === 0) return [];
+    const records = this.outputBytes("css_sheet_references");
     const view = new DataView(records.buffer);
     const references = new Array(count);
     let offset = 0;
@@ -2225,8 +2501,8 @@ export class DomCore {
   fontUnicodeRanges(text) {
     const count = this.status("font_unicode_range_parse", ...this.input(text));
     if (count < 0) return null;
-    const pointer = this.exports.abi_output_pointer();
-    return new Uint32Array(this.refreshBytes().buffer.slice(pointer, pointer + count * UNICODE_RANGE_SIZE));
+    if (count === 0) return new Uint32Array(0);
+    return new Uint32Array(this.outputBytes("font_unicode_range_parse", 0, count * UNICODE_RANGE_SIZE).buffer);
   }
 
   cascadeBegin() {
@@ -2283,24 +2559,20 @@ export class DomCore {
 
   resourceInfo(handle) {
     this.status("resource_info", handle);
-    const view = new DataView(
-      this.memory.buffer,
-      this.exports.abi_output_pointer(),
-      RESOURCE_INFO_SIZE,
-    );
+    const view = this.output("resource_info");
     return Object.fromEntries(RESOURCE_INFO_FIELDS.map(([name, offset, read]) => [name, view[read](offset, true)]));
   }
 
   resourceKey(handle) {
     this.status("resource_key", handle);
-    return this.outputString();
+    return this.outputString("resource_key");
   }
 
   // The request a url()'s modifiers name for the resource (CSS Values 5
   // §4.1.1; resource_request): the fields of a host resource demand.
   resourceRequest(handle) {
     const request = this.status("resource_request", handle);
-    return this.requestFields(request, this.outputString());
+    return this.requestFields(request, this.outputString("resource_request"));
   }
 
   // The demand fields of a url() request: `request` holds the credentials
@@ -2439,11 +2711,7 @@ export class DomCore {
     const invocation = this.handle("canvas_reset_next", request);
     try {
       this.status("canvas_reset_info", request);
-      const view = new DataView(
-        this.memory.buffer,
-        this.exports.abi_output_pointer(),
-        CANVAS_RESET_SIZE,
-      );
+      const view = this.output("canvas_reset_info");
       resetDevice({
         width: view.getFloat64(CANVAS_RESET_WIDTH, true),
         height: view.getFloat64(CANVAS_RESET_HEIGHT, true),
@@ -2580,11 +2848,11 @@ export class DomCore {
   // cssText }; throws a SyntaxError on invalid input.
   resolveLength(value) {
     const kind = this.status("length_resolve", ...this.input(value));
-    if (kind === LENGTH_RESULT.KEYWORD) return this.outputString();
+    if (kind === LENGTH_RESULT.KEYWORD) return this.outputString("length_resolve");
     if (kind === LENGTH_RESULT.EXPRESSION) {
       return {
         expression: this.exports.length_result_expression(),
-        cssText: this.outputString(),
+        cssText: this.outputString("length_resolve"),
       };
     }
     const pixels = this.exports.length_result_pixels();
@@ -2645,13 +2913,10 @@ export class DomCore {
     return handle;
   }
 
-  engineRecordPublicationText(publication) {
+  // The publication's text [start, end), decoded.
+  engineRecordPublicationText(publication, start, end) {
     this.status("engine_record_publication_text", publication);
-    const pointer = this.exports.abi_output_pointer();
-    return this.refreshBytes().subarray(
-      pointer,
-      pointer + this.exports.abi_output_length(),
-    );
+    return this.output("engine_record_publication_text").text(this.decoder, start, end);
   }
 
   engineRecordRelease(publication) {
@@ -2663,10 +2928,8 @@ export class DomCore {
   engineRecordChanged(publication) {
     const count = this.status("engine_record_changed", publication);
     if (count < 0) this.throwIfError();
-    const pointer = this.exports.abi_output_pointer();
-    return new Uint32Array(
-      this.refreshBytes().buffer.slice(pointer, pointer + count * 4),
-    );
+    if (count === 0) return new Uint32Array(0);
+    return new Uint32Array(this.outputBytes("engine_record_changed", 0, count * 4).buffer);
   }
 
   engineRecordReused(publication) {
@@ -2676,10 +2939,8 @@ export class DomCore {
   engineRecordLowered(publication) {
     const count = this.status("engine_record_lowered", publication);
     if (count < 0) this.throwIfError();
-    const pointer = this.exports.abi_output_pointer();
-    return new Uint32Array(
-      this.refreshBytes().buffer.slice(pointer, pointer + count * 4),
-    );
+    if (count === 0) return new Uint32Array(0);
+    return new Uint32Array(this.outputBytes("engine_record_lowered", 0, count * 4).buffer);
   }
 
   // The query containers that the last scene build met
@@ -2687,8 +2948,8 @@ export class DomCore {
   // types (1 size, 2 inline-size, 4 scroll-state).
   sceneQueryContainers() {
     const count = this.status("scene_query_containers");
-    const pointer = this.exports.abi_output_pointer();
-    const words = new BigInt64Array(this.refreshBytes().buffer.slice(pointer, pointer + count * 16));
+    if (count === 0) return [];
+    const words = new BigInt64Array(this.outputBytes("scene_query_containers", 0, count * 16).buffer);
     return Array.from({ length: count }, (_, index) => ({ handle: words[index * 2], types: Number(words[index * 2 + 1]) }));
   }
 
@@ -2707,11 +2968,7 @@ export class DomCore {
       );
     }
     this.status("engine_record_published_row", stableId, sourceRevision);
-    const pointer = this.exports.abi_output_pointer();
-    return this.refreshBytes().slice(
-      pointer,
-      pointer + this.exports.abi_output_length(),
-    );
+    return this.outputBytes("engine_record_published_row");
   }
 
   // The after-change record of one row of the last scene build, as owned
@@ -2720,8 +2977,7 @@ export class DomCore {
   // (engine_record_after_change).
   engineRecordAfterChange(stableId, sourceRevision) {
     this.status("engine_record_after_change", stableId, sourceRevision);
-    const pointer = this.exports.abi_output_pointer();
-    return this.refreshBytes().slice(pointer, pointer + this.exports.abi_output_length());
+    return this.outputBytes("engine_record_after_change");
   }
 
   svgPathRegister(path, fillRule, stroke = null) {
@@ -2738,17 +2994,18 @@ export class DomCore {
 
   svgPathDefinition(pathIndex) {
     this.status("svg_path_definition", pathIndex);
-    const record = readSvgPathDefinition(new DataView(this.refreshBytes().buffer), this.exports.abi_output_pointer());
+    const output = this.output("svg_path_definition");
+    const record = readSvgPathDefinition(output, 0);
     return {
       pathIndex,
-      pathDef: this.decoder.decode(this.bytes.subarray(record.dataPointer, record.dataPointer + record.dataLength)),
+      pathDef: output.memoryText(this.decoder, record.dataPointer, record.dataLength),
       fillRule: record.fillRule ? "evenodd" : "nonzero",
       stroke: record.stroked ? {
         width: record.strokeWidth,
         cap: record.cap,
         join: record.join,
         miterLimit: record.miterLimit,
-        dashArray: Array.from(new Float32Array(this.memory.buffer, record.dashPointer, record.dashCount)),
+        dashArray: Array.from(new Float32Array(output.memoryBytes(record.dashPointer, record.dashCount * 4).buffer)),
         dashPhase: record.dashPhase,
       } : null,
       // A device coverage index: the raster the stroke fills, under the
@@ -2765,13 +3022,12 @@ export class DomCore {
 
   sceneSvgPathBounds(publication, index) {
     if (!this.status("scene_svg_path_bounds", publication, index)) return null;
-    const pointer = this.exports.abi_output_pointer();
-    const view = new DataView(this.refreshBytes().buffer);
+    const view = this.output("scene_svg_path_bounds");
     return {
-      xMin: view.getFloat64(pointer + SVG_PATH_BOUNDS_X_MIN, true),
-      yMin: view.getFloat64(pointer + SVG_PATH_BOUNDS_Y_MIN, true),
-      xMax: view.getFloat64(pointer + SVG_PATH_BOUNDS_X_MAX, true),
-      yMax: view.getFloat64(pointer + SVG_PATH_BOUNDS_Y_MAX, true),
+      xMin: view.getFloat64(SVG_PATH_BOUNDS_X_MIN, true),
+      yMin: view.getFloat64(SVG_PATH_BOUNDS_Y_MIN, true),
+      xMax: view.getFloat64(SVG_PATH_BOUNDS_X_MAX, true),
+      yMax: view.getFloat64(SVG_PATH_BOUNDS_Y_MAX, true),
     };
   }
 
@@ -2822,10 +3078,7 @@ export class DomCore {
     const outcome = this.exports.engine_record_frame();
     if (outcome === ENGINE_FRAME_DECLINED) return null;
     if (outcome !== ENGINE_FRAME_RECORDED) this.throwIfError();
-    const output = readEngineFrameOutput(
-      new DataView(this.memory.buffer),
-      this.exports.abi_output_pointer(),
-    );
+    const output = readEngineFrameOutput(this.output("engine_record_frame"), 0);
     return {
       count: output.count,
       records: output.records,
@@ -2965,15 +3218,11 @@ export class DomCore {
     const changedSubtrees = new Set();
     if (count !== 0) {
       const recordSize = this.callbackRecordSize;
-      const view = new DataView(this.memory.buffer, this.outputPointerRegister.value, count * recordSize);
+      const view = this.output("callback_records_export");
       for (let index = 0; index < count; index += 1) {
         const offset = index * recordSize;
-        const text = (pointerField, lengthField) => {
-          const pointer = view.getUint32(offset + pointerField, true);
-          return this.decoder.decode(
-            this.refreshBytes().subarray(pointer, pointer + view.getUint32(offset + lengthField, true)),
-          );
-        };
+        const text = (pointerField, lengthField) =>
+          view.memoryText(this.decoder, view.getUint32(offset + pointerField, true), view.getUint32(offset + lengthField, true));
         const flags = view.getUint32(offset + CALLBACK_FIELD_FLAGS, true);
         const kind = view.getUint32(offset + CALLBACK_FIELD_KIND, true);
         const relatedA = view.getBigUint64(offset + CALLBACK_FIELD_RELATED_A, true);
@@ -2997,7 +3246,6 @@ export class DomCore {
             : text(CALLBACK_FIELD_OLD_VALUE_POINTER, CALLBACK_FIELD_OLD_VALUE_LENGTH),
         });
       }
-      this.exports.callback_records_acknowledge();
     }
     scheduleMutationObservers(this);
     for (const record of records) {
@@ -3009,9 +3257,26 @@ export class DomCore {
         );
       }
     }
+    // The nodes of the records that the host delivers, as wrappers, while
+    // the unacknowledged records still keep them: a wrapper holds its
+    // node, so a collection after the acknowledgement or during the
+    // delivery's script frees none of them (records.watpart).
+    for (const record of records) {
+      if (record.effects === 0 && record.notify === CALLBACK_NOTIFY_NONE) continue;
+      record.targetNode = this.wrapperFor(record.target);
+      record.relatedANode = this.wrapperFor(record.relatedA);
+      record.relatedBNode = this.wrapperFor(record.relatedB);
+      if (record.notify === CALLBACK_NOTIFY_STRUCTURE) {
+        record.previousNode = this.wrapperFor(record.previous);
+        record.nextNode = this.wrapperFor(record.next);
+      }
+    }
     // Each subtree is settled once, against the tree the whole operation
     // left.
     for (const handle of changedSubtrees) this.updateConnectedWrappers(handle);
+    // The acknowledgement lets the core collect what only the records held
+    // (records.watpart): it comes after the last read of their handles.
+    if (count !== 0) this.exports.callback_records_acknowledge();
     for (const record of records) {
       if (record.effects & CALLBACK_EFFECT_SLOT_CHANGE) {
         this.slotChangeHandler?.(this.wrapperFor(record.target));
@@ -3021,7 +3286,7 @@ export class DomCore {
     // entries are copied before wrapperFor can reenter the core.
     const toggleCount = this.detailsToggleCountRegister.value === 0 ? 0 : this.exports.details_toggle_take();
     if (toggleCount !== 0) {
-      const toggleView = new DataView(this.memory.buffer, this.outputPointerRegister.value, toggleCount * DETAILS_TOGGLE_SIZE);
+      const toggleView = this.output("details_toggle_take");
       const toggles = Array.from({ length: toggleCount }, (_, index) => [
         toggleView.getBigUint64(index * DETAILS_TOGGLE_SIZE + DETAILS_TOGGLE_NODE, true),
         toggleView.getBigUint64(index * DETAILS_TOGGLE_SIZE + DETAILS_TOGGLE_TOKEN, true),
@@ -3066,6 +3331,7 @@ export class DomCore {
     this.wrapperCaches.delete(documentHandle);
     this.status("document_dispose", documentHandle);
     releaseEventIdentities?.();
+    for (const listener of this.documentDisposalListeners) listener(documentHandle);
     for (const [id, reference] of this.observersById) {
       const observer = reference.deref();
       if (observer === undefined || observer._ownerHandle === documentHandle) {

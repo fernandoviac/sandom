@@ -120,9 +120,8 @@ function entryValues(entries) {
   return entries.flatMap((entry) => [entry.entryType, entry.name, entry.startTime]);
 }
 
-function outputIndices(count) {
-  const pointer = core.exports.abi_output_pointer();
-  return new Uint32Array(core.refreshBytes().slice(pointer, pointer + count * 4).buffer);
+function outputIndices(operation, count) {
+  return count === 0 ? new Uint32Array(0) : new Uint32Array(core.outputBytes(operation, 0, count * 4).buffer);
 }
 
 // User Timing, "convert a mark to a timestamp".
@@ -155,11 +154,11 @@ function createPagePerformance(clock) {
   // filter: the PERFORMANCE_FILTER_* bits; none lists every entry.
   const listed = (filter, type = "", name = "") => {
     const count = core.status("frame_performance_list", ...core.valueListInput([filter, type, name, ...entryValues(entries)]));
-    return Array.from(outputIndices(count), (index) => entries[index]);
+    return Array.from(outputIndices("frame_performance_list", count), (index) => entries[index]);
   };
   const clear = (measure, name) => {
     const count = core.status("frame_performance_clear", measure, ...core.valueListInput([name, ...entryValues(entries)]));
-    const indices = outputIndices(count);
+    const indices = outputIndices("frame_performance_clear", count);
     for (let index = indices.length - 1; index >= 0; index--) entries.splice(indices[index], 1);
   };
   return Object.freeze({

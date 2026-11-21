@@ -58,7 +58,7 @@ function runRangeMutation(record, mode, node = 0n) {
     if (mutation === 0n) return 0n;
     try {
       while (core.selectionStatus("range_mutation_next", mutation)) {
-        const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), RANGE_MUTATION_STEP.SIZE);
+        const view = core.output("range_mutation_next");
         const token = view.getBigUint64(RANGE_MUTATION_STEP.TOKEN, true);
         const run = view.getBigUint64(RANGE_MUTATION_STEP.RUN, true);
         try {
@@ -438,7 +438,7 @@ export class SDSelection extends SelectionRecord {
   _bindingDirection() {
     this._layoutUpdate();
     this._core.selectionStatus("selection_direction", this._handle);
-    return this._core.outputString();
+    return this._core.outputString("selection_direction");
   }
   _selectedSpans() {
     return this._core.selectionSpans(this._handle);
@@ -447,8 +447,7 @@ export class SDSelection extends SelectionRecord {
   // text control setter): report it at the node it changed at, once.
   _takeChange() {
     if (!this._core.status("selection_change_take", this._handle)) return;
-    const view = new DataView(this._core.refreshBytes().buffer);
-    this._onChange(this._core.wrapperFor(view.getBigUint64(this._core.exports.abi_output_pointer(), true)));
+    this._onChange(this._core.wrapperFor(this._core.output("selection_change_take").getBigUint64(0, true)));
   }
   // The text of the selection (core): the control's selection in a text
   // control, else the rendered text of the range.

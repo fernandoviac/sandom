@@ -1,8 +1,17 @@
 import { mapGpuBufferSync } from './gpu-thread.js';
+import { gpuPassPurposeName, gpuPassTimestampWrites, noteGpuTextureOperation, submitTimed } from './gpu-pass-timing.js';
+import { createNativeGpuBinding, isNativeGpuDevice } from './native-gpu-host.js';
+// WebGPU's constants, which a server runtime without WebGPU lacks as globals.
+import { GPUMapMode } from './dom/webgpu-facade.js';
 
 // The record contract is docs/specifications/gpu-command-stream.md.
 // This binding performs native effects; renderer-core writes every record.
+// effects.label names the binding's render passes in the GPU pass timing
+// (gpu-pass-timing.js). On a GPUDevice of the native GPU host
+// (native-gpu-host.js), the host executes the stream itself and labels its
+// passes by purpose.
 export function createGpuBinding(core, device, effects = {}) {
+  if (isNativeGpuDevice(device)) return createNativeGpuBinding(core, device, effects);
   const stream = core.gpu_stream_create();
   const resources = new Map();
   const owned = new Set();
@@ -187,6 +196,7 @@ export function createGpuBinding(core, device, effects = {}) {
             store(first, device.createTexture({ size: { width: second, height: third }, format, usage: fifth,
               mipLevelCount: view.getUint32(offset + 28, true) || 1,
               sampleCount: view.getUint32(offset + 32, true) || 1 }), true);
+            noteGpuTextureOperation(effects.label ?? 'unlabeled', 'create', second, third, format, 0);
             break;
           }
           case 3:
@@ -199,15 +209,20 @@ export function createGpuBinding(core, device, effects = {}) {
             requireSpan(third, fourth);
             device.queue.writeBuffer(requireResource(first), second, memoryBytes, third, fourth);
             break;
-          case 5:
+          case 5: {
             if (fourth > 1) throw new Error(`GPU pass load operation ${fourth} is unsupported`);
-            store(first, requireResource(second).beginRenderPass({ colorAttachments: [{
+            const descriptor = { colorAttachments: [{
               view: textureView(requireResource(third), fifth === 0 ? undefined : { baseMipLevel: fifth - 1, mipLevelCount: 1 }),
               loadOp: fourth === 1 ? 'load' : 'clear', storeOp: 'store',
               clearValue: { r: view.getFloat64(offset + 32, true), g: view.getFloat64(offset + 40, true),
                 b: view.getFloat64(offset + 48, true), a: view.getFloat64(offset + 56, true) },
-            }] }));
+            }] };
+            const purpose = gpuPassPurposeName(view.getUint32(offset + 28, true));
+            const timestampWrites = gpuPassTimestampWrites(device, effects.label ?? 'unlabeled', purpose);
+            if (timestampWrites !== undefined) descriptor.timestampWrites = timestampWrites;
+            store(first, requireResource(second).beginRenderPass(descriptor));
             break;
+          }
           case 6:
             requireResource(first).end();
             resources.delete(first);
@@ -239,7 +254,7 @@ export function createGpuBinding(core, device, effects = {}) {
             if (first !== 0) buffers.push(requireResource(first));
             if (second !== 0) buffers.push(requireResource(second));
             buffers.push(requireResource(third));
-            try { device.queue.submit(buffers); }
+            try { submitTimed(device, buffers); }
             catch (error) {
               if (fourth !== 0) {
                 frameToken = 0;
@@ -297,6 +312,8 @@ export function createGpuBinding(core, device, effects = {}) {
               x: view.getUint32(offset + 32, true), y: view.getUint32(offset + 36, true),
             } }, bytes.buffer.resizable || bytes.buffer.growable ? bytes.slice() : bytes,
               { bytesPerRow: fourth }, { width: fifth, height: view.getUint32(offset + 28, true) });
+            noteGpuTextureOperation(effects.label ?? 'unlabeled', 'write', fifth, view.getUint32(offset + 28, true),
+              requireResource(first).format, third);
             break;
           }
           case 19:
@@ -335,7 +352,7 @@ export function createGpuBinding(core, device, effects = {}) {
             requireResource(first).copyBufferToBuffer(requireResource(second), 0, requireResource(third), 0, fourth);
             break;
           case 26: {
-            try { device.queue.submit([requireResource(first)]); }
+            try { submitTimed(device, [requireResource(first)]); }
             catch (error) { completeReadback(fifth, 1); throw error; }
             if (second !== 0) {
               mapReadback(second, third, fourth, fifth);
@@ -511,6 +528,9 @@ export function createGpuBinding(core, device, effects = {}) {
                 depthLoadOp: 'clear', depthClearValue: 0, depthStoreOp: 'discard',
                 stencilLoadOp: 'clear', stencilClearValue: 0, stencilStoreOp: 'discard' };
             }
+            const purpose = gpuPassPurposeName(view.getUint32(offset + 36, true));
+            const timestampWrites = gpuPassTimestampWrites(device, effects.label ?? 'unlabeled', purpose);
+            if (timestampWrites !== undefined) descriptor.timestampWrites = timestampWrites;
             store(first, requireResource(second).beginRenderPass(descriptor));
             break;
           }

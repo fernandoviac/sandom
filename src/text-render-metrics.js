@@ -86,14 +86,12 @@ export function compareTextRendering(chromeMeasurement, sandomDisplayList) {
     [Array.isArray(chromeMeasurement?.runs), COMPARE.CHROME_RUNS], [recordType(sandomDisplayList), COMPARE.SANDOM_RECORD],
     [Array.isArray(sandomDisplayList?.commands), COMPARE.SANDOM_COMMANDS]]);
   const count = core.status("font_compare_text", chromePointer, chromeRuns.length, sandomPointer, commands.length, types);
-  const bytes = core.refreshBytes();
-  const view = new DataView(bytes.buffer);
-  const output = core.exports.abi_output_pointer();
+  const comparison = core.output("font_compare_text");
+  const view = comparison.memory();
+  const output = comparison.pointer;
   const runs = new Array(count);
-  const nativeText = (field) => {
-    const start = view.getUint32(field + COMPARE.SPAN_POINTER, true);
-    return decoder.decode(bytes.subarray(start, start + view.getUint32(field + COMPARE.SPAN_LENGTH, true)));
-  };
+  const nativeText = (field) =>
+    view.memoryText(decoder, view.getUint32(field + COMPARE.SPAN_POINTER, true), view.getUint32(field + COMPARE.SPAN_LENGTH, true));
   for (let index = 0; index < count; index++) {
     const row = output + COMPARE.HEADER_SIZE + index * COMPARE.PAIR_SIZE;
     const word = (field) => view.getUint32(row + field, true);

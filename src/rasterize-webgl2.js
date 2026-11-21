@@ -1196,6 +1196,9 @@ uniform vec4 pathMaskUv;
 uniform vec4 pathMaskInvA;
 uniform vec4 pathMaskTranslation;
 uniform vec4 maskInfo;
+// COMPOSITE_SHADER's sourceShift: srcTex's texel t + sourceShift is the
+// source's texel t.
+uniform vec2 sourceShift;
 uniform sampler2D srcTex;
 uniform sampler2D backdropTex;
 uniform sampler2D pathMaskTex;
@@ -1340,13 +1343,19 @@ float median(float r, float g, float b) {
   return max(min(r, g), min(max(r, g), b));
 }
 
-// COMPOSITE_SHADER's targetTexel (see its comments): a target-sized
-// texture is read at the fragment's own texel.
-vec4 targetTexel(sampler2D source) {
-  if (vec2(textureSize(source, 0)) == resolution) {
-    return texelFetch(source, ivec2(gl_FragCoord.xy), 0);
+// COMPOSITE_SHADER's targetTexel (see its comments): a source the size of
+// the target is read at the fragment's own texel; the source's texel t is
+// the texture's texel t + shift.
+vec4 targetTexel(sampler2D source, vec2 shift) {
+  vec2 size = vec2(textureSize(source, 0));
+  vec2 extent = size - 2.0 * shift;
+  if (extent == resolution) {
+    return texelFetch(source, ivec2(gl_FragCoord.xy + shift), 0);
   }
-  return textureLod(source, vUv, 0.0);
+  if (shift == vec2(0.0)) {
+    return textureLod(source, vUv, 0.0);
+  }
+  return textureLod(source, (vUv * extent + shift) / size, 0.0);
 }
 
 // COMPOSITE_SHADER's pathMaskTexel (see its comments): the mask path's
@@ -1394,7 +1403,7 @@ void main() {
 ${CLIP_EVAL_GLSL}
 
   bool isPorterDuff = porterDuff > 0.5;
-  vec4 src = targetTexel(srcTex);
+  vec4 src = targetTexel(srcTex, sourceShift);
   if (src.a < 0.001 && !isPorterDuff) { discard; }
   src.rgb = max(src.rgb, vec3(0.0)) / max(src.a, 1e-6);
   if (pathMaskInfo.x > 0.5) {
@@ -1436,7 +1445,7 @@ ${CLIP_EVAL_GLSL}
     if (src.a < 0.001 && !isPorterDuff) { discard; }
   }
   if (maskInfo.x > 0.5) {
-    src.a = src.a * targetTexel(maskTex).a;
+    src.a = src.a * targetTexel(maskTex, vec2(0.0)).a;
     if (src.a < 0.001 && !isPorterDuff) { discard; }
   }
 
@@ -1452,7 +1461,7 @@ ${CLIP_EVAL_GLSL}
 
   vec4 color = src;
   if (blendMode != ${BLEND_NORMAL}.0) {
-    vec4 backdrop = targetTexel(backdropTex);
+    vec4 backdrop = targetTexel(backdropTex, vec2(0.0));
     vec3 backdropColor = backdrop.a > 0.0
       ? max(backdrop.rgb, vec3(0.0)) / max(backdrop.a, 1e-6)
       : vec3(0.0);
@@ -1467,7 +1476,7 @@ ${CLIP_EVAL_GLSL}
     color = vec4(mixed, src.a);
   }
   if (isPorterDuff) {
-    vec4 destination = targetTexel(backdropTex);
+    vec4 destination = targetTexel(backdropTex, vec2(0.0));
     float alpha = color.a * opacity;
     vec2 factors = porterDuffFactors(porterDuff, alpha, destination.a);
     vec4 composed = min(vec4(color.rgb * alpha, alpha) * factors.x + destination * factors.y, vec4(1.0));
@@ -1548,9 +1557,18 @@ precision highp float;
 uniform vec2 resolution;
 uniform vec2 direction;
 uniform float boxWidth;
+// BOX_BLUR_SHADER's shift: srcTex's texel t + shift is the source's texel t.
+uniform vec2 shift;
 uniform sampler2D srcTex;
 in vec2 vUv;
 out vec4 fragColor;
+// BOX_BLUR_SHADER's sourceSample.
+vec4 sourceSample(vec2 uv) {
+  if (shift == vec2(0.0)) {
+    return textureLod(srcTex, uv, 0.0);
+  }
+  return textureLod(srcTex, (uv * resolution + shift) / vec2(textureSize(srcTex, 0)), 0.0);
+}
 void main() {
   vec2 texelSize = direction / resolution;
   float radius = floor(boxWidth / 2.0);
@@ -1561,7 +1579,7 @@ void main() {
     if (sampleUv.x < 0.0 || sampleUv.x > 1.0 || sampleUv.y < 0.0 || sampleUv.y > 1.0) {
       continue;
     }
-    sum = sum + textureLod(srcTex, sampleUv, 0.0);
+    sum = sum + sourceSample(sampleUv);
     count = count + 1.0;
   }
   fragColor = sum / max(count, 1.0);
@@ -1577,39 +1595,32 @@ precision highp float;
 uniform vec2 resolution;
 uniform vec2 shadowOffset;
 uniform vec4 shadowColor;
+// DROP_SHADOW_SHADER's shifts: a texture's texel t + shift is its
+// source's texel t.
+uniform vec2 blurredAlphaShift;
+uniform vec2 currentShift;
 uniform sampler2D blurredAlphaTex;
 uniform sampler2D currentTex;
 in vec2 vUv;
 out vec4 fragColor;
+// DROP_SHADOW_SHADER's shiftedUv.
+vec2 shiftedUv(vec2 size, vec2 uv, vec2 shift) {
+  if (shift == vec2(0.0)) {
+    return uv;
+  }
+  return (uv * resolution + shift) / size;
+}
 void main() {
   vec2 offsetUv = vUv - shadowOffset / resolution;
   float shadowAlpha = 0.0;
   if (offsetUv.x >= 0.0 && offsetUv.x <= 1.0 && offsetUv.y >= 0.0 && offsetUv.y <= 1.0) {
-    shadowAlpha = textureLod(blurredAlphaTex, offsetUv, 0.0).a;
+    shadowAlpha = textureLod(blurredAlphaTex,
+      shiftedUv(vec2(textureSize(blurredAlphaTex, 0)), offsetUv, blurredAlphaShift), 0.0).a;
   }
   float shadowAlphaOut = shadowColor.a * shadowAlpha;
   vec4 shadow = vec4(shadowColor.rgb * shadowAlphaOut, shadowAlphaOut);
-  vec4 current = texture(currentTex, vUv);
+  vec4 current = texture(currentTex, shiftedUv(vec2(textureSize(currentTex, 0)), vUv, currentShift));
   fragColor = current + shadow * (1.0 - current.a);
-}
-`;
-
-// --------------------------------------------------------------------------
-// Filter-window program (port of FILTER_WINDOW_SHADER) — pads a group
-// target into its filter region and crops the filtered region back.
-// Texel row 0 holds the image's top row here too, so the WGSL shift
-// applies to gl_FragCoord unchanged.
-// --------------------------------------------------------------------------
-
-const FILTER_WINDOW_FRAGMENT_GLSL = `#version 300 es
-precision highp float;
-uniform vec2 shift; // whole texels; the native adapter sets float uniforms
-uniform sampler2D srcTex;
-out vec4 fragColor;
-void main() {
-  ivec2 last = textureSize(srcTex, 0) - ivec2(1);
-  ivec2 texel = clamp(ivec2(gl_FragCoord.xy) + ivec2(shift), ivec2(0), last);
-  fragColor = texelFetch(srcTex, texel, 0);
 }
 `;
 
@@ -2530,12 +2541,6 @@ async function createSharedWebgl2State() {
     FULLSCREEN_VERTEX_GLSL,
     DROP_SHADOW_FRAGMENT_GLSL,
   );
-  const filterWindowProgram = compileProgram(
-    gl,
-    "filterWindow",
-    FULLSCREEN_VERTEX_GLSL,
-    FILTER_WINDOW_FRAGMENT_GLSL,
-  );
   const downsampleProgram = compileProgram(
     gl,
     "downsample",
@@ -2597,6 +2602,7 @@ async function createSharedWebgl2State() {
         "pathMaskInvA",
         "pathMaskTranslation",
         "maskInfo",
+        "sourceShift",
         "srcTex",
         "backdropTex",
         "pathMaskTex",
@@ -2617,6 +2623,7 @@ async function createSharedWebgl2State() {
         "resolution",
         "direction",
         "boxWidth",
+        "shift",
         "srcTex",
       ]),
     },
@@ -2626,13 +2633,11 @@ async function createSharedWebgl2State() {
         "resolution",
         "shadowOffset",
         "shadowColor",
+        "blurredAlphaShift",
+        "currentShift",
         "blurredAlphaTex",
         "currentTex",
       ]),
-    },
-    filterWindow: {
-      program: filterWindowProgram,
-      uniforms: uniformLocations(gl, filterWindowProgram, ["shift", "srcTex"]),
     },
     downsample: {
       program: downsampleProgram,
@@ -3356,6 +3361,9 @@ export function renderWebgl2(context, options = {}) {
     hasMask = 0,
     clipState = EMPTY_CLIP_STATE,
     srcTexture,
+    // srcTexture's texel t + sourceShift is the source's texel t.
+    sourceShiftX = 0,
+    sourceShiftY = 0,
     backdropTexture,
     maskTexture = null,
   }) {
@@ -3416,6 +3424,7 @@ export function renderWebgl2(context, options = {}) {
       composite.uniforms.maskInfo,
       new Float32Array([hasMask, 0, 0, 0]),
     );
+    gl.uniform2f(composite.uniforms.sourceShift, sourceShiftX, sourceShiftY);
     gl.uniform1i(composite.uniforms.srcTex, 0);
     gl.uniform1i(composite.uniforms.backdropTex, 1);
     gl.uniform1i(composite.uniforms.pathMaskTex, 2);
@@ -3437,7 +3446,7 @@ export function renderWebgl2(context, options = {}) {
   }
 
   // Filter passes mirror the WebGPU backend's: each writes a target the
-  // size of the one it reads (the frame, or the padded filter region of
+  // size of the source it reads (the frame, or the padded filter region of
   // applyFilterPasses), scissored to the part of that region a later pass
   // still reads. The scissor is set after the clear, which it would
   // otherwise bound.
@@ -3455,34 +3464,21 @@ export function renderWebgl2(context, options = {}) {
     );
   }
 
-  function applyWindowPass(
-    sourceTarget,
-    outputWidth,
-    outputHeight,
-    shiftX,
-    shiftY,
-  ) {
-    const outputTarget = makeCanvasTarget(outputWidth, outputHeight);
-    bindTarget(outputTarget);
-    gl.disable(gl.BLEND);
-    const filterWindow = programs.filterWindow;
-    gl.useProgram(filterWindow.program);
-    gl.uniform2f(filterWindow.uniforms.shift, shiftX, shiftY);
-    gl.uniform1i(filterWindow.uniforms.srcTex, 0);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, sourceTarget.texture);
-    gl.bindVertexArray(fullscreenVertexArray);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    gl.bindVertexArray(null);
-    setStandardBlend();
-    return outputTarget;
+  // The source a filter pass reads: `target`'s texel t + shift is the
+  // source's texel t (the WebGPU $gpuGroupsFilters), so the source is
+  // `target` grown by -shift on each side.
+  function filterSource(target, shiftX = 0, shiftY = 0) {
+    return {
+      target,
+      shiftX,
+      shiftY,
+      width: target.width - 2 * shiftX,
+      height: target.height - 2 * shiftY,
+    };
   }
 
-  function applyMatrixPass(sourceTarget, matrixRows, reachX, reachY) {
-    const outputTarget = makeCanvasTarget(
-      sourceTarget.width,
-      sourceTarget.height,
-    );
+  function applyMatrixPass(source, matrixRows, reachX, reachY) {
+    const outputTarget = makeCanvasTarget(source.width, source.height);
     clearTargetTransparent(outputTarget);
     enableFilterScissor(outputTarget, reachX, reachY);
     // Pure overwrite of associated color — no blending (see the WebGPU
@@ -3493,7 +3489,9 @@ export function renderWebgl2(context, options = {}) {
       hasMatrix: 1,
       outputPremultiplied: 1,
       matrixRows,
-      srcTexture: sourceTarget.texture,
+      srcTexture: source.target.texture,
+      sourceShiftX: source.shiftX,
+      sourceShiftY: source.shiftY,
     });
     drawCompositeQuad();
     gl.disable(gl.SCISSOR_TEST);
@@ -3501,21 +3499,15 @@ export function renderWebgl2(context, options = {}) {
     return outputTarget;
   }
 
-  function applyBlurPass(sourceTarget, uniform, reachX, reachY) {
+  function applyBlurPass(source, uniform, reachX, reachY) {
     gl.disable(gl.BLEND);
     const boxBlur = programs.boxBlur;
     gl.useProgram(boxBlur.program);
-    gl.uniform2f(
-      boxBlur.uniforms.resolution,
-      sourceTarget.width,
-      sourceTarget.height,
-    );
+    gl.uniform2f(boxBlur.uniforms.resolution, source.width, source.height);
+    gl.uniform2f(boxBlur.uniforms.shift, source.shiftX, source.shiftY);
     gl.uniform1i(boxBlur.uniforms.srcTex, 0);
     gl.bindVertexArray(fullscreenVertexArray);
-    const passTarget = makeCanvasTarget(
-      sourceTarget.width,
-      sourceTarget.height,
-    );
+    const passTarget = makeCanvasTarget(source.width, source.height);
     bindTarget(passTarget);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -3523,7 +3515,7 @@ export function renderWebgl2(context, options = {}) {
     gl.uniform2f(boxBlur.uniforms.direction, uniform[1], uniform[2]);
     gl.uniform1f(boxBlur.uniforms.boxWidth, uniform[0]);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, sourceTarget.texture);
+    gl.bindTexture(gl.TEXTURE_2D, source.target.texture);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     gl.disable(gl.SCISSOR_TEST);
     gl.bindVertexArray(null);
@@ -3532,16 +3524,13 @@ export function renderWebgl2(context, options = {}) {
   }
 
   function applyDropShadowPass(
-    blurredAlphaTarget,
-    sourceTarget,
+    blurredAlpha,
+    source,
     uniform,
     reachX,
     reachY,
   ) {
-    const outputTarget = makeCanvasTarget(
-      sourceTarget.width,
-      sourceTarget.height,
-    );
+    const outputTarget = makeCanvasTarget(source.width, source.height);
     bindTarget(outputTarget);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -3549,11 +3538,7 @@ export function renderWebgl2(context, options = {}) {
     gl.disable(gl.BLEND);
     const dropShadow = programs.dropShadow;
     gl.useProgram(dropShadow.program);
-    gl.uniform2f(
-      dropShadow.uniforms.resolution,
-      sourceTarget.width,
-      sourceTarget.height,
-    );
+    gl.uniform2f(dropShadow.uniforms.resolution, source.width, source.height);
     gl.uniform2f(
       dropShadow.uniforms.shadowOffset,
       uniform[0],
@@ -3566,12 +3551,14 @@ export function renderWebgl2(context, options = {}) {
       uniform[5],
       uniform[6],
     );
+    gl.uniform2f(dropShadow.uniforms.blurredAlphaShift, blurredAlpha.shiftX, blurredAlpha.shiftY);
+    gl.uniform2f(dropShadow.uniforms.currentShift, source.shiftX, source.shiftY);
     gl.uniform1i(dropShadow.uniforms.blurredAlphaTex, 0);
     gl.uniform1i(dropShadow.uniforms.currentTex, 1);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, blurredAlphaTarget.texture);
+    gl.bindTexture(gl.TEXTURE_2D, blurredAlpha.target.texture);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, sourceTarget.texture);
+    gl.bindTexture(gl.TEXTURE_2D, source.target.texture);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindVertexArray(fullscreenVertexArray);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -3583,53 +3570,45 @@ export function renderWebgl2(context, options = {}) {
 
   // The filter region of the pass list at `list` (raster_plan_filter_reach,
   // raster_plan_filter_padding; the WebGPU path is gpu-groups.watpart).
+  // Each pass that reads the list's source reads sourceTarget as the
+  // padded source (shift -padding), clamped to its edge. The result is
+  // the padded region: the frame's texel t is its target's texel t + shift.
   function applyFilterPasses(sourceTarget, passes, list) {
     const core = options.rasterPlan.exports;
     const maxExtent = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     const padX = core.raster_plan_filter_padding(core.raster_plan_filter_reach(list, 0, 0), width, maxExtent);
     const padY = core.raster_plan_filter_padding(core.raster_plan_filter_reach(list, 0, 1), height, maxExtent);
-    const padded = padX > 0 || padY > 0;
-    let target = padded
-      ? applyWindowPass(
-        sourceTarget,
-        width + 2 * padX,
-        height + 2 * padY,
-        -padX,
-        -padY,
-      )
-      : sourceTarget;
-    let blurSource = target;
+    let source = filterSource(sourceTarget, -padX, -padY);
+    let blurSource = source;
     let blurPassIndex = 0;
     for (let index = 0; index < passes.length; index++) {
       const pass = passes[index];
       const reachX = core.raster_plan_filter_reach(list, index + 1, 0);
       const reachY = core.raster_plan_filter_reach(list, index + 1, 1);
       if (pass.kind === RASTER_PLAN_PASS_MATRIX) {
-        target = applyMatrixPass(target, pass.uniform, reachX, reachY);
+        source = filterSource(applyMatrixPass(source, pass.uniform, reachX, reachY));
         blurPassIndex = 0;
       } else if (
         pass.kind === RASTER_PLAN_PASS_BOX_BLUR_H ||
         pass.kind === RASTER_PLAN_PASS_BOX_BLUR_V
       ) {
-        if (blurPassIndex === 0) blurSource = target;
-        target = applyBlurPass(target, pass.uniform, reachX, reachY);
+        if (blurPassIndex === 0) blurSource = source;
+        source = filterSource(applyBlurPass(source, pass.uniform, reachX, reachY));
         blurPassIndex = (blurPassIndex + 1) % 6;
       } else if (pass.kind === RASTER_PLAN_PASS_DROP_SHADOW) {
-        target = applyDropShadowPass(
-          target,
+        source = filterSource(applyDropShadowPass(
+          source,
           blurSource,
           pass.uniform,
           reachX,
           reachY,
-        );
+        ));
         blurPassIndex = 0;
       } else {
         throw new Error(`render: unknown native filter pass ${pass.kind}`);
       }
     }
-    return padded
-      ? applyWindowPass(target, width, height, padX, padY)
-      : target;
+    return { target: source.target, shiftX: padX + source.shiftX, shiftY: padY + source.shiftY };
   }
 
   function compositeTexture(sourceTarget, blendMode, backdropTarget) {
@@ -3877,7 +3856,7 @@ export function renderWebgl2(context, options = {}) {
       const entry = opacityStack.pop();
       currentTarget = entry.previousTarget;
 
-      const filteredTarget = applyFilterPasses(
+      const filtered = applyFilterPasses(
         entry.target,
         entry.filterPasses,
         entry.filterList,
@@ -3921,7 +3900,9 @@ export function renderWebgl2(context, options = {}) {
         pathMaskUniforms,
         hasMask: nativeComposite?.[50] ?? (maskTarget ? 1 : 0),
         clipState,
-        srcTexture: filteredTarget.texture,
+        srcTexture: filtered.target.texture,
+        sourceShiftX: filtered.shiftX,
+        sourceShiftY: filtered.shiftY,
         backdropTexture: backdropTarget ? backdropTarget.texture : null,
         maskTexture: maskTarget ? maskTarget.texture : null,
       });
@@ -4015,7 +3996,7 @@ export function renderWebgl2(context, options = {}) {
       }
       case CMD_PUSH_BACKDROP_FILTER: {
       const snapshot = snapshotTarget(currentTarget);
-      const filteredTarget = applyFilterPasses(
+      const filtered = applyFilterPasses(
         snapshot,
         batch.filterPasses,
         batch.filterList,
@@ -4024,7 +4005,9 @@ export function renderWebgl2(context, options = {}) {
       setStandardBlend();
       setCompositeUniforms({
         clipState: batch.ownClipState ?? EMPTY_CLIP_STATE,
-        srcTexture: filteredTarget.texture,
+        srcTexture: filtered.target.texture,
+        sourceShiftX: filtered.shiftX,
+        sourceShiftY: filtered.shiftY,
       });
       drawCompositeQuad();
     }

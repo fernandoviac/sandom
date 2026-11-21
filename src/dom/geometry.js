@@ -5,7 +5,7 @@
 // store (geometry-text-store.watpart), scrollbar descriptors, revisions and
 // the viewport. The live layout pass that feeds a synchronous read lives
 // in live-geometry.js.
-import { boxSnapshotFor, encodeGeometrySuccessorTail, encodeGeometryTail, GEOMETRY_FRAGMENT_SIZE } from "../dom-wasm/geometry-wire.js";
+import { boxSnapshotFor, GEOMETRY_FRAGMENT_SIZE } from "../dom-wasm/geometry-wire.js";
 import { layoutConstant } from "../wasm/layout-table.js";
 import { nodeMember } from "./node-members.js";
 
@@ -288,13 +288,19 @@ function ownedGeometry(core, handle, operation, tail) {
   return result;
 }
 
+// The geometry tail of a frame without scrollbars: a header that counts
+// none. A frame's scrollbars come from the core as a tail of their own
+// (scrollbars_tail, src/dom/scrollbars.js).
+export const EMPTY_SCROLLBAR_TAIL = new Uint8Array(layoutConstant("GEOMETRY_TAIL_HEADER_SIZE"));
+
 // `textStore` (a geometry_text_store, or 0) gives the snapshot's carets and
-// glyphs; the snapshot holds a reference to it.
-export function buildGeometry({ root, boxes, publication, viewport, viewportIndex, revision = 0, scrollbars = [], textStore = 0, presented = false, sourceRevisions }) {
+// glyphs; the snapshot holds a reference to it. `scrollbarTail` is the
+// geometry tail of the snapshot's scrollbars.
+export function buildGeometry({ root, boxes, publication, viewport, viewportIndex, revision = 0, scrollbarTail = EMPTY_SCROLLBAR_TAIL, textStore = 0, presented = false, sourceRevisions }) {
   const document = nodeMember(root, "ownerDocument");
   const core = document._domCore;
   const revisions = sourceRevisions ? { ...sourceRevisions, presentation: revision } : null;
-  const tail = encodeGeometryTail({ scrollbars });
+  const tail = scrollbarTail;
   const snapshot = boxSnapshotFor(boxes, core);
   // The document element with a live surface is the viewport's client.
   const viewportClient = document.documentElement === root && Boolean(root._renderSurface);
@@ -315,8 +321,8 @@ export function buildGeometry({ root, boxes, publication, viewport, viewportInde
 // records whose facts it built again, whether the restyle walked the flat
 // tree, elements resolved, records copied with the pages they shared,
 // records derived and box rows compared.
-function successorWork(core) {
-  const output = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), GEOMETRY.GEOMETRY_WORK_SIZE);
+function successorWork(core, operation) {
+  const output = core.output(operation);
   return Object.freeze({
     rebuiltRecords: output.getUint32(GEOMETRY.GEOMETRY_WORK_REBUILT_RECORDS, true),
     treeWalked: output.getUint32(GEOMETRY.GEOMETRY_WORK_TREE_WALKED, true) === 1,
@@ -350,10 +356,10 @@ export function buildGeometryFrameSuccessor(options) {
   return successorOf("geometry_frame_successor", options);
 }
 
-function successorOf(operation, { predecessor, root, boxes, revision, scrollbars, textStore = 0, sourceRevisions }) {
+function successorOf(operation, { predecessor, root, boxes, revision, scrollbarTail, textStore = 0, sourceRevisions }) {
   const document = nodeMember(root, "ownerDocument");
   const core = document._domCore;
-  const tail = encodeGeometrySuccessorTail({ scrollbars });
+  const tail = scrollbarTail;
   const snapshot = boxSnapshotFor(boxes, core);
   let work = null;
   let handle;
@@ -361,7 +367,7 @@ function successorOf(operation, { predecessor, root, boxes, revision, scrollbars
     handle = buildAnsweringFontFamilies(document, { ...sourceRevisions, presentation: revision }, tail, (pointer) => {
       const result = core.status(operation, document._coreHandle, predecessor.handle, snapshot.handle,
         pointer, pointer + GEOMETRY.GEOMETRY_REVISIONS_SIZE, tail.byteLength, textStore);
-      work = successorWork(core);
+      work = successorWork(core, operation);
       return result;
     });
   } finally {
@@ -381,10 +387,10 @@ function successorOf(operation, { predecessor, root, boxes, revision, scrollbars
 // it refuses, and this returns no geometry and the refusal ("tree", "rows"
 // or "fragments") for the caller to build instead. `work`: the
 // successor's work (successorWork), null after a refusal.
-export function buildGeometryRestyleSuccessor({ predecessor, root, boxes, publication, viewportIndex, revision, scrollbars, textStore = 0, sourceRevisions }) {
+export function buildGeometryRestyleSuccessor({ predecessor, root, boxes, publication, viewportIndex, revision, scrollbarTail, textStore = 0, sourceRevisions }) {
   const document = nodeMember(root, "ownerDocument");
   const core = document._domCore;
-  const tail = encodeGeometrySuccessorTail({ scrollbars });
+  const tail = scrollbarTail;
   const snapshot = boxSnapshotFor(boxes, core);
   // The document element with a live surface is the viewport's client.
   const viewportClient = document.documentElement === root && Boolean(root._renderSurface);
@@ -395,7 +401,7 @@ export function buildGeometryRestyleSuccessor({ predecessor, root, boxes, public
       const result = core.status("geometry_restyle_successor", document._coreHandle, predecessor.handle,
         publication ?? 0, root._coreHandle, snapshot.handle, viewportClient ? 1 : 0, viewportIndex ?? -1,
         pointer, pointer + GEOMETRY.GEOMETRY_REVISIONS_SIZE, tail.byteLength, textStore);
-      if (result >= GEOMETRY_HANDLE_MINIMUM) work = successorWork(core);
+      if (result >= GEOMETRY_HANDLE_MINIMUM) work = successorWork(core, "geometry_restyle_successor");
       return result;
     });
   } finally {
@@ -430,7 +436,9 @@ export function geometryRect(core, handle, node) {
 // a box.
 export function geometryClientRects(core, handle, node) {
   const count = core.status("geometry_client_rects", handle, node);
-  const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * GEOMETRY_FRAGMENT_SIZE);
+  // Without a rectangle the operation produces no output.
+  if (count === 0) return [];
+  const view = core.output("geometry_client_rects");
   const rectangles = [];
   for (let index = 0; index < count; index++) {
     const at = index * GEOMETRY_FRAGMENT_SIZE;
@@ -449,7 +457,7 @@ export function geometryClientRects(core, handle, node) {
 // text geometry (live-geometry.js withLiveTextGeometry).
 export function geometryRangeRects(core, handle, range, bounding) {
   const count = core.status("geometry_range_rects", handle, range._handle, bounding ? 1 : 0);
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * GEOMETRY_FRAGMENT_SIZE);
+  const view = count === 0 ? null : core.output("geometry_range_rects");
   const rectangles = [];
   for (let index = 0; index < count; index++) {
     const at = index * GEOMETRY_FRAGMENT_SIZE;
@@ -469,7 +477,7 @@ export function geometryRangeRects(core, handle, range, bounding) {
 // made, since making one can run another core operation.
 export function geometryCaretPosition(core, handle, x, y) {
   if (core.status("geometry_caret_position", handle, x, y) === 0) return null;
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), GEOMETRY.GEOMETRY_CARET_POSITION_SIZE);
+  const view = core.output("geometry_caret_position");
   const node = view.getBigUint64(GEOMETRY.GEOMETRY_CARET_POSITION_NODE, true);
   const offset = view.getFloat64(GEOMETRY.GEOMETRY_CARET_POSITION_OFFSET, true);
   return { node: core.wrapperFor(node), offset };
@@ -480,7 +488,9 @@ export function geometryCaretPosition(core, handle, x, y) {
 // made, since making one can run another core operation.
 export function geometryHits(core, handle, x, y) {
   const count = core.status("geometry_hits_test", handle, x, y);
-  const view = new DataView(core.memory.buffer, core.exports.abi_output_pointer(), count * BigUint64Array.BYTES_PER_ELEMENT);
+  // Without a node at the point the operation produces no output.
+  if (count === 0) return [];
+  const view = core.output("geometry_hits_test");
   const handles = [];
   for (let index = 0; index < count; index++) handles.push(view.getBigUint64(index * BigUint64Array.BYTES_PER_ELEMENT, true));
   return handles.map((node) => core.wrapperFor(node));
@@ -496,10 +506,10 @@ function writeSelectionSpan(view, offset, span) {
   view.setFloat64(offset + GEOMETRY.GEOMETRY_SPAN_DELTA_Y, span.deltaY ?? 0, true);
 }
 
-function readSelectionRectangles(core, count) {
+function readSelectionRectangles(core, operation, count) {
   if (count === 0) return noSelectionRectangles;
   const size = GEOMETRY.GEOMETRY_SELECTION_RECTANGLE_SIZE;
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * size);
+  const view = core.output(operation);
   const rectangles = [];
   for (let index = 0; index < count; index++) {
     const offset = index * size;
@@ -529,7 +539,7 @@ export function selectionRectangles(snapshot, spans, {
   }
   const count = core.status("geometry_selection_rects", snapshot.geometryHandle,
     pointer, spans.length, physical ? 1 : 0, deviceScale);
-  return readSelectionRectangles(core, count);
+  return readSelectionRectangles(core, "geometry_selection_rects", count);
 }
 
 // The caret rectangle at `position` in `node` (a text node or a text
@@ -542,7 +552,7 @@ export function caretRectangle(snapshot, node, position, {
   const core = snapshot.geometryCore;
   const count = core.status("geometry_caret_rect", snapshot.geometryHandle,
     node._coreHandle, position, deltaX, deltaY, deviceScale);
-  return count === 0 ? null : readSelectionRectangles(core, count)[0];
+  return count === 0 ? null : readSelectionRectangles(core, "geometry_caret_rect", count)[0];
 }
 
 // The selection rectangles of text control `element` in presented frame

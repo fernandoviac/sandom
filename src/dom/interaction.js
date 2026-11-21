@@ -24,8 +24,7 @@ export function normalizeInputRecord(record) {
     throw new TypeError("An input record must be an object.");
   }
   const length = sharedDomCore.statusRaw("input_record_normalize", ...sharedDomCore.byteInput(encodeInputRecord(record)));
-  const pointer = sharedDomCore.exports.abi_output_pointer();
-  return decodeInputRecord(sharedDomCore.refreshBytes().slice(pointer, pointer + length));
+  return decodeInputRecord(sharedDomCore.outputBytes("input_record_normalize", 0, length));
 }
 
 const bigintHex = BigInt.prototype.toString;

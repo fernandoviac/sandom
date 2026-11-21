@@ -31,5 +31,5 @@ export function imageConversionUniform(descriptor, renderMode, canvasColorSpace 
       `image conversion: ${colorEncoding.transferFunction === 'icc' ? 'ICC-tagged descriptors must be converted before upload' : 'no conversion for this descriptor'}`,
     );
   }
-  return new Float32Array(core.refreshBytes().buffer.slice(core.exports.abi_output_pointer(), core.exports.abi_output_pointer() + 80));
+  return new Float32Array(core.outputBytes("image_conversion_uniform", 0, 80).buffer);
 }

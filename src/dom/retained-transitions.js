@@ -66,16 +66,9 @@ const TRAVERSAL_NAMES = new Map([
 const hostSetTimeout = globalThis.setTimeout.bind(globalThis);
 const hostClearTimeout = globalThis.clearTimeout.bind(globalThis);
 
-function outputView(core) {
-  return new DataView(
-    core.refreshBytes().buffer,
-    core.exports.abi_output_pointer(),
-    core.exports.abi_output_length(),
-  );
-}
-
-function readRevision(core) {
-  const view = outputView(core);
+// The revision record in the output of $operation.
+function readRevision(core, operation) {
+  const view = core.output(operation);
   return Object.freeze({
     handle: view.getBigInt64(RECORD.HANDLE, true),
     instance: view.getUint32(RECORD.INSTANCE, true),
@@ -85,10 +78,10 @@ function readRevision(core) {
   });
 }
 
-// The steps that an operation ended, each with the message that the core
-// writes for it.
-function readFinishList(core) {
-  const view = outputView(core);
+// The steps that operation $operation ended, each with the message that
+// the core writes for it.
+function readFinishList(core, operation) {
+  const view = core.output(operation);
   const instance = view.getUint32(FINISH.INSTANCE, true);
   const ordinal = view.getUint32(FINISH.ORDINAL, true);
   const entries = [];
@@ -103,13 +96,13 @@ function readFinishList(core) {
   }
   return entries.map(([step, kind, cause, limit]) => {
     core.statusRaw("revision_step_message", instance, ordinal, step, kind, cause, limit);
-    return { step, message: core.outputString() };
+    return { step, message: core.outputString("revision_step_message") };
   });
 }
 
-// The provenance that the core wrote for a captured artifact.
-function readProvenance(core, kind) {
-  const view = outputView(core);
+// The provenance that $operation wrote for a captured artifact.
+function readProvenance(core, kind, operation) {
+  const view = core.output(operation);
   return Object.freeze({
     observation: view.getBigInt64(PROVENANCE.OBSERVATION, true),
     kind,
@@ -179,7 +172,7 @@ export function createRetainedInstance({
   let documentSelection = null;
   identifyCore(core);
   const handle = core.statusRaw("revision_instance_create");
-  let revision = readRevision(core);
+  let revision = readRevision(core, "revision_instance_create");
   let disposed = false;
   // The callbacks of each step that has not ended, by step handle.
   const steps = new Map();
@@ -199,7 +192,7 @@ export function createRetainedInstance({
         // ends as cancelled, with the refusal as its cause.
         if (disposed) return;
         if (core.statusRaw("revision_step_cancel", handle, step) === 1) {
-          endSteps(readFinishList(core), step, error);
+          endSteps(readFinishList(core, "revision_step_cancel"), step, error);
           return;
         }
       }
@@ -235,15 +228,15 @@ export function createRetainedInstance({
     }
   };
 
-  const published = (step) => {
-    revision = readRevision(core);
+  const published = (step, operation) => {
+    revision = readRevision(core, operation);
     const entry = release(step);
     (entry.kind === STEP_RESET ? entry.onReady : entry.onPublished)?.(revision);
   };
 
   const fail = (step, cause, error) => {
     if (core.statusRaw("revision_step_fail", handle, step, cause) === 0) return;
-    endSteps(readFinishList(core), step, error);
+    endSteps(readFinishList(core, "revision_step_fail"), step, error);
   };
 
   const runReset = async (step) => {
@@ -256,7 +249,7 @@ export function createRetainedInstance({
       return;
     }
     stepEnded();
-    if (core.statusRaw("revision_step_applied", handle, step, 0) === REPORT_PUBLISHED) published(step);
+    if (core.statusRaw("revision_step_applied", handle, step, 0) === REPORT_PUBLISHED) published(step, "revision_step_applied");
   };
 
   const runTransition = async (step) => {
@@ -269,7 +262,7 @@ export function createRetainedInstance({
         limit = core.statusRaw("revision_step_defer", handle, step);
         return Object.freeze({
           settle() {
-            if (core.statusRaw("revision_step_settle", handle, step) === REPORT_PUBLISHED) published(step);
+            if (core.statusRaw("revision_step_settle", handle, step) === REPORT_PUBLISHED) published(step, "revision_step_settle");
           },
           fail(error) {
             fail(step, CAUSE_SETTLEMENT, error);
@@ -295,11 +288,11 @@ export function createRetainedInstance({
         typeof result?.then === "function" ? 1 : 0,
       );
       if (applied === REPORT_FAILED) {
-        endSteps(readFinishList(core));
+        endSteps(readFinishList(core, "revision_step_applied"));
         return;
       }
       if (applied === REPORT_PUBLISHED) {
-        published(step);
+        published(step, "revision_step_applied");
         return;
       }
       // Ended while its applicator ran (a cancellation): nothing waits.
@@ -309,7 +302,7 @@ export function createRetainedInstance({
       await new Promise((resolve) => {
         const timer = hostSetTimeout(() => {
           if (core.statusRaw("revision_step_timeout", handle, step) === 0) return;
-          endSteps(readFinishList(core));
+          endSteps(readFinishList(core, "revision_step_timeout"));
         }, limit);
         entry.release = () => {
           hostClearTimeout(timer);
@@ -360,7 +353,7 @@ export function createRetainedInstance({
         // the step.
         cancel() {
           if (core.statusRaw("revision_step_cancel", handle, step) === 0) return false;
-          endSteps(readFinishList(core));
+          endSteps(readFinishList(core, "revision_step_cancel"));
           return true;
         },
       });
@@ -526,7 +519,10 @@ export function createRetainedInstance({
         }
         if (raster) core.statusRaw("revision_observation_rastered", handle, observation, artifact.width, artifact.height);
         else core.statusRaw("revision_observation_captured", handle, observation, artifact.handle);
-        return Object.freeze({ artifact, provenance: readProvenance(core, kind) });
+        return Object.freeze({
+          artifact,
+          provenance: readProvenance(core, kind, raster ? "revision_observation_rastered" : "revision_observation_captured"),
+        });
       }).then(
         (captured) => deliver(onCaptured, captured),
         (error) => {
@@ -544,7 +540,7 @@ export function createRetainedInstance({
     dispose() {
       core.statusRaw("revision_instance_dispose", handle);
       disposed = true;
-      endSteps(readFinishList(core));
+      endSteps(readFinishList(core, "revision_instance_dispose"));
     },
   });
 }

@@ -86,6 +86,9 @@ export class GlyphResourceManager {
     this._module = atlasRuntime.moduleIdentity();
     if (!this._module) throw new Error("Initialize the atlas runtime before constructing its glyph resource manager");
     this._native = this._module.exports;
+    // The operations of the engine's renderer core, whose output the
+    // manager's operations write.
+    this._operations = this._module.engine.core.operations;
     this.maxEntries = maxEntries;
     this.maxBytes = maxBytes;
     this._handle = this._native.glyph_manager_create(
@@ -128,8 +131,7 @@ export class GlyphResourceManager {
   _failure(code, first = 0, second = 0, a = "", b = "") {
     const native = this._native;
     const errorClass = native.glyph_manager_message(code, first, second, ...this._text(a), ...this._text(b));
-    const pointer = native.abi_output_pointer();
-    const message = decoder.decode(new Uint8Array(this._module.memory.buffer, pointer, native.abi_output_length()));
+    const message = this._operations.outputText("glyph_manager_message", decoder);
     if (errorClass === GLYPH_CODE.CLASS_HOST_ERROR) throw new Error(message);
     if (errorClass === GLYPH_CODE.CLASS_ABORT) return new DOMException(message, "AbortError");
     const classes = new Map([[GLYPH_CODE.CLASS_TYPE_ERROR, TypeError], [GLYPH_CODE.CLASS_RANGE_ERROR, RangeError]]);
@@ -159,13 +161,16 @@ export class GlyphResourceManager {
       const fields = REQUEST_FIELDS.flatMap((field) =>
         [typeof request[field] === "number" ? request[field] : NaN, fieldKind(request[field])]);
       const code = this._native.glyph_request_check(pointer, identifiers.length, ...fields);
-      const output = this._native.abi_output_pointer();
       const failingGlyph = code === GLYPH_CODE.MESSAGE_GLYPH_IDENTIFIER;
-      const view = new DataView(this._module.memory.buffer, output, code === 0 ? GLYPH.REQUEST_CHECK_SIZE : failingGlyph ? 4 : 0);
+      // A rejected field produces no output; a rejected glyph produces its
+      // index, an accepted request its face and variation.
+      if (code !== 0 && !failingGlyph) {
+        throw this._failure(code, requestIndex, 0, String(request[REQUEST_FIELDS[code - GLYPH_CODE.MESSAGE_FIRST_FIELD]]));
+      }
+      const view = this._operations.output("glyph_request_check");
       if (failingGlyph) {
         throw this._failure(code, requestIndex, 0, String(glyphIds[view.getUint32(GLYPH.REQUEST_CHECK_FAILING_GLYPH, true)]));
       }
-      if (code !== 0) throw this._failure(code, requestIndex, 0, String(request[REQUEST_FIELDS[code - GLYPH_CODE.MESSAGE_FIRST_FIELD]]));
       return {
         ...request, glyphIds, faceIndex: view.getUint32(GLYPH.REQUEST_CHECK_FACE, true),
         variationWidth: view.getFloat64(GLYPH.REQUEST_CHECK_WIDTH, true),

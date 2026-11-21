@@ -8,8 +8,11 @@
 // - labels: { undo, redo, cut, copy, paste, selectAll }, strings in the
 //   user's language; a missing label is English.
 // - clipboard: { write(text), read(request) }, or null. `read` calls
-//   `request.reply(text)` once, at any later time. Without a clipboard, the
-//   menu's cut, copy and paste are unavailable.
+//   `request.reply(text)` or `request.refuse()` once, at any later time.
+//   Without a clipboard, the menu's cut, copy and paste are unavailable.
+//   The clipboard keys use the same clipboard (src/dom/input-controller.js):
+//   copy and cut by key write it, and the paste key reads it; without one
+//   the paste key pastes nothing.
 
 const LABEL_CODES = Object.freeze({ undo: 1, redo: 2, cut: 3, copy: 4, paste: 5, selectAll: 6 });
 const COMMAND = Object.freeze({ UNDO: 1, REDO: 2, CUT: 3, COPY: 4, PASTE: 5, SELECT_ALL: 6, REPLACE: 7 });
@@ -58,15 +61,19 @@ export function runFieldMenuCommand(runtime, root, { command, field, text }) {
     if (copied !== null) clipboard.write(copied);
   } else if (command === COMMAND.PASTE) {
     let answered = false;
+    const answer = () => {
+      if (answered) throw new Error("context menu paste: the clipboard already answered");
+      answered = true;
+    };
     clipboard.read(Object.freeze({
       reply(pasted) {
-        if (answered) throw new Error("context menu paste: the clipboard already answered");
         if (typeof pasted !== "string") {
           throw new TypeError(`context menu paste: the clipboard text is ${describe(pasted)}; expected a string`);
         }
-        answered = true;
+        answer();
         runtime.paste(root, pasted, { target });
       },
+      refuse: answer,
     }));
   } else if (command === COMMAND.SELECT_ALL) {
     runtime.selectAll(root, { target });

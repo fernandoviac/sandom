@@ -343,11 +343,7 @@ const EVENT = Object.freeze(Object.fromEntries([
 
 function decodeDispatchPath(core, handle) {
   const count = core.status("event_dispatch_path", handle);
-  const view = new DataView(
-    core.memory.buffer,
-    core.exports.abi_output_pointer(),
-    count * EVENT.PATH_SIZE,
-  );
+  const view = count === 0 ? null : core.output("event_dispatch_path");
   // Copy numeric values before wrapper materialization can allocate/grow memory.
   const records = Array.from({ length: count }, (_, index) => {
     const offset = index * EVENT.PATH_SIZE;
@@ -377,11 +373,7 @@ function decodeDispatchPath(core, handle) {
 
 function dispatchCoordinator(core, handle, path) {
   const count = core.status("event_dispatch_listeners", handle);
-  const view = new DataView(
-    core.memory.buffer,
-    core.exports.abi_output_pointer(),
-    count * EVENT.LISTENER_SIZE,
-  );
+  const view = count === 0 ? null : core.output("event_dispatch_listeners");
   let coordinator = null;
   for (let index = 0; index < count; index++) {
     const at = index * EVENT.LISTENER_SIZE;
@@ -407,6 +399,13 @@ function invokeListener(callback, event) {
   return typeof callback === "function"
     ? callback.call(this, event)
     : callback.handleEvent(event);
+}
+
+// The activation events of input runs (core/dom/input-run.watpart): the run
+// follows the hyperlink of such a click itself.
+const runActivationEvents = new WeakSet();
+export function markRunActivationEvent(event) {
+  runActivationEvents.add(event);
 }
 
 // `targetOverride` is the HTML Standard's "legacy target override flag": the
@@ -483,11 +482,7 @@ function dispatch(target, event, reportException, targetOverride = null) {
           return accepted;
         }
         core.status("event_dispatch_invocation", handle);
-        const view = new DataView(
-          core.memory.buffer,
-          core.exports.abi_output_pointer(),
-          EVENT_INVOCATION.SIZE,
-        );
+        const view = core.output("event_dispatch_invocation");
         const listener = view.getBigUint64(EVENT_INVOCATION.LISTENER, true);
         const identity = view.getUint32(EVENT_INVOCATION.IDENTITY, true);
         const index = view.getUint32(EVENT_INVOCATION.INDEX, true);
@@ -507,11 +502,7 @@ function dispatch(target, event, reportException, targetOverride = null) {
           handle,
           index,
         );
-        const visible = new DataView(
-          core.memory.buffer,
-          core.exports.abi_output_pointer(),
-          visibleCount * Uint32Array.BYTES_PER_ELEMENT,
-        );
+        const visible = visibleCount === 0 ? null : core.output("event_dispatch_visible_path");
         state.visiblePath = Array.from(
           { length: visibleCount },
           (_, offset) => path[visible.getUint32(offset * Uint32Array.BYTES_PER_ELEMENT, true)].node,
@@ -559,8 +550,9 @@ function dispatch(target, event, reportException, targetOverride = null) {
     finish();
     // A click that no listener canceled reaches the activation behavior of
     // the hyperlink around its target (event_state_follows_hyperlink,
-    // src/dom/scripts.js).
-    if (document?._scriptProcessing &&
+    // src/dom/scripts.js). The click of an input run reaches it through
+    // the run (INPUT_EFFECT_HYPERLINK, src/dom/input-activation.js).
+    if (document?._scriptProcessing && !runActivationEvents.has(event) &&
       stateCore.status("event_state_follows_hyperlink", state.stateHandle, ...stateCore.input(state.type)) !== 0) {
       document._scriptProcessing.followHyperlink(target);
     }
@@ -678,6 +670,15 @@ function toDouble(interfaceName, member, value, fallback = 0) {
     throw new TypeError(`Failed to construct '${interfaceName}': The provided double value of '${member}' is non-finite.`);
   }
   return number;
+}
+// Web IDL §3.2.6 (float): the single precision value closest to a finite
+// double, ties to even; a double whose closest single is infinite throws.
+function toFloat(interfaceName, member, value, fallback = 0) {
+  const single = Math.fround(toDouble(interfaceName, member, value, fallback));
+  if (!Number.isFinite(single)) {
+    throw new TypeError(`Failed to construct '${interfaceName}': The provided float value of '${member}' is outside the range of a float.`);
+  }
+  return single;
 }
 const toNullable = (value) => value ?? null;
 // A Window? member: null, or a window (the global object of a document,
@@ -940,7 +941,15 @@ export const SDMouseEvent = class MouseEvent extends SDUIEvent {
 };
 defineEventInterface(SDMouseEvent, "MouseEvent");
 
+// input_pointer_orientation's output and given bits (input-pointer.watpart),
+// by WAT name without the INPUT_POINTER_ORIENTATION_ prefix.
+const POINTER_ORIENTATION = Object.freeze(Object.fromEntries([
+  "SIZE", "TILT_X", "TILT_Y", "ALTITUDE", "AZIMUTH", "GIVEN_TILT_X", "GIVEN_TILT_Y", "GIVEN_ALTITUDE", "GIVEN_AZIMUTH",
+].map((name) => [name, layoutConstant(`INPUT_POINTER_ORIENTATION_${name}`)])));
+
 export const SDPointerEvent = class PointerEvent extends SDMouseEvent {
+  #altitudeAngle;
+  #azimuthAngle;
   #height;
   #isPrimary;
   #pointerId;
@@ -959,10 +968,21 @@ export const SDPointerEvent = class PointerEvent extends SDMouseEvent {
     this.#isPrimary = Boolean(init.isPrimary);
     this.#pointerId = toLong(init.pointerId);
     this.#pointerType = toDOMString(init.pointerType);
-    this.#pressure = toDouble("PointerEvent", "pressure", init.pressure);
-    this.#tangentialPressure = toDouble("PointerEvent", "tangentialPressure", init.tangentialPressure);
-    this.#tiltX = toLong(init.tiltX);
-    this.#tiltY = toLong(init.tiltY);
+    this.#pressure = toFloat("PointerEvent", "pressure", init.pressure);
+    this.#tangentialPressure = toFloat("PointerEvent", "tangentialPressure", init.tangentialPressure);
+    // The orientation members that the init gives, converted to their IDL
+    // types; the core gives the four members (Pointer Events 3 §4.1.5).
+    const given = (init.tiltX === undefined ? 0 : POINTER_ORIENTATION.GIVEN_TILT_X) |
+      (init.tiltY === undefined ? 0 : POINTER_ORIENTATION.GIVEN_TILT_Y) |
+      (init.altitudeAngle === undefined ? 0 : POINTER_ORIENTATION.GIVEN_ALTITUDE) |
+      (init.azimuthAngle === undefined ? 0 : POINTER_ORIENTATION.GIVEN_AZIMUTH);
+    stateCore.status("input_pointer_orientation", toLong(init.tiltX), toLong(init.tiltY),
+      toDouble("PointerEvent", "altitudeAngle", init.altitudeAngle), toDouble("PointerEvent", "azimuthAngle", init.azimuthAngle), given);
+    const orientation = stateCore.output("input_pointer_orientation");
+    this.#tiltX = orientation.getInt32(POINTER_ORIENTATION.TILT_X, true);
+    this.#tiltY = orientation.getInt32(POINTER_ORIENTATION.TILT_Y, true);
+    this.#altitudeAngle = orientation.getFloat64(POINTER_ORIENTATION.ALTITUDE, true);
+    this.#azimuthAngle = orientation.getFloat64(POINTER_ORIENTATION.AZIMUTH, true);
     this.#twist = toLong(init.twist);
     this.#width = toDouble("PointerEvent", "width", init.width, 1);
   }
@@ -989,6 +1009,12 @@ export const SDPointerEvent = class PointerEvent extends SDMouseEvent {
   }
   get twist() {
     return this.#twist;
+  }
+  get altitudeAngle() {
+    return this.#altitudeAngle;
+  }
+  get azimuthAngle() {
+    return this.#azimuthAngle;
   }
   get pointerType() {
     return this.#pointerType;

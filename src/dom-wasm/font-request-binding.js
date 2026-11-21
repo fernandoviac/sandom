@@ -55,13 +55,11 @@ export function createFontRequestPlan(core, instances, mode) {
   const handle = core.status("font_requests_create", pointer, rows.length, mode);
   try {
     const count = core.status("font_requests_rows", handle);
-    const output = core.exports.abi_output_pointer();
-    const memory = core.refreshBytes();
-    const result = new DataView(memory.buffer);
-    const text = (at) => {
-      const start = result.getUint32(at + TEXT_ROW_POINTER, true);
-      return decoder.decode(memory.subarray(start, start + result.getUint32(at + TEXT_ROW_LENGTH, true)));
-    };
+    const rows = count === 0 ? null : core.output("font_requests_rows");
+    const output = rows?.pointer ?? 0;
+    const result = rows?.memory();
+    const text = (at) => result.memoryText(decoder, result.getUint32(at + TEXT_ROW_POINTER, true),
+      result.getUint32(at + TEXT_ROW_LENGTH, true));
     const requests = Array.from({ length: count }, (_, index) => {
       const at = output + index * REQUEST.SIZE;
       return {
@@ -71,8 +69,9 @@ export function createFontRequestPlan(core, instances, mode) {
       };
     });
     const indexCount = core.status("font_requests_indices", handle);
-    const indices = new Int32Array(core.refreshBytes().buffer,
-      core.exports.abi_output_pointer(), indexCount).slice();
+    const indices = indexCount === 0
+      ? new Int32Array(0)
+      : new Int32Array(core.outputBytes("font_requests_indices", 0, indexCount * 4).buffer);
     return { handle, requests, indices };
   } catch (error) {
     core.status("font_requests_release", handle);

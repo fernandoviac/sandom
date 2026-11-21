@@ -194,13 +194,12 @@ export function addImplicitKeyframes(keyframes, context, implicit) {
     view.setBigUint64(pointer + index * IMPLICIT.KEYFRAME_SIZE + IMPLICIT.KEYFRAME_PROPERTIES, bits, true);
   });
   core.status("animation_implicit_keyframes", pointer, frames.length);
-  view = new DataView(core.refreshBytes().buffer);
-  const output = core.exports.abi_output_pointer();
+  const output = core.output("animation_implicit_keyframes");
   // The placements at offset 0 and at offset 1: a keyframe index and the
   // properties that it takes.
   const placements = [0, 1].map((placement) => {
-    const at = output + placement * IMPLICIT.PLACEMENT_SIZE;
-    return [view.getInt32(at + IMPLICIT.PLACEMENT_INDEX, true), view.getBigUint64(at + IMPLICIT.PLACEMENT_PROPERTIES, true)];
+    const at = placement * IMPLICIT.PLACEMENT_SIZE;
+    return [output.getInt32(at + IMPLICIT.PLACEMENT_INDEX, true), output.getBigUint64(at + IMPLICIT.PLACEMENT_PROPERTIES, true)];
   });
   const implicitFrame = (offset) => ({
     offset,

@@ -369,15 +369,15 @@ function ensureNode(value) {
 // The mutation record a callback record notifies, in the shape of a
 // MutationRecord (src/dom/document-session.js and src/dom/scripts.js read
 // it).
-function mutationRecordOf(core, record, target, relatedA, relatedB) {
+function mutationRecordOf(record, target, relatedA, relatedB) {
   if (record.notify === CALLBACK_NOTIFY_STRUCTURE) {
     return {
       type: "childList",
       target,
       addedNodes: relatedA ? [relatedA] : [],
       removedNodes: relatedB ? [relatedB] : [],
-      previousSibling: core.wrapperFor(record.previous),
-      nextSibling: core.wrapperFor(record.next),
+      previousSibling: record.previousNode,
+      nextSibling: record.nextNode,
     };
   }
   if (record.notify === CALLBACK_NOTIFY_TEXT) return { type: "characterData", target, oldValue: record.oldValue };
@@ -742,9 +742,9 @@ export class SDNode extends SDEventTarget {
     for (const record of core.callbackRecords()) {
       const { effects } = record;
       if (effects === 0 && record.notify === CALLBACK_NOTIFY_NONE) continue;
-      const target = core.wrapperFor(record.target);
-      const relatedA = core.wrapperFor(record.relatedA);
-      const relatedB = core.wrapperFor(record.relatedB);
+      const target = record.targetNode;
+      const relatedA = record.relatedANode;
+      const relatedB = record.relatedBNode;
       if (effects & CALLBACK_EFFECT_RETAIN) {
         moveListenedNode(target, target._documentRetention, relatedB);
         target._documentRetention = relatedB;
@@ -766,7 +766,7 @@ export class SDNode extends SDEventTarget {
       if (effects & CALLBACK_EFFECT_SELECTION) target._mutationDocument()?.getSelection()?._takeChange();
       if (effects & CALLBACK_EFFECT_SURFACE_CONNECT) target._renderSurface?._connectSubtree(relatedA);
       if (record.notify === CALLBACK_NOTIFY_NONE) continue;
-      const mutation = mutationRecordOf(core, record, target, relatedA, relatedB);
+      const mutation = mutationRecordOf(record, target, relatedA, relatedB);
       target._notifyMutation(CALLBACK_NOTIFY_KINDS.get(record.notify), mutation.attributeName, mutation, effects);
     }
   }
@@ -1245,7 +1245,7 @@ export const SDHTMLElement = createElementInterface(class SDHTMLElement extends 
     const core = this._domCore;
     const action = core.statusRaw("content_editable_keyword", ...core.input(String(value)));
     if (action === CONTENT_EDITABLE_REMOVE) nodeMember(this, "removeAttribute").call(this, "contenteditable");
-    else nodeMember(this, "setAttribute").call(this, "contenteditable", core.outputString());
+    else nodeMember(this, "setAttribute").call(this, "contenteditable", core.outputString("content_editable_keyword"));
   }
   // isContentEditable (HTML), from the core (input-activation.watpart).
   get isContentEditable() {

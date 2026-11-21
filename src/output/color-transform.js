@@ -129,8 +129,7 @@ function workingPixels(descriptor) {
   if (core.exports.working_samples_from_unorm8(source, count) !== 1) {
     throw new Error(`output transform: ${count} rgba8 samples exceed the 32-bit working memory; encode a smaller frame`);
   }
-  const pointer = core.exports.abi_output_pointer();
-  return new Float32Array(core.refreshBytes().buffer.slice(pointer, pointer + count * 4));
+  return new Float32Array(core.outputBytes("working_samples_from_unorm8", 0, count * 4).buffer);
 }
 
 export function quantizeWorkingPixels(pixels) {

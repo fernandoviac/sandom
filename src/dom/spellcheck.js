@@ -33,17 +33,16 @@ export function sendSpellcheckRequests(document) {
   if (!checker) return;
   const core = document._domCore;
   if (typeof checker.suggest === "function" && core.status("spellcheck_suggest_take", document._coreHandle) === 1) {
-    sendSuggestRequest(core, checker);
+    sendSuggestRequest(core, checker, "spellcheck_suggest_take");
   }
   const count = core.status("spellcheck_requests_take", document._coreHandle);
   if (count === 0) return;
-  const pointer = core.exports.abi_output_pointer();
-  const bytes = core.refreshBytes();
-  const view = new DataView(bytes.buffer);
-  const text = (at) => core.decoder.decode(bytes.subarray(view.getUint32(at, true), view.getUint32(at, true) + view.getUint32(at + 4, true)));
+  const output = core.output("spellcheck_requests_take");
+  const view = output.memory();
+  const text = (at) => view.memoryText(core.decoder, view.getUint32(at, true), view.getUint32(at + 4, true));
   const requests = [];
   for (let index = 0; index < count; index++) {
-    const row = pointer + index * REQUEST_SIZE;
+    const row = output.pointer + index * REQUEST_SIZE;
     requests.push({
       handle: view.getBigUint64(row, true),
       revision: view.getUint32(row + 8, true),
@@ -92,11 +91,11 @@ function reply(core, field, handle, value, revision, errors) {
   if (result === 1) field._renderSurface?._scheduleAnimationFrame(field);
 }
 
-function sendSuggestRequest(core, checker) {
-  const pointer = core.exports.abi_output_pointer();
-  const bytes = core.refreshBytes();
-  const view = new DataView(bytes.buffer);
-  const text = (at) => core.decoder.decode(bytes.subarray(view.getUint32(at, true), view.getUint32(at, true) + view.getUint32(at + 4, true)));
+function sendSuggestRequest(core, checker, operation) {
+  const output = core.output(operation);
+  const pointer = output.pointer;
+  const view = output.memory();
+  const text = (at) => view.memoryText(core.decoder, view.getUint32(at, true), view.getUint32(at + 4, true));
   const handle = view.getBigUint64(pointer, true);
   const revision = view.getUint32(pointer + 8, true);
   const word = text(pointer + 12);

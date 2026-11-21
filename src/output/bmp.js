@@ -10,6 +10,5 @@ export function encodeBMP(descriptor, request) {
   const { pixels } = transformImageForOutput(descriptor, request);
   const [rgb] = core.byteInput(packSignal(pixels, 8, 3));
   core.status("output_bmp_frame", rgb, descriptor.width, descriptor.height);
-  const pointer = core.exports.abi_output_pointer();
-  return core.refreshBytes().slice(pointer, pointer + core.exports.abi_output_length());
+  return core.outputBytes("output_bmp_frame");
 }

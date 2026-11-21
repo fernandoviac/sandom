@@ -28,11 +28,6 @@
 //   be exact, so dropping it changes work, not results.
 // - Selector state is reset per texel instead of carried between texels
 //   (same exactness argument: the carry is a pruning bound).
-//
-// The per-glyph contour cap is MAX_CONTOURS; the generator REJECTS glyphs
-// above it with a structured failure (no silent fallback).
-
-export const MAX_CONTOURS = 16;
 
 export const WORKGROUP_SIZE = 64;
 
@@ -41,7 +36,7 @@ const STENCIL_ERROR = 1;
 const STENCIL_PROTECTED = 2;
 
 export const MSDF_COMPUTE_WGSL = /* wgsl */ `
-const MAX_CONTOURS: u32 = ${MAX_CONTOURS}u;
+const CACHED_CONTOURS: u32 = 16u;
 const STENCIL_ERROR: u32 = ${STENCIL_ERROR}u;
 const STENCIL_PROTECTED: u32 = ${STENCIL_PROTECTED}u;
 const DISTANCE_DELTA_FACTOR: f32 = 1.001;
@@ -604,10 +599,19 @@ fn multiStateDistance(s: MultiState, p: vec2f) -> vec3f {
   );
 }
 
+// Each channel merges in a variable of its own: a pointer argument to a
+// member of dst needs WGSL's unrestricted_pointer_parameters, which
+// naga's SPIR-V output does not implement (it panics on such a call).
 fn multiStateMerge(dst: ptr<function, MultiState>, src: MultiState) {
-  perpSelMerge(&(*dst).r, src.r);
-  perpSelMerge(&(*dst).g, src.g);
-  perpSelMerge(&(*dst).b, src.b);
+  var r = (*dst).r;
+  var g = (*dst).g;
+  var b = (*dst).b;
+  perpSelMerge(&r, src.r);
+  perpSelMerge(&g, src.g);
+  perpSelMerge(&b, src.b);
+  (*dst).r = r;
+  (*dst).g = g;
+  (*dst).b = b;
 }
 
 fn resolveMulti(d: vec3f) -> f32 {
@@ -618,32 +622,44 @@ fn contourWinding(contourIndex: u32) -> i32 {
   return i32(contours[contourIndex].z) - 1;
 }
 
+// One contour's MSDF selector state at shape-space point p.
+fn msdfContourState(contourIndex: u32, p: vec2f) -> MultiState {
+  // WGSL forbids pointer arguments into one variable (Chrome rejects the
+  // module: "invalid aliased pointer argument"): each channel selector
+  // is a variable of its own until the contour's edges are added.
+  var r = perpSelInit();
+  var g = perpSelInit();
+  var b = perpSelInit();
+  let contour = contours[contourIndex];
+  let edgeStart = contour.x;
+  let edgeCount = contour.y;
+  for (var e = 0u; e < edgeCount; e++) {
+    let edgeIndex = edgeStart + e;
+    let prevIndex = edgeStart + select(e - 1u, edgeCount - 1u, e == 0u);
+    let nextIndex = edgeStart + select(e + 1u, 0u, e + 1u == edgeCount);
+    multiSelAddEdge(&r, &g, &b, p, prevIndex, edgeIndex, nextIndex);
+  }
+  var st: MultiState;
+  st.r = r;
+  st.g = g;
+  st.b = b;
+  return st;
+}
+
 // Evaluates the production MSDF distance (MultiDistance, overlap support)
 // at shape-space point p for glyph gRec. Ring evaluation per contour, then
-// the exact OverlappingContourCombiner::distance() selection.
+// the exact OverlappingContourCombiner::distance() selection. A glyph may
+// have any number of contours: the first loop merges each contour's state
+// as it is computed and keeps the distances of the first CACHED_CONTOURS
+// contours; the selection recomputes the distance of any later contour.
+// One three-phase loop holds the only call to msdfContourState, so GPU
+// compilers inline the contour's edge loop once: phase 0 merges every
+// contour; phase 1 selects among the contours of the selected winding;
+// phase 2 among the others, against the distance phase 1 selected.
 fn msdfDistanceAt(glyphIndex: u32, p: vec2f) -> vec3f {
   let gRec = glyphs[glyphIndex];
-  var states: array<MultiState, MAX_CONTOURS>;
-  var contourDistances: array<vec3f, MAX_CONTOURS>;
+  var contourDistances: array<vec3f, CACHED_CONTOURS>;
   let contourCount = gRec.contourCount;
-
-  for (var ci = 0u; ci < contourCount; ci++) {
-    var st: MultiState;
-    st.r = perpSelInit();
-    st.g = perpSelInit();
-    st.b = perpSelInit();
-    let contour = contours[gRec.contourStart + ci];
-    let edgeStart = contour.x;
-    let edgeCount = contour.y;
-    for (var e = 0u; e < edgeCount; e++) {
-      let edgeIndex = edgeStart + e;
-      let prevIndex = edgeStart + select(e - 1u, edgeCount - 1u, e == 0u);
-      let nextIndex = edgeStart + select(e + 1u, 0u, e + 1u == edgeCount);
-      multiSelAddEdge(&st.r, &st.g, &st.b, p, prevIndex, edgeIndex, nextIndex);
-    }
-    states[ci] = st;
-    contourDistances[ci] = multiStateDistance(st, p);
-  }
 
   var shapeState: MultiState;
   shapeState.r = perpSelInit();
@@ -651,53 +667,55 @@ fn msdfDistanceAt(glyphIndex: u32, p: vec2f) -> vec3f {
   shapeState.b = perpSelInit();
   var innerState = shapeState;
   var outerState = shapeState;
-  for (var ci = 0u; ci < contourCount; ci++) {
-    let resolved = resolveMulti(contourDistances[ci]);
-    let winding = contourWinding(gRec.contourStart + ci);
-    multiStateMerge(&shapeState, states[ci]);
-    if (winding > 0 && resolved >= 0.0) { multiStateMerge(&innerState, states[ci]); }
-    if (winding < 0 && resolved <= 0.0) { multiStateMerge(&outerState, states[ci]); }
-  }
-
-  let shapeDistance = multiStateDistance(shapeState, p);
-  let innerDistance = multiStateDistance(innerState, p);
-  let outerDistance = multiStateDistance(outerState, p);
-  let innerScalar = resolveMulti(innerDistance);
-  let outerScalar = resolveMulti(outerDistance);
-
-  var distance = vec3f(-HUGE_DISTANCE);
+  var shapeDistance: vec3f;
+  var distance: vec3f;
   var winding = 0;
-  if (innerScalar >= 0.0 && abs(innerScalar) <= abs(outerScalar)) {
-    distance = innerDistance;
-    winding = 1;
+  var opposite = 0.0;
+  for (var phase = 0u; phase < 3u; phase++) {
     for (var ci = 0u; ci < contourCount; ci++) {
-      if (contourWinding(gRec.contourStart + ci) > 0) {
-        let cd = contourDistances[ci];
-        if (abs(resolveMulti(cd)) < abs(outerScalar) && resolveMulti(cd) > resolveMulti(distance)) {
+      let contourWindingValue = contourWinding(gRec.contourStart + ci);
+      if (phase > 0u && (contourWindingValue == winding) != (phase == 1u)) { continue; }
+      var st: MultiState;
+      var cd: vec3f;
+      if (phase == 0u || ci >= CACHED_CONTOURS) {
+        st = msdfContourState(gRec.contourStart + ci, p);
+        cd = multiStateDistance(st, p);
+      } else {
+        cd = contourDistances[ci];
+      }
+      let resolved = resolveMulti(cd);
+      if (phase == 0u) {
+        if (ci < CACHED_CONTOURS) { contourDistances[ci] = cd; }
+        multiStateMerge(&shapeState, st);
+        if (contourWindingValue > 0 && resolved >= 0.0) { multiStateMerge(&innerState, st); }
+        if (contourWindingValue < 0 && resolved <= 0.0) { multiStateMerge(&outerState, st); }
+      } else {
+        let current = resolveMulti(distance);
+        if (phase == 1u) {
+          if (abs(resolved) < abs(opposite) && select((resolved < current), (resolved > current), (winding > 0))) {
+            distance = cd;
+          }
+        } else if (resolved * current >= 0.0 && abs(resolved) < abs(current)) {
           distance = cd;
         }
       }
     }
-  } else if (outerScalar <= 0.0 && abs(outerScalar) < abs(innerScalar)) {
-    distance = outerDistance;
-    winding = -1;
-    for (var ci = 0u; ci < contourCount; ci++) {
-      if (contourWinding(gRec.contourStart + ci) < 0) {
-        let cd = contourDistances[ci];
-        if (abs(resolveMulti(cd)) < abs(innerScalar) && resolveMulti(cd) < resolveMulti(distance)) {
-          distance = cd;
-        }
-      }
-    }
-  } else {
-    return shapeDistance;
-  }
-
-  for (var ci = 0u; ci < contourCount; ci++) {
-    if (contourWinding(gRec.contourStart + ci) != winding) {
-      let cd = contourDistances[ci];
-      if (resolveMulti(cd) * resolveMulti(distance) >= 0.0 && abs(resolveMulti(cd)) < abs(resolveMulti(distance))) {
-        distance = cd;
+    if (phase == 0u) {
+      shapeDistance = multiStateDistance(shapeState, p);
+      let innerDistance = multiStateDistance(innerState, p);
+      let outerDistance = multiStateDistance(outerState, p);
+      let innerScalar = resolveMulti(innerDistance);
+      let outerScalar = resolveMulti(outerDistance);
+      if (innerScalar >= 0.0 && abs(innerScalar) <= abs(outerScalar)) {
+        distance = innerDistance;
+        winding = 1;
+        opposite = outerScalar;
+      } else if (outerScalar <= 0.0 && abs(outerScalar) < abs(innerScalar)) {
+        distance = outerDistance;
+        winding = -1;
+        opposite = innerScalar;
+      } else {
+        return shapeDistance;
       }
     }
   }
@@ -707,74 +725,75 @@ fn msdfDistanceAt(glyphIndex: u32, p: vec2f) -> vec3f {
   return distance;
 }
 
+// One contour's single-channel selector state at shape-space point p.
+fn psdfContourState(contourIndex: u32, p: vec2f) -> PerpSel {
+  var st = perpSelInit();
+  let contour = contours[contourIndex];
+  let edgeStart = contour.x;
+  let edgeCount = contour.y;
+  for (var e = 0u; e < edgeCount; e++) {
+    let edgeIndex = edgeStart + e;
+    let prevIndex = edgeStart + select(e - 1u, edgeCount - 1u, e == 0u);
+    let nextIndex = edgeStart + select(e + 1u, 0u, e + 1u == edgeCount);
+    perpSelAddEdgeAllColors(&st, p, prevIndex, edgeIndex, nextIndex);
+  }
+  return st;
+}
+
 // Single-channel PSDF distance (PerpendicularDistanceSelector +
-// OverlappingContourCombiner) for the shape distance checker.
+// OverlappingContourCombiner) for the shape distance checker, with the
+// contour handling and the single call site of msdfDistanceAt.
 fn psdfDistanceAt(glyphIndex: u32, p: vec2f) -> f32 {
   let gRec = glyphs[glyphIndex];
-  var states: array<PerpSel, MAX_CONTOURS>;
-  var contourDistances: array<f32, MAX_CONTOURS>;
+  var contourDistances: array<f32, CACHED_CONTOURS>;
   let contourCount = gRec.contourCount;
-
-  for (var ci = 0u; ci < contourCount; ci++) {
-    var st = perpSelInit();
-    let contour = contours[gRec.contourStart + ci];
-    let edgeStart = contour.x;
-    let edgeCount = contour.y;
-    for (var e = 0u; e < edgeCount; e++) {
-      let edgeIndex = edgeStart + e;
-      let prevIndex = edgeStart + select(e - 1u, edgeCount - 1u, e == 0u);
-      let nextIndex = edgeStart + select(e + 1u, 0u, e + 1u == edgeCount);
-      perpSelAddEdgeAllColors(&st, p, prevIndex, edgeIndex, nextIndex);
-    }
-    states[ci] = st;
-    contourDistances[ci] = perpSelComputeDistance(st, p);
-  }
 
   var shapeState = perpSelInit();
   var innerState = perpSelInit();
   var outerState = perpSelInit();
-  for (var ci = 0u; ci < contourCount; ci++) {
-    let winding = contourWinding(gRec.contourStart + ci);
-    perpSelMerge(&shapeState, states[ci]);
-    if (winding > 0 && contourDistances[ci] >= 0.0) { perpSelMerge(&innerState, states[ci]); }
-    if (winding < 0 && contourDistances[ci] <= 0.0) { perpSelMerge(&outerState, states[ci]); }
-  }
-
-  let shapeDistance = perpSelComputeDistance(shapeState, p);
-  let innerDistance = perpSelComputeDistance(innerState, p);
-  let outerDistance = perpSelComputeDistance(outerState, p);
-
-  var distance = -HUGE_DISTANCE;
+  var distance = 0.0;
   var winding = 0;
-  if (innerDistance >= 0.0 && abs(innerDistance) <= abs(outerDistance)) {
-    distance = innerDistance;
-    winding = 1;
+  var opposite = 0.0;
+  for (var phase = 0u; phase < 3u; phase++) {
     for (var ci = 0u; ci < contourCount; ci++) {
-      if (contourWinding(gRec.contourStart + ci) > 0) {
-        let cd = contourDistances[ci];
-        if (abs(cd) < abs(outerDistance) && cd > distance) { distance = cd; }
+      let contourWindingValue = contourWinding(gRec.contourStart + ci);
+      if (phase > 0u && (contourWindingValue == winding) != (phase == 1u)) { continue; }
+      var st: PerpSel;
+      var cd: f32;
+      if (phase == 0u || ci >= CACHED_CONTOURS) {
+        st = psdfContourState(gRec.contourStart + ci, p);
+        cd = perpSelComputeDistance(st, p);
+      } else {
+        cd = contourDistances[ci];
+      }
+      if (phase == 0u) {
+        if (ci < CACHED_CONTOURS) { contourDistances[ci] = cd; }
+        perpSelMerge(&shapeState, st);
+        if (contourWindingValue > 0 && cd >= 0.0) { perpSelMerge(&innerState, st); }
+        if (contourWindingValue < 0 && cd <= 0.0) { perpSelMerge(&outerState, st); }
+      } else if (phase == 1u) {
+        if (abs(cd) < abs(opposite) && select((cd < distance), (cd > distance), (winding > 0))) { distance = cd; }
+      } else if (cd * distance >= 0.0 && abs(cd) < abs(distance)) {
+        distance = cd;
       }
     }
-  } else if (outerDistance <= 0.0 && abs(outerDistance) < abs(innerDistance)) {
-    distance = outerDistance;
-    winding = -1;
-    for (var ci = 0u; ci < contourCount; ci++) {
-      if (contourWinding(gRec.contourStart + ci) < 0) {
-        let cd = contourDistances[ci];
-        if (abs(cd) < abs(innerDistance) && cd < distance) { distance = cd; }
+    if (phase == 0u) {
+      let shapeDistance = perpSelComputeDistance(shapeState, p);
+      let innerDistance = perpSelComputeDistance(innerState, p);
+      let outerDistance = perpSelComputeDistance(outerState, p);
+      if (innerDistance >= 0.0 && abs(innerDistance) <= abs(outerDistance)) {
+        distance = innerDistance;
+        winding = 1;
+        opposite = outerDistance;
+      } else if (outerDistance <= 0.0 && abs(outerDistance) < abs(innerDistance)) {
+        distance = outerDistance;
+        winding = -1;
+        opposite = innerDistance;
+      } else {
+        return shapeDistance;
       }
     }
-  } else {
-    return shapeDistance;
   }
-
-  for (var ci = 0u; ci < contourCount; ci++) {
-    if (contourWinding(gRec.contourStart + ci) != winding) {
-      let cd = contourDistances[ci];
-      if (cd * distance >= 0.0 && abs(cd) < abs(distance)) { distance = cd; }
-    }
-  }
-  if (distance == shapeDistance) { distance = shapeDistance; }
   return distance;
 }
 
@@ -1110,43 +1129,42 @@ fn hasDiagonalArtifactBase(am: f32, a: vec3f, b: vec3f, c: vec3f, d: vec3f, span
   return false;
 }
 
-// Shape-checked variants: candidate flag triggers the expensive distance
-// evaluation; the artifact flag short-circuits it (evaluate at
-// MSDFErrorCorrection.cpp:58). Every texel is protected in this pass
-// (CHECK_DISTANCE_AT_EDGE runs protectAll first).
-fn hasLinearArtifactInnerShape(
-  glyphIndex: u32, msd: vec3f, sdfCoord: vec2f, shapeCoord: vec2f, direction: vec2f,
-  am: f32, bm: f32, a: vec3f, b: vec3f, dA: f32, dB: f32, span: f32,
-) -> bool {
+// Shape-checked classification: the classifier finds up to two candidate
+// positions per channel along a neighbor direction, with their rangeTest
+// flags. The artifact flag decides at once; the candidate flag needs the
+// expensive distance evaluation (evaluate at MSDFErrorCorrection.cpp:58).
+// Every texel is protected in this pass (CHECK_DISTANCE_AT_EDGE runs
+// protectAll first). pass_find_errors_shape calls shapeCheckArtifact from
+// one site: GPU compilers inline every call, and one inlined copy of the
+// glyph distance evaluation per neighbor, channel and root made this
+// pipeline take seconds to compile.
+struct ArtifactCandidates {
+  t: array<f32, 2>,
+  flags: array<u32, 2>,
+  count: i32,
+}
+
+// hasLinearArtifactInner's candidate.
+fn linearArtifactCandidates(am: f32, bm: f32, a: vec3f, b: vec3f, dA: f32, dB: f32, span: f32) -> ArtifactCandidates {
+  var result: ArtifactCandidates;
+  result.count = 0;
   let t = dA / (dA - dB);
   if (t > ARTIFACT_T_EPSILON && t < 1.0 - ARTIFACT_T_EPSILON) {
     let xm = interpolatedMedianLinear(a, b, t);
-    let flags = rangeTest(0.0, 1.0, t, am, bm, xm, span, true);
-    if ((flags & 1u) != 0u) {
-      if ((flags & 2u) != 0u) { return true; }
-      return shapeCheckArtifact(glyphIndex, msd, sdfCoord, shapeCoord, direction, t);
-    }
+    result.t[0] = t;
+    result.flags[0] = rangeTest(0.0, 1.0, t, am, bm, xm, span, true);
+    result.count = 1;
   }
-  return false;
+  return result;
 }
 
-fn hasLinearArtifactShape(
-  glyphIndex: u32, msd: vec3f, sdfCoord: vec2f, shapeCoord: vec2f, direction: vec2f,
-  am: f32, a: vec3f, b: vec3f, span: f32,
-) -> bool {
-  let bm = med3(b.x, b.y, b.z);
-  return abs(am - 0.5) >= abs(bm - 0.5) && (
-    hasLinearArtifactInnerShape(glyphIndex, msd, sdfCoord, shapeCoord, direction, am, bm, a, b, a.y - a.x, b.y - b.x, span) ||
-    hasLinearArtifactInnerShape(glyphIndex, msd, sdfCoord, shapeCoord, direction, am, bm, a, b, a.z - a.y, b.z - b.y, span) ||
-    hasLinearArtifactInnerShape(glyphIndex, msd, sdfCoord, shapeCoord, direction, am, bm, a, b, a.x - a.z, b.x - b.z, span)
-  );
-}
-
-fn hasDiagonalArtifactInnerShape(
-  glyphIndex: u32, msd: vec3f, sdfCoord: vec2f, shapeCoord: vec2f, direction: vec2f,
+// hasDiagonalArtifactInner's candidates.
+fn diagonalArtifactCandidates(
   am: f32, dm: f32, a: vec3f, l: vec3f, q: vec3f,
   dA: f32, dBC: f32, dD: f32, tEx0: f32, tEx1: f32, span: f32,
-) -> bool {
+) -> ArtifactCandidates {
+  var result: ArtifactCandidates;
+  result.count = 0;
   let roots = solveQuadratic(dD - dBC + dA, dBC - dA - dA, dA);
   for (var i = 0; i < 2; i++) {
     if (i >= roots.count) { break; }
@@ -1168,32 +1186,12 @@ fn hasDiagonalArtifactInnerShape(
         if (tEx1 > t) { tEnd1 = tEx1; em1 = em; } else { tEnd0 = tEx1; em0 = em; }
         rangeFlags |= rangeTest(tEnd0, tEnd1, t, em0, em1, xm, span, true);
       }
-      if ((rangeFlags & 1u) != 0u) {
-        if ((rangeFlags & 2u) != 0u) { return true; }
-        if (shapeCheckArtifact(glyphIndex, msd, sdfCoord, shapeCoord, direction, t)) { return true; }
-      }
+      result.t[result.count] = t;
+      result.flags[result.count] = rangeFlags;
+      result.count++;
     }
   }
-  return false;
-}
-
-fn hasDiagonalArtifactShape(
-  glyphIndex: u32, msd: vec3f, sdfCoord: vec2f, shapeCoord: vec2f, direction: vec2f,
-  am: f32, a: vec3f, b: vec3f, c: vec3f, d: vec3f, span: f32,
-) -> bool {
-  let dm = med3(d.x, d.y, d.z);
-  if (abs(am - 0.5) >= abs(dm - 0.5)) {
-    let abc = a - b - c;
-    let l = -a - abc;
-    let q = d + abc;
-    let tEx = -0.5 * l / q;
-    return (
-      hasDiagonalArtifactInnerShape(glyphIndex, msd, sdfCoord, shapeCoord, direction, am, dm, a, l, q, a.y - a.x, b.y - b.x + c.y - c.x, d.y - d.x, tEx.x, tEx.y, span) ||
-      hasDiagonalArtifactInnerShape(glyphIndex, msd, sdfCoord, shapeCoord, direction, am, dm, a, l, q, a.z - a.y, b.z - b.y + c.z - c.y, d.z - d.y, tEx.y, tEx.z, span) ||
-      hasDiagonalArtifactInnerShape(glyphIndex, msd, sdfCoord, shapeCoord, direction, am, dm, a, l, q, a.x - a.z, b.x - b.z + c.x - c.z, d.x - d.z, tEx.z, tEx.x, span)
-    );
-  }
-  return false;
+  return result;
 }
 
 // ---- pass 3: findErrors, stencil-only classifier ----
@@ -1256,21 +1254,48 @@ fn pass_find_errors_shape(@builtin(global_invocation_id) gid: vec3<u32>) {
   let shapeCoord = unproject(gRec, sdfCoord);
   let gi = ctx.glyphIndex;
 
-  var l = vec3f(0.0); var b = vec3f(0.0); var r = vec3f(0.0); var t = vec3f(0.0);
-  if (x > 0) { l = fieldTexel(gRec, ctx.x - 1u, ctx.y); }
-  if (y > 0) { b = fieldTexel(gRec, ctx.x, ctx.y - 1u); }
-  if (x < w - 1) { r = fieldTexel(gRec, ctx.x + 1u, ctx.y); }
-  if (y < h - 1) { t = fieldTexel(gRec, ctx.x, ctx.y + 1u); }
-
-  let hasError =
-    (x > 0 && hasLinearArtifactShape(gi, c, sdfCoord, shapeCoord, vec2f(-1.0, 0.0), cm, c, l, hSpan)) ||
-    (y > 0 && hasLinearArtifactShape(gi, c, sdfCoord, shapeCoord, vec2f(0.0, -1.0), cm, c, b, hSpan)) ||
-    (x < w - 1 && hasLinearArtifactShape(gi, c, sdfCoord, shapeCoord, vec2f(1.0, 0.0), cm, c, r, hSpan)) ||
-    (y < h - 1 && hasLinearArtifactShape(gi, c, sdfCoord, shapeCoord, vec2f(0.0, 1.0), cm, c, t, hSpan)) ||
-    (x > 0 && y > 0 && hasDiagonalArtifactShape(gi, c, sdfCoord, shapeCoord, vec2f(-1.0, -1.0), cm, c, l, b, fieldTexel(gRec, ctx.x - 1u, ctx.y - 1u), dSpan)) ||
-    (x < w - 1 && y > 0 && hasDiagonalArtifactShape(gi, c, sdfCoord, shapeCoord, vec2f(1.0, -1.0), cm, c, r, b, fieldTexel(gRec, ctx.x + 1u, ctx.y - 1u), dSpan)) ||
-    (x > 0 && y < h - 1 && hasDiagonalArtifactShape(gi, c, sdfCoord, shapeCoord, vec2f(-1.0, 1.0), cm, c, l, t, fieldTexel(gRec, ctx.x - 1u, ctx.y + 1u), dSpan)) ||
-    (x < w - 1 && y < h - 1 && hasDiagonalArtifactShape(gi, c, sdfCoord, shapeCoord, vec2f(1.0, 1.0), cm, c, r, t, fieldTexel(gRec, ctx.x + 1u, ctx.y + 1u), dSpan));
+  // Neighbors: left, bottom, right, top, then the four diagonals.
+  let offsets = array<vec2i, 8>(vec2i(-1, 0), vec2i(0, -1), vec2i(1, 0), vec2i(0, 1),
+    vec2i(-1, -1), vec2i(1, -1), vec2i(-1, 1), vec2i(1, 1));
+  var hasError = false;
+  for (var neighbor = 0u; neighbor < 8u && !hasError; neighbor++) {
+    let offset = offsets[neighbor];
+    let nx = x + offset.x;
+    let ny = y + offset.y;
+    if (nx < 0 || nx >= w || ny < 0 || ny >= h) { continue; }
+    let diagonal = neighbor >= 4u;
+    // a is this texel; b the horizontal neighbor; c the vertical one; d
+    // the diagonal one. A linear direction uses a and b only.
+    let b = fieldTexel(gRec, u32(nx), select(ctx.y, u32(ny), !diagonal));
+    let cVertical = fieldTexel(gRec, ctx.x, u32(ny));
+    let d = fieldTexel(gRec, u32(nx), u32(ny));
+    let far = select(b, d, diagonal);
+    let farMedian = med3(far.x, far.y, far.z);
+    if (abs(cm - 0.5) < abs(farMedian - 0.5)) { continue; }
+    let abc = c - b - cVertical;
+    let l = -c - abc;
+    let q = d + abc;
+    let tEx = -0.5 * l / q;
+    let direction = vec2f(offset);
+    for (var channel = 0u; channel < 3u && !hasError; channel++) {
+      let i0 = channel;
+      let i1 = (channel + 1u) % 3u;
+      var candidates: ArtifactCandidates;
+      if (diagonal) {
+        candidates = diagonalArtifactCandidates(cm, farMedian, c, l, q, c[i1] - c[i0],
+          b[i1] - b[i0] + cVertical[i1] - cVertical[i0], d[i1] - d[i0], tEx[i0], tEx[i1], dSpan);
+      } else {
+        candidates = linearArtifactCandidates(cm, farMedian, c, b, c[i1] - c[i0], b[i1] - b[i0], hSpan);
+      }
+      for (var candidate = 0; candidate < candidates.count && !hasError; candidate++) {
+        let flags = candidates.flags[candidate];
+        if ((flags & 1u) != 0u) {
+          hasError = (flags & 2u) != 0u ||
+            shapeCheckArtifact(gi, c, sdfCoord, shapeCoord, direction, candidates.t[candidate]);
+        }
+      }
+    }
+  }
 
   if (hasError) {
     stencil[index] = stencil[index] | STENCIL_ERROR;

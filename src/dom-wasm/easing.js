@@ -34,15 +34,10 @@ function parseEasingTransport(raw) {
   try {
     core.exports.css_easing_text(handle);
     throwEasingError(core);
-    const cssText = core.outputString();
+    const cssText = core.outputString("css_easing_text");
     core.exports.css_easing_payload(handle);
     throwEasingError(core);
-    core.refreshBytes();
-    const view = new DataView(
-      core.memory.buffer,
-      core.exports.abi_output_pointer(),
-      core.exports.abi_output_length(),
-    );
+    const view = core.output("css_easing_payload");
     switch (view.getUint32(EASING_PAYLOAD.KIND, true)) {
       case EASING_KIND.KEYWORD:
         return cssText;
@@ -58,7 +53,7 @@ function parseEasingTransport(raw) {
       case EASING_KIND.STEPS: {
         const count = view.getFloat64(EASING_PAYLOAD.COUNT, true);
         core.status("css_easing_step_position", handle);
-        return { kind: "steps", count, position: core.outputString(), cssText };
+        return { kind: "steps", count, position: core.outputString("css_easing_step_position"), cssText };
       }
       case EASING_KIND.LINEAR: {
         const points = new Array(view.getUint32(EASING_PAYLOAD.POINT_COUNT, true));
@@ -145,7 +140,7 @@ function serializeEasingTransport({ kind, text, strings, inputs }) {
     encoded.length,
   );
   throwEasingError(core);
-  return core.outputString();
+  return core.outputString("css_easing_serialize");
 }
 
 export const { parseCSSEasing, serializeCSSEasing } = createEasingBindings({

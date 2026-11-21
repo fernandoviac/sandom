@@ -16,7 +16,7 @@ const CONSTRUCTION = Symbol("DataTransfer item construction");
 function dataTransferFormat(format) {
   const input = sharedDomCore.input(String(format));
   const firstURL = sharedDomCore.status("data_transfer_format", ...input) === DATA_TRANSFER_FIRST_URL;
-  return [sharedDomCore.outputString(), firstURL];
+  return [sharedDomCore.outputString("data_transfer_format"), firstURL];
 }
 
 const asciiLowercase = (text) => text.replace(/[A-Z]+/g, (letters) => letters.toLowerCase());

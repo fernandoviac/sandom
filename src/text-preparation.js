@@ -37,9 +37,12 @@ export function createTextPreparationRuntime(engine) {
   };
 
   return Object.freeze({
-    // Nodes are retained only to format optional inspection artifacts.
+    // The batch keeps which rows are text (for the inspection artifacts),
+    // not the nodes: a node names its document, which a batch, kept until
+    // the next write, must not keep alive.
     prepareTextBatch(nodes) {
       const handle = check(native.engine_record_prepare_text(), "batch");
+      const textRows = Uint8Array.from(nodes, (node) => node.display === "text" ? 1 : 0);
 
       let released = false;
       let results = 0;
@@ -64,8 +67,8 @@ export function createTextPreparationRuntime(engine) {
           if (copiedRuns !== null) return copiedRuns;
           const base = resultsBase();
           const view = new DataView(engine.memory.buffer);
-          copiedRuns = Object.freeze(nodes.map((node, index) => {
-            if (node.display !== "text") return null;
+          copiedRuns = Object.freeze(Array.from(textRows, (text, index) => {
+            if (text === 0) return null;
             const result = base + index * TEXT_PREPARATION_RESULT_SIZE;
             const bytes = view.getUint32(result + TEXT_PREPARATION_RESULT.BYTES, true);
             const length = view.getUint32(result + TEXT_PREPARATION_RESULT.LENGTH, true);
@@ -107,8 +110,8 @@ export function createTextPreparationRuntime(engine) {
         runSpans() {
           const base = resultsBase();
           const view = new DataView(engine.memory.buffer);
-          return nodes.map((node, index) => {
-            if (node.display !== "text") return null;
+          return Array.from(textRows, (text, index) => {
+            if (text === 0) return null;
             const result = base + index * TEXT_PREPARATION_RESULT_SIZE;
             return {
               bytes: {

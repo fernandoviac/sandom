@@ -1495,11 +1495,10 @@ export class CanvasRenderingContext2D {
         continue;
       }
       if (status === CANVAS_FILTER_UNSUPPORTED) {
-        throw notSupported(`${INTERFACE}.filter`, `the value ${text} (${dom.outputString()})`);
+        throw notSupported(`${INTERFACE}.filter`, `the value ${text} (${dom.outputString("canvas_filter_resolve")})`);
       }
       if (status === 0) return null;
-      const pointer = dom.outputPointerRegister.value;
-      const words = new Float32Array(dom.refreshBytes().buffer.slice(pointer, pointer + dom.outputLengthRegister.value));
+      const words = new Float32Array(dom.outputBytes("canvas_filter_resolve").buffer);
       return { status, words, rootFontSize };
     }
   }
@@ -1593,7 +1592,7 @@ export class CanvasRenderingContext2D {
         displayP3);
     }
     if (status === 0) return null;
-    const view = new DataView(core.refreshBytes().buffer, core.outputPointerRegister.value, DOM_CORE.CANVAS_COLOR_SIZE);
+    const view = core.output("canvas_color_resolve");
     const [r, g, b, a] = colorComponents(view, DOM_CORE.CANVAS_COLOR_PARSED);
     const color = { r, g, b, a };
     const draw = colorComponents(view, DOM_CORE.CANVAS_COLOR_DRAWN);
@@ -1714,7 +1713,7 @@ export class CanvasRenderingContext2D {
         // Black is exact through OKLab.
         return { color: [0, 0, 0, 1], oklabColor: [0, 0, 0, 1], oklabPadding: [0, 0, 0, 1], legacy: true };
       }
-      const view = new DataView(core.refreshBytes().buffer, core.outputPointerRegister.value, DOM_CORE.CANVAS_COLOR_SIZE);
+      const view = core.output("canvas_color_resolve");
       const color = colorComponents(view, DOM_CORE.CANVAS_COLOR_DRAWN);
       const alpha = color[3];
       const { stop, own } = core.parsedOklabStop(color[0], color[1], color[2]);
@@ -1995,8 +1994,7 @@ export class CanvasRenderingContext2D {
     const status = dom.status("canvas_font_parse", ...dom.input(text), environment.connected, environment.parentSize,
       environment.parentWeight, environment.rootSize, environment.viewport.width, environment.viewport.height);
     if (status === 0) return null;
-    const pointer = dom.outputPointerRegister.value;
-    const bytes = dom.refreshBytes().slice(pointer, pointer + dom.outputLengthRegister.value);
+    const bytes = dom.outputBytes("canvas_font_parse");
     const view = new DataView(bytes.buffer);
     return {
       size: view.getFloat64(DOM_CORE.CANVAS_FONT_SIZE, true),
@@ -2057,8 +2055,7 @@ export class CanvasRenderingContext2D {
     if (text === (which === 0 ? state.letterSpacingText : state.wordSpacingText)) return;
     const dom = this.#canvas._domCore;
     if (dom.status("canvas_spacing_parse", ...dom.input(text)) === 0) return;
-    const pointer = dom.outputPointerRegister.value;
-    const bytes = dom.refreshBytes().slice(pointer, pointer + dom.outputLengthRegister.value);
+    const bytes = dom.outputBytes("canvas_spacing_parse");
     const view = new DataView(bytes.buffer);
     const number = view.getFloat64(DOM_CORE.CANVAS_SPACING_NUMBER, true);
     const unit = view.getInt32(DOM_CORE.CANVAS_SPACING_UNIT, true);
@@ -2407,7 +2404,7 @@ export class CanvasRenderingContext2D {
   #applyFocusRingStyle() {
     const dom = this.#canvas._domCore;
     dom.status("canvas_focus_ring_color", this.#settings.colorSpace === "display-p3");
-    const view = new DataView(dom.refreshBytes().buffer, dom.outputPointerRegister.value, DOM_CORE.CANVAS_COLOR_SIZE);
+    const view = dom.output("canvas_focus_ring_color");
     this.#core.focus_ring_style(...colorComponents(view, DOM_CORE.CANVAS_COLOR_PARSED),
       ...colorComponents(view, DOM_CORE.CANVAS_COLOR_DRAWN));
   }

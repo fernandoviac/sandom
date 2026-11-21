@@ -1,7 +1,9 @@
 import { REFERENCE_WHITE_LUMINANCE } from "../color.js";
 import { srgb8Pixels } from "../wasm/color-source.js";
 import { canvasFrameSource } from "./canvas-gpu-binding.js";
-import { isGpuThreadDevice } from "./webgpu-facade.js";
+// WebGPU's constants come from the facade: a server runtime without WebGPU
+// lacks them as globals.
+import { GPUBufferUsage, GPUMapMode, GPUTextureUsage, isGpuThreadDevice } from "./webgpu-facade.js";
 import { getDefaultGpu } from "../gpu-thread.js";
 import { layoutConstant } from "../wasm/layout-table.js";
 
@@ -83,6 +85,14 @@ function releaseFrame(frame) {
     throw new Error("Canvas frame lease count became negative");
   }
   if (frame.retired && frame.leases === 0) frame.finish();
+}
+
+// A device outlives the documents whose canvases it configures (a realm's
+// device serves every document): its lost reaction holds the context
+// weakly, so the device keeps no canvas, and no document, alive.
+function watchConfiguredDeviceLoss(context, device) {
+  const reference = new WeakRef(context);
+  void device.lost.then((information) => reference.deref()?._configuredDeviceLost(device, information));
 }
 
 export class SandomGPUCanvasContext {
@@ -189,17 +199,20 @@ export class SandomGPUCanvasContext {
     });
     this._failure = null;
     this.canvas.ownerDocument._preferredCanvasDevice ??= device;
-    const configuredDevice = device;
-    void device.lost.then((information) => {
-      if (this._configuration?.device !== configuredDevice) return;
-      this._failure = new Error(
-        `Canvas WebGPU device was lost: ${
-          information?.message ?? "unknown reason"
-        }`,
-      );
-      this._updateResource(RESOURCE_FAILED, false, 1);
-      this.canvas._notifyCanvasPaint();
-    });
+    watchConfiguredDeviceLoss(this, device);
+    this.canvas._notifyCanvasPaint();
+  }
+
+  // The device that `configure` gave was lost: a context still configured
+  // with it fails its canvas.
+  _configuredDeviceLost(configuredDevice, information) {
+    if (this._configuration?.device !== configuredDevice) return;
+    this._failure = new Error(
+      `Canvas WebGPU device was lost: ${
+        information?.message ?? "unknown reason"
+      }`,
+    );
+    this._updateResource(RESOURCE_FAILED, false, 1);
     this.canvas._notifyCanvasPaint();
   }
 
@@ -449,13 +462,13 @@ export class SandomGPUCanvasContext {
           toneMapping: frame.toneMapping.mode,
         });
       } else if (frame !== null) {
-        // Select the published descriptor before queuing work. Presentation may
-        // intentionally lag the current frame; capture must preserve that choice.
+        // A renderer on another device paints the presented frame, as one on
+        // the frame's device does: the published bytes when they are this
+        // frame's, otherwise this frame's readback, which the capture waits for.
         const published = this._publishedDescriptor;
-        if (
-          published === null ||
-          this._publishedPresentationSequence !== frame.presentationSequence
-        ) {
+        const current = published !== null &&
+          this._publishedPresentationSequence === frame.presentationSequence;
+        if (!current) {
           readback = this._readbackOperationsByPresentation.get(
             frame.presentationSequence,
           ) ?? null;
@@ -469,7 +482,7 @@ export class SandomGPUCanvasContext {
             readback = this._queueReadback(frame);
           }
         }
-        if (published !== null) {
+        if (current) {
           owner = published;
           heldFrame = null;
           releaseFrame(frame);

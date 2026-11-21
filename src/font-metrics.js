@@ -16,11 +16,11 @@ function resultOffset(field) {
   return sharedDomCore.exports[`font_metrics_result_${field}_offset`].value;
 }
 
-function readResult(pointer) {
-  const view = new DataView(sharedDomCore.refreshBytes().buffer);
-  const signed = (field) => view.getInt32(pointer + resultOffset(field), true);
+// The scalar record in the output of font_metrics_inspect.
+function readResult(view) {
+  const signed = (field) => view.getInt32(resultOffset(field), true);
   return Object.freeze({
-    upem: view.getUint32(pointer + resultOffset("upem"), true),
+    upem: view.getUint32(resultOffset("upem"), true),
     ascender: signed("ascender"),
     descender: signed("descender"),
     lineGap: signed("line_gap"),
@@ -28,7 +28,7 @@ function readResult(pointer) {
     underlineThickness: signed("underline_thickness"),
     strikeoutPosition: signed("strikeout_position"),
     strikeoutThickness: signed("strikeout_thickness"),
-    zeroAdvanceRatio: view.getFloat64(pointer + resultOffset("zero_advance_ratio"), true),
+    zeroAdvanceRatio: view.getFloat64(resultOffset("zero_advance_ratio"), true),
   });
 }
 
@@ -47,17 +47,14 @@ export function readFontMetrics(bytes, { faceIndex } = {}) {
 
   const succeeded = sharedDomCore.status("font_metrics_inspect",
     ...sharedDomCore.byteInput(bytes), index);
-  const pointer = sharedDomCore.exports.abi_output_pointer();
+  const output = sharedDomCore.output("font_metrics_inspect");
   if (succeeded === 0) {
-    const memory = sharedDomCore.refreshBytes();
-    const view = new DataView(memory.buffer, pointer);
-    const error = new Error(decoder.decode(memory.subarray(pointer + FAILURE.TEXT,
-      pointer + sharedDomCore.exports.abi_output_length())));
-    error.fontMetricsCode = view.getUint32(FAILURE.CODE, true);
-    error.fontMetricsField = view.getUint32(FAILURE.FIELD, true);
+    const error = new Error(output.text(decoder, FAILURE.TEXT));
+    error.fontMetricsCode = output.getUint32(FAILURE.CODE, true);
+    error.fontMetricsField = output.getUint32(FAILURE.FIELD, true);
     throw error;
   }
-  const metrics = readResult(pointer);
+  const metrics = readResult(output);
   if (!cachedByFace) {
     cachedByFace = new Map();
     metricsByBytes.set(bytes, cachedByFace);

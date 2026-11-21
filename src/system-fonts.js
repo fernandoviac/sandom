@@ -98,12 +98,9 @@ function bundledFamilyCatalog(families) {
 
 function bundledFamilyDescriptor(catalog, index) {
   sharedDomCore.status("font_bundled_describe", catalog, index);
-  const bytes = sharedDomCore.refreshBytes();
-  const view = new DataView(bytes.buffer, sharedDomCore.exports.abi_output_pointer(), BUNDLED.DESCRIPTION_SIZE);
-  const text = (field) => {
-    const start = view.getUint32(field + BUNDLED.SPAN_POINTER, true);
-    return fontTextDecoder.decode(bytes.subarray(start, start + view.getUint32(field + BUNDLED.SPAN_LENGTH, true)));
-  };
+  const view = sharedDomCore.output("font_bundled_describe");
+  const text = (field) =>
+    view.memoryText(fontTextDecoder, view.getUint32(field + BUNDLED.SPAN_POINTER, true), view.getUint32(field + BUNDLED.SPAN_LENGTH, true));
   return {
     fallback: view.getUint32(BUNDLED.DESCRIPTION_HAS_FALLBACK, true) ? text(BUNDLED.DESCRIPTION_FALLBACK) : undefined,
     familyIdentity: text(BUNDLED.DESCRIPTION_IDENTITY),
@@ -112,11 +109,10 @@ function bundledFamilyDescriptor(catalog, index) {
 
 function bundledFaceDescriptor(file) {
   sharedDomCore.status("font_bundled_face", ...sharedDomCore.input(file));
-  const bytes = sharedDomCore.refreshBytes();
-  const pointer = sharedDomCore.exports.abi_output_pointer();
+  const output = sharedDomCore.output("font_bundled_face");
   return {
-    faceIndex: new DataView(bytes.buffer).getUint32(pointer + BUNDLED.FACE_INDEX, true),
-    faceIdentity: fontTextDecoder.decode(bytes.subarray(pointer + BUNDLED.FACE_IDENTITY, pointer + sharedDomCore.exports.abi_output_length())),
+    faceIndex: output.getUint32(BUNDLED.FACE_INDEX, true),
+    faceIdentity: output.text(fontTextDecoder, BUNDLED.FACE_IDENTITY),
   };
 }
 
@@ -156,8 +152,12 @@ export const FONT_SET_FALLBACK_FAMILIES_SYMBOL = Symbol.for("sandom.fontSetFallb
 export const FONT_SET_SPECIFIER = "https://cdn.urania-libs.com/set/2621941e2c701e45/sandom-fonts/";
 
 // The location of the font set: the import-map target of
-// FONT_SET_SPECIFIER, else the published set of the pin.
+// FONT_SET_SPECIFIER, else the published set of the pin. The npm package
+// names the published set itself (deployment/npm/stage-package.js), which
+// no import map redirects; Deno running an npm package refuses to resolve an
+// https URL.
 export function fontSetLocation() {
+  if (FONT_SET_SPECIFIER === FONT_SET.url) return FONT_SET.url;
   const resolved = import.meta.resolve(FONT_SET_SPECIFIER);
   return resolved === FONT_SET_SPECIFIER ? FONT_SET.url : resolved;
 }

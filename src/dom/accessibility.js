@@ -112,20 +112,17 @@ export function buildAccessibilitySnapshot({ root, presentedFrame, identify, doc
   const handle = core.status("geometry_accessibility_build", presentedFrame.geometryHandle, root._coreHandle, pointer, states.length);
   try {
     const count = core.status("geometry_accessibility_export", handle);
-    const output = core.exports.abi_output_pointer();
-    const memory = core.refreshBytes();
-    const result = new DataView(memory.buffer);
+    const records = count === 0 ? null : core.output("geometry_accessibility_export");
+    const output = records?.pointer ?? 0;
+    const result = records?.memory();
     const decoded = [];
     // Decode before identify callbacks can reenter and grow native memory.
     for (let index = 0; index < count; index++) {
       const offset = output + index * ACCESSIBILITY.RECORD_SIZE;
       const word = (field) => result.getUint32(offset + field, true);
       const number = (field) => result.getFloat64(offset + field, true);
-      const text = (field) => {
-        const p = word(field + ACCESSIBILITY.STRING_POINTER);
-        const length = word(field + ACCESSIBILITY.STRING_LENGTH);
-        return core.decoder.decode(memory.subarray(p, p + length));
-      };
+      const text = (field) =>
+        result.memoryText(core.decoder, word(field + ACCESSIBILITY.STRING_POINTER), word(field + ACCESSIBILITY.STRING_LENGTH));
       const flags = word(ACCESSIBILITY.RECORD_FLAGS);
       const flag = (name) => (flags & ACCESSIBILITY[`FLAG_${name}`]) !== 0;
       const actions = word(ACCESSIBILITY.RECORD_ACTIONS);

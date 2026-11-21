@@ -6,6 +6,7 @@
 // memory, executes the records through the GPU binding, and keeps the
 // caller-owned textures with the host objects that own them.
 import { instantiateRendererCore } from '../wasm/renderer-core-binary.js';
+import { CoreOperations, observeMemoryGrowth } from '../dom-wasm/core.js';
 import { createGpuBinding } from '../gpu-binding.js';
 import { canvasUnpremultiplyTable } from '../canvas-unpremultiply.js';
 import { composeShaderBytes, shaderLibraryFor } from '../shaders/compose.js';
@@ -51,6 +52,7 @@ const formats = ['rgba8unorm', 'rgba16float', 'rgba16uint', 'rgba32float',
   'r8unorm', 'r8uint', 'depth24plus-stencil8', 'bgra8unorm', 'rgba8unorm-srgb', 'bgra8unorm-srgb'];
 const bindings = new WeakMap();
 let canvasCore;
+let canvasOperations;
 
 // The record size of a Canvas 2D command (canvas-2d-core.watpart).
 const canvasConstant = moduleLayoutConstants(canvas2dBinary, 'canvas 2d');
@@ -71,8 +73,15 @@ function bitmapFormat(format) {
   return format === 'rgba16float' ? CANVAS_FORMAT_RGBA16FLOAT : CANVAS_FORMAT_RGBA8UNORM;
 }
 
+// The renderer core of Canvas 2D execution: its exports, which record their
+// operations so an output is read only through canvasOperations.
 function executionCore() {
-  return canvasCore ??= instantiateRendererCore().exports;
+  if (canvasCore === undefined) {
+    const { exports } = instantiateRendererCore();
+    canvasOperations = new CoreOperations(exports);
+    canvasCore = observeMemoryGrowth(exports.memory, exports, () => {}, canvasOperations);
+  }
+  return canvasCore;
 }
 
 const CANVAS_SPACES = new Map([['srgb', 0], ['display-p3', 1]]);
@@ -87,7 +96,7 @@ export function canvasGamutRows(source, destination) {
   }
   const core = executionCore();
   if (core.canvas_gamut_rows(from, to) !== 1) throw new Error('canvas_gamut_rows failed');
-  const entries = new Float64Array(core.memory.buffer, core.abi_output_pointer(), 9);
+  const entries = new Float64Array(canvasOperations.outputBytes('canvas_gamut_rows', 0, 9 * 8).buffer);
   return [0, 3, 6].map((start) => Array.from(entries.subarray(start, start + 3)));
 }
 
@@ -95,7 +104,7 @@ function bindingFor(device) {
   let binding = bindings.get(device);
   if (binding !== undefined) return binding;
   const core = executionCore();
-  const gpu = createGpuBinding(core, device);
+  const gpu = createGpuBinding(core, device, { label: "2d canvas" });
   const table = canvasUnpremultiplyTable();
   const pointer = gpu.input(table.length).byteOffset;
   new Uint8Array(core.memory.buffer, pointer, table.length).set(table);

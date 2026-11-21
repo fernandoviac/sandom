@@ -23,5 +23,5 @@ export function viewportPlanDocument(trace) {
     );
   }
   core.status("output_viewport_visual", ...core.valueListInput(values));
-  return core.outputString();
+  return core.outputString("output_viewport_visual");
 }

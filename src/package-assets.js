@@ -50,8 +50,10 @@ const LIBRARY_MODULES = Object.freeze([
 const FONT_SET_LOCATION = "https://cdn.urania-libs.com/set/2621941e2c701e45/sandom-fonts/";
 // The font set's location as src/system-fonts.js resolves it: the
 // import-map target of FONT_SET_LOCATION, else the published set of the pin
-// (a realm without an import map, such as a dedicated worker).
-const mappedFontSet = import.meta.resolve(FONT_SET_LOCATION);
+// (a realm without an import map, such as a dedicated worker). The npm
+// package names the published set itself, which no import map redirects and
+// which Deno, running an npm package, refuses to resolve.
+const mappedFontSet = FONT_SET_LOCATION === FONT_SET.url ? FONT_SET.url : import.meta.resolve(FONT_SET_LOCATION);
 const fontSetRoot = mappedFontSet === FONT_SET_LOCATION ? FONT_SET.url : mappedFontSet;
 // The module URL goes through a variable on purpose. Vite's asset transform
 // rewrites the literal form `new URL("../", import.meta.url)` at serve time

@@ -1,7 +1,7 @@
 import { createInputBindings } from "./dom-bindings.generated.js";
 import { createEvent, dispatchEvent as dispatchSandomEvent } from "./events.js";
 import { SDDataTransfer } from "./data-transfer.js";
-import { executeInputRun, INPUT_OUTCOME, setSystemFocus } from "./input-activation.js";
+import { effectText, eventFlagsInit, executeInputRun, INPUT_OUTCOME, setSystemFocus } from "./input-activation.js";
 import { fieldMenuCommand, runFieldMenuCommand } from "./field-menu.js";
 import { eyedropperRequest, releaseEyedropperCapture, runEyedropper } from "./eyedropper.js";
 import { autofill, autofillFields, autofillSuggestions } from "./autofill.js";
@@ -19,9 +19,17 @@ const INPUT_TYPES_INSERT_TEXT = layoutConstant("INPUT_TYPES_INSERT_TEXT");
 const INPUT_TYPES_DELETE_SELECTION = layoutConstant("INPUT_TYPES_DELETE_SELECTION");
 const INPUT_AUX_INPUT_TYPE_MASK = layoutConstant("INPUT_AUX_INPUT_TYPE_MASK");
 const INPUT_AUX_COMPOSING = layoutConstant("INPUT_AUX_COMPOSING");
+// The normalized input kinds that a backend method delivers rather than
+// an input batch, by that method.
+const METHOD_INPUT_KINDS = Object.freeze({
+  "text-input": "insertText",
+  "clipboard": "copy, cut or paste",
+  "system-focus": "systemFocus",
+});
 // The event type, inputType and pointerType names of the core's codes.
 const coreName = (exportName) => (code) => sharedDomCore.string(exportName, code);
-const eventName = coreName("input_event_name");
+const INPUT_SOURCE_BATCH = layoutConstant("INPUT_SOURCE_BATCH");
+const eventName = (code) => sharedDomCore.string("input_event_type", INPUT_SOURCE_BATCH, code);
 const inputTypeName = coreName("input_type_name");
 const pointerTypeName = coreName("input_pointer_type_name");
 const stateFinalizer = typeof FinalizationRegistry === "function"
@@ -30,7 +38,11 @@ const stateFinalizer = typeof FinalizationRegistry === "function"
 // Text editing follows Chrome on one platform (plans/dom/PLAN-platform-
 // editing-behavior.md): its key bindings and its caret motion rules. The
 // code is the input state's platform in the DOM core.
-const EDITING_PLATFORMS = Object.freeze({ mac: 0, windows: 1, linux: 2 });
+const EDITING_PLATFORMS = Object.freeze({
+  mac: layoutConstant("INPUT_PLATFORM_MAC"),
+  windows: layoutConstant("INPUT_PLATFORM_WINDOWS"),
+  linux: layoutConstant("INPUT_PLATFORM_LINUX"),
+});
 
 // The platform of the host: in a browser, the platform the browser reports
 // (navigator.userAgentData, else navigator.platform); in a host process,
@@ -121,6 +133,7 @@ const INPUT = Object.freeze(Object.fromEntries([
   "RECORD_DELTA_X", "RECORD_DELTA_Y", "RECORD_TIME", "RECORD_PRESSURE", "RECORD_BUTTON", "RECORD_BUTTONS",
   "RECORD_TARGET", "RECORD_TEXT_OFFSET", "RECORD_TEXT_LENGTH", "RECORD_CODE_OFFSET", "RECORD_CODE_LENGTH",
   "RECORD_SELECTION_START", "RECORD_SELECTION_END", "RECORD_UTF16_LENGTH", "RECORD_AUXILIARY", "RECORD_ROOT",
+  "RECORD_TILT_X", "RECORD_TILT_Y", "RECORD_TWIST", "RECORD_WIDTH", "RECORD_HEIGHT", "RECORD_TANGENTIAL_PRESSURE",
   "FLAG_PRIMARY", "FLAG_SHIFT", "FLAG_ALT", "FLAG_CTRL", "FLAG_META", "FLAG_REPEAT", "FLAG_CANCELLED",
   "ACTION_SCROLL_CHAIN", "ACTION_SCROLL_INTERACTION_END", "ACTION_SCROLLBAR", "ACTION_RECORD_START",
   "ACTION_RECORD_END", "ACTION_POINTER_TARGET",
@@ -130,10 +143,15 @@ const INPUT = Object.freeze(Object.fromEntries([
 const EVENT_FIELD = Object.freeze(Object.fromEntries([
   "MODIFIERS", "BUTTON", "BUTTON_NONE", "BUTTONS", "BUTTONS_NONE", "BUTTONS_PRIMARY", "CLIENT", "CLIENT_ZERO",
   "POINTER_ID", "POINTER", "POINTER_TYPE_CORE", "RELATED_TARGET", "WHEEL", "KEY", "DATA", "DATA_EMPTY",
-  "INPUT_TYPE", "INSERTED_TEXT", "CLIPBOARD", "DATA_TRANSFER", "DETAIL",
+  "INPUT_TYPE", "INSERTED_TEXT", "CLIPBOARD", "DATA_TRANSFER", "DETAIL", "POINTER_LAST",
 ].map((name) => [name, layoutConstant(`INPUT_EVENT_FIELD_${name}`)])));
+// The output of input_run_pointer_last (input-pointer.watpart), by WAT name
+// without the INPUT_POINTER_LAST_ prefix.
+const POINTER_LAST = Object.freeze(Object.fromEntries([
+  "SIZE", "X", "Y", "PRESSURE", "TYPE", "PRIMARY", "TILT_X", "TILT_Y", "TWIST", "WIDTH", "HEIGHT", "TANGENTIAL_PRESSURE",
+].map((name) => [name, layoutConstant(`INPUT_POINTER_LAST_${name}`)])));
 
-const CLIPBOARD = Object.freeze(Object.fromEntries(["LISTENER_DATA", "CONTROL_SELECTION", "DOCUMENT_SELECTION", "NONE"]
+const CLIPBOARD = Object.freeze(Object.fromEntries(["LISTENER_DATA", "CONTROL_SELECTION", "DOCUMENT_SELECTION", "NONE", "READ_REPLY", "READ_REFUSE"]
   .map((name) => [name, layoutConstant(`INPUT_CLIPBOARD_${name}`)])));
 // The commands and clipboard operations of input_edit_begin, by WAT name
 // without the INPUT_EDIT_ prefix.
@@ -164,9 +182,15 @@ function encodeRecords(core, root, records) {
       [INPUT.RECORD_Y, record.y], [INPUT.RECORD_DELTA_X, record.deltaX], [INPUT.RECORD_DELTA_Y, record.deltaY],
       [INPUT.RECORD_TIME, recordTime(root, record)], [INPUT.RECORD_PRESSURE, record.pressure],
       [INPUT.RECORD_BUTTON, record.button], [INPUT.RECORD_BUTTONS, record.buttons],
-      [INPUT.RECORD_SELECTION_START, record.selectionStart], [INPUT.RECORD_SELECTION_END, record.selectionEnd]]) {
+      [INPUT.RECORD_SELECTION_START, record.selectionStart], [INPUT.RECORD_SELECTION_END, record.selectionEnd],
+      [INPUT.RECORD_TILT_X, record.tiltX], [INPUT.RECORD_TILT_Y, record.tiltY], [INPUT.RECORD_TWIST, record.twist],
+      [INPUT.RECORD_TANGENTIAL_PRESSURE, record.tangentialPressure]]) {
       view.setFloat64(base + field, value ?? 0, true);
     }
+    // A width or height that the record does not give is NaN: the core
+    // gives such a pointer the default 1 (Pointer Events 3 §4.1).
+    view.setFloat64(base + INPUT.RECORD_WIDTH, record.width ?? NaN, true);
+    view.setFloat64(base + INPUT.RECORD_HEIGHT, record.height ?? NaN, true);
     view.setBigUint64(base + INPUT.RECORD_TARGET, record.target?._coreHandle ?? 0n, true);
     view.setUint32(base + INPUT.RECORD_TEXT_OFFSET, cursor, true);
     view.setUint32(base + INPUT.RECORD_TEXT_LENGTH, item.text.byteLength, true);
@@ -191,7 +215,7 @@ function documentOf(root) {
 
 function inputTypeCode(operation, inputType, set) {
   const code = sharedDomCore.status("input_type_code", set, ...sharedDomCore.input(String(inputType)));
-  if (code === 0) throw new RangeError(`${operation}: ${sharedDomCore.outputString()}`);
+  if (code === 0) throw new RangeError(`${operation}: ${sharedDomCore.outputString("input_type_code")}`);
   return code;
 }
 
@@ -210,12 +234,13 @@ function clipboardText(core, notification, record) {
 }
 
 // The Event of an input batch event notification (input action 1's
-// fields): the core names the init fields, and each comes from the record
-// or is the constant its bit names.
-function eventFor(core, notification, record, relatedTarget) {
+// fields) of run `run`: the core names the init fields, and each comes from
+// the record, from the core's state of the pointer or is the constant its
+// bit names.
+function eventFor(core, run, notification, record, relatedTarget) {
   const { code, aux } = notification;
   const has = core.exports.input_event_fields(code, aux);
-  const fields = { bubbles: Boolean(notification.flags & 1), cancelable: Boolean(notification.flags & 2), composed: Boolean(notification.flags & 4) };
+  const fields = eventFlagsInit(notification.flags);
   if (has & EVENT_FIELD.MODIFIERS) Object.assign(fields, { shiftKey: record.shiftKey ?? false, altKey: record.altKey ?? false, ctrlKey: record.ctrlKey ?? false, metaKey: record.metaKey ?? false });
   if (has & EVENT_FIELD.BUTTON) fields.button = record.button ?? 0;
   if (has & EVENT_FIELD.BUTTON_NONE) fields.button = -1;
@@ -225,7 +250,12 @@ function eventFor(core, notification, record, relatedTarget) {
   if (has & EVENT_FIELD.CLIENT) Object.assign(fields, { clientX: record.x ?? 0, clientY: record.y ?? 0 });
   if (has & EVENT_FIELD.CLIENT_ZERO) Object.assign(fields, { clientX: 0, clientY: 0 });
   if (has & (EVENT_FIELD.POINTER_ID | EVENT_FIELD.POINTER)) fields.pointerId = record.pointerId;
-  if (has & EVENT_FIELD.POINTER) Object.assign(fields, { pointerType: record.pointerType, isPrimary: record.isPrimary, pressure: record.pressure ?? 0 });
+  if (has & EVENT_FIELD.POINTER) {
+    Object.assign(fields, {
+      pointerType: record.pointerType, isPrimary: record.isPrimary, pressure: record.pressure ?? 0, tiltX: record.tiltX, tiltY: record.tiltY,
+      twist: record.twist, width: record.width, height: record.height, tangentialPressure: record.tangentialPressure,
+    });
+  }
   if (has & EVENT_FIELD.POINTER_TYPE_CORE) Object.assign(fields, { pointerType: pointerTypeName(notification.c), isPrimary: Boolean(notification.d) });
   if (has & EVENT_FIELD.RELATED_TARGET) fields.relatedTarget = relatedTarget;
   if (has & EVENT_FIELD.WHEEL) Object.assign(fields, { deltaX: record.deltaX, deltaY: record.deltaY, deltaMode: record.deltaMode });
@@ -241,6 +271,19 @@ function eventFor(core, notification, record, relatedTarget) {
   if (has & EVENT_FIELD.CLIPBOARD) fields.clipboardData = record.clipboardData;
   if (has & EVENT_FIELD.DATA_TRANSFER) fields.dataTransfer = record.clipboardData ?? null;
   if (has & EVENT_FIELD.DETAIL) fields.detail = notification.a;
+  if (has & EVENT_FIELD.POINTER_LAST) {
+    core.status("input_run_pointer_last", run);
+    const view = core.output("input_run_pointer_last");
+    const type = view.getUint32(POINTER_LAST.TYPE, true);
+    Object.assign(fields, {
+      clientX: view.getFloat64(POINTER_LAST.X, true), clientY: view.getFloat64(POINTER_LAST.Y, true),
+      pressure: view.getFloat64(POINTER_LAST.PRESSURE, true), isPrimary: view.getUint32(POINTER_LAST.PRIMARY, true) !== 0,
+      tiltX: view.getFloat64(POINTER_LAST.TILT_X, true), tiltY: view.getFloat64(POINTER_LAST.TILT_Y, true),
+      twist: view.getFloat64(POINTER_LAST.TWIST, true), width: view.getFloat64(POINTER_LAST.WIDTH, true),
+      height: view.getFloat64(POINTER_LAST.HEIGHT, true), tangentialPressure: view.getFloat64(POINTER_LAST.TANGENTIAL_PRESSURE, true),
+    });
+    fields.pointerType = pointerTypeName(type);
+  }
   return createEvent(eventName(code), fields);
 }
 
@@ -292,6 +335,7 @@ export function createInputController(layoutOptions, editingPlatform, document, 
     let scrolled = false;
     const menuCommands = [];
     const eyedropperRequests = [];
+    const clipboardReads = [];
     executeInputRun(core, run, {
       batchEvent(notification) {
         const index = notification.record;
@@ -302,7 +346,13 @@ export function createInputController(layoutOptions, editingPlatform, document, 
         } else {
           target = core.wrapperFor(notification.target);
         }
-        const event = eventFor(core, notification, records[index], core.wrapperFor(notification.related));
+        // The clipboard event of a clipboard key takes a DataTransfer of
+        // its own, as the host's clipboard commands give theirs.
+        const record = records[index];
+        if (record.clipboardData === undefined && (core.exports.input_event_fields(notification.code, notification.aux) & EVENT_FIELD.CLIPBOARD)) {
+          record.clipboardData = new SDDataTransfer();
+        }
+        const event = eventFor(core, run, notification, record, core.wrapperFor(notification.related));
         dispatchSandomEvent(target, event);
         return event.defaultPrevented ? INPUT_OUTCOME.CANCELED : INPUT_OUTCOME.DONE;
       },
@@ -316,14 +366,34 @@ export function createInputController(layoutOptions, editingPlatform, document, 
         if (action === INPUT.ACTION_SCROLLBAR) scrollbarChanged = true;
         root._renderSurface?._inputScrolled(action, Boolean(notification.a));
       },
+      // The copied text of a copy or cut. A clipboard key's goes to the
+      // document's host clipboard (backend.setContextMenu's `clipboard`).
       clipboard(notification) {
-        copiedText = clipboardText(core, notification, records[notification.record]);
+        const record = records[notification.record];
+        copiedText = clipboardText(core, notification, record);
+        if (record.kind === "key-down" && copiedText !== null) documentOf(root)._contextMenuClipboard?.write(copiedText);
+      },
+      // The paste key asks the host to read its clipboard (input run host
+      // effect 13); the answer pastes after this run.
+      clipboardRead(notification) {
+        clipboardReads.push({ operation: notification.a, target: core.wrapperFor(notification.target) });
       },
       fieldMenu(notification) {
         menuCommands.push(fieldMenuCommand(core, notification));
       },
       eyedropper(notification) {
         eyedropperRequests.push(eyedropperRequest(core, notification));
+      },
+      // A followed hyperlink (input run host effect 10, which the run
+      // executor follows): the input's host receives the link and its URL
+      // (`hooks.hyperlink(link, url)`).
+      hyperlink(link, url) {
+        hooks.hyperlink?.(link, url);
+      },
+      // A changed cursor (input run host effect 11) shows at the surface's
+      // cursor target.
+      cursor(notification) {
+        root._renderSurface?._applyCursor(effectText(core, notification));
       },
       recordHook(notification) {
         const index = notification.record;
@@ -352,7 +422,42 @@ export function createInputController(layoutOptions, editingPlatform, document, 
     // So is the colour an eyedropper takes (src/dom/eyedropper.js).
     for (const request of eyedropperRequests) runEyedropper(runtime, root, request);
     releaseEyedropperCapture(core, documentOf(root));
+    for (const read of clipboardReads) readClipboard(state, root, read);
     return { results, scrollbarChanged, valueChanged, copiedText };
+  }
+  // Reads the document's host clipboard for clipboard read `operation` of
+  // the paste key at `target`: `clipboard.read(request)` answers once, at
+  // any later time, with `request.reply(text)` or `request.refuse()`;
+  // without a clipboard the read is refused. The core pastes a reply at the
+  // target (input_run_clipboard_answer).
+  function readClipboard(state, root, { operation, target }) {
+    const clipboard = documentOf(root)._contextMenuClipboard;
+    let answered = false;
+    const answer = (text) => {
+      if (answered) throw new Error("paste key: the clipboard already answered");
+      answered = true;
+      bind(state, root);
+      const run = state.core.status("input_run_clipboard_answer", state.handle, operation,
+        text === null ? CLIPBOARD.READ_REFUSE : CLIPBOARD.READ_REPLY, ...state.core.input(text ?? ""));
+      if (run === 0n) return;
+      const clipboardData = new SDDataTransfer();
+      clipboardData.setData("text/plain", text);
+      runOwned(state, root, run, [{ kind: "clipboard", text, clipboardData }]);
+    };
+    if (!clipboard) {
+      answer(null);
+      return;
+    }
+    clipboard.read(Object.freeze({
+      target,
+      reply(text) {
+        if (typeof text !== "string") throw new TypeError(`paste key: the clipboard text is ${typeof text}; expected a string`);
+        answer(text);
+      },
+      refuse() {
+        answer(null);
+      },
+    }));
   }
   // A run over a batch that `begin` makes, with the root's binding.
   function adopt(state, root, begin) {
@@ -360,6 +465,14 @@ export function createInputController(layoutOptions, editingPlatform, document, 
     return state.core.status("input_run_adopt", begin());
   }
   function dispatchBatch(root, records, hooks = {}) {
+    records.forEach((record, index) => {
+      const method = METHOD_INPUT_KINDS[record.kind];
+      if (method === undefined) return;
+      throw new TypeError(
+        `Input record ${index} is a ${record.kind} record, which an input batch does not carry: ` +
+          `deliver it through the backend's ${method}, or dispatchInteraction (src/dom/document-operations.js).`,
+      );
+    });
     // A pointer on a page of a paged surface that the frame does not show
     // (a selection dragged past the page's edge): the batch runs against
     // the paged geometry of the pages its points are on, as the geometry
@@ -400,20 +513,6 @@ export function createInputController(layoutOptions, editingPlatform, document, 
     );
     const run = state.core.status("input_run_begin", state.handle, snapshot?.geometryHandle ?? 0n, pointer, length, records.length, touchPanning);
     const results = runOwned(state, root, run, records, hooks).results;
-    // The engine knows which CSS cursor belongs at a document point. A host
-    // that named an element for it gets the answer applied there, so the
-    // pointer over text is a text cursor without every interactive host
-    // resolving and assigning it again.
-    if (surface?._cursorTarget && snapshot) {
-      for (let index = records.length - 1; index >= 0; index--) {
-        const record = records[index];
-        if (typeof record.x !== "number" || typeof record.y !== "number") {
-          continue;
-        }
-        surface._applyCursor(record.x, record.y);
-        break;
-      }
-    }
     // The scrollbar under the pointer shows an overlay bar and holds it
     // shown (design/scrollbars.md, decision 2); a pointer that
     // goes down on a thumb presses it until the pointer goes up.
@@ -511,14 +610,14 @@ export function createInputController(layoutOptions, editingPlatform, document, 
       return one(root, { kind: "composition-end", text, cancelled, shiftKey, altKey, ctrlKey, metaKey });
     },
     accessibilityAction(root, target, action) { return one(root, { ...action, kind: "accessibility-action", target }); },
-    pointerDown(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, button = 0, buttons = 1, pressure = 0.5, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
-      return one(root, { kind: "pointer-down", x, y, pointerId, pointerType, isPrimary, button, buttons, pressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
+    pointerDown(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, button = 0, buttons = 1, pressure = 0.5, tiltX = 0, tiltY = 0, twist = 0, width, height, tangentialPressure = 0, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
+      return one(root, { kind: "pointer-down", x, y, pointerId, pointerType, isPrimary, button, buttons, pressure, tiltX, tiltY, twist, width, height, tangentialPressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
     },
-    pointerMove(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, buttons = 1, pressure = 0.5, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
-      return one(root, { kind: "pointer-move", x, y, pointerId, pointerType, isPrimary, button: -1, buttons, pressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
+    pointerMove(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, buttons = 1, pressure = 0.5, tiltX = 0, tiltY = 0, twist = 0, width, height, tangentialPressure = 0, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
+      return one(root, { kind: "pointer-move", x, y, pointerId, pointerType, isPrimary, button: -1, buttons, pressure, tiltX, tiltY, twist, width, height, tangentialPressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
     },
-    pointerUp(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, button = 0, pressure = 0, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
-      return one(root, { kind: "pointer-up", x, y, pointerId, pointerType, isPrimary, button, buttons: 0, pressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
+    pointerUp(root, x, y, { pointerId = 1, pointerType = "touch", isPrimary = true, button = 0, pressure = 0, tiltX = 0, tiltY = 0, twist = 0, width, height, tangentialPressure = 0, shiftKey = false, altKey = false, ctrlKey = false, metaKey = false, timeMilliseconds } = {}) {
+      return one(root, { kind: "pointer-up", x, y, pointerId, pointerType, isPrimary, button, buttons: 0, pressure, tiltX, tiltY, twist, width, height, tangentialPressure, shiftKey, altKey, ctrlKey, metaKey, timeMilliseconds });
     },
     pointerCancel(root, pointerId = 1) { return one(root, { kind: "pointer-cancel", pointerId }); },
     pointerLeave(root, pointerId = 1) { return one(root, { kind: "pointer-leave", pointerId }); },

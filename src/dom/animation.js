@@ -254,10 +254,10 @@ export class Animation {
     this._timing.endDelay = Number(this._timing.endDelay ?? 0);
     this._timing.iterations = this._timing.iterations ?? 1;
     const scroll = this._isScrollDriven();
-    const defaults = this._core.status("animation_timing_defaults", this._timing.duration, scroll ? 1 : 0);
-    const defaultView = new DataView(this._core.refreshBytes().buffer);
-    this._timing.duration = defaultView.getFloat64(defaults + TIMING_DEFAULTS.DURATION, true);
-    const defaultFill = defaultView.getUint32(defaults + TIMING_DEFAULTS.FILL, true);
+    this._core.status("animation_timing_defaults", this._timing.duration, scroll ? 1 : 0);
+    const defaultView = this._core.output("animation_timing_defaults");
+    this._timing.duration = defaultView.getFloat64(TIMING_DEFAULTS.DURATION, true);
+    const defaultFill = defaultView.getUint32(TIMING_DEFAULTS.FILL, true);
     const measurement = globalThis[MEASUREMENT];
     if (measurement) measurement.record({
       category: "animation", operation: "animation.timing-defaults",
@@ -382,12 +382,23 @@ export class Animation {
     return this._core.string("animation_enumeration_name", ANIMATION_ENUMERATION_REPLACE_STATE, this._value(ANIMATION_VALUE_REPLACE_STATE));
   }
   persist() { this._control(ANIMATION_CONTROL_PERSIST); }
-  // An animation is the event target of its playback events (remove).
-  get onremove() { return this._onremove ?? null; }
-  set onremove(callback) {
-    if (this._onremove) this.removeEventListener("remove", this._onremove);
-    this._onremove = typeof callback === "function" ? callback : null;
-    if (this._onremove) this.addEventListener("remove", this._onremove);
+  // An animation is the event target of its playback events (finish,
+  // cancel, remove), with an event handler attribute for each.
+  get onfinish() { return this._eventHandler("finish"); }
+  set onfinish(callback) { this._setEventHandler("finish", callback); }
+  get oncancel() { return this._eventHandler("cancel"); }
+  set oncancel(callback) { this._setEventHandler("cancel", callback); }
+  get onremove() { return this._eventHandler("remove"); }
+  set onremove(callback) { this._setEventHandler("remove", callback); }
+  _eventHandler(type) { return this._eventHandlers?.get(type) ?? null; }
+  _setEventHandler(type, callback) {
+    this._eventHandlers ??= new Map();
+    const previous = this._eventHandlers.get(type);
+    if (previous) this.removeEventListener(type, previous);
+    if (typeof callback === "function") {
+      this._eventHandlers.set(type, callback);
+      this.addEventListener(type, callback);
+    } else this._eventHandlers.delete(type);
   }
   addEventListener(type, callback, options) { addEventListener(this, type, callback, options); }
   removeEventListener(type, callback, options) { removeEventListener(this, type, callback, options); }
@@ -530,6 +541,13 @@ export class Animation {
     if (state === ANIMATION_PLAY_STATE_PAUSED) track.pause(this._surface.currentTime);
     return track;
   }
+  // The finish notification steps (Web Animations 1, section 4.4.15): the
+  // finished promise resolves and the `finish` event, with the animation's
+  // current time, waits for the next frame's update.
+  _notifyFinished(resolve) {
+    resolve(this);
+    this._surface._queuePlaybackEvent(this, "finish", this.currentTime);
+  }
   _applyActions(actions) {
     // A settled promise gives the frame's animation update a microtask
     // checkpoint to run its reactions in (RenderSurface._render).
@@ -563,19 +581,22 @@ export class Animation {
       this._engineHandle.captureSamples(this._surface.currentTime);
     }
     if (actions & ACTION.LEAVE_HOST) this._leaveHost();
-    if (actions & ACTION.REJECT_FINISHED) this._rejectFinished(new DOMException("Animation canceled", "AbortError"));
+    if (actions & ACTION.REJECT_FINISHED) {
+      this._rejectFinished(new DOMException("Animation canceled", "AbortError"));
+      this._surface._queuePlaybackEvent(this, "cancel", null);
+    }
     if (actions & ACTION.REJECT_READY) {
       this._rejectReady(new DOMException("Animation canceled", "AbortError"));
       this._ready = Promise.resolve(this);
     }
-    if (actions & ACTION.RESOLVE_FINISHED) this._resolveFinished(this);
+    if (actions & ACTION.RESOLVE_FINISHED) this._notifyFinished(this._resolveFinished);
     if (actions & ACTION.NOTIFY_FINISHED) {
       // The core decides in a microtask whether the promise of this
       // generation still resolves (animation_finish_notify).
       const generation = this._value(ANIMATION_VALUE_PROMISE_GENERATION);
       const resolve = this._resolveFinished;
       queueMicrotask(() => {
-        if (this._core.status("animation_finish_notify", this._animationId, generation) !== 0) resolve(this);
+        if (this._core.status("animation_finish_notify", this._animationId, generation) !== 0) this._notifyFinished(resolve);
       });
     }
     if (actions & ACTION.FRAME) this._surface._scheduleAnimationFrame(this._element);
@@ -1129,9 +1150,8 @@ function sortInCompositeOrder(animations) {
     view.setUint32(row + ORDER.PROPERTY_LENGTH, properties[index][1], true);
   }
   const count = native.status("animation_composite_order", rows, animations.length);
-  const output = native.exports.abi_output_pointer();
-  const order = new DataView(native.refreshBytes().buffer);
-  const sorted = Array.from({ length: count }, (_, index) => animations[order.getUint32(output + index * U32, true)]);
+  const order = count === 0 ? null : native.output("animation_composite_order");
+  const sorted = Array.from({ length: count }, (_, index) => animations[order.getUint32(index * U32, true)]);
   for (let index = 0; index < count; index++) animations[index] = sorted[index];
   return animations;
 }
@@ -1173,9 +1193,8 @@ export function removeReplacedAnimations(animations, now) {
     const core = list[0]._core;
     const [pointer] = core.byteInput(new Uint8Array(input.buffer));
     const count = core.status("animation_remove_replaced", pointer, list.length, now);
-    const output = core.exports.abi_output_pointer();
-    const view = new DataView(core.refreshBytes().buffer);
-    for (let index = 0; index < count; index++) removed.push(list[view.getUint32(output + index * U32, true)]);
+    const view = count === 0 ? null : core.output("animation_remove_replaced");
+    for (let index = 0; index < count; index++) removed.push(list[view.getUint32(index * U32, true)]);
   }
   // commitStyles() of a removed animation writes the values it had here;
   // each is sampled before any removed track leaves its stack.
@@ -1273,6 +1292,12 @@ class PendingAnimationTimeline {
   // No style update runs on a timeline without a renderer: the surface
   // that adopts the element brings its CSS animations up to date.
   _startStyleChangeAnimations() {}
+  // A timeline without a renderer has no frame to send events in: an
+  // animation's finish and cancel events wait on it for the surface that
+  // adopts its element (DOMRenderSurface._adoptPendingAnimations).
+  _queuePlaybackEvent(animation, type, currentTime) {
+    (animation._heldPlaybackEvents ??= []).push({ type, currentTime });
+  }
   _removeAnimation(animation) {
     const index = this._animations.indexOf(animation);
     if (index >= 0) this._animations.splice(index, 1);

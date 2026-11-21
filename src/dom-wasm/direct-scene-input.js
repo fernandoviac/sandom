@@ -57,10 +57,10 @@ export function prepareAuthoredSceneInput(core, nodes, fontRegistry) {
   const publication = { core, handle, fontRegistry, boxes: [], authored: true };
   try {
     const count = core.status("engine_authored_rows", handle);
-    const pointer = core.exports.abi_output_pointer();
-    const bytes = core.refreshBytes();
-    const view = new DataView(bytes.buffer);
-    const text = (pointer, length) => decoder.decode(bytes.subarray(pointer, pointer + length));
+    const rows = count === 0 ? null : core.output("engine_authored_rows");
+    const pointer = rows?.pointer ?? 0;
+    const view = rows?.memory();
+    const text = (pointer, length) => view.memoryText(decoder, pointer, length);
     const decode = (pointer) => {
       const kind = view.getUint32(pointer + VALUE.KIND, true);
       if (kind === KIND.UNDEFINED) return undefined;

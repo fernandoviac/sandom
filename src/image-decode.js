@@ -81,7 +81,7 @@ async function decode(bytes, locator, codecRuntime) {
 function svgNaturalSize(document) {
   const core = document._domCore;
   if (core.status("svg_image_natural_size", document._coreHandle) === 0) return null;
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), core.exports.abi_output_length());
+  const view = core.output("svg_image_natural_size");
   const ratio = view.getFloat64(SVG_IMAGE_SIZE.RATIO, true);
   return {
     naturalWidth: view.getFloat64(SVG_IMAGE_SIZE.WIDTH, true),

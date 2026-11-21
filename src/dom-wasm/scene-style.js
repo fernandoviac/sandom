@@ -76,7 +76,7 @@ export function readSceneRowStyle(
     box.h,
   );
   const view = new DataView(core.refreshBytes().buffer);
-  const output = core.exports.abi_output_pointer();
+  const output = core.output("scene_row_style");
   const F32 = Float32Array.BYTES_PER_ELEMENT;
   const number = (offset) => view.getFloat32(record + offset, true);
   // An RGBA color as four f32 values.
@@ -89,15 +89,15 @@ export function readSceneRowStyle(
   const style = {
     matrix: Array.from(
       { length: 6 },
-      (_, index) => view.getFloat32(output + ROW_STYLE_MATRIX + index * Float32Array.BYTES_PER_ELEMENT, true),
+      (_, index) => output.getFloat32(ROW_STYLE_MATRIX + index * Float32Array.BYTES_PER_ELEMENT, true),
     ),
     diagnosticMatrix: Array.from(
       { length: 6 },
-      (_, index) => view.getFloat64(output + ROW_STYLE_DIAGNOSTIC_MATRIX + index * Float64Array.BYTES_PER_ELEMENT, true),
+      (_, index) => output.getFloat64(ROW_STYLE_DIAGNOSTIC_MATRIX + index * Float64Array.BYTES_PER_ELEMENT, true),
     ),
     worldMatrix: Array.from(
       { length: 6 },
-      (_, index) => view.getFloat32(output + ROW_STYLE_WORLD_MATRIX + index * Float32Array.BYTES_PER_ELEMENT, true),
+      (_, index) => output.getFloat32(ROW_STYLE_WORLD_MATRIX + index * Float32Array.BYTES_PER_ELEMENT, true),
     ),
     border: Object.fromEntries(
       sides.map((

@@ -74,6 +74,7 @@ const TRAP_SITE_NAMES = new Map([
   [37, "the allocator refused the float shelf geometry, in MiB"],
   [39, "the allocator refused the explicit frame stack of a recursive call cycle; the tree nests deeper than memory holds"],
   [40, "the allocator refused a chunk of the clip arena; the page nests too many clipping boxes for memory"],
+  [42, "paint damage named a node past the layout buffer's node capacity"],
 ]);
 
 // Trap site 15 carries the glyph in trap_value and the operation in
@@ -180,12 +181,13 @@ export function makeHbImports(memory, allocator) {
 // Links an hb.wasm instance to renderer-core exports, from the interface the
 // core publishes itself: renderer_hb_names names the hb.wasm export of each
 // renderer_hb_table entry, and harfbuzz_callback_table holds the core
-// functions HarfBuzz calls back. Returns the HarfBuzz function-table index of
-// the first callback, for harfbuzz_callbacks_initialize after init.
-export function linkHarfBuzz(coreExports, hb, memory) {
+// functions HarfBuzz calls back. `coreExports` are the export wrappers that
+// record their calls in `operations` (observeMemoryGrowth). Returns the
+// HarfBuzz function-table index of the first callback, for
+// harfbuzz_callbacks_initialize after init.
+export function linkHarfBuzz(coreExports, hb, operations) {
   const count = coreExports.renderer_hb_names();
-  const names = new TextDecoder().decode(new Uint8Array(memory.buffer,
-    coreExports.abi_output_pointer(), coreExports.abi_output_length())).split("\0");
+  const names = operations.outputText("renderer_hb_names", new TextDecoder()).split("\0");
   if (names.length !== count) {
     throw new Error(`renderer_hb_names lists ${names.length} names for ${count} renderer_hb_table entries`);
   }
@@ -269,8 +271,8 @@ async function initializeEngine(core, harfbuzzBytes) {
     );
   }
 
-  const callbackBase = linkHarfBuzz(allocator, hb, memory);
-  const observed = observeMemoryGrowth(memory, allocator, () => core.notifyGrowth());
+  const observed = observeMemoryGrowth(memory, allocator, () => core.notifyGrowth(), core.operations);
+  const callbackBase = linkHarfBuzz(observed, hb, core.operations);
   const measurement = globalThis[Symbol.for("sandom.domCore.measurement")];
   const exports = attributeEngineTraps(
     measurement ? measurement.wrapExports(observed, "engine") : observed,

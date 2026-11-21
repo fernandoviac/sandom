@@ -17,8 +17,7 @@ export function encodeRaw(descriptor, request) {
   const payload = packHalf(pixels);
   const [pointer, length] = core.byteInput(new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength));
   core.status("output_sraw_frame", pointer, length, descriptor.width, descriptor.height);
-  const output = core.exports.abi_output_pointer();
-  return core.refreshBytes().slice(output, output + core.exports.abi_output_length());
+  return core.outputBytes("output_sraw_frame");
 }
 
 export function decodeRaw(bytes) {
@@ -30,7 +29,7 @@ export function decodeRaw(bytes) {
     error.field = core.exports.output_sraw_error_field();
     throw error;
   }
-  const [width, height] = new Uint32Array(core.refreshBytes().buffer, core.exports.abi_output_pointer(), 2);
+  const [width, height] = new Uint32Array(core.outputBytes("output_sraw_check", 0, 8).buffer);
   const payload = bytes.slice(HEADER_SIZE);
   const pixels = unpackHalf(new Uint16Array(payload.buffer, payload.byteOffset, payload.byteLength / 2));
   return {

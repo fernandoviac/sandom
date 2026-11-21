@@ -8,16 +8,17 @@ import { hostNow } from "../host-clock.js";
 import { serializeToScene } from "./serialize.js";
 import { layoutConstant } from "../wasm/layout-table.js";
 
-// `count` f64 values of the standard output.
-function float64Output(core, count) {
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), count * Float64Array.BYTES_PER_ELEMENT);
+// `count` f64 values of the output of $operation.
+function float64Output(core, operation, count) {
+  const view = core.output(operation);
   return Array.from({ length: count }, (_, index) => view.getFloat64(index * Float64Array.BYTES_PER_ELEMENT, true));
 }
 
-// The `count` u64 handles of the standard output from byte `offset`.
-function handleOutput(core, offset, count) {
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer() + offset, count * BigUint64Array.BYTES_PER_ELEMENT);
-  return Array.from({ length: count }, (_, index) => view.getBigUint64(index * BigUint64Array.BYTES_PER_ELEMENT, true));
+// The `count` u64 handles of the output of $operation from byte `offset`.
+function handleOutput(core, operation, offset, count) {
+  if (count === 0) return [];
+  const view = core.output(operation);
+  return Array.from({ length: count }, (_, index) => view.getBigUint64(offset + index * BigUint64Array.BYTES_PER_ELEMENT, true));
 }
 
 const SVG_CLIP_OBJECT_BOUNDING_BOX = layoutConstant("SVG_CLIP_OBJECT_BOUNDING_BOX");
@@ -26,9 +27,9 @@ const SVG_CLIP_PERCENTAGE_GEOMETRY = layoutConstant("SVG_CLIP_PERCENTAGE_GEOMETR
 const SVG_CLIP_LEAF = Object.freeze(Object.fromEntries(["SIZE", "HANDLE", "X_MIN", "Y_MIN", "X_MAX", "Y_MAX"]
   .map((name) => [name, layoutConstant(`SVG_CLIP_LEAF_${name}`)])));
 
-// A clip export failed: its output is the failure's message.
-function clipFailure(core, locator) {
-  throw new Error(`SVG image ${locator}: ${core.outputString()}`);
+// Clip export $operation failed: its output is the failure's message.
+function clipFailure(core, operation, locator) {
+  throw new Error(`SVG image ${locator}: ${core.outputString(operation)}`);
 }
 
 const identity = [1, 0, 0, 1, 0, 0];
@@ -36,8 +37,8 @@ const identity = [1, 0, 0, 1, 0, 0];
 // A path transformed by a matrix (svg_clip_path_transform).
 function transformPath(core, path, matrix, locator) {
   const result = core.status("svg_clip_path_transform", ...core.input(path), ...matrix);
-  if (result < 0) clipFailure(core, locator);
-  return core.outputString();
+  if (result < 0) clipFailure(core, "svg_clip_path_transform", locator);
+  return core.outputString("svg_clip_path_transform");
 }
 
 // The clip path of a clipPath element, its definition transforms baked in
@@ -45,10 +46,10 @@ function transformPath(core, path, matrix, locator) {
 function clipDefinition(element, locator) {
   const core = element._domCore;
   const result = core.status("svg_clip_definition", element._coreHandle);
-  if (result < 0) clipFailure(core, locator);
+  if (result < 0) clipFailure(core, "svg_clip_definition", locator);
   return {
     units: result & SVG_CLIP_OBJECT_BOUNDING_BOX ? "objectBoundingBox" : "userSpaceOnUse",
-    d: core.outputString(),
+    d: core.outputString("svg_clip_definition"),
     fillRule: result & SVG_CLIP_EVENODD ? "evenodd" : "nonzero",
   };
 }
@@ -61,9 +62,9 @@ function shapeBounds(element, node, locator) {
     if (!node.d) throw new Error(`SVG ${element.localName} has no path geometry`);
     return null;
   }
-  if (result === SVG_CLIP_PERCENTAGE_GEOMETRY) throw new Error(core.outputString());
-  if (result < 0) clipFailure(core, locator);
-  const [xMin, yMin, xMax, yMax] = float64Output(core, 4);
+  if (result === SVG_CLIP_PERCENTAGE_GEOMETRY) throw new Error(core.outputString("svg_shape_bounds"));
+  if (result < 0) clipFailure(core, "svg_shape_bounds", locator);
+  const [xMin, yMin, xMax, yMax] = float64Output(core, "svg_shape_bounds", 4);
   return { xMin, yMin, xMax, yMax };
 }
 
@@ -85,7 +86,7 @@ async function pathBoundsFor(pathDef, fillRule, runtime, cache, timings) {
 // path's from the path atlas), which svg_clip_target_matrix combines.
 async function clipTargetMatrix(element, serialized, runtime, cache, locator, timings) {
   const core = element._domCore;
-  const leaves = handleOutput(core, 0, core.status("svg_clip_target_leaves", element._coreHandle));
+  const leaves = handleOutput(core, "svg_clip_target_leaves", 0, core.status("svg_clip_target_leaves", element._coreHandle));
   const rows = [];
   for (const handle of leaves) {
     const leaf = core.wrapperFor(handle);
@@ -107,16 +108,18 @@ async function clipTargetMatrix(element, serialized, runtime, cache, locator, ti
     view.setFloat64(row + SVG_CLIP_LEAF.Y_MAX, bounds.yMax, true);
   });
   const [pointer] = core.byteInput(bytes);
-  if (core.status("svg_clip_target_matrix", element._coreHandle, pointer, rows.length) < 0) clipFailure(core, locator);
-  return float64Output(core, 6);
+  if (core.status("svg_clip_target_matrix", element._coreHandle, pointer, rows.length) < 0) {
+    clipFailure(core, "svg_clip_target_matrix", locator);
+  }
+  return float64Output(core, "svg_clip_target_matrix", 6);
 }
 
 export function prepareSvgImageDefinitions(root, core, locator, timings = null) {
-  if (core.status("svg_image_definitions", root._coreHandle) < 0) clipFailure(core, locator);
-  const counts = new Uint32Array(core.refreshBytes().buffer.slice(core.exports.abi_output_pointer(),
-    core.exports.abi_output_pointer() + 2 * Uint32Array.BYTES_PER_ELEMENT));
-  const [removeCount, pairCount] = counts;
-  const handles = handleOutput(core, counts.byteLength, removeCount + 2 * pairCount);
+  if (core.status("svg_image_definitions", root._coreHandle) < 0) clipFailure(core, "svg_image_definitions", locator);
+  const output = core.output("svg_image_definitions");
+  const removeCount = output.getUint32(0, true);
+  const pairCount = output.getUint32(Uint32Array.BYTES_PER_ELEMENT, true);
+  const handles = handleOutput(core, "svg_image_definitions", 2 * Uint32Array.BYTES_PER_ELEMENT, removeCount + 2 * pairCount);
   const removed = handles.slice(0, removeCount).map((handle) => core.wrapperFor(handle));
   const pairs = Array.from({ length: pairCount }, (_, index) => [
     core.wrapperFor(handles[removeCount + 2 * index]),

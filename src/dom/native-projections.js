@@ -59,9 +59,7 @@ export function projectionHandle(value, kind, label) {
 // The string whose block-relative offset is at `record + field` and whose
 // byte length is at `record + lengthField`.
 function stringAt(view, block, record, field, lengthField) {
-  const offset = view.getUint32(record + field, true);
-  const length = view.getInt32(record + lengthField, true);
-  return decoder.decode(new Uint8Array(view.buffer, block + offset, length));
+  return view.memoryText(decoder, block + view.getUint32(record + field, true), view.getInt32(record + lengthField, true));
 }
 
 function nullableStringAt(view, block, record, field, lengthField) {
@@ -76,11 +74,10 @@ const identifier = (sceneIndex) => `scene-node-${sceneIndex}`;
 function structureFacade(core, handle, onRelease) {
   let released = false;
   let nodes = null;
-  // The record's block and a view of the memory, taken fresh at each read:
-  // a growth of the memory detaches every earlier view.
+  // The record's block and a checked view of it, taken fresh at each read.
   const record = () => {
     const block = core.status("projection_block", handle, KIND_STRUCTURE);
-    return { block, view: new DataView(core.refreshBytes().buffer) };
+    return { block, view: core.resultMemory("projection_block") };
   };
   const readNodes = () => {
     const { block, view } = record();
@@ -235,8 +232,9 @@ export function captureStructure(document, {
 // core writes it.
 export function projectionHostValue(projection, kind, label) {
   const { core, handle } = projectionHandle(projection, kind, label);
-  const length = core.status(KIND_SOURCES.get(kind).encoder, handle);
-  return core.refreshBytes().slice(core.exports.abi_output_pointer(), core.exports.abi_output_pointer() + length);
+  const encoder = KIND_SOURCES.get(kind).encoder;
+  const length = core.status(encoder, handle);
+  return length === 0 ? new Uint8Array(0) : core.outputBytes(encoder, 0, length);
 }
 
 export { KIND_STRUCTURE };

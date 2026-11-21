@@ -1,4 +1,4 @@
-import { createEvent, createEventUsing, createSyntheticEvent, dispatchEvent, SDEvent } from "./events.js";
+import { createEvent, createEventUsing, createSyntheticEvent, dispatchEvent, markRunActivationEvent, SDEvent } from "./events.js";
 import { controlSelectionQueued, controlSelectionSet, controlValueEdited } from "./input-controls.js";
 import { documentScripts } from "./scripts.js";
 import { giveSubmissionEntries, queueFormNavigation } from "./form-data.js";
@@ -42,9 +42,22 @@ const EFFECT_RESET_OUTPUT = constant("INPUT_EFFECT_RESET_OUTPUT");
 const EFFECT_FIELD_MENU = constant("INPUT_EFFECT_FIELD_MENU");
 const EFFECT_RESIZE = constant("INPUT_EFFECT_RESIZE");
 const EFFECT_EYEDROPPER = constant("INPUT_EFFECT_EYEDROPPER");
+const EFFECT_HYPERLINK = constant("INPUT_EFFECT_HYPERLINK");
+const EFFECT_CURSOR = constant("INPUT_EFFECT_CURSOR");
+const EFFECT_CLIPBOARD_READ = constant("INPUT_EFFECT_CLIPBOARD_READ");
 export const INPUT_OUTCOME = Object.freeze({
   DONE: constant("INPUT_OUTCOME_DONE"), CANCELED: constant("INPUT_OUTCOME_CANCELED"), FAILED: constant("INPUT_OUTCOME_FAILED"),
 });
+const EVENT_FLAG = Object.freeze(Object.fromEntries(["BUBBLES", "CANCELABLE", "COMPOSED"]
+  .map((name) => [name, constant(`INPUT_EVENT_FLAG_${name}`)])));
+// The bubbles, cancelable and composed of an event notification, from its
+// INPUT_EVENT_FLAG_* flags.
+export function eventFlagsInit(flags) {
+  return {
+    bubbles: (flags & EVENT_FLAG.BUBBLES) !== 0, cancelable: (flags & EVENT_FLAG.CANCELABLE) !== 0,
+    composed: (flags & EVENT_FLAG.COMPOSED) !== 0,
+  };
+}
 // The pseudo-class name of a state notification that a style rule reads.
 const STATE_NAMES = new Map([
   [STATE.HOVER, "hover"], [STATE.ACTIVE, "active"], [STATE.FOCUS, "focus"], [STATE.CHECKED, "checked"],
@@ -83,12 +96,15 @@ export function queueTopLayerTask(core, element, token) {
   documentScripts(nodeMember(element, "ownerDocument")).queueTask(() => {
     const kind = core.status("top_layer_task_claim", token);
     if (kind === 0) return;
-    const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), TOP_LAYER_CLAIM.SIZE);
-    const target = core.wrapperFor(view.getBigUint64(TOP_LAYER_CLAIM.ELEMENT, true));
-    const source = core.wrapperFor(view.getBigUint64(TOP_LAYER_CLAIM.SOURCE, true));
+    // Capture the claim before resolving a wrapper can reenter the core.
+    const view = core.output("top_layer_task_claim");
+    const element = view.getBigUint64(TOP_LAYER_CLAIM.ELEMENT, true);
+    const sourceHandle = view.getBigUint64(TOP_LAYER_CLAIM.SOURCE, true);
+    const oldState = TOGGLE_STATES.get(view.getUint32(TOP_LAYER_CLAIM.OLD_STATE, true));
+    const newState = TOGGLE_STATES.get(view.getUint32(TOP_LAYER_CLAIM.NEW_STATE, true));
+    const target = core.wrapperFor(element);
+    const source = core.wrapperFor(sourceHandle);
     if (kind === TOP_LAYER_TASK_TOGGLE) {
-      const oldState = TOGGLE_STATES.get(view.getUint32(TOP_LAYER_CLAIM.OLD_STATE, true));
-      const newState = TOGGLE_STATES.get(view.getUint32(TOP_LAYER_CLAIM.NEW_STATE, true));
       dispatchEvent(target, createEvent("toggle", { oldState, newState, source }));
     } else if (kind === TOP_LAYER_TASK_CLOSE) {
       dispatchEvent(target, createEvent("close"));
@@ -103,7 +119,7 @@ const NOTIFICATION = Object.freeze(Object.fromEntries(["SIZE", "KIND", "CODE", "
   "B", "C", "D", "RECORD", "SOURCE", "TOKEN"].map((name) => [name, layoutConstant(`INPUT_NOTIFICATION_${name}`)])));
 
 function readNotification(core) {
-  const view = new DataView(core.refreshBytes().buffer, core.exports.abi_output_pointer(), NOTIFICATION.SIZE);
+  const view = core.output("input_run_next");
   // Capture the borrowed record before resolving a wrapper can reenter the core.
   return {
     kind: view.getUint32(NOTIFICATION.KIND, true), code: view.getUint32(NOTIFICATION.CODE, true),
@@ -116,36 +132,53 @@ function readNotification(core) {
   };
 }
 
-// The Event object of an activation event notification. The clicks of a
-// click() run are synthetic: their isTrusted is false (HTML "fire a
-// synthetic pointer event" with the not trusted flag). A user's click is
-// trusted.
+// The Event object of an activation event notification, with the
+// bubbles, cancelable and composed that the core gives in its flags. The
+// clicks of a click() run are synthetic: their isTrusted is false (HTML
+// "fire a synthetic pointer event" with the not trusted flag). A user's
+// click is trusted.
 function activationEvent(core, notification, syntheticClicks) {
   const related = core.wrapperFor(notification.related);
+  const init = eventFlagsInit(notification.flags);
   switch (notification.code) {
-    case EVENT.BLUR: return createEvent("blur", { composed: true, relatedTarget: related });
-    case EVENT.FOCUSOUT: return createEvent("focusout", { bubbles: true, composed: true, relatedTarget: related });
-    case EVENT.FOCUS: return createEvent("focus", { composed: true, relatedTarget: related });
-    case EVENT.FOCUSIN: return createEvent("focusin", { bubbles: true, composed: true, relatedTarget: related });
+    case EVENT.BLUR: return createEvent("blur", { ...init, relatedTarget: related });
+    case EVENT.FOCUSOUT: return createEvent("focusout", { ...init, relatedTarget: related });
+    case EVENT.FOCUS: return createEvent("focus", { ...init, relatedTarget: related });
+    case EVENT.FOCUSIN: return createEvent("focusin", { ...init, relatedTarget: related });
     // The core gives the click count of the press as notification a (1
-    // for a click without one; input-activation.watpart). A click is
-    // composed, as are the clicks of click() (HTML "fire a synthetic
-    // pointer event").
-    case EVENT.CLICK: return (syntheticClicks ? createSyntheticEvent : createEvent)("click", { bubbles: true, cancelable: true, composed: true, detail: notification.a });
-    case EVENT.INPUT: return createEvent("input", { bubbles: true, composed: true, inputType: null, data: null });
-    case EVENT.CHANGE: return createEvent("change", { bubbles: true });
-    case EVENT.SUBMIT: return createEvent("submit", { bubbles: true, cancelable: true, submitter: related });
+    // for a click without one; input-activation.watpart).
+    case EVENT.CLICK: return (syntheticClicks ? createSyntheticEvent : createEvent)("click", { ...init, detail: notification.a });
+    case EVENT.INPUT: return createEvent("input", { ...init, inputType: null, data: null });
+    case EVENT.CHANGE: return createEvent("change", init);
+    case EVENT.SUBMIT: return createEvent("submit", { ...init, submitter: related });
     case EVENT.BEFORETOGGLE: return createEvent("beforetoggle", toggleEventInit(core, notification));
     case EVENT.CANCEL: return createEvent("cancel", { cancelable: (notification.aux & 1) !== 0 });
-    case EVENT.INVALID: return createEvent("invalid", { cancelable: true });
-    case EVENT.RESET: return createEvent("reset", { bubbles: true, cancelable: true });
+    case EVENT.INVALID: return createEvent("invalid", init);
+    case EVENT.RESET: return createEvent("reset", init);
     // The key events of a fill are plain events, as Chrome fires them
     // (core/dom/autofill.watpart).
-    case EVENT.AUTOFILL_KEYDOWN: return createEventUsing(SDEvent, "keydown", { bubbles: true });
-    case EVENT.AUTOFILL_KEYUP: return createEventUsing(SDEvent, "keyup", { bubbles: true });
+    case EVENT.AUTOFILL_KEYDOWN: return createEventUsing(SDEvent, "keydown", init);
+    case EVENT.AUTOFILL_KEYUP: return createEventUsing(SDEvent, "keyup", init);
     default: throw new Error(`Unknown native activation event ${notification.code}`);
   }
 
+}
+
+// The UTF-8 text of a host effect notification: the b bytes at address
+// a, as the clipboard text, a hyperlink's URL and a cursor keyword give it.
+export function effectText(core, notification) {
+  return core.decoder.decode(core.refreshBytes().subarray(notification.a, notification.a + notification.b));
+}
+
+// Follows the hyperlink of a host effect notification (HTML "follow the
+// hyperlink"): the core gives the link and its URL, parsed against the
+// document base URL; the document runs a javascript: URL. Returns the
+// link and the URL.
+function followRunHyperlink(core, notification) {
+  const link = core.wrapperFor(notification.target);
+  const url = effectText(core, notification);
+  nodeMember(link, "ownerDocument")._scriptProcessing?.followURL(url);
+  return { link, url };
 }
 
 // Executes one notification; returns its INPUT_OUTCOME.
@@ -157,6 +190,8 @@ function executeNotification(core, notification, host) {
     if (notification.source === SOURCE_BATCH) return host.batchEvent(notification);
     const target = core.wrapperFor(notification.target);
     const event = activationEvent(core, notification, host.syntheticClicks === true);
+    // The run follows the hyperlink of its click itself (EFFECT_HYPERLINK).
+    markRunActivationEvent(event);
     return dispatchEvent(target, event) ? INPUT_OUTCOME.DONE : INPUT_OUTCOME.CANCELED;
   }
   if (kind === NOTIFY.STATE) {
@@ -168,7 +203,7 @@ function executeNotification(core, notification, host) {
       controlValueEdited(target, Boolean(notification.a), Boolean(notification.b));
       host.valueEdited?.(notification);
     } else if (code === STATE.SELECTION_SET) {
-      controlSelectionSet(target);
+      controlSelectionSet(target, notification.a !== 0);
     } else if (code === STATE.DOCUMENT_SELECTION) {
       core.wrapperFor(notification.related).getSelection()._onChange(target);
     } else if (code === STATE.SCROLLED) {
@@ -215,6 +250,13 @@ function executeNotification(core, notification, host) {
       if (Number.isFinite(notification.b)) target.style.height = `${notification.b}px`;
     } else if (code === EFFECT_EYEDROPPER) {
       host.eyedropper(notification);
+    } else if (code === EFFECT_HYPERLINK) {
+      const { link, url } = followRunHyperlink(core, notification);
+      host.hyperlink(link, url);
+    } else if (code === EFFECT_CURSOR) {
+      host.cursor(notification);
+    } else if (code === EFFECT_CLIPBOARD_READ) {
+      host.clipboardRead(notification);
     } else {
       throw new Error(`Unknown native host effect ${code}`);
     }
@@ -266,8 +308,12 @@ const activationHost = {
   batchEvent() { throw new Error("An activation run has no input batch event"); },
   scrolled() { throw new Error("An activation run does not scroll"); },
   clipboard() { throw new Error("An activation run has no clipboard text"); },
+  clipboardRead() { throw new Error("An activation run has no paste key"); },
   fieldMenu() { throw new Error("An activation run has no context menu"); },
   eyedropper() { throw new Error("An activation run has no colour picker eyedropper"); },
+  // A click() run has no input host to give its followed hyperlink.
+  hyperlink() {},
+  cursor() { throw new Error("An activation run has no pointer record for a cursor"); },
   recordHook() { throw new Error("An activation run has no input records"); },
   validity() { throw new Error("An activation run has no validity result"); },
 };

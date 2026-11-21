@@ -53,8 +53,9 @@ function trackInput(values) {
 
 function readTracks(values, mode) {
   const count = core.status("scene_grid_tracks", trackInput(values), values.length, mode);
-  const pointer = core.exports.abi_output_pointer();
-  const view = new DataView(core.memory.buffer);
+  const tracks = count === 0 ? null : core.output("scene_grid_tracks");
+  const pointer = tracks?.pointer ?? 0;
+  const view = tracks?.memory();
   const breadth = (record, typeOffset, valueOffset, percentageOffset) => {
     const type = view.getUint8(record + typeOffset);
     const name = breadthNames[type];
@@ -94,8 +95,8 @@ function gridText(value, scale, mode) {
   const kind = typeof value === "number" ? GRID_VALUE_NUMBER : typeof value === "string" ? GRID_VALUE_STRING : GRID_VALUE_ABSENT;
   const [pointer, length] = typeof value === "string" ? core.input(value) : [0, 0];
   const outputKind = core.status("scene_grid_text", pointer, length, typeof value === "number" ? value : 0, kind, scale, mode);
-  if (outputKind === GRID_VALUE_NUMBER) return new DataView(core.memory.buffer).getFloat64(core.exports.abi_output_pointer(), true);
-  if (outputKind === GRID_VALUE_STRING) return core.outputString();
+  if (outputKind === GRID_VALUE_NUMBER) return core.output("scene_grid_text").getFloat64(0, true);
+  if (outputKind === GRID_VALUE_STRING) return core.outputString("scene_grid_text");
   throw new Error(`Unknown native grid text kind ${outputKind}`);
 }
 
@@ -116,19 +117,18 @@ const projectionFields = [
 export function readSceneRowGrid(core, node) {
   const publication = node._corePublication;
   if (publication?.core !== core) throw new TypeError("Grid readback requires a publication from the supplied core");
-  const pointer = core.status("scene_row_grid", publication.handle, node._corePublicationIndex);
-  const view = new DataView(core.memory.buffer);
-  const bytes = core.refreshBytes();
+  core.status("scene_row_grid", publication.handle, node._corePublicationIndex);
+  const view = core.output("scene_row_grid");
   const result = {};
   projectionFields.forEach((property, index) => {
-    const offset = pointer + index * GRID_PROJECTION.SIZE;
+    const offset = index * GRID_PROJECTION.SIZE;
     const kind = view.getUint32(offset + GRID_PROJECTION.KIND, true);
     if (kind === GRID_VALUE_ABSENT) return;
     if (kind === GRID_VALUE_NUMBER) {
       result[property] = view.getFloat64(offset + GRID_PROJECTION.NUMBER, true);
     } else if (kind === GRID_VALUE_STRING) {
       const text = view.getUint32(offset + GRID_PROJECTION.TEXT, true);
-      result[property] = core.decoder.decode(bytes.subarray(text, text + view.getUint32(offset + GRID_PROJECTION.LENGTH, true)));
+      result[property] = view.memoryText(core.decoder, text, view.getUint32(offset + GRID_PROJECTION.LENGTH, true));
     } else {
       throw new Error(`Unknown native grid projection kind ${kind}`);
     }

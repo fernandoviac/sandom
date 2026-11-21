@@ -105,14 +105,16 @@ export function canvasTextEnvironment(canvas) {
       viewport: viewportOf(canvas),
     };
   }
+  const dom = canvas._domCore;
+  // The language is read before a computed style getter reaches the core.
+  dom.status("canvas_language", canvas._coreHandle);
+  const language = dom.outputString("canvas_language");
   const computed = document.getComputedStyle(canvas);
   const root = document.documentElement;
-  const dom = canvas._domCore;
-  dom.status("canvas_language", canvas._coreHandle);
   return {
     connected: true,
     direction: computed.direction === "rtl" ? 1 : 0,
-    language: dom.outputString(),
+    language,
     parentSize: parseFloat(computed.fontSize),
     parentWeight: parseFloat(computed.fontWeight),
     rootSize: root === null ? NaN : parseFloat(document.getComputedStyle(root).fontSize),
@@ -145,7 +147,7 @@ function styleText(dom, style) {
   dom.status("canvas_measurement_style", ...dom.input(style.families), style.size, style.slope, style.style,
     style.weight, style.fontStretch, style.fontVariantCaps, style.fontKerning, style.textRendering,
     style.letterSpacingPx, style.direction);
-  return dom.outputString();
+  return dom.outputString("canvas_measurement_style");
 }
 
 // Lays `text` out with the resolved text style through the renderer

@@ -163,15 +163,14 @@ function nextReaction(core, handle, registry) {
   const { definitions } = coreState(core);
   const pointer = core.status("custom_reaction_next", handle, registry);
   if (!pointer) return null;
-  const token = core.handle("custom_reaction_token", handle, registry);
-  const view = new DataView(core.refreshBytes().buffer);
+  const view = core.resultMemory("custom_reaction_next");
   const string = (field) => {
     const length = view.getInt32(pointer + field + CUSTOM.STRING_LENGTH, true);
     if (length === -1) return null;
-    const start = view.getUint32(pointer + field + CUSTOM.STRING_POINTER, true);
-    return core.decoder.decode(core.bytes.subarray(start, start + length));
+    return view.memoryText(core.decoder, view.getUint32(pointer + field + CUSTOM.STRING_POINTER, true), length);
   };
-  // Decode the complete owned invocation before crossing into authored code.
+  // Decode the complete owned invocation before the next core operation and
+  // before crossing into authored code.
   const elementHandle = view.getBigUint64(pointer + CUSTOM.REACTION_ELEMENT, true);
   const definition = definitions.get(view.getUint32(pointer + CUSTOM.REACTION_DEFINITION, true));
   const kind = view.getUint32(pointer + CUSTOM.REACTION_KIND, true);
@@ -180,6 +179,7 @@ function nextReaction(core, handle, registry) {
   const newValue = string(CUSTOM.REACTION_NEW_VALUE);
   const oldDocument = view.getBigUint64(pointer + CUSTOM.REACTION_OLD_DOCUMENT, true);
   const newDocument = view.getBigUint64(pointer + CUSTOM.REACTION_NEW_DOCUMENT, true);
+  const token = core.handle("custom_reaction_token", handle, registry);
   const element = core.wrapperFor(elementHandle);
   return {
     token,
@@ -352,12 +352,9 @@ class CustomStateSetRuntime extends Set {
         serial,
       );
       if (!pointer) return;
-      const view = new DataView(core.refreshBytes().buffer);
+      const view = core.resultMemory("custom_state_after");
       serial = view.getBigUint64(pointer + CUSTOM.STATE_SERIAL, true);
-      const length = view.getUint32(pointer + CUSTOM.STATE_LENGTH, true);
-      yield core.decoder.decode(
-        core.bytes.subarray(pointer + CUSTOM.STATE_NAME, pointer + CUSTOM.STATE_NAME + length),
-      );
+      yield view.memoryText(core.decoder, pointer + CUSTOM.STATE_NAME, view.getUint32(pointer + CUSTOM.STATE_LENGTH, true));
     }
   }
   *_bindingEntries() {
@@ -404,13 +401,9 @@ class ElementInternalsRuntime {
   _reflectionRead(name) {
     const core = this._host._domCore;
     const type = core.status("custom_internals_get", this._host._coreHandle, ...core.input(name));
-    if (type === CUSTOM_INTERNALS_STRING) return core.outputString();
+    if (type === CUSTOM_INTERNALS_STRING) return core.outputString("custom_internals_get");
     if (type !== CUSTOM_INTERNALS_ELEMENTS) return null;
-    const pointer = core.exports.abi_output_pointer();
-    const count = core.exports.abi_output_length() / BigUint64Array.BYTES_PER_ELEMENT;
-    const view = new DataView(core.refreshBytes().buffer);
-    return Array.from({ length: count }, (_, index) =>
-      core.wrapperFor(view.getBigUint64(pointer + index * BigUint64Array.BYTES_PER_ELEMENT, true)));
+    return core.outputNodes("custom_internals_get", core.output("custom_internals_get").byteLength / BigUint64Array.BYTES_PER_ELEMENT);
   }
   _reflectionWrite(name, value, type) {
     const host = this._host;
